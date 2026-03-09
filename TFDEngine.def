@@ -1,0 +1,5 @@
+LIBRARY TFDEngine
+EXPORTS
+    SKSEPlugin_Load
+    SKSEPlugin_Query
+    SKSEPlugin_Version

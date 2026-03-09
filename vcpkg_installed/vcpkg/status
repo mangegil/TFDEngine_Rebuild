@@ -1,0 +1,42 @@
+Package: vcpkg-cmake-config
+Version: 2022-02-06
+Port-Version: 1
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 7c40e10dab05057559901472009173c73e58743c7916a46bc8dbe12a7b2388df
+Status: install ok installed
+
+Package: vcpkg-cmake
+Version: 2023-05-04
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 17c584b77f9c6186b0bbe23c2b35bcd4b8ac7833db661252b16fc08dd6f28c22
+Status: install ok installed
+
+Package: fmt
+Version: 10.2.1
+Depends: vcpkg-cmake:x64-windows, vcpkg-cmake-config:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 5ff27a0cd4e55cbc5aa11697bb163f3fda11677671b811269da49c817c5af6bc
+Description: Formatting library for C++. It can be used as a safe alternative to printf or as a fast alternative to IOStreams.
+Status: install ok installed
+
+Package: rapidcsv
+Version: 8.64
+Depends: vcpkg-cmake:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 47968abad8b01c0754ba50e66f26cc76af12172c20546c32bbe594e8d0837a93
+Description: Rapidcsv is a C++ header-only library for CSV parsing.
+Status: install ok installed
+
+Package: spdlog
+Version: 1.12.0
+Depends: fmt, vcpkg-cmake:x64-windows, vcpkg-cmake-config:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 602293a2a519f65e752dc75521014b832fe734f7b93e5f4bfee3e40034141263
+Description: Very fast, header only, C++ logging library
+Status: install ok installed
+

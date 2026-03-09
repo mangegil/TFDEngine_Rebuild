@@ -1,0 +1,8 @@
+x64-windows-static/
+x64-windows-static/include/
+x64-windows-static/include/rapidcsv.h
+x64-windows-static/share/
+x64-windows-static/share/rapidcsv/
+x64-windows-static/share/rapidcsv/copyright
+x64-windows-static/share/rapidcsv/vcpkg.spdx.json
+x64-windows-static/share/rapidcsv/vcpkg_abi_info.txt

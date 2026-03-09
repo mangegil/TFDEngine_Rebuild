@@ -1,0 +1,154 @@
+{
+  "configurations": [
+    {
+      "name": "x64-Release-SE1597",
+      "generator": "Ninja",
+      "configurationType": "Release",
+      "inheritEnvironments": [ "msvc_x64_x64" ],
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "variables": [
+        {
+          "name": "CMAKE_TOOLCHAIN_FILE",
+          "value": "E:/SINTA/dev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+          "type": "FILEPATH"
+        },
+        {
+          "name": "VCPKG_TARGET_TRIPLET",
+          "value": "x64-windows-static",
+          "type": "STRING"
+        },
+        {
+          "name": "VCPKG_HOST_TRIPLET",
+          "value": "x64-windows-static",
+          "type": "STRING"
+        },
+        {
+          "name": "CMAKE_CXX_STANDARD",
+          "value": "23",
+          "type": "STRING"
+        },
+        {
+          "name": "CMAKE_CXX_STANDARD_REQUIRED",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "CMAKE_CXX_EXTENSIONS",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "BUILD_TESTING",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "BUILD_TESTS",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_SE",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_AE",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_VR",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "TFDEnableSmf",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "CMAKE_MAKE_PROGRAM",
+          "value": "C:\\Users\\ROG\\AppData\\Local\\Microsoft\\WinGet\\Links\\ninja.exe",
+          "type": "FILEPATH"
+        }
+      ]
+    },
+    {
+      "name": "x64-Debug-SE1597",
+      "generator": "Ninja",
+      "configurationType": "Debug",
+      "inheritEnvironments": [ "msvc_x64_x64" ],
+      "buildRoot": "${projectDir}\\out\\build\\${name}",
+      "installRoot": "${projectDir}\\out\\install\\${name}",
+      "variables": [
+        {
+          "name": "CMAKE_TOOLCHAIN_FILE",
+          "value": "E:/SINTA/dev/vcpkg/scripts/buildsystems/vcpkg.cmake",
+          "type": "FILEPATH"
+        },
+        {
+          "name": "VCPKG_TARGET_TRIPLET",
+          "value": "x64-windows-static",
+          "type": "STRING"
+        },
+        {
+          "name": "VCPKG_HOST_TRIPLET",
+          "value": "x64-windows-static",
+          "type": "STRING"
+        },
+        {
+          "name": "CMAKE_CXX_STANDARD",
+          "value": "23",
+          "type": "STRING"
+        },
+        {
+          "name": "CMAKE_CXX_STANDARD_REQUIRED",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "CMAKE_CXX_EXTENSIONS",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "BUILD_TESTING",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "BUILD_TESTS",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_SE",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_AE",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "ENABLE_SKYRIM_VR",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
+          "name": "TFDEnableSmf",
+          "value": "True",
+          "type": "BOOL"
+        },
+        {
+          "name": "CMAKE_MAKE_PROGRAM",
+          "value": "C:\\Users\\ROG\\AppData\\Local\\Microsoft\\WinGet\\Links\\ninja.exe",
+          "type": "FILEPATH"
+        }
+      ]
+    }
+  ]
+}

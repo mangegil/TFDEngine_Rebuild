@@ -1,0 +1,542 @@
+﻿#include "TFDForceGreet.h"
+#include "TFDSettings.h"
+
+#include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
+
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <mutex>
+
+#include <spdlog/spdlog.h>
+
+namespace TFD::ForceGreet
+{
+	namespace
+	{
+		using Clock = std::chrono::steady_clock;
+
+		struct Job
+		{
+			std::uint32_t speakerHandle{ 0 };
+			Mode mode{ Mode::None };
+
+			double endTimeSec{ 0.0 };
+			double nextTrySec{ 0.0 };
+
+			bool active{ false };
+			bool success{ false };
+		};
+
+		std::mutex lock;
+		Job job;
+
+		std::atomic_bool installed{ false };
+		std::atomic_bool inputSinkAdded{ false };
+		std::atomic_bool menuSinkAdded{ false };
+
+		Clock::time_point t0 = Clock::now();
+
+		std::uint32_t stickyHandle{ 0 };
+		Mode stickyMode{ Mode::None };
+		bool stickyArmed{ false };
+		double dialogueOpenedAtSec{ 0.0 };
+		double suppressUntilSec{ 0.0 };
+
+		constexpr float kCaptiveApproachDistance = 140.0f;
+		constexpr float kCaptiveApproachDistanceSq = kCaptiveApproachDistance * kCaptiveApproachDistance;
+		constexpr double kCaptiveSuppressSeconds = 6.0;
+		constexpr double kNormalSuppressSeconds = 1.5;
+
+		double NowSec()
+		{
+			const auto now = Clock::now();
+			return std::chrono::duration<double>(now - t0).count();
+		}
+
+		bool IsDialogueOpen()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+		}
+
+		bool IsBlockingMenuOpen()
+		{
+			auto* ui = RE::UI::GetSingleton();
+			if (!ui) {
+				return false;
+			}
+
+			if (ui->IsMenuOpen(RE::Console::MENU_NAME)) {
+				return true;
+			}
+			if (ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)) {
+				return true;
+			}
+			if (ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME)) {
+				return true;
+			}
+			if (ui->IsMenuOpen(RE::JournalMenu::MENU_NAME)) {
+				return true;
+			}
+
+			return false;
+		}
+
+		RE::Actor* ResolveSpeaker(std::uint32_t handle)
+		{
+			if (!handle) {
+				return nullptr;
+			}
+			auto sp = RE::Actor::LookupByHandle(handle);
+			return sp.get();
+		}
+
+		void SendModEvent(const char* eventName, RE::Actor* sender)
+		{
+			if (!eventName) {
+				return;
+			}
+
+			auto* src = SKSE::GetModCallbackEventSource();
+			if (!src) {
+				return;
+			}
+
+			SKSE::ModCallbackEvent e(eventName, "", 0.0f, sender);
+			src->SendEvent(&e);
+		}
+
+		void ClearCaptiveAliases(RE::Actor* speaker, const char* reason)
+		{
+			SendModEvent("TFDCaptiveClearAll", speaker);
+
+			if (speaker) {
+				spdlog::info("[TFD][ForceGreet] CaptiveClearAll reason={} speaker={:08X}",
+					reason ? reason : "unknown", speaker->GetFormID());
+			}
+			else {
+				spdlog::info("[TFD][ForceGreet] CaptiveClearAll reason={} speaker=<none>",
+					reason ? reason : "unknown");
+			}
+		}
+
+		float DistanceSq3D(RE::Actor* a, RE::Actor* b)
+		{
+			if (!a || !b) {
+				return FLT_MAX;
+			}
+
+			const auto pa = a->GetPosition();
+			const auto pb = b->GetPosition();
+
+			const float dx = pa.x - pb.x;
+			const float dy = pa.y - pb.y;
+			const float dz = pa.z - pb.z;
+
+			return (dx * dx) + (dy * dy) + (dz * dz);
+		}
+
+		void NudgeApproach(RE::Actor* speaker)
+		{
+			if (!speaker) {
+				return;
+			}
+
+			if (speaker->IsInCombat()) {
+				speaker->StopCombat();
+			}
+			speaker->DrawWeaponMagicHands(false);
+
+			speaker->EvaluatePackage(true, false);
+		}
+
+		void ClearStickyGreet(RE::Actor* speaker, Mode mode)
+		{
+			if (!speaker) {
+				return;
+			}
+
+			if (speaker->IsInCombat()) {
+				speaker->StopCombat();
+			}
+			speaker->DrawWeaponMagicHands(false);
+
+			speaker->SetDialogueWithPlayer(false, false, nullptr);
+
+			if (mode == Mode::Bleedout) {
+				speaker->EvaluatePackage(true, false);
+			}
+		}
+
+		bool TryStartDialogue(RE::Actor* speaker, Mode mode)
+		{
+			if (!speaker) {
+				return false;
+			}
+
+			if (IsBlockingMenuOpen()) {
+				return false;
+			}
+
+			if (NowSec() < suppressUntilSec) {
+				return false;
+			}
+
+			if (speaker->IsDead()) {
+				return false;
+			}
+
+			if (speaker->IsInCombat()) {
+				speaker->StopCombat();
+			}
+			speaker->DrawWeaponMagicHands(false);
+
+			const bool ok = speaker->SetDialogueWithPlayer(true, true, nullptr);
+
+			if (mode != Mode::CaptiveMarker) {
+				speaker->EvaluatePackage(true, false);
+			}
+
+			spdlog::info("[TFD][ForceGreet] TryStartDialogue speaker={:08X} mode={} ok={}",
+				speaker->GetFormID(), static_cast<int>(mode), ok ? "true" : "false");
+			return ok;
+		}
+
+		void BeginInternal(RE::Actor* speaker, Mode mode, int windowSeconds, bool immediateStart)
+		{
+			if (!speaker) {
+				return;
+			}
+
+			if (windowSeconds <= 0) {
+				windowSeconds = 8;
+			}
+
+			const double now = NowSec();
+
+			{
+				std::scoped_lock lk(lock);
+
+				job.speakerHandle = speaker->GetHandle().native_handle();
+				job.mode = mode;
+				job.endTimeSec = now + static_cast<double>(windowSeconds);
+				job.nextTrySec = now;
+				job.active = true;
+				job.success = false;
+			}
+
+			spdlog::info("[TFD][ForceGreet] Begin speaker={:08X} mode={} window={}s immediate={}",
+				speaker->GetFormID(), static_cast<int>(mode), windowSeconds, immediateStart ? "true" : "false");
+
+			if (immediateStart) {
+				TryStartDialogue(speaker, mode);
+			}
+		}
+
+		void SetSuccessLocked()
+		{
+			job.success = true;
+			job.active = false;
+			job.mode = Mode::None;
+		}
+
+		class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* e, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+			{
+				if (!e) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (e->menuName == RE::DialogueMenu::MENU_NAME && e->opening) {
+					std::scoped_lock lk(lock);
+
+					if (job.active) {
+						stickyHandle = job.speakerHandle;
+						stickyMode = job.mode;
+						stickyArmed = (stickyHandle != 0);
+						dialogueOpenedAtSec = NowSec();
+
+						spdlog::info("[TFD][ForceGreet] DialogueMenu opened -> success (sticky armed)");
+						SetSuccessLocked();
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (e->menuName == RE::DialogueMenu::MENU_NAME && !e->opening) {
+					bool shouldClearCaptive = false;
+					RE::Actor* speakerForClear = nullptr;
+
+					if (stickyArmed) {
+						const double now = NowSec();
+
+						if ((now - dialogueOpenedAtSec) < 120.0) {
+							auto* speaker = ResolveSpeaker(stickyHandle);
+
+							ClearStickyGreet(speaker, stickyMode);
+
+							if (stickyMode == Mode::CaptiveMarker) {
+								suppressUntilSec = now + kCaptiveSuppressSeconds;
+								shouldClearCaptive = true;
+								speakerForClear = speaker;
+
+								spdlog::info("[TFD][ForceGreet] Captive dialogue closed -> suppress + clearall");
+							}
+							else {
+								suppressUntilSec = now + kNormalSuppressSeconds;
+								spdlog::info("[TFD][ForceGreet] Dialogue closed -> suppress");
+							}
+						}
+
+						stickyArmed = false;
+						stickyHandle = 0;
+						stickyMode = Mode::None;
+					}
+
+					if (shouldClearCaptive) {
+						ClearCaptiveAliases(speakerForClear, "dialogue_closed");
+					}
+
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		static MenuSink menuSink;
+
+		class InputSink : public RE::BSTEventSink<RE::InputEvent*>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const*, RE::BSTEventSource<RE::InputEvent*>*) override
+			{
+				TFD::ForceGreet::Tick();
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		static InputSink inputSink;
+
+		void OnSkseMessage(SKSE::MessagingInterface::Message* msg)
+		{
+			if (!msg) {
+				return;
+			}
+
+			if (msg->type == SKSE::MessagingInterface::kInputLoaded) {
+				if (inputSinkAdded.exchange(true)) {
+					return;
+				}
+
+				auto* input = RE::BSInputDeviceManager::GetSingleton();
+				if (input) {
+					input->AddEventSink(&inputSink);
+					spdlog::info("[TFD][ForceGreet] InputSink added");
+				}
+				else {
+					spdlog::warn("[TFD][ForceGreet] BSInputDeviceManager null");
+					inputSinkAdded.store(false);
+				}
+			}
+		}
+	}
+
+	void Install()
+	{
+		if (installed.exchange(true)) {
+			return;
+		}
+
+		if (auto* messaging = SKSE::GetMessagingInterface()) {
+			messaging->RegisterListener(OnSkseMessage);
+		}
+		else {
+			spdlog::warn("[TFD][ForceGreet] MessagingInterface null");
+		}
+
+		if (!menuSinkAdded.exchange(true)) {
+			if (auto* ui = RE::UI::GetSingleton()) {
+				ui->AddEventSink<RE::MenuOpenCloseEvent>(&menuSink);
+				spdlog::info("[TFD][ForceGreet] MenuSink added");
+			}
+			else {
+				spdlog::warn("[TFD][ForceGreet] UI singleton null (MenuSink not added)");
+				menuSinkAdded.store(false);
+			}
+		}
+	}
+
+	void BeginBleedout(RE::Actor* speaker)
+	{
+		const int window = TFD::Settings::GetBleedWindowSeconds();
+		BeginInternal(speaker, Mode::Bleedout, window, true);
+	}
+
+	void BeginCaptiveMarker(RE::Actor* speaker)
+	{
+		const int window = TFD::Settings::GetBleedWindowSeconds();
+		BeginInternal(speaker, Mode::CaptiveMarker, window, false);
+		Tick();
+	}
+
+	void Tick()
+	{
+		Job snap;
+		{
+			std::scoped_lock lk(lock);
+			snap = job;
+		}
+
+		if (!snap.active) {
+			return;
+		}
+
+		if (IsDialogueOpen()) {
+			std::scoped_lock lk(lock);
+			SetSuccessLocked();
+			return;
+		}
+
+		const double now = NowSec();
+
+		if (now >= snap.endTimeSec) {
+			RE::Actor* speaker = ResolveSpeaker(snap.speakerHandle);
+			const bool wasCaptive = (snap.mode == Mode::CaptiveMarker);
+
+			{
+				std::scoped_lock lk(lock);
+				job.active = false;
+				job.mode = Mode::None;
+				job.speakerHandle = 0;
+			}
+
+			spdlog::info("[TFD][ForceGreet] Timed out mode={}", static_cast<int>(snap.mode));
+
+			if (wasCaptive) {
+				ClearCaptiveAliases(speaker, "timeout");
+			}
+			return;
+		}
+
+		if (now < snap.nextTrySec) {
+			return;
+		}
+
+		{
+			std::scoped_lock lk(lock);
+			job.nextTrySec = now + 0.50;
+		}
+
+		auto* speaker = ResolveSpeaker(snap.speakerHandle);
+		if (!speaker) {
+			const bool wasCaptive = (snap.mode == Mode::CaptiveMarker);
+
+			{
+				std::scoped_lock lk(lock);
+				job.active = false;
+				job.mode = Mode::None;
+				job.speakerHandle = 0;
+			}
+
+			spdlog::info("[TFD][ForceGreet] Speaker lost -> cancel");
+
+			if (wasCaptive) {
+				ClearCaptiveAliases(nullptr, "speaker_lost");
+			}
+			return;
+		}
+
+		if (snap.mode == Mode::CaptiveMarker) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return;
+			}
+
+			if (speaker->GetParentCell() != player->GetParentCell()) {
+				NudgeApproach(speaker);
+				spdlog::info("[TFD][ForceGreet] Captive approach waiting same cell speaker={:08X}",
+					speaker->GetFormID());
+				return;
+			}
+
+			const float distSq = DistanceSq3D(speaker, player);
+
+			if (distSq > kCaptiveApproachDistanceSq) {
+				NudgeApproach(speaker);
+
+				spdlog::info("[TFD][ForceGreet] Captive approach dist={:.1f} speaker={:08X}",
+					std::sqrt(distSq), speaker->GetFormID());
+				return;
+			}
+
+			spdlog::info("[TFD][ForceGreet] Captive close enough -> start dialogue dist={:.1f} speaker={:08X}",
+				std::sqrt(distSq), speaker->GetFormID());
+		}
+
+		TryStartDialogue(speaker, snap.mode);
+	}
+
+	void Cancel()
+	{
+		RE::Actor* stickySpeaker = nullptr;
+		Mode oldStickyMode = Mode::None;
+		Mode oldJobMode = Mode::None;
+		RE::Actor* jobSpeaker = nullptr;
+
+		{
+			std::scoped_lock lk(lock);
+
+			if (stickyArmed) {
+				stickySpeaker = ResolveSpeaker(stickyHandle);
+				oldStickyMode = stickyMode;
+			}
+
+			oldJobMode = job.mode;
+			jobSpeaker = ResolveSpeaker(job.speakerHandle);
+
+			job.active = false;
+			job.success = false;
+			job.mode = Mode::None;
+			job.speakerHandle = 0;
+			job.endTimeSec = 0.0;
+			job.nextTrySec = 0.0;
+
+			stickyArmed = false;
+			stickyHandle = 0;
+			stickyMode = Mode::None;
+			suppressUntilSec = 0.0;
+			dialogueOpenedAtSec = 0.0;
+		}
+
+		if (stickySpeaker) {
+			ClearStickyGreet(stickySpeaker, oldStickyMode);
+		}
+
+		if (oldStickyMode == Mode::CaptiveMarker || oldJobMode == Mode::CaptiveMarker) {
+			ClearCaptiveAliases(jobSpeaker ? jobSpeaker : stickySpeaker, "cancel");
+		}
+	}
+
+	bool IsActive()
+	{
+		std::scoped_lock lk(lock);
+		return job.active;
+	}
+
+	bool DidSucceed()
+	{
+		std::scoped_lock lk(lock);
+		return job.success;
+	}
+
+	Mode GetMode()
+	{
+		std::scoped_lock lk(lock);
+		return job.mode;
+	}
+}
