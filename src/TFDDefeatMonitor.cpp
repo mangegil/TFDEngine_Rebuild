@@ -80,7 +80,12 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_leftForDeadNextPulse{};
 		std::chrono::steady_clock::time_point g_lastRescueContextPoll{};
 		RE::FormID g_lastKnownRescueLocationId = 0;
-
+		bool g_pendingRescueNearBed = false;
+		bool g_pendingRescueNearBedHideFader = false;
+		RE::ObjectRefHandle g_pendingRescueNearBedRef{};
+		RE::ObjectRefHandle g_pendingRescueNearDestRef{};
+		std::chrono::steady_clock::time_point g_pendingRescueNearBedNotBefore{};
+		std::chrono::steady_clock::time_point g_pendingRescueNearBedExpire{};
 
 		RE::ActorHandle g_lastAggressor{};
 		bool g_bleedSawDialogue = false;
@@ -313,6 +318,9 @@ namespace TFD::DefeatMonitor
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID);
+		static void ClearPendingRescueNearBed(const char* reason, bool hideNow);
+		static void QueuePendingRescueNearBed(RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs);
+		static void ProcessPendingRescueNearBed();
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
 
@@ -584,6 +592,144 @@ namespace TFD::DefeatMonitor
 			return nullptr;
 		}
 
+
+		static void ClearPendingRescueNearBed(const char* reason, bool hideNow)
+		{
+			const bool shouldHide = hideNow || g_pendingRescueNearBedHideFader;
+			const bool hadPending = g_pendingRescueNearBed;
+
+			g_pendingRescueNearBed = false;
+			g_pendingRescueNearBedHideFader = false;
+			g_pendingRescueNearBedRef = RE::ObjectRefHandle{};
+			g_pendingRescueNearDestRef = RE::ObjectRefHandle{};
+			g_pendingRescueNearBedNotBefore = {};
+			g_pendingRescueNearBedExpire = {};
+
+			if (reason && reason[0]) {
+				spdlog::info("[TFD][Transition] rescue near-bed pending cleared reason={}", reason);
+			}
+
+			if (shouldHide && (hadPending || hideNow)) {
+				HideBlackoutFader();
+			}
+		}
+
+		static void QueuePendingRescueNearBed(RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs)
+		{
+			if (!bedRef || !destRef) {
+				return;
+			}
+
+			g_pendingRescueNearBed = true;
+			g_pendingRescueNearBedHideFader = true;
+			g_pendingRescueNearBedRef = bedRef->GetHandle();
+			g_pendingRescueNearDestRef = destRef->GetHandle();
+			g_pendingRescueNearBedNotBefore = Now() + std::chrono::milliseconds((std::max)(minDelayMs, 0));
+			g_pendingRescueNearBedExpire = Now() + std::chrono::seconds(8);
+
+			spdlog::info(
+				"[TFD][Transition] rescue near-bed deferred queued bed={:08X} dest={:08X} minDelayMs={}",
+				bedRef->GetFormID(),
+				destRef->GetFormID(),
+				(std::max)(minDelayMs, 0));
+		}
+
+		static void ProcessPendingRescueNearBed()
+		{
+			if (!g_pendingRescueNearBed) {
+				return;
+			}
+
+			auto* ui = RE::UI::GetSingleton();
+			if (ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) {
+				return;
+			}
+
+			const auto now = Now();
+			if (now < g_pendingRescueNearBedNotBefore) {
+				return;
+			}
+
+			auto* player = Player();
+			if (!player) {
+				if (now >= g_pendingRescueNearBedExpire) {
+					spdlog::info("[TFD][Transition] rescue near-bed deferred timeout cause=no_player");
+					ClearPendingRescueNearBed("timeout_no_player", true);
+				}
+				return;
+			}
+
+			auto bedSP = g_pendingRescueNearBedRef.get();
+			auto destSP = g_pendingRescueNearDestRef.get();
+			auto* bedRef = bedSP.get();
+			auto* destRef = destSP.get();
+
+			if (!bedRef || !destRef) {
+				spdlog::info(
+					"[TFD][Transition] rescue near-bed deferred cancelled cause=ref_invalid bed={:08X} dest={:08X}",
+					bedRef ? bedRef->GetFormID() : 0,
+					destRef ? destRef->GetFormID() : 0);
+				ClearPendingRescueNearBed("ref_invalid", true);
+				return;
+			}
+
+			if (!SharesParentCell(destRef, bedRef)) {
+				spdlog::info(
+					"[TFD][Transition] rescue near-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
+					bedRef->GetFormID(),
+					destRef->GetFormID());
+				ClearPendingRescueNearBed("cell_mismatch", true);
+				return;
+			}
+
+			auto* playerCell = player->GetParentCell();
+			auto* bedCell = bedRef->GetParentCell();
+			auto* destCell = destRef->GetParentCell();
+
+			if (!playerCell || !bedCell || !destCell) {
+				if (now >= g_pendingRescueNearBedExpire) {
+					spdlog::info(
+						"[TFD][Transition] rescue near-bed deferred timeout cause=null_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
+						playerCell ? playerCell->GetFormID() : 0,
+						bedCell ? bedCell->GetFormID() : 0,
+						destCell ? destCell->GetFormID() : 0);
+					ClearPendingRescueNearBed("timeout_null_cell", true);
+				}
+				return;
+			}
+
+			const auto playerCellId = playerCell->GetFormID();
+			const auto bedCellId = bedCell->GetFormID();
+			const auto destCellId = destCell->GetFormID();
+			if (playerCellId != bedCellId || playerCellId != destCellId) {
+				if (now >= g_pendingRescueNearBedExpire) {
+					spdlog::info(
+						"[TFD][Transition] rescue near-bed deferred timeout cause=player_not_in_dest_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
+						playerCellId,
+						bedCellId,
+						destCellId);
+					ClearPendingRescueNearBed("timeout_player_not_in_dest_cell", true);
+				}
+				return;
+			}
+
+			if (SnapPlayerNearBed(player, bedRef, destRef)) {
+				spdlog::info(
+					"[TFD][Transition] rescue near-bed deferred applied bed={:08X} dest={:08X} playerCell={:08X}",
+					bedRef->GetFormID(),
+					destRef->GetFormID(),
+					playerCellId);
+				ClearPendingRescueNearBed("applied", true);
+			}
+			else {
+				spdlog::info(
+					"[TFD][Transition] rescue near-bed deferred failed bed={:08X} dest={:08X}",
+					bedRef->GetFormID(),
+					destRef->GetFormID());
+				ClearPendingRescueNearBed("failed", true);
+			}
+		}
+
 		static bool SnapPlayerNearBed(RE::Actor* player, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef)
 		{
 			if (!player || !bedRef) {
@@ -686,22 +832,15 @@ namespace TFD::DefeatMonitor
 			const bool canSnapNearBed = bedRef && SharesParentCell(dest, bedRef);
 			const char* bedSnapState = "no";
 
+			ClearPendingRescueNearBed(nullptr, false);
 			ShowBlackoutFader();
 			std::this_thread::sleep_for(std::chrono::milliseconds(300));
 			player->MoveTo(dest);
 			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 			RecoverPlayerForTransition();
 			if (canSnapNearBed) {
-				if (SnapPlayerNearBed(player, bedRef, dest)) {
-					bedSnapState = "near_bed";
-				}
-				else {
-					bedSnapState = "near_bed_failed";
-					spdlog::info(
-						"[TFD][Transition] rescue near-bed snap failed bed={:08X} dest={:08X}",
-						bedRef->GetFormID(),
-						dest->GetFormID());
-				}
+				QueuePendingRescueNearBed(bedRef, dest, 1200);
+				bedSnapState = "near_bed_deferred";
 			}
 			else if (bedRef) {
 				bedSnapState = "cell_mismatch";
@@ -715,7 +854,9 @@ namespace TFD::DefeatMonitor
 			SetGraceSeconds(4);
 			UpdatePreCombatState();
 			std::this_thread::sleep_for(std::chrono::milliseconds(400));
-			HideBlackoutFader();
+			if (!g_pendingRescueNearBed) {
+				HideBlackoutFader();
+			}
 			spdlog::info(
 				"[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X} bed={:08X} bedSnap={}",
 				reason ? reason : "unknown",
@@ -1480,6 +1621,7 @@ namespace TFD::DefeatMonitor
 			if (g_loadTransition.load(std::memory_order_acquire)) return;
 			auto* ui = RE::UI::GetSingleton();
 			PollTransitionResult();
+			ProcessPendingRescueNearBed();
 			if (IsTransitionAwaiting()) {
 				MaintainTransitionCalmWindow();
 				UpdatePreCombatState();
@@ -1715,6 +1857,7 @@ namespace TFD::DefeatMonitor
 		TFD::AggressionClamp::Clear();
 		TFD::ForceGreet::Cancel();
 		ClearLeftForDeadCooldown();
+		ClearPendingRescueNearBed("reset_for_load", true);
 		spdlog::info("[TFD][Defeat] ResetForLoad -> runtime only");
 	}
 
@@ -1724,6 +1867,7 @@ namespace TFD::DefeatMonitor
 		if (active) {
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
+			ClearPendingRescueNearBed("load_transition", true);
 			spdlog::info("[TFD][Defeat] SetLoadTransition(true)");
 		}
 		else {
