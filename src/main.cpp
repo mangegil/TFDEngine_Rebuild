@@ -230,6 +230,9 @@ public:
 
             spdlog::info("[TFD] LoadingMenu closed -> player in world (cell={:08X})", cell->GetFormID());
             InitOnceAfterLoad();
+            if (cell->IsInteriorCell()) {
+                TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
+            }
             FinalizeLoadAfterWorldReady();
         }
 

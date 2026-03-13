@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <cmath>
+#include <cctype>
 
 #include <spdlog/spdlog.h>
 
@@ -21,6 +23,7 @@
 #include "TFDForceGreet.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDDefeatMonitor.h"
+#include "EditorIdCache.h"
 
 #ifndef UNICODE
 #define UNICODE
@@ -102,6 +105,320 @@ namespace TFDMenu
 		static float GetGlobalValue(RE::TESGlobal* g)
 		{
 			return g ? g->value : 0.0f;
+		}
+
+		static const char* SafeStr(const char* s)
+		{
+			return (s && s[0]) ? s : "";
+		}
+
+		static RE::BGSLocation* GetCellLocation(RE::TESObjectREFR* ref)
+		{
+			auto* cell = ref ? ref->GetParentCell() : nullptr;
+			return cell ? cell->GetLocation() : nullptr;
+		}
+
+		static RE::BGSLocationRefType* LookupLocRefType(const char* editorID)
+		{
+			if (!editorID || !editorID[0]) {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>(editorID);
+		}
+
+		static bool LocationHasSpecialRefTypeByEditorID(RE::BGSLocation* loc, const char* editorID)
+		{
+			if (!loc) {
+				return false;
+			}
+
+			auto* want = LookupLocRefType(editorID);
+			if (!want) {
+				return false;
+			}
+
+			for (std::uint32_t i = 0; i < loc->specialRefs.size(); ++i) {
+				const auto& sref = loc->specialRefs[i];
+				auto* type = sref.type;
+				if (!type) {
+					continue;
+				}
+				if (type == want || type->GetFormID() == want->GetFormID()) {
+					return true;
+				}
+			}
+
+			return false;
+		}
+
+		static void RenderSpecialRefSummary(const char* label, RE::BGSLocation* loc)
+		{
+			const bool hasCenter = LocationHasSpecialRefTypeByEditorID(loc, "LocationCenterMarker");
+			const bool hasInside = LocationHasSpecialRefTypeByEditorID(loc, "InsideEntrance");
+			const bool hasOutside = LocationHasSpecialRefTypeByEditorID(loc, "OutsideEntrance");
+			const bool hasBoss = LocationHasSpecialRefTypeByEditorID(loc, "Boss");
+			const bool hasBossContainer = LocationHasSpecialRefTypeByEditorID(loc, "BossContainer");
+			const bool hasCaptive = LocationHasSpecialRefTypeByEditorID(loc, "CaptiveMarker");
+
+			ImGuiMCP::Text(
+				"%s: Center=%d Inside=%d Outside=%d Boss=%d BossContainer=%d Captive=%d",
+				label,
+				hasCenter ? 1 : 0,
+				hasInside ? 1 : 0,
+				hasOutside ? 1 : 0,
+				hasBoss ? 1 : 0,
+				hasBossContainer ? 1 : 0,
+				hasCaptive ? 1 : 0);
+		}
+
+		static void RenderSpecialRefs(const char* label, RE::BGSLocation* loc)
+		{
+			ImGuiMCP::Text("%s", label);
+
+			if (!loc) {
+				ImGuiMCP::Text("  <null loc>");
+				return;
+			}
+
+			const auto count = static_cast<std::uint32_t>(loc->specialRefs.size());
+			ImGuiMCP::Text("  Count=%u", count);
+
+			for (std::uint32_t i = 0; i < count && i < 12; ++i) {
+				const auto& sref = loc->specialRefs[i];
+				auto* type = sref.type;
+				auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(sref.refData.refID);
+				auto* base = ref ? ref->GetBaseObject() : nullptr;
+
+				const auto typeId = type ? type->GetFormID() : 0;
+				const auto refId = sref.refData.refID;
+				const auto typeEdid = type ? TFD::Util::GetEditorId(type) : std::string{};
+				const auto refEdid = ref ? TFD::Util::GetEditorId(ref) : std::string{};
+				const auto baseEdid = base ? TFD::Util::GetEditorId(base) : std::string{};
+
+				ImGuiMCP::Text(
+					"  [%u] Type=0x%08X %s | Ref=0x%08X %s | Base=%s",
+					i,
+					typeId,
+					typeEdid.c_str(),
+					refId,
+					refEdid.c_str(),
+					baseEdid.c_str());
+			}
+		}
+
+		static void RenderLocationLine(const char* label, RE::BGSLocation* loc)
+		{
+			const auto formId = loc ? loc->GetFormID() : 0;
+			const auto editorId = loc ? TFD::Util::GetEditorId(loc) : std::string{};
+			const char* name = (loc && loc->GetName()) ? loc->GetName() : "";
+
+			const bool isInn = TFD::Location::LocationHasKeywordByEditorID(loc, "LocTypeInn");
+			const bool isDwelling = TFD::Location::LocationHasKeywordByEditorID(loc, "LocTypeDwelling");
+			const bool isCandidate = TFD::Location::IsRescueCandidateLocation(loc);
+
+			ImGuiMCP::Text(
+				"%s: 0x%08X | %s | %s | Candidate=%d Inn=%d Dwelling=%d",
+				label,
+				formId,
+				editorId.c_str(),
+				SafeStr(name),
+				isCandidate ? 1 : 0,
+				isInn ? 1 : 0,
+				isDwelling ? 1 : 0);
+		}
+
+		static void RenderLocationChain(const char* label, RE::BGSLocation* seed)
+		{
+			ImGuiMCP::Text("%s", label);
+
+			RE::BGSLocation* cur = seed;
+			for (int i = 0; i < 8; ++i) {
+				if (!cur) {
+					ImGuiMCP::Text("  [%d] <null>", i);
+					break;
+				}
+
+				const auto formId = cur->GetFormID();
+				const auto editorId = TFD::Util::GetEditorId(cur);
+				const char* name = cur->GetName() ? cur->GetName() : "";
+
+				const bool isInn = TFD::Location::LocationHasKeywordByEditorID(cur, "LocTypeInn");
+				const bool isDwelling = TFD::Location::LocationHasKeywordByEditorID(cur, "LocTypeDwelling");
+				const bool isCandidate = TFD::Location::IsRescueCandidateLocation(cur);
+
+				ImGuiMCP::Text(
+					"  [%d] 0x%08X | %s | %s | Candidate=%d Inn=%d Dwelling=%d",
+					i,
+					formId,
+					editorId.c_str(),
+					SafeStr(name),
+					isCandidate ? 1 : 0,
+					isInn ? 1 : 0,
+					isDwelling ? 1 : 0);
+
+				cur = cur->parentLoc;
+			}
+		}
+
+		static bool ContainsNoCase(std::string_view haystack, std::string_view needle)
+		{
+			if (needle.empty() || haystack.size() < needle.size()) {
+				return false;
+			}
+
+			auto lower = [](char c) {
+				return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				};
+
+			for (std::size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+				bool ok = true;
+				for (std::size_t j = 0; j < needle.size(); ++j) {
+					if (lower(haystack[i + j]) != lower(needle[j])) {
+						ok = false;
+						break;
+					}
+				}
+				if (ok) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static bool IsBedLikeBase(RE::TESBoundObject* base)
+		{
+			if (!base) {
+				return false;
+			}
+
+			if (base->GetFormType() != RE::FormType::Furniture) {
+				return false;
+			}
+
+			const auto edid = TFD::Util::GetEditorId(base);
+			const char* name = base->GetName() ? base->GetName() : "";
+
+			if (ContainsNoCase(edid, "BedRoll") || ContainsNoCase(name, "Bed Roll")) {
+				return true;
+			}
+			if (ContainsNoCase(edid, "Bed") || ContainsNoCase(name, "Bed")) {
+				return true;
+			}
+
+			return false;
+		}
+
+		static void RenderNearbyBedRefs(RE::TESObjectREFR* player)
+		{
+			ImGuiMCP::Text("Nearby Bed / BedRoll Monitor");
+
+			if (!player) {
+				ImGuiMCP::Text("  <null player>");
+				return;
+			}
+
+			auto* cell = player->GetParentCell();
+			if (!cell) {
+				ImGuiMCP::Text("  <null cell>");
+				return;
+			}
+
+			auto& runtime = cell->GetRuntimeData();
+			std::uint32_t shown = 0;
+
+			for (const auto& refPtr : runtime.references) {
+				RE::TESObjectREFR* ref = refPtr.get();
+				if (!ref) {
+					continue;
+				}
+
+				RE::TESBoundObject* base = ref->GetBaseObject();
+				if (!IsBedLikeBase(base)) {
+					continue;
+				}
+
+				const auto refEdid = TFD::Util::GetEditorId(ref);
+				const auto baseEdid = TFD::Util::GetEditorId(base);
+				const char* baseName = (base && base->GetName()) ? base->GetName() : "";
+				const auto pos = ref->GetPosition();
+
+				ImGuiMCP::Text(
+					"  [%u] Ref=0x%08X %s | Base=%s | Name=%s | Pos=%.0f %.0f %.0f",
+					shown,
+					ref->GetFormID(),
+					refEdid.c_str(),
+					baseEdid.c_str(),
+					SafeStr(baseName),
+					pos.x,
+					pos.y,
+					pos.z);
+
+				++shown;
+				if (shown >= 12) {
+					break;
+				}
+			}
+
+			if (shown == 0) {
+				ImGuiMCP::Text("  <no nearby bed-like furniture refs found in current cell>");
+			}
+		}
+
+		static void RenderLocationMonitor()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				ImGuiMCP::Text("Player: <null>");
+				return;
+			}
+
+			auto* cell = player->GetParentCell();
+			auto* world = cell ? cell->worldSpace : nullptr;
+
+			auto* currentLoc = player->GetCurrentLocation();
+			auto* cellLoc = GetCellLocation(player);
+			auto* resolvedLoc = TFD::Location::GetLocationFromRef(player);
+
+			auto* targetFromCurrent = TFD::Location::ResolveRescueTargetLocation(currentLoc);
+			auto* targetFromCell = TFD::Location::ResolveRescueTargetLocation(cellLoc);
+			auto* targetFromResolved = TFD::Location::ResolveRescueTargetLocation(resolvedLoc);
+
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("Location / Cell Monitor");
+
+			ImGuiMCP::Text(
+				"Cell: 0x%08X | %s | interior=%d",
+				cell ? cell->GetFormID() : 0,
+				cell ? TFD::Util::GetEditorId(cell).c_str() : "",
+				(cell && cell->IsInteriorCell()) ? 1 : 0);
+
+			ImGuiMCP::Text(
+				"Worldspace: 0x%08X | %s",
+				world ? world->GetFormID() : 0,
+				world ? TFD::Util::GetEditorId(world).c_str() : "");
+
+			RenderLocationLine("CurrentLocation()", currentLoc);
+			RenderLocationLine("CellLocation()", cellLoc);
+			RenderLocationLine("TFD GetLocationFromRef()", resolvedLoc);
+
+			RenderLocationLine("Target from Current", targetFromCurrent);
+			RenderLocationLine("Target from Cell", targetFromCell);
+			RenderLocationLine("Target from Resolved", targetFromResolved);
+
+			RenderLocationChain("Parent Chain from CurrentLocation()", currentLoc);
+			RenderLocationChain("Parent Chain from CellLocation()", cellLoc);
+			RenderLocationChain("Parent Chain from TFD GetLocationFromRef()", resolvedLoc);
+
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("Location Ref Type Monitor");
+			RenderSpecialRefSummary("Summary from Current", currentLoc);
+			RenderSpecialRefSummary("Summary from Cell", cellLoc);
+			RenderSpecialRefSummary("Summary from Resolved", resolvedLoc);
+			RenderSpecialRefs("SpecialRefs from CurrentLocation()", currentLoc);
+			RenderSpecialRefs("SpecialRefs from TFD GetLocationFromRef()", resolvedLoc);
+
+			ImGuiMCP::Separator();
+			RenderNearbyBedRefs(player);
 		}
 
 		// Source of truth captive = native defeat monitor
@@ -464,6 +781,8 @@ namespace TFDMenu
 			ImGuiMCP::Text("CaptivePhase(C++): %.0f", IsCaptivePhase() ? 1.0f : 0.0f);
 			ImGuiMCP::Text("CaptiveState(Global): %.0f", GetGlobalValue(gCaptiveState) >= 0.5f ? 1.0f : 0.0f);
 			ImGuiMCP::Text("PreCombatState: %.0f", IsPreCombatPhase() ? 1.0f : 0.0f);
+
+			RenderLocationMonitor();
 		}
 
 		static void TryRegisterMenu()
