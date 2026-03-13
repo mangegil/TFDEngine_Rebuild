@@ -111,6 +111,8 @@ namespace TFD::DefeatMonitor
 		bool g_queuedCaptiveState = false;
 		CaptivePhaseValue g_queuedCaptivePhase = CaptivePhaseValue::None;
 
+		static bool SnapPlayerNearBed(RE::Actor* player, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef);
+
 		static RE::PlayerCharacter* Player()
 		{
 			return RE::PlayerCharacter::GetSingleton();
