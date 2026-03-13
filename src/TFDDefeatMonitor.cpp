@@ -71,6 +71,10 @@ namespace TFD::DefeatMonitor
 		int g_bleedLastSeconds = -1;
 		bool g_bleedPaused = false;
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
+		bool g_pendingBleedoutChoice = false;
+		std::string g_pendingBleedoutChoiceReason{};
+		std::chrono::steady_clock::time_point g_pendingBleedoutChoiceAt{};
+		static constexpr int kBleedoutChoiceSettleMs = 1100;
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -1350,6 +1354,27 @@ namespace TFD::DefeatMonitor
 
 		static void EnterNonCaptiveChoice(const char* reason);
 
+		static void ClearPendingBleedoutChoice(const char* reason)
+		{
+			if (g_pendingBleedoutChoice && reason && reason[0]) {
+				spdlog::info("[TFD][Transition] non-captive bleedout defer cleared reason={}", reason);
+			}
+			g_pendingBleedoutChoice = false;
+			g_pendingBleedoutChoiceReason.clear();
+			g_pendingBleedoutChoiceAt = {};
+		}
+
+		static void QueueNonCaptiveChoiceAfterBleedout(const char* reason, int settleMs = kBleedoutChoiceSettleMs)
+		{
+			g_pendingBleedoutChoice = true;
+			g_pendingBleedoutChoiceReason = reason ? reason : "unknown";
+			g_pendingBleedoutChoiceAt = Now() + std::chrono::milliseconds((std::max)(0, settleMs));
+			spdlog::info(
+				"[TFD][Transition] non-captive choice deferred until bleedout settles reason={} delayMs={}",
+				g_pendingBleedoutChoiceReason,
+				(std::max)(0, settleMs));
+		}
+
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
 		{
 			if (!player) {
@@ -1377,26 +1402,18 @@ namespace TFD::DefeatMonitor
 
 				if (!IsCaptiveSupportedAggressor(aggressor)) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> LeftForDead", aggressor->GetFormID());
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("unsupported_aggressor_nonhumanoid");
+					QueueNonCaptiveChoiceAfterBleedout("unsupported_aggressor_nonhumanoid");
 					return;
 				}
 
 				const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
 				if (!captiveSupported) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> LeftForDead", aggressor->GetFormID());
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("unsupported_aggressor_allowlist");
+					QueueNonCaptiveChoiceAfterBleedout("unsupported_aggressor_allowlist");
 					return;
 				}
 
@@ -1404,13 +1421,9 @@ namespace TFD::DefeatMonitor
 				if (!CanUseAggressorForBleedoutGreet(player, aggressor, greetDistance)) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} -> noncaptive fallback",
 						aggressor->GetFormID(), greetDistance);
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("aggressor_not_greetable");
+					QueueNonCaptiveChoiceAfterBleedout("aggressor_not_greetable");
 					return;
 				}
 
@@ -1445,6 +1458,7 @@ namespace TFD::DefeatMonitor
 			g_bleedLastSeconds = -1;
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
+			ClearPendingBleedoutChoice("enter_non_captive_choice");
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 
 			auto* player = Player();
@@ -1646,6 +1660,13 @@ namespace TFD::DefeatMonitor
 					}
 					return;
 				}
+				if (g_pendingBleedoutChoice && Now() >= g_pendingBleedoutChoiceAt) {
+					const auto deferredReason = g_pendingBleedoutChoiceReason;
+					spdlog::info("[TFD][Transition] non-captive choice released after bleedout settle reason={}", deferredReason);
+					ClearPendingBleedoutChoice("released");
+					EnterNonCaptiveChoice(deferredReason.c_str());
+					return;
+				}
 				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Now() - g_bleedStart).count();
 				const int remain = bleedSeconds - static_cast<int>(elapsed);
 				if (remain != g_bleedLastSeconds) {
@@ -1674,8 +1695,9 @@ namespace TFD::DefeatMonitor
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 				auto* aggressor = FindBestAggressor(scanRadius);
 				if (!aggressor) {
-					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> LeftForDead");
-					EnterNonCaptiveChoice("no_valid_npc");
+					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> bleedout settle then LeftForDead choice");
+					StartBleedWindow(player, nullptr);
+					QueueNonCaptiveChoiceAfterBleedout("no_valid_npc");
 					SetGraceSeconds(1);
 					return;
 				}
@@ -1710,6 +1732,7 @@ namespace TFD::DefeatMonitor
 		g_minHp = 0.0f;
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
+		ClearPendingBleedoutChoice("install");
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
 		TFD::ForceGreet::Install();
@@ -1729,6 +1752,7 @@ namespace TFD::DefeatMonitor
 		g_queuedCaptivePhase = CaptivePhaseValue::None;
 		g_inBleedState.store(false, std::memory_order_release);
 		g_loadTransition.store(false, std::memory_order_release);
+		ClearPendingBleedoutChoice("shutdown");
 		ResetLockpickWatch();
 		ClearEscapeContext();
 		ClearLeftForDeadCooldown();
@@ -1800,6 +1824,7 @@ namespace TFD::DefeatMonitor
 		g_inBleedState.store(false, std::memory_order_release);
 		g_minHp = 0.0f;
 		g_bleedSawDialogue = false;
+		ClearPendingBleedoutChoice("reset_for_load");
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
 		g_lastAggressor = RE::ActorHandle{};
@@ -1819,6 +1844,7 @@ namespace TFD::DefeatMonitor
 	{
 		g_loadTransition.store(active, std::memory_order_release);
 		if (active) {
+			ClearPendingBleedoutChoice("load_transition");
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
 			ClearPendingRescueNearBed("load_transition", true);

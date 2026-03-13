@@ -8,6 +8,11 @@ namespace RE
 	class BGSLocation;
 }
 
+namespace SKSE
+{
+	class SerializationInterface;
+}
+
 namespace TFD::Location
 {
 	struct SafeCheckpoint
@@ -60,6 +65,10 @@ namespace TFD::Location
 	bool GetBestApprovedBedForLocation(RE::BGSLocation* loc, ApprovedBed& outBed);
 
 	RE::TESObjectREFR* ResolvePreferredRescueDestination(RE::BGSLocation* safeLoc, bool preferInterior = true);
+
+	void ClearRescueCache();
+	bool SaveRescueCache(SKSE::SerializationInterface* intfc);
+	bool LoadRescueCache(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length);
 
 	void DumpRescueCacheToLog();
 }

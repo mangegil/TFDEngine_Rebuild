@@ -81,6 +81,8 @@ static void ResetTransientStateForLoad()
 static constexpr std::uint32_t kSerializationID = 'TFDE';
 static constexpr std::uint32_t kProgressRecord = 'TDSP';
 static constexpr std::uint32_t kProgressVersion = 1;
+static constexpr std::uint32_t kLocationCacheRecord = 'TDLC';
+static constexpr std::uint32_t kLocationCacheVersion = 1;
 
 struct SavedProgressRecord
 {
@@ -151,12 +153,23 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
     }
 
     spdlog::info("[TFD] Serialization Save -> state={} phase={}", rec.captiveState, rec.captivePhase);
+
+    if (!intfc->OpenRecord(kLocationCacheRecord, kLocationCacheVersion)) {
+        spdlog::error("[TFD] Serialization Save -> OpenRecord location cache failed");
+        return;
+    }
+
+    if (!TFD::Location::SaveRescueCache(intfc)) {
+        spdlog::error("[TFD] Serialization Save -> SaveRescueCache failed");
+        return;
+    }
 }
 
 static void OnSerializationRevert(SKSE::SerializationInterface*)
 {
     spdlog::info("[TFD] Serialization Revert -> prepare save swap");
     TFD::DefeatMonitor::QueueDefaultProgressState();
+    TFD::Location::ClearRescueCache();
     ResetTransientStateForLoad();
     TFD::DefeatMonitor::SetLoadTransition(true);
     gPendingLoadFinalize.store(true, std::memory_order_release);
@@ -167,6 +180,7 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
     spdlog::info("[TFD] Serialization Load -> read cosave progress state");
 
     TFD::DefeatMonitor::QueueDefaultProgressState();
+    TFD::Location::ClearRescueCache();
     gPendingLoadFinalize.store(true, std::memory_order_release);
 
     if (!intfc) {
@@ -177,32 +191,45 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
     std::uint32_t type = 0;
     std::uint32_t version = 0;
     std::uint32_t length = 0;
+    bool sawProgress = false;
+    bool sawLocationCache = false;
 
     while (intfc->GetNextRecordInfo(type, version, length)) {
-        if (type != kProgressRecord) {
-            std::string skip(length, '\0');
-            if (length > 0) {
-                intfc->ReadRecordData(skip.data(), length);
+        if (type == kProgressRecord) {
+            SavedProgressRecord rec{};
+            const auto toRead = (std::min)(static_cast<std::uint32_t>(sizeof(rec)), length);
+            if (toRead > 0 && !intfc->ReadRecordData(&rec, toRead)) {
+                spdlog::error("[TFD] Serialization Load -> ReadRecordData failed");
+                break;
+            }
+
+            if (length > toRead) {
+                std::string skip(length - toRead, '\0');
+                intfc->ReadRecordData(skip.data(), static_cast<std::uint32_t>(skip.size()));
+            }
+
+            TFD::DefeatMonitor::QueueLoadedProgressState(rec.captiveState >= 1u, rec.captivePhase);
+            spdlog::info("[TFD] Serialization Load -> state={} phase={} version={}", rec.captiveState, rec.captivePhase, version);
+            sawProgress = true;
+            continue;
+        }
+
+        if (type == kLocationCacheRecord) {
+            if (TFD::Location::LoadRescueCache(intfc, version, length)) {
+                sawLocationCache = true;
             }
             continue;
         }
 
-        SavedProgressRecord rec{};
-        const auto toRead = (std::min)(static_cast<std::uint32_t>(sizeof(rec)), length);
-        if (toRead > 0 && !intfc->ReadRecordData(&rec, toRead)) {
-            spdlog::error("[TFD] Serialization Load -> ReadRecordData failed");
-            break;
+        std::string skip(length, '\0');
+        if (length > 0) {
+            intfc->ReadRecordData(skip.data(), length);
         }
-
-        if (length > toRead) {
-            std::string skip(length - toRead, '\0');
-            intfc->ReadRecordData(skip.data(), static_cast<std::uint32_t>(skip.size()));
-        }
-
-        TFD::DefeatMonitor::QueueLoadedProgressState(rec.captiveState >= 1u, rec.captivePhase);
-        spdlog::info("[TFD] Serialization Load -> state={} phase={} version={}", rec.captiveState, rec.captivePhase, version);
-        break;
     }
+
+    spdlog::info("[TFD] Serialization Load -> progressRecord={} locationCache={}",
+        sawProgress ? "yes" : "no",
+        sawLocationCache ? "yes" : "no");
 }
 
 class LoadMenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
