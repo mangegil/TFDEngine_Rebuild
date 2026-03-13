@@ -608,7 +608,7 @@ namespace TFD::DefeatMonitor
 			g_pendingRescueNearBedExpire = {};
 
 			if (reason && reason[0]) {
-				spdlog::info("[TFD][Transition] rescue near-bed pending cleared reason={}", reason);
+				spdlog::info("[TFD][Transition] rescue direct-bed pending cleared reason={}", reason);
 			}
 
 			if (shouldHide && (hadPending || hideNow)) {
@@ -630,7 +630,7 @@ namespace TFD::DefeatMonitor
 			g_pendingRescueNearBedExpire = Now() + std::chrono::seconds(8);
 
 			spdlog::info(
-				"[TFD][Transition] rescue near-bed deferred queued bed={:08X} dest={:08X} minDelayMs={}",
+				"[TFD][Transition] rescue direct-bed deferred queued bed={:08X} dest={:08X} minDelayMs={}",
 				bedRef->GetFormID(),
 				destRef->GetFormID(),
 				(std::max)(minDelayMs, 0));
@@ -655,7 +655,7 @@ namespace TFD::DefeatMonitor
 			auto* player = Player();
 			if (!player) {
 				if (now >= g_pendingRescueNearBedExpire) {
-					spdlog::info("[TFD][Transition] rescue near-bed deferred timeout cause=no_player");
+					spdlog::info("[TFD][Transition] rescue direct-bed deferred timeout cause=no_player");
 					ClearPendingRescueNearBed("timeout_no_player", true);
 				}
 				return;
@@ -668,7 +668,7 @@ namespace TFD::DefeatMonitor
 
 			if (!bedRef || !destRef) {
 				spdlog::info(
-					"[TFD][Transition] rescue near-bed deferred cancelled cause=ref_invalid bed={:08X} dest={:08X}",
+					"[TFD][Transition] rescue direct-bed deferred cancelled cause=ref_invalid bed={:08X} dest={:08X}",
 					bedRef ? bedRef->GetFormID() : 0,
 					destRef ? destRef->GetFormID() : 0);
 				ClearPendingRescueNearBed("ref_invalid", true);
@@ -677,7 +677,7 @@ namespace TFD::DefeatMonitor
 
 			if (!SharesParentCell(destRef, bedRef)) {
 				spdlog::info(
-					"[TFD][Transition] rescue near-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
+					"[TFD][Transition] rescue direct-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
 					bedRef->GetFormID(),
 					destRef->GetFormID());
 				ClearPendingRescueNearBed("cell_mismatch", true);
@@ -691,7 +691,7 @@ namespace TFD::DefeatMonitor
 			if (!playerCell || !bedCell || !destCell) {
 				if (now >= g_pendingRescueNearBedExpire) {
 					spdlog::info(
-						"[TFD][Transition] rescue near-bed deferred timeout cause=null_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
+						"[TFD][Transition] rescue direct-bed deferred timeout cause=null_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
 						playerCell ? playerCell->GetFormID() : 0,
 						bedCell ? bedCell->GetFormID() : 0,
 						destCell ? destCell->GetFormID() : 0);
@@ -706,7 +706,7 @@ namespace TFD::DefeatMonitor
 			if (playerCellId != bedCellId || playerCellId != destCellId) {
 				if (now >= g_pendingRescueNearBedExpire) {
 					spdlog::info(
-						"[TFD][Transition] rescue near-bed deferred timeout cause=player_not_in_dest_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
+						"[TFD][Transition] rescue direct-bed deferred timeout cause=player_not_in_dest_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
 						playerCellId,
 						bedCellId,
 						destCellId);
@@ -717,7 +717,7 @@ namespace TFD::DefeatMonitor
 
 			if (SnapPlayerNearBed(player, bedRef, destRef)) {
 				spdlog::info(
-					"[TFD][Transition] rescue near-bed deferred applied bed={:08X} dest={:08X} playerCell={:08X}",
+					"[TFD][Transition] rescue direct-bed deferred applied bed={:08X} dest={:08X} playerCell={:08X}",
 					bedRef->GetFormID(),
 					destRef->GetFormID(),
 					playerCellId);
@@ -725,7 +725,7 @@ namespace TFD::DefeatMonitor
 			}
 			else {
 				spdlog::info(
-					"[TFD][Transition] rescue near-bed deferred failed bed={:08X} dest={:08X}",
+					"[TFD][Transition] rescue direct-bed deferred failed bed={:08X} dest={:08X}",
 					bedRef->GetFormID(),
 					destRef->GetFormID());
 				ClearPendingRescueNearBed("failed", true);
@@ -743,63 +743,15 @@ namespace TFD::DefeatMonitor
 			}
 
 			const auto bedPos = bedRef->GetPosition();
-			const auto destPos = destRef->GetPosition();
-			const float angleZ = bedRef->GetAngleZ();
-			const float cosA = std::cos(angleZ);
-			const float sinA = std::sin(angleZ);
-			constexpr float kPi = 3.14159265358979323846f;
-
-			struct Candidate
-			{
-				float forward;
-				float right;
-				float faceAngle;
-				const char* name;
-			};
-
-			const Candidate candidates[] = {
-				{ -8.0f,  144.0f, angleZ + kPi, "right_side_far" },
-				{ -8.0f, -144.0f, angleZ + kPi, "left_side_far" },
-				{ -156.0f, 0.0f,  angleZ,       "foot_far" },
-				{  96.0f,  0.0f,  angleZ + kPi, "head" }
-			};
-
-			float bestDistSq = -1.0f;
-			RE::NiPoint3 bestPos = bedPos;
-			float bestAngle = angleZ + kPi;
-			const char* bestName = "bed_side";
-
-			for (const auto& candidate : candidates) {
-				RE::NiPoint3 pos;
-				pos.x = bedPos.x + (cosA * candidate.forward) - (sinA * candidate.right);
-				pos.y = bedPos.y + (sinA * candidate.forward) + (cosA * candidate.right);
-				pos.z = bedPos.z + 6.0f;
-
-				const float dx = pos.x - destPos.x;
-				const float dy = pos.y - destPos.y;
-				const float distSq = (dx * dx) + (dy * dy);
-
-				if (distSq > bestDistSq) {
-					bestDistSq = distSq;
-					bestPos = pos;
-					bestAngle = candidate.faceAngle;
-					bestName = candidate.name;
-				}
-			}
-
-			player->SetPosition(bestPos, true);
-			player->SetRotationX(0.0f);
-			player->SetRotationZ(bestAngle);
+			player->MoveTo(bedRef);
 			player->StopMoving(0.0f);
 
 			spdlog::info(
-				"[TFD][Transition] rescue near-bed snap success bed={:08X} mode={} x={:.1f} y={:.1f} z={:.1f} fromDestDistSq={:.1f}",
+				"[TFD][Transition] rescue direct-bed move success bed={:08X} x={:.1f} y={:.1f} z={:.1f}",
 				bedRef->GetFormID(),
-				bestName,
-				bestPos.x,
-				bestPos.y,
-				bestPos.z,
-				bestDistSq);
+				bedPos.x,
+				bedPos.y,
+				bedPos.z);
 
 			return true;
 		}
@@ -842,12 +794,12 @@ namespace TFD::DefeatMonitor
 			RecoverPlayerForTransition();
 			if (canSnapNearBed) {
 				QueuePendingRescueNearBed(bedRef, dest, 1200);
-				bedSnapState = "near_bed_deferred";
+				bedSnapState = "direct_bed_deferred";
 			}
 			else if (bedRef) {
 				bedSnapState = "cell_mismatch";
 				spdlog::info(
-					"[TFD][Transition] rescue near-bed snap skipped bed={:08X} dest={:08X} cause=cell_mismatch",
+					"[TFD][Transition] rescue direct-bed skipped bed={:08X} dest={:08X} cause=cell_mismatch",
 					bedRef->GetFormID(),
 					dest->GetFormID());
 			}
