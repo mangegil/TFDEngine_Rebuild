@@ -539,8 +539,10 @@ namespace TFD::Location
 
 			const auto origin = scanRef->GetPosition();
 			RE::TESObjectREFR* best = nullptr;
+			int bestTier = std::numeric_limits<int>::min();
 			int bestScore = std::numeric_limits<int>::min();
 			double bestDistSq = std::numeric_limits<double>::max();
+			bool bestHasOwner = false;
 
 			cell->ForEachReferenceInRange(origin, kCheckpointBedScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
 				if (!candidate || candidate == scanRef) {
@@ -561,6 +563,9 @@ namespace TFD::Location
 					return RE::BSContainer::ForEachResult::kContinue;
 				}
 
+				const bool hasOwner = candidate->GetOwner() != nullptr;
+				const int tier = hasOwner ? 0 : 1;  // ownerless first, owned as fallback
+
 				int score = 0;
 				auto* candidateLoc = GetLocationFromRef(candidate);
 				if (candidateLoc == safeLoc) {
@@ -577,6 +582,10 @@ namespace TFD::Location
 					score += 300;
 				}
 
+				if (!hasOwner) {
+					score += 100;
+				}
+
 				const auto cp = candidate->GetPosition();
 				const double dx = static_cast<double>(cp.x - origin.x);
 				const double dy = static_cast<double>(cp.y - origin.y);
@@ -588,11 +597,16 @@ namespace TFD::Location
 				const auto candidateId = candidate->GetFormID();
 				const auto bestId = best ? best->GetFormID() : 0;
 
-				if (!best || score > bestScore || (score == bestScore && distSq < bestDistSq) ||
-					(score == bestScore && distSq == bestDistSq && candidateId < bestId)) {
+				if (!best ||
+					tier > bestTier ||
+					(tier == bestTier && score > bestScore) ||
+					(tier == bestTier && score == bestScore && distSq < bestDistSq) ||
+					(tier == bestTier && score == bestScore && distSq == bestDistSq && candidateId < bestId)) {
 					best = candidate;
+					bestTier = tier;
 					bestScore = score;
 					bestDistSq = distSq;
+					bestHasOwner = hasOwner;
 				}
 
 				return RE::BSContainer::ForEachResult::kContinue;
@@ -600,11 +614,13 @@ namespace TFD::Location
 
 			if (best) {
 				spdlog::info(
-					"[TFD][Location] Auto checkpoint bed hit loc={:08X} marker={:08X} bed={:08X} cell={:08X} score={} distSq={:.1f}",
+					"[TFD][Location] Auto checkpoint bed hit loc={:08X} marker={:08X} bed={:08X} cell={:08X} owner={} tier={} score={} distSq={:.1f}",
 					safeLoc->GetFormID(),
 					preferredMarker ? preferredMarker->GetFormID() : 0,
 					best->GetFormID(),
 					best->GetParentCell() ? best->GetParentCell()->GetFormID() : 0,
+					bestHasOwner ? 1 : 0,
+					bestTier,
 					bestScore,
 					bestDistSq);
 			}
