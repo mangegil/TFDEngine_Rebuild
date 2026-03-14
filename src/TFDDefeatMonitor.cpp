@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 
+#include <RE/A/ActorValues.h>
 #include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
 #include <SKSE/SKSE.h>
@@ -1661,7 +1662,7 @@ namespace TFD::DefeatMonitor
 					return;
 				}
 				if (g_pendingBleedoutChoice && Now() >= g_pendingBleedoutChoiceAt) {
-					const auto deferredReason = g_pendingBleedoutChoiceReason;
+					const std::string deferredReason = g_pendingBleedoutChoiceReason;  // intentional copy
 					spdlog::info("[TFD][Transition] non-captive choice released after bleedout settle reason={}", deferredReason);
 					ClearPendingBleedoutChoice("released");
 					EnterNonCaptiveChoice(deferredReason.c_str());
