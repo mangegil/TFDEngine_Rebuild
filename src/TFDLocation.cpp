@@ -1404,4 +1404,4 @@ namespace TFD::Location
 
 		return true;
 	}
-}.
+}

@@ -427,6 +427,21 @@ namespace TFDMenu
 			return TFD::DefeatMonitor::IsCaptivePhase();
 		}
 
+		static std::uint32_t GetCaptivePhaseRaw()
+		{
+			return TFD::DefeatMonitor::GetCaptivePhaseRaw();
+		}
+
+		static const char* GetCaptivePhaseName()
+		{
+			return TFD::DefeatMonitor::GetCaptivePhaseName();
+		}
+
+		static bool IsCaptiveFamily()
+		{
+			return TFD::DefeatMonitor::IsCaptiveFamily();
+		}
+
 		static bool IsPreCombatPhase()
 		{
 			ResolveGlobals();
@@ -778,7 +793,10 @@ namespace TFDMenu
 			ImGuiMCP::Text("Actors: %d", TFD::ActorScan::GetCount());
 			ImGuiMCP::Text("Hotkey: %s", KeyLabel(TFD::Settings::GetHotkeyScanCode()).c_str());
 			ImGuiMCP::Text("InputSink: %s", inputSinkAdded.load() ? "READY" : "WAITING");
-			ImGuiMCP::Text("CaptivePhase(C++): %.0f", IsCaptivePhase() ? 1.0f : 0.0f);
+			ImGuiMCP::Text("CaptivePhase(C++ bool): %.0f", IsCaptivePhase() ? 1.0f : 0.0f);
+			ImGuiMCP::Text("CaptivePhaseRaw(C++): %u", GetCaptivePhaseRaw());
+			ImGuiMCP::Text("CaptivePhaseName(C++): %s", GetCaptivePhaseName());
+			ImGuiMCP::Text("CaptiveFamily(C++): %.0f", IsCaptiveFamily() ? 1.0f : 0.0f);
 			ImGuiMCP::Text("CaptiveState(Global): %.0f", GetGlobalValue(gCaptiveState) >= 0.5f ? 1.0f : 0.0f);
 			ImGuiMCP::Text("PreCombatState: %.0f", IsPreCombatPhase() ? 1.0f : 0.0f);
 

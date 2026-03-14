@@ -9,7 +9,6 @@
 #include <cmath>
 #include <string>
 #include <cstring>
-#include <limits>
 
 #include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
@@ -71,10 +70,6 @@ namespace TFD::DefeatMonitor
 		int g_bleedLastSeconds = -1;
 		bool g_bleedPaused = false;
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
-		bool g_pendingBleedoutChoice = false;
-		std::string g_pendingBleedoutChoiceReason{};
-		std::chrono::steady_clock::time_point g_pendingBleedoutChoiceAt{};
-		static constexpr int kBleedoutChoiceSettleMs = 1100;
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -82,15 +77,7 @@ namespace TFD::DefeatMonitor
 		bool g_leftForDeadActive = false;
 		std::chrono::steady_clock::time_point g_leftForDeadUntil{};
 		std::chrono::steady_clock::time_point g_leftForDeadNextPulse{};
-		std::chrono::steady_clock::time_point g_lastRescueContextPoll{};
-		RE::FormID g_lastKnownRescueLocationId = 0;
-		bool g_pendingRescueNearBed = false;
-		bool g_pendingRescueNearBedHideFader = false;
-		RE::ObjectRefHandle g_pendingRescueNearBedRef{};
-		RE::ObjectRefHandle g_pendingRescueNearDestRef{};
-		std::uint32_t g_pendingRescueSafeLocId = 0;
-		std::chrono::steady_clock::time_point g_pendingRescueNearBedNotBefore{};
-		std::chrono::steady_clock::time_point g_pendingRescueNearBedExpire{};
+
 
 		RE::ActorHandle g_lastAggressor{};
 		bool g_bleedSawDialogue = false;
@@ -115,8 +102,6 @@ namespace TFD::DefeatMonitor
 		bool g_hasQueuedProgressState = false;
 		bool g_queuedCaptiveState = false;
 		CaptivePhaseValue g_queuedCaptivePhase = CaptivePhaseValue::None;
-
-		static bool SnapPlayerNearBed(RE::Actor* player, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef);
 
 		static RE::PlayerCharacter* Player()
 		{
@@ -239,37 +224,6 @@ namespace TFD::DefeatMonitor
 			queue->ProcessCommands();
 		}
 
-		static void SendBridgeEvent(const char* eventName, RE::TESForm* sender = nullptr, float numArg = 0.0f, const char* strArg = "")
-		{
-			if (!eventName) {
-				return;
-			}
-
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				return;
-			}
-
-			const std::string name{ eventName };
-			const std::string text{ strArg ? strArg : "" };
-			const RE::FormID senderId = sender ? sender->GetFormID() : 0;
-
-			task->AddTask([name, text, numArg, senderId]() {
-				auto* src = SKSE::GetModCallbackEventSource();
-				if (!src) {
-					return;
-				}
-
-				RE::TESForm* outSender = nullptr;
-				if (senderId != 0) {
-					outSender = RE::TESForm::LookupByID(senderId);
-				}
-
-				SKSE::ModCallbackEvent ev{ name.c_str(), text.c_str(), numArg, outSender };
-				src->SendEvent(&ev);
-				});
-		}
-
 		static void AdvanceGameHoursSoft(float hours)
 		{
 			if (hours <= 0.0f) {
@@ -325,9 +279,7 @@ namespace TFD::DefeatMonitor
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID);
-		static void ClearPendingRescueNearBed(const char* reason, bool hideNow);
-		static void QueuePendingRescueNearBed(RE::BGSLocation* safeLoc, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs);
-		static void ProcessPendingRescueNearBed();
+		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc);
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
 
@@ -513,74 +465,14 @@ namespace TFD::DefeatMonitor
 			return RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
 		}
 
-		static void UpdateRescueContextCache(RE::PlayerCharacter* player)
-		{
-			if (!player) {
-				return;
-			}
-
-			const auto now = Now();
-			if (g_lastRescueContextPoll.time_since_epoch().count() != 0 && now < g_lastRescueContextPoll + std::chrono::seconds(2)) {
-				return;
-			}
-			g_lastRescueContextPoll = now;
-
-			auto* startLoc = TFD::Location::GetLocationFromRef(player);
-			auto* safeLoc = TFD::Location::ResolveRescueTargetLocation(startLoc);
-			if (safeLoc) {
-				g_lastKnownRescueLocationId = safeLoc->GetFormID();
-			}
-		}
-
-		static bool SharesParentCell(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
-		{
-			if (!a || !b) {
-				return false;
-			}
-			auto* aCell = a->GetParentCell();
-			auto* bCell = b->GetParentCell();
-			if (!aCell || !bCell) {
-				return false;
-			}
-			return aCell == bCell || aCell->GetFormID() == bCell->GetFormID();
-		}
-
-		static RE::TESObjectREFR* ResolveApprovedBedRefForSafeLocation(RE::BGSLocation* safeLoc)
+		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc)
 		{
 			if (!safeLoc) {
 				return nullptr;
 			}
-
-			TFD::Location::ApprovedBed bed{};
-			if (!TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
-				return nullptr;
-			}
-
-			return LookupRefByFormID(bed.bedRefId);
-		}
-
-		static RE::TESObjectREFR* ResolveBestRescueMarker(RE::BGSLocation* safeLoc, RE::TESObjectREFR* preferredBed)
-		{
-			if (!safeLoc) {
-				return nullptr;
-			}
-
-			const auto preferredCellId = preferredBed && preferredBed->GetParentCell() ? preferredBed->GetParentCell()->GetFormID() : 0;
 
 			TFD::Location::SafeCheckpoint cp{};
 			if (TFD::Location::GetLastSafeCheckpointForLocation(safeLoc, cp)) {
-				if (preferredCellId != 0) {
-					if (auto* ref = LookupRefByFormID(cp.insideEntranceRefId); ref && ref->GetParentCell() && ref->GetParentCell()->GetFormID() == preferredCellId) {
-						return ref;
-					}
-					if (auto* ref = LookupRefByFormID(cp.centerMarkerRefId); ref && ref->GetParentCell() && ref->GetParentCell()->GetFormID() == preferredCellId) {
-						return ref;
-					}
-					if (auto* ref = LookupRefByFormID(cp.entryDoorRefId); ref && ref->GetParentCell() && ref->GetParentCell()->GetFormID() == preferredCellId) {
-						return ref;
-					}
-				}
-
 				if (auto* ref = LookupRefByFormID(cp.insideEntranceRefId)) {
 					return ref;
 				}
@@ -592,213 +484,14 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			if (auto* ref = TFD::Location::ResolvePreferredRescueDestination(safeLoc, true)) {
-				return ref;
+			TFD::Location::ApprovedBed bed{};
+			if (TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
+				if (auto* ref = LookupRefByFormID(bed.bedRefId)) {
+					return ref;
+				}
 			}
 
 			return nullptr;
-		}
-
-
-		static void ClearPendingRescueNearBed(const char* reason, bool hideNow)
-		{
-			const bool shouldHide = hideNow || g_pendingRescueNearBedHideFader;
-			const bool hadPending = g_pendingRescueNearBed;
-
-			g_pendingRescueNearBed = false;
-			g_pendingRescueNearBedHideFader = false;
-			g_pendingRescueNearBedRef = RE::ObjectRefHandle{};
-			g_pendingRescueNearDestRef = RE::ObjectRefHandle{};
-			g_pendingRescueSafeLocId = 0;
-			g_pendingRescueNearBedNotBefore = {};
-			g_pendingRescueNearBedExpire = {};
-
-			if (reason && reason[0]) {
-				spdlog::info("[TFD][Transition] rescue direct-bed pending cleared reason={}", reason);
-			}
-
-			if (shouldHide && (hadPending || hideNow)) {
-				HideBlackoutFader();
-			}
-		}
-
-		static void QueuePendingRescueNearBed(RE::BGSLocation* safeLoc, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs)
-		{
-			if (!destRef) {
-				return;
-			}
-
-			g_pendingRescueNearBed = true;
-			g_pendingRescueNearBedHideFader = true;
-			g_pendingRescueNearBedRef = bedRef ? bedRef->GetHandle() : RE::ObjectRefHandle{};
-			g_pendingRescueNearDestRef = destRef->GetHandle();
-			g_pendingRescueSafeLocId = safeLoc ? safeLoc->GetFormID() : 0;
-			g_pendingRescueNearBedNotBefore = Now() + std::chrono::milliseconds((std::max)(minDelayMs, 0));
-			g_pendingRescueNearBedExpire = Now() + std::chrono::seconds(8);
-
-			spdlog::info(
-				"[TFD][Transition] rescue direct-bed deferred queued safeLoc={:08X} bed={:08X} dest={:08X} minDelayMs={} ",
-				g_pendingRescueSafeLocId,
-				bedRef ? bedRef->GetFormID() : 0,
-				destRef->GetFormID(),
-				(std::max)(minDelayMs, 0));
-		}
-
-		static void ProcessPendingRescueNearBed()
-		{
-			if (!g_pendingRescueNearBed) {
-				return;
-			}
-
-			auto* ui = RE::UI::GetSingleton();
-			if (ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) {
-				return;
-			}
-
-			const auto now = Now();
-			if (now < g_pendingRescueNearBedNotBefore) {
-				return;
-			}
-
-			auto* player = Player();
-			if (!player) {
-				if (now >= g_pendingRescueNearBedExpire) {
-					spdlog::info("[TFD][Transition] rescue direct-bed deferred timeout cause=no_player");
-					ClearPendingRescueNearBed("timeout_no_player", true);
-				}
-				return;
-			}
-
-			auto bedSP = g_pendingRescueNearBedRef.get();
-			auto destSP = g_pendingRescueNearDestRef.get();
-			auto* bedRef = bedSP.get();
-			auto* destRef = destSP.get();
-			auto* safeLoc = g_pendingRescueSafeLocId ? RE::TESForm::LookupByID<RE::BGSLocation>(g_pendingRescueSafeLocId) : nullptr;
-
-			if (!destRef) {
-				spdlog::info("[TFD][Transition] rescue direct-bed deferred cancelled cause=dest_invalid");
-				ClearPendingRescueNearBed("dest_invalid", true);
-				return;
-			}
-
-			if (!bedRef && safeLoc) {
-				TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
-				bedRef = ResolveApprovedBedRefForSafeLocation(safeLoc);
-				if (bedRef) {
-					g_pendingRescueNearBedRef = bedRef->GetHandle();
-					spdlog::info(
-						"[TFD][Transition] rescue direct-bed deferred resolved after arrival safeLoc={:08X} bed={:08X} dest={:08X}",
-						safeLoc->GetFormID(),
-						bedRef->GetFormID(),
-						destRef->GetFormID());
-				}
-			}
-
-			if (!bedRef) {
-				if (now >= g_pendingRescueNearBedExpire) {
-					spdlog::info(
-						"[TFD][Transition] rescue direct-bed deferred timeout cause=no_bed_after_arrival safeLoc={:08X} dest={:08X}",
-						safeLoc ? safeLoc->GetFormID() : 0,
-						destRef->GetFormID());
-					ClearPendingRescueNearBed("timeout_no_bed_after_arrival", true);
-				}
-				return;
-			}
-
-			if (!SharesParentCell(destRef, bedRef)) {
-				if (safeLoc) {
-					TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
-					auto* refreshedBed = ResolveApprovedBedRefForSafeLocation(safeLoc);
-					if (refreshedBed && SharesParentCell(destRef, refreshedBed)) {
-						bedRef = refreshedBed;
-						g_pendingRescueNearBedRef = bedRef->GetHandle();
-						spdlog::info(
-							"[TFD][Transition] rescue direct-bed deferred refreshed bed after arrival safeLoc={:08X} bed={:08X} dest={:08X}",
-							safeLoc->GetFormID(),
-							bedRef->GetFormID(),
-							destRef->GetFormID());
-					}
-				}
-				if (!SharesParentCell(destRef, bedRef)) {
-					spdlog::info(
-						"[TFD][Transition] rescue direct-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
-						bedRef->GetFormID(),
-						destRef->GetFormID());
-					ClearPendingRescueNearBed("cell_mismatch", true);
-					return;
-				}
-			}
-
-			auto* playerCell = player->GetParentCell();
-			auto* bedCell = bedRef->GetParentCell();
-			auto* destCell = destRef->GetParentCell();
-
-			if (!playerCell || !bedCell || !destCell) {
-				if (now >= g_pendingRescueNearBedExpire) {
-					spdlog::info(
-						"[TFD][Transition] rescue direct-bed deferred timeout cause=null_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
-						playerCell ? playerCell->GetFormID() : 0,
-						bedCell ? bedCell->GetFormID() : 0,
-						destCell ? destCell->GetFormID() : 0);
-					ClearPendingRescueNearBed("timeout_null_cell", true);
-				}
-				return;
-			}
-
-			const auto playerCellId = playerCell->GetFormID();
-			const auto bedCellId = bedCell->GetFormID();
-			const auto destCellId = destCell->GetFormID();
-			if (playerCellId != bedCellId || playerCellId != destCellId) {
-				if (now >= g_pendingRescueNearBedExpire) {
-					spdlog::info(
-						"[TFD][Transition] rescue direct-bed deferred timeout cause=player_not_in_dest_cell playerCell={:08X} bedCell={:08X} destCell={:08X}",
-						playerCellId,
-						bedCellId,
-						destCellId);
-					ClearPendingRescueNearBed("timeout_player_not_in_dest_cell", true);
-				}
-				return;
-			}
-
-			if (SnapPlayerNearBed(player, bedRef, destRef)) {
-				spdlog::info(
-					"[TFD][Transition] rescue direct-bed deferred applied bed={:08X} dest={:08X} playerCell={:08X}",
-					bedRef->GetFormID(),
-					destRef->GetFormID(),
-					playerCellId);
-				ClearPendingRescueNearBed("applied", true);
-			}
-			else {
-				spdlog::info(
-					"[TFD][Transition] rescue direct-bed deferred failed bed={:08X} dest={:08X}",
-					bedRef->GetFormID(),
-					destRef->GetFormID());
-				ClearPendingRescueNearBed("failed", true);
-			}
-		}
-
-		static bool SnapPlayerNearBed(RE::Actor* player, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef)
-		{
-			if (!player || !bedRef) {
-				return false;
-			}
-
-			if (!destRef || !SharesParentCell(destRef, bedRef)) {
-				return false;
-			}
-
-			const auto bedPos = bedRef->GetPosition();
-			player->MoveTo(bedRef);
-			player->StopMoving(0.0f);
-
-			spdlog::info(
-				"[TFD][Transition] rescue direct-bed move success bed={:08X} x={:.1f} y={:.1f} z={:.1f}",
-				bedRef->GetFormID(),
-				bedPos.x,
-				bedPos.y,
-				bedPos.z);
-
-			return true;
 		}
 
 		static bool BeginRescueTransition(const char* reason)
@@ -809,72 +502,46 @@ namespace TFD::DefeatMonitor
 			}
 
 			auto* safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
-			if (!safeLoc && g_lastKnownRescueLocationId != 0) {
-				safeLoc = RE::TESForm::LookupByID<RE::BGSLocation>(g_lastKnownRescueLocationId);
-				if (safeLoc) {
-					spdlog::info("[TFD][Transition] rescue using cached safeLoc={:08X}", safeLoc->GetFormID());
-				}
-			}
 			if (!safeLoc) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_safe_location", reason ? reason : "unknown");
 				return false;
 			}
 
-			auto* bedRef = ResolveApprovedBedRefForSafeLocation(safeLoc);
-			auto* dest = ResolveBestRescueMarker(safeLoc, bedRef);
+			auto* dest = ResolveBestRescueDestination(safeLoc);
 			if (!dest) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} safeLoc={:08X} cause=no_destination",
 					reason ? reason : "unknown", safeLoc->GetFormID());
 				return false;
 			}
 
-			const bool canSnapNearBed = bedRef && SharesParentCell(dest, bedRef);
-			const bool shouldResolveBedAfterArrival = (bedRef == nullptr);
-			const char* bedSnapState = "no";
-
-			ClearPendingRescueNearBed(nullptr, false);
 			ShowBlackoutFader();
 			std::this_thread::sleep_for(std::chrono::milliseconds(300));
 			player->MoveTo(dest);
 			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 			RecoverPlayerForTransition();
-			if (canSnapNearBed || shouldResolveBedAfterArrival) {
-				QueuePendingRescueNearBed(safeLoc, bedRef, dest, 1200);
-				bedSnapState = canSnapNearBed ? "direct_bed_deferred" : "resolve_after_arrival";
-			}
-			else if (bedRef) {
-				bedSnapState = "cell_mismatch";
-				spdlog::info(
-					"[TFD][Transition] rescue direct-bed skipped bed={:08X} dest={:08X} cause=cell_mismatch",
-					bedRef->GetFormID(),
-					dest->GetFormID());
-			}
 			MaintainTransitionCalmWindow();
 			BeginLeftForDeadCooldown(5);
 			SetGraceSeconds(4);
 			UpdatePreCombatState();
 			std::this_thread::sleep_for(std::chrono::milliseconds(400));
-			if (!g_pendingRescueNearBed) {
-				HideBlackoutFader();
-			}
-			spdlog::info(
-				"[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X} bed={:08X} bedSnap={}",
-				reason ? reason : "unknown",
-				safeLoc->GetFormID(),
-				dest->GetFormID(),
-				bedRef ? bedRef->GetFormID() : 0,
-				bedSnapState);
+			HideBlackoutFader();
+			spdlog::info("[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X}",
+				reason ? reason : "unknown", safeLoc->GetFormID(), dest->GetFormID());
 			return true;
 		}
 
 		static void BeginRecoverTransition(const char* reason)
 		{
+			ShowBlackoutFader();
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
 			RecoverPlayerForTransition();
 			MaintainTransitionCalmWindow();
 			BeginLeftForDeadCooldown(3);
 			SetGraceSeconds(2);
 			UpdatePreCombatState();
-			spdlog::info("[TFD][Transition] recover complete reason={} visual=no_blackout", reason ? reason : "unknown");
+			std::this_thread::sleep_for(std::chrono::milliseconds(250));
+			HideBlackoutFader();
+			spdlog::info("[TFD][Transition] recover complete reason={}", reason ? reason : "unknown");
 		}
 
 		static void PollTransitionResult()
@@ -1396,27 +1063,6 @@ namespace TFD::DefeatMonitor
 
 		static void EnterNonCaptiveChoice(const char* reason);
 
-		static void ClearPendingBleedoutChoice(const char* reason)
-		{
-			if (g_pendingBleedoutChoice && reason && reason[0]) {
-				spdlog::info("[TFD][Transition] non-captive bleedout defer cleared reason={}", reason);
-			}
-			g_pendingBleedoutChoice = false;
-			g_pendingBleedoutChoiceReason.clear();
-			g_pendingBleedoutChoiceAt = {};
-		}
-
-		static void QueueNonCaptiveChoiceAfterBleedout(const char* reason, int settleMs = kBleedoutChoiceSettleMs)
-		{
-			g_pendingBleedoutChoice = true;
-			g_pendingBleedoutChoiceReason = reason ? reason : "unknown";
-			g_pendingBleedoutChoiceAt = Now() + std::chrono::milliseconds((std::max)(0, settleMs));
-			spdlog::info(
-				"[TFD][Transition] non-captive choice deferred until bleedout settles reason={} delayMs={}",
-				g_pendingBleedoutChoiceReason,
-				(std::max)(0, settleMs));
-		}
-
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
 		{
 			if (!player) {
@@ -1444,18 +1090,26 @@ namespace TFD::DefeatMonitor
 
 				if (!IsCaptiveSupportedAggressor(aggressor)) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> LeftForDead", aggressor->GetFormID());
+					g_inBleedState.store(false, std::memory_order_release);
+					g_minHp = 0.0f;
+					g_bleedSawDialogue = false;
+					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					QueueNonCaptiveChoiceAfterBleedout("unsupported_aggressor_nonhumanoid");
+					EnterNonCaptiveChoice("unsupported_aggressor_nonhumanoid");
 					return;
 				}
 
 				const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
 				if (!captiveSupported) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> LeftForDead", aggressor->GetFormID());
+					g_inBleedState.store(false, std::memory_order_release);
+					g_minHp = 0.0f;
+					g_bleedSawDialogue = false;
+					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					QueueNonCaptiveChoiceAfterBleedout("unsupported_aggressor_allowlist");
+					EnterNonCaptiveChoice("unsupported_aggressor_allowlist");
 					return;
 				}
 
@@ -1463,9 +1117,13 @@ namespace TFD::DefeatMonitor
 				if (!CanUseAggressorForBleedoutGreet(player, aggressor, greetDistance)) {
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} -> noncaptive fallback",
 						aggressor->GetFormID(), greetDistance);
+					g_inBleedState.store(false, std::memory_order_release);
+					g_minHp = 0.0f;
+					g_bleedSawDialogue = false;
+					g_bleedLastSeconds = -1;
 					TFD::ForceGreet::Cancel();
 					TFD::FactionMask::Clear();
-					QueueNonCaptiveChoiceAfterBleedout("aggressor_not_greetable");
+					EnterNonCaptiveChoice("aggressor_not_greetable");
 					return;
 				}
 
@@ -1500,7 +1158,6 @@ namespace TFD::DefeatMonitor
 			g_bleedLastSeconds = -1;
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
-			ClearPendingBleedoutChoice("enter_non_captive_choice");
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 
 			auto* player = Player();
@@ -1631,7 +1288,6 @@ namespace TFD::DefeatMonitor
 			if (g_loadTransition.load(std::memory_order_acquire)) return;
 			auto* ui = RE::UI::GetSingleton();
 			PollTransitionResult();
-			ProcessPendingRescueNearBed();
 			if (IsTransitionAwaiting()) {
 				MaintainTransitionCalmWindow();
 				UpdatePreCombatState();
@@ -1658,7 +1314,6 @@ namespace TFD::DefeatMonitor
 				SyncPreCombatGlobal(false);
 				return;
 			}
-			UpdateRescueContextCache(player);
 			UpdatePreCombatState();
 			if (IsLeftForDeadCooldownActive()) {
 				TickLeftForDeadCooldown();
@@ -1702,13 +1357,6 @@ namespace TFD::DefeatMonitor
 					}
 					return;
 				}
-				if (g_pendingBleedoutChoice && Now() >= g_pendingBleedoutChoiceAt) {
-					const auto deferredReason = g_pendingBleedoutChoiceReason;
-					spdlog::info("[TFD][Transition] non-captive choice released after bleedout settle reason={}", deferredReason);
-					ClearPendingBleedoutChoice("released");
-					EnterNonCaptiveChoice(deferredReason.c_str());
-					return;
-				}
 				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Now() - g_bleedStart).count();
 				const int remain = bleedSeconds - static_cast<int>(elapsed);
 				if (remain != g_bleedLastSeconds) {
@@ -1737,9 +1385,8 @@ namespace TFD::DefeatMonitor
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 				auto* aggressor = FindBestAggressor(scanRadius);
 				if (!aggressor) {
-					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> bleedout settle then LeftForDead choice");
-					StartBleedWindow(player, nullptr);
-					QueueNonCaptiveChoiceAfterBleedout("no_valid_npc");
+					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> LeftForDead");
+					EnterNonCaptiveChoice("no_valid_npc");
 					SetGraceSeconds(1);
 					return;
 				}
@@ -1774,7 +1421,6 @@ namespace TFD::DefeatMonitor
 		g_minHp = 0.0f;
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
-		ClearPendingBleedoutChoice("install");
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
 		TFD::ForceGreet::Install();
@@ -1794,7 +1440,6 @@ namespace TFD::DefeatMonitor
 		g_queuedCaptivePhase = CaptivePhaseValue::None;
 		g_inBleedState.store(false, std::memory_order_release);
 		g_loadTransition.store(false, std::memory_order_release);
-		ClearPendingBleedoutChoice("shutdown");
 		ResetLockpickWatch();
 		ClearEscapeContext();
 		ClearLeftForDeadCooldown();
@@ -1866,7 +1511,6 @@ namespace TFD::DefeatMonitor
 		g_inBleedState.store(false, std::memory_order_release);
 		g_minHp = 0.0f;
 		g_bleedSawDialogue = false;
-		ClearPendingBleedoutChoice("reset_for_load");
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
 		g_lastAggressor = RE::ActorHandle{};
@@ -1878,7 +1522,6 @@ namespace TFD::DefeatMonitor
 		TFD::AggressionClamp::Clear();
 		TFD::ForceGreet::Cancel();
 		ClearLeftForDeadCooldown();
-		ClearPendingRescueNearBed("reset_for_load", true);
 		spdlog::info("[TFD][Defeat] ResetForLoad -> runtime only");
 	}
 
@@ -1886,10 +1529,8 @@ namespace TFD::DefeatMonitor
 	{
 		g_loadTransition.store(active, std::memory_order_release);
 		if (active) {
-			ClearPendingBleedoutChoice("load_transition");
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
-			ClearPendingRescueNearBed("load_transition", true);
 			spdlog::info("[TFD][Defeat] SetLoadTransition(true)");
 		}
 		else {
@@ -1905,5 +1546,32 @@ namespace TFD::DefeatMonitor
 	bool IsCaptivePhase()
 	{
 		return g_captiveState && g_captivePhase == CaptivePhaseValue::Captive;
+	}
+
+	std::uint32_t GetCaptivePhaseRaw()
+	{
+		if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) {
+			return 2u;  // legacy/normalized escape fallback
+		}
+		return static_cast<std::uint32_t>(static_cast<int>(g_captivePhase));
+	}
+
+	const char* GetCaptivePhaseName()
+	{
+		switch (g_captivePhase) {
+		case CaptivePhaseValue::None:
+			return g_captiveState ? "Escape" : "None";
+		case CaptivePhaseValue::Captive:
+			return "Captive";
+		case CaptivePhaseValue::Escape:
+			return "Escape";
+		default:
+			return "Unknown";
+		}
+	}
+
+	bool IsCaptiveFamily()
+	{
+		return g_captiveState || g_captivePhase != CaptivePhaseValue::None;
 	}
 }

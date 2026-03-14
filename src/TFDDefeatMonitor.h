@@ -21,5 +21,8 @@ namespace TFD::DefeatMonitor
 	void SetLoadTransition(bool active);
 
 	bool IsCaptivePhase();
+	std::uint32_t GetCaptivePhaseRaw();
+	const char* GetCaptivePhaseName();
+	bool IsCaptiveFamily();
 	bool IsLeftForDeadRecoveryActive();
 }
