@@ -11,7 +11,6 @@
 #include <cstring>
 #include <limits>
 
-#include <RE/A/ActorValues.h>
 #include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
 #include <SKSE/SKSE.h>
@@ -89,6 +88,7 @@ namespace TFD::DefeatMonitor
 		bool g_pendingRescueNearBedHideFader = false;
 		RE::ObjectRefHandle g_pendingRescueNearBedRef{};
 		RE::ObjectRefHandle g_pendingRescueNearDestRef{};
+		std::uint32_t g_pendingRescueSafeLocId = 0;
 		std::chrono::steady_clock::time_point g_pendingRescueNearBedNotBefore{};
 		std::chrono::steady_clock::time_point g_pendingRescueNearBedExpire{};
 
@@ -326,7 +326,7 @@ namespace TFD::DefeatMonitor
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID);
 		static void ClearPendingRescueNearBed(const char* reason, bool hideNow);
-		static void QueuePendingRescueNearBed(RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs);
+		static void QueuePendingRescueNearBed(RE::BGSLocation* safeLoc, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs);
 		static void ProcessPendingRescueNearBed();
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
@@ -609,6 +609,7 @@ namespace TFD::DefeatMonitor
 			g_pendingRescueNearBedHideFader = false;
 			g_pendingRescueNearBedRef = RE::ObjectRefHandle{};
 			g_pendingRescueNearDestRef = RE::ObjectRefHandle{};
+			g_pendingRescueSafeLocId = 0;
 			g_pendingRescueNearBedNotBefore = {};
 			g_pendingRescueNearBedExpire = {};
 
@@ -621,22 +622,24 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
-		static void QueuePendingRescueNearBed(RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs)
+		static void QueuePendingRescueNearBed(RE::BGSLocation* safeLoc, RE::TESObjectREFR* bedRef, RE::TESObjectREFR* destRef, int minDelayMs)
 		{
-			if (!bedRef || !destRef) {
+			if (!destRef) {
 				return;
 			}
 
 			g_pendingRescueNearBed = true;
 			g_pendingRescueNearBedHideFader = true;
-			g_pendingRescueNearBedRef = bedRef->GetHandle();
+			g_pendingRescueNearBedRef = bedRef ? bedRef->GetHandle() : RE::ObjectRefHandle{};
 			g_pendingRescueNearDestRef = destRef->GetHandle();
+			g_pendingRescueSafeLocId = safeLoc ? safeLoc->GetFormID() : 0;
 			g_pendingRescueNearBedNotBefore = Now() + std::chrono::milliseconds((std::max)(minDelayMs, 0));
 			g_pendingRescueNearBedExpire = Now() + std::chrono::seconds(8);
 
 			spdlog::info(
-				"[TFD][Transition] rescue direct-bed deferred queued bed={:08X} dest={:08X} minDelayMs={}",
-				bedRef->GetFormID(),
+				"[TFD][Transition] rescue direct-bed deferred queued safeLoc={:08X} bed={:08X} dest={:08X} minDelayMs={} ",
+				g_pendingRescueSafeLocId,
+				bedRef ? bedRef->GetFormID() : 0,
 				destRef->GetFormID(),
 				(std::max)(minDelayMs, 0));
 		}
@@ -670,23 +673,60 @@ namespace TFD::DefeatMonitor
 			auto destSP = g_pendingRescueNearDestRef.get();
 			auto* bedRef = bedSP.get();
 			auto* destRef = destSP.get();
+			auto* safeLoc = g_pendingRescueSafeLocId ? RE::TESForm::LookupByID<RE::BGSLocation>(g_pendingRescueSafeLocId) : nullptr;
 
-			if (!bedRef || !destRef) {
-				spdlog::info(
-					"[TFD][Transition] rescue direct-bed deferred cancelled cause=ref_invalid bed={:08X} dest={:08X}",
-					bedRef ? bedRef->GetFormID() : 0,
-					destRef ? destRef->GetFormID() : 0);
-				ClearPendingRescueNearBed("ref_invalid", true);
+			if (!destRef) {
+				spdlog::info("[TFD][Transition] rescue direct-bed deferred cancelled cause=dest_invalid");
+				ClearPendingRescueNearBed("dest_invalid", true);
+				return;
+			}
+
+			if (!bedRef && safeLoc) {
+				TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
+				bedRef = ResolveApprovedBedRefForSafeLocation(safeLoc);
+				if (bedRef) {
+					g_pendingRescueNearBedRef = bedRef->GetHandle();
+					spdlog::info(
+						"[TFD][Transition] rescue direct-bed deferred resolved after arrival safeLoc={:08X} bed={:08X} dest={:08X}",
+						safeLoc->GetFormID(),
+						bedRef->GetFormID(),
+						destRef->GetFormID());
+				}
+			}
+
+			if (!bedRef) {
+				if (now >= g_pendingRescueNearBedExpire) {
+					spdlog::info(
+						"[TFD][Transition] rescue direct-bed deferred timeout cause=no_bed_after_arrival safeLoc={:08X} dest={:08X}",
+						safeLoc ? safeLoc->GetFormID() : 0,
+						destRef->GetFormID());
+					ClearPendingRescueNearBed("timeout_no_bed_after_arrival", true);
+				}
 				return;
 			}
 
 			if (!SharesParentCell(destRef, bedRef)) {
-				spdlog::info(
-					"[TFD][Transition] rescue direct-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
-					bedRef->GetFormID(),
-					destRef->GetFormID());
-				ClearPendingRescueNearBed("cell_mismatch", true);
-				return;
+				if (safeLoc) {
+					TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
+					auto* refreshedBed = ResolveApprovedBedRefForSafeLocation(safeLoc);
+					if (refreshedBed && SharesParentCell(destRef, refreshedBed)) {
+						bedRef = refreshedBed;
+						g_pendingRescueNearBedRef = bedRef->GetHandle();
+						spdlog::info(
+							"[TFD][Transition] rescue direct-bed deferred refreshed bed after arrival safeLoc={:08X} bed={:08X} dest={:08X}",
+							safeLoc->GetFormID(),
+							bedRef->GetFormID(),
+							destRef->GetFormID());
+					}
+				}
+				if (!SharesParentCell(destRef, bedRef)) {
+					spdlog::info(
+						"[TFD][Transition] rescue direct-bed deferred cancelled cause=cell_mismatch bed={:08X} dest={:08X}",
+						bedRef->GetFormID(),
+						destRef->GetFormID());
+					ClearPendingRescueNearBed("cell_mismatch", true);
+					return;
+				}
 			}
 
 			auto* playerCell = player->GetParentCell();
@@ -789,6 +829,7 @@ namespace TFD::DefeatMonitor
 			}
 
 			const bool canSnapNearBed = bedRef && SharesParentCell(dest, bedRef);
+			const bool shouldResolveBedAfterArrival = (bedRef == nullptr);
 			const char* bedSnapState = "no";
 
 			ClearPendingRescueNearBed(nullptr, false);
@@ -797,9 +838,9 @@ namespace TFD::DefeatMonitor
 			player->MoveTo(dest);
 			std::this_thread::sleep_for(std::chrono::milliseconds(150));
 			RecoverPlayerForTransition();
-			if (canSnapNearBed) {
-				QueuePendingRescueNearBed(bedRef, dest, 1200);
-				bedSnapState = "direct_bed_deferred";
+			if (canSnapNearBed || shouldResolveBedAfterArrival) {
+				QueuePendingRescueNearBed(safeLoc, bedRef, dest, 1200);
+				bedSnapState = canSnapNearBed ? "direct_bed_deferred" : "resolve_after_arrival";
 			}
 			else if (bedRef) {
 				bedSnapState = "cell_mismatch";
@@ -1662,7 +1703,7 @@ namespace TFD::DefeatMonitor
 					return;
 				}
 				if (g_pendingBleedoutChoice && Now() >= g_pendingBleedoutChoiceAt) {
-					const std::string deferredReason = g_pendingBleedoutChoiceReason;  // intentional copy
+					const auto deferredReason = g_pendingBleedoutChoiceReason;
 					spdlog::info("[TFD][Transition] non-captive choice released after bleedout settle reason={}", deferredReason);
 					ClearPendingBleedoutChoice("released");
 					EnterNonCaptiveChoice(deferredReason.c_str());
