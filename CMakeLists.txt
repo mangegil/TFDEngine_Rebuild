@@ -60,19 +60,24 @@ add_subdirectory(extern/CommonLibSSE-NG)
 
 # ---- TFDEngine DLL ----
 add_library(TFDEngine SHARED
-  src/main.cpp
-  src/TFDSettings.cpp
-  src/TFDLocation.cpp
-  src/TFDActorScan.cpp
-  src/TFDAntiAggro.cpp
-  src/TFDDefeatMonitor.cpp
-  src/TFDFactionMask.cpp
-  src/TFDForceGreet.cpp
-  src/TFDAggressionClamp.cpp
-  src/TFDPreCombatGreet.cpp
-  src/MenuFramework.cpp
-  src/TFDCaptiveHostility.cpp
-  src/TFDCaptiveDoorController.cpp
+    src/main.cpp
+    src/TFDSettings.cpp
+    src/TFDLocation.cpp
+    src/TFDActorScan.cpp
+    src/TFDAntiAggro.cpp
+    src/TFDDefeatMonitor.cpp
+    src/TFDFactionMask.cpp
+    src/TFDForceGreet.cpp
+    src/TFDAggressionClamp.cpp
+    src/TFDPreCombat.cpp
+    src/TFDPreCombatGreet.cpp
+    src/TFDPacify.cpp
+    src/TFDPacifyHooks.cpp
+    src/TFDTargetClassifier.cpp
+    src/TFDInteractionRouter.cpp
+    src/MenuFramework.cpp
+    src/TFDCaptiveHostility.cpp
+    src/TFDCaptiveDoorController.cpp
 )
 
 if(TFDEnableSmf)

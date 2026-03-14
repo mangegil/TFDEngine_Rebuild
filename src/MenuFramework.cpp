@@ -23,6 +23,7 @@
 #include "TFDForceGreet.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDTargetClassifier.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -640,15 +641,123 @@ namespace TFDMenu
 			return dot >= 0.20f;
 		}
 
-		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius)
+		enum class HotkeyPickMode
+		{
+			None = 0,
+			TrucePreCombat,
+			Tame,
+			TruceInCombat
+		};
+
+		static float ScoreHotkeyCandidate(
+			RE::Actor* actor,
+			RE::PlayerCharacter* player,
+			const TFD::ActorScan::Entry& entry,
+			HotkeyPickMode* outMode)
+		{
+			if (outMode) {
+				*outMode = HotkeyPickMode::None;
+			}
+
+			if (!actor || !player) {
+				return -1.0e30f;
+			}
+
+			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
+			const bool inCombat = actor->IsInCombat();
+			const bool negotiable = TFD::TargetClassifier::IsNegotiable(actor);
+			const bool creature = TFD::TargetClassifier::IsCreature(actor);
+			const bool weaponDrawn = actor->IsWeaponDrawn();
+
+			if (negotiable && !inCombat && front && entry.dist <= 1150.0f) {
+				if (outMode) {
+					*outMode = HotkeyPickMode::TrucePreCombat;
+				}
+
+				float score = 50000.0f;
+				score -= entry.dist;
+				if (weaponDrawn) {
+					score += 900.0f;
+				}
+				if (entry.hostile) {
+					score += 350.0f;
+				}
+				return score;
+			}
+
+			if (creature && !inCombat && front && entry.dist <= 768.0f) {
+				if (outMode) {
+					*outMode = HotkeyPickMode::Tame;
+				}
+
+				float score = 30000.0f;
+				score -= entry.dist;
+				if (weaponDrawn) {
+					score += 350.0f;
+				}
+				return score;
+			}
+
+			if (negotiable && inCombat && entry.dist <= 1400.0f) {
+				if (outMode) {
+					*outMode = HotkeyPickMode::TruceInCombat;
+				}
+
+				float score = 20000.0f;
+				score -= entry.dist;
+				if (front) {
+					score += 500.0f;
+				}
+				return score;
+			}
+
+			return -1.0e30f;
+		}
+
+		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius, HotkeyPickMode* outMode)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (outMode) {
+				*outMode = HotkeyPickMode::None;
+			}
 			if (!player) {
 				return nullptr;
 			}
 
-			TFD::ActorScan::Rescan(radius, true);
-			return TFD::ActorScan::GetBestPreCombatCandidate();
+			TFD::ActorScan::Rescan(radius, false);
+
+			RE::Actor* best = nullptr;
+			HotkeyPickMode bestMode = HotkeyPickMode::None;
+			float bestScore = -1.0e30f;
+
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				if (!actor) {
+					continue;
+				}
+				if (actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (!actor->Is3DLoaded()) {
+					continue;
+				}
+
+				HotkeyPickMode mode = HotkeyPickMode::None;
+				const float score = ScoreHotkeyCandidate(actor, player, entry, &mode);
+				if (score > bestScore) {
+					bestScore = score;
+					best = actor;
+					bestMode = mode;
+				}
+			}
+
+			if (outMode) {
+				*outMode = bestMode;
+			}
+
+			return best;
 		}
 
 		enum class CaptureResult
@@ -906,19 +1015,34 @@ namespace TFDMenu
 						continue;
 					}
 
-					// Precombat
-					auto* target = PickPreCombatTargetSameCellLoaded(3500.0f);
-					if (!target) {
-						RE::DebugNotification("TFD: No PreCombat Target");
+					// Precombat / InCombat / Tame
+					HotkeyPickMode pickMode = HotkeyPickMode::None;
+					auto* target = PickPreCombatTargetSameCellLoaded(3500.0f, &pickMode);
+					if (!target || pickMode == HotkeyPickMode::None) {
+						RE::DebugNotification("TFD: No Truce Target");
 						continue;
 					}
 
 					if (!TFD::PreCombatGreet::BeginForActor(target)) {
-						RE::DebugNotification("TFD: PreCombat Failed");
+						RE::DebugNotification("TFD: Truce Failed");
 						continue;
 					}
 
-					RE::DebugNotification("TFD: PreCombat Truce");
+					switch (pickMode) {
+					case HotkeyPickMode::TrucePreCombat:
+						RE::DebugNotification("TFD: PreCombat Truce");
+						break;
+					case HotkeyPickMode::Tame:
+						RE::DebugNotification("TFD: Tame");
+						break;
+					case HotkeyPickMode::TruceInCombat:
+						RE::DebugNotification("TFD: InCombat Truce");
+						break;
+					case HotkeyPickMode::None:
+					default:
+						RE::DebugNotification("TFD: Truce Started");
+						break;
+					}
 				}
 
 				return RE::BSEventNotifyControl::kContinue;

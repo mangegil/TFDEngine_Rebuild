@@ -24,6 +24,7 @@ namespace TFD::InteractionRouter
         InvalidTarget,
         NoUsableAction,
         TargetRejected,
+        TruceUnavailable,
         SessionBeginFailed
     };
 

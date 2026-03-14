@@ -282,6 +282,7 @@ namespace TFD::DefeatMonitor
 		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc);
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
+		static void DoBlackoutTeleport();
 
 		static void ResolveGlobals()
 		{
@@ -471,6 +472,13 @@ namespace TFD::DefeatMonitor
 				return nullptr;
 			}
 
+			TFD::Location::ApprovedBed bed{};
+			if (TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
+				if (auto* ref = LookupRefByFormID(bed.bedRefId)) {
+					return ref;
+				}
+			}
+
 			TFD::Location::SafeCheckpoint cp{};
 			if (TFD::Location::GetLastSafeCheckpointForLocation(safeLoc, cp)) {
 				if (auto* ref = LookupRefByFormID(cp.insideEntranceRefId)) {
@@ -484,11 +492,8 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			TFD::Location::ApprovedBed bed{};
-			if (TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
-				if (auto* ref = LookupRefByFormID(bed.bedRefId)) {
-					return ref;
-				}
+			if (auto* ref = TFD::Location::ResolvePreferredRescueDestination(safeLoc, true)) {
+				return ref;
 			}
 
 			return nullptr;
@@ -502,12 +507,28 @@ namespace TFD::DefeatMonitor
 			}
 
 			auto* safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
+			auto* dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
+
+			if ((!safeLoc || !dest)) {
+				auto* fallbackLoc = TFD::Location::GetMostRecentCachedSafeLocation();
+				if (fallbackLoc) {
+					auto* fallbackDest = ResolveBestRescueDestination(fallbackLoc);
+					if (fallbackDest) {
+						spdlog::info("[TFD][Transition] rescue fallback to recent cache reason={} currentLoc={:08X} fallbackLoc={:08X}",
+							reason ? reason : "unknown",
+							safeLoc ? safeLoc->GetFormID() : 0,
+							fallbackLoc->GetFormID());
+						safeLoc = fallbackLoc;
+						dest = fallbackDest;
+					}
+				}
+			}
+
 			if (!safeLoc) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_safe_location", reason ? reason : "unknown");
 				return false;
 			}
 
-			auto* dest = ResolveBestRescueDestination(safeLoc);
 			if (!dest) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} safeLoc={:08X} cause=no_destination",
 					reason ? reason : "unknown", safeLoc->GetFormID());
@@ -1115,6 +1136,14 @@ namespace TFD::DefeatMonitor
 
 				float greetDistance = 99999.0f;
 				if (!CanUseAggressorForBleedoutGreet(player, aggressor, greetDistance)) {
+					if (ResolveCaptiveMarkerForOutcome()) {
+						spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} but captive marker exists -> captive blackout",
+							aggressor->GetFormID(), greetDistance);
+						DoBlackoutTeleport();
+						SetGraceSeconds(4);
+						return;
+					}
+
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} -> noncaptive fallback",
 						aggressor->GetFormID(), greetDistance);
 					g_inBleedState.store(false, std::memory_order_release);
@@ -1308,6 +1337,11 @@ namespace TFD::DefeatMonitor
 			else if (g_captiveState && g_captivePhase == CaptivePhaseValue::Escape) {
 				TryResolveEscapeByLocation();
 			}
+
+			if (g_captiveState) {
+				return;
+			}
+
 			if (ui && ui->GameIsPaused()) return;
 			auto* player = Player();
 			if (!player) {
@@ -1346,6 +1380,7 @@ namespace TFD::DefeatMonitor
 					if (ResolveCaptiveMarkerForOutcome()) {
 						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> captive marker found");
 						DoBlackoutTeleport();
+						SetGraceSeconds(4);
 					}
 					else {
 						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> no marker -> LeftForDead");
@@ -1385,6 +1420,13 @@ namespace TFD::DefeatMonitor
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 				auto* aggressor = FindBestAggressor(scanRadius);
 				if (!aggressor) {
+					if (ResolveCaptiveMarkerForOutcome()) {
+						spdlog::info("[TFD][Defeat] no valid NPC aggressor but captive marker exists -> captive blackout");
+						DoBlackoutTeleport();
+						SetGraceSeconds(4);
+						return;
+					}
+
 					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> LeftForDead");
 					EnterNonCaptiveChoice("no_valid_npc");
 					SetGraceSeconds(1);

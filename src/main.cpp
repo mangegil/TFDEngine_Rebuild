@@ -16,6 +16,7 @@
 #include "TFDLocation.h"
 #include "TFDFactionMask.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDPacifyHooks.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -315,6 +316,8 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 
     spdlog::info("[TFD] SKSEPlugin_Load");
     spdlog::info("[TFD] {}", BuildStamp());
+
+    TFD::PacifyHooks::Install();
 
 #if TFDEnableSmf
     TFDMenu::Init();

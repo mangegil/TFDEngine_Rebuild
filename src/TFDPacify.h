@@ -15,6 +15,18 @@ namespace TFD::Pacify
         TruceInCombat
     };
 
+    enum class ReleaseReason : std::uint8_t
+    {
+        Generic = 0,
+        HardFailsafeExpired,
+        InvalidActor,
+        PlayerAggression,
+        PlayerArmed,
+        DialogueClosed,
+        TooFar,
+        TameBroken
+    };
+
     struct Entry
     {
         RE::FormID actorId{ 0 };
@@ -25,6 +37,8 @@ namespace TFD::Pacify
 
         double startTimeSec{ 0.0 };
         double endTimeSec{ 0.0 };
+        double lastPacifyApplySec{ 0.0 };
+        double lastPackageEvalSec{ 0.0 };
 
         bool allowDialogue{ false };
         bool isPrimaryTarget{ false };
@@ -37,9 +51,11 @@ namespace TFD::Pacify
         RE::FormID primaryTargetId{ 0 };
 
         Mode primaryMode{ Mode::None };
+        ReleaseReason pendingReleaseReason{ ReleaseReason::Generic };
 
         double startTimeSec{ 0.0 };
         double endTimeSec{ 0.0 };
+        double invalidSinceSec{ 0.0 };
 
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
@@ -68,8 +84,13 @@ namespace TFD::Pacify
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
 
-    void ReleaseSession(RE::FormID sessionId);
+    bool CanStartTruce(RE::Actor* actor);
+    bool HasSpentTruce(RE::Actor* actor);
+    bool WasTruceBetrayed(RE::Actor* actor);
+
+    void ReleaseSession(RE::FormID sessionId, ReleaseReason reason = ReleaseReason::Generic);
     void ReleaseAll();
 
     const char* ToString(Mode mode);
+    const char* ToString(ReleaseReason reason);
 }

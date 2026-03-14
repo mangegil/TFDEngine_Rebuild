@@ -1112,6 +1112,11 @@ namespace TFD::Location
 		return true;
 	}
 
+	RE::BGSLocation* GetMostRecentCachedSafeLocation()
+	{
+		return ResolveMostRecentCachedSafeLocation();
+	}
+
 	RE::TESObjectREFR* ResolvePreferredRescueDestination(RE::BGSLocation* safeLoc, bool preferInterior)
 	{
 		if (!safeLoc) {

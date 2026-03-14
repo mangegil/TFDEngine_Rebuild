@@ -6,8 +6,8 @@ namespace TFD::TargetClassifier
 {
     namespace
     {
-        constexpr float kMaxTameDistance = 384.0f;
-        constexpr float kMaxTruceDistance = 512.0f;
+        constexpr float kMaxTameDistance = 768.0f;
+        constexpr float kMaxTruceDistance = 1024.0f;
 
         bool ContainsInsensitive(std::string_view text, std::string_view needle)
         {

@@ -1,9 +1,9 @@
 #include "TFDPreCombat.h"
 
 #include "RE/Skyrim.h"
-#include "SKSE/SKSE.h"
 #include "SKSE/API.h"
 #include "SKSE/Events.h"
+#include "SKSE/SKSE.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,8 +13,9 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDActorScan.h"
-#include "TFDAntiAggro.h"
 #include "TFDFactionMask.h"
+#include "TFDInteractionRouter.h"
+#include "TFDPacify.h"
 
 #ifndef UNICODE
 #define UNICODE
@@ -38,78 +39,43 @@ namespace TFD::PreCombat
 
 		struct Config
 		{
-			float claimRadius = 1800.0f;
 			int enforceTickMs = 120;
-			int claimTimeoutMs = 8000;
 			int hotkeyCooldownMs = 250;
 		};
 
 		struct Session
 		{
 			RE::ActorHandle target;
+			RE::FormID pacifySessionId = 0;
 			State state = State::Idle;
-			std::int32_t originalAggression = -1;
+			TFD::InteractionRouter::Action action = TFD::InteractionRouter::Action::None;
 			Clock::time_point started{};
-			Clock::time_point lastEnforce{};
+			bool dialogueRequested = false;
 			bool sawDialogueOpen = false;
+			bool sentAssignEvent = false;
 		};
 
 		Config g_cfg{};
 		Session g_session{};
+
 		std::atomic_bool g_installed{ false };
 		std::atomic_bool g_running{ false };
 		std::atomic_flag g_tickPending = ATOMIC_FLAG_INIT;
 		std::thread g_worker{};
+
 		bool g_hotkeyWasDown = false;
 		Clock::time_point g_lastHotkeyTry{};
-
-		static constexpr auto kPreCombatTruceFactionEditorID = "TFDPreCombatTruceFaction";
-		RE::TESFaction* g_preCombatTruceFaction = nullptr;
-
-		RE::Actor* GetTarget();
-		void BeginRestore();
-
-		class HitSink : public RE::BSTEventSink<RE::TESHitEvent>
-		{
-		public:
-			RE::BSEventNotifyControl ProcessEvent(const RE::TESHitEvent* e, RE::BSTEventSource<RE::TESHitEvent>*) override
-			{
-				if (!e || g_session.state == State::Idle) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				auto* player = RE::PlayerCharacter::GetSingleton();
-				auto* claimed = GetTarget();
-				if (!player || !claimed) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				auto* target = e->target.get();
-				auto* cause = e->cause.get();
-				if (!target || !cause) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				auto* causeActor = cause->As<RE::Actor>();
-				if (!causeActor) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				if (causeActor->GetFormID() == player->GetFormID() && target->GetFormID() == claimed->GetFormID()) {
-					spdlog::info("[TFD][PreCombat] player attacked claimed actor -> restore");
-					BeginRestore();
-				}
-
-				return RE::BSEventNotifyControl::kContinue;
-			}
-		};
-
-		HitSink g_hitSink{};
+		Clock::time_point g_t0 = Clock::now();
 
 		RE::Actor* GetTarget()
 		{
 			auto sp = g_session.target.get();
 			return sp.get();
+		}
+
+		double NowSec()
+		{
+			return std::chrono::duration<double>(Clock::now() - g_t0).count();
 		}
 
 		bool IsAnyBlockingMenuOpen()
@@ -131,21 +97,8 @@ namespace TFD::PreCombat
 			if (!ui) {
 				return false;
 			}
+
 			return ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) || ui->IsMenuOpen("Dialogue Menu");
-		}
-
-		bool ResolveForms()
-		{
-			if (!g_preCombatTruceFaction) {
-				g_preCombatTruceFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>(kPreCombatTruceFactionEditorID);
-				if (g_preCombatTruceFaction) {
-					spdlog::info("[TFD][PreCombat] truce faction resolved {:08X}", g_preCombatTruceFaction->GetFormID());
-				} else {
-					spdlog::warn("[TFD][PreCombat] truce faction missing (EditorID='{}')", kPreCombatTruceFactionEditorID);
-				}
-			}
-
-			return g_preCombatTruceFaction != nullptr;
 		}
 
 		bool SendModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f)
@@ -174,9 +127,6 @@ namespace TFD::PreCombat
 			if (TFD::FactionMask::IsActive()) {
 				return true;
 			}
-			if (IsDialogueOpen()) {
-				return true;
-			}
 			return false;
 		}
 
@@ -187,42 +137,6 @@ namespace TFD::PreCombat
 			if (actor->IsDisabled()) return false;
 			if (!actor->Is3DLoaded()) return false;
 			return true;
-		}
-
-		void ApplyLock(RE::Actor* actor)
-		{
-			if (!actor) {
-				return;
-			}
-
-			ResolveForms();
-
-			if (g_preCombatTruceFaction) {
-				TFD::AntiAggro::EnsureFactionRank(actor, g_preCombatTruceFaction, 1);
-			}
-
-			TFD::AntiAggro::SetAggression(actor, 0);
-			TFD::AntiAggro::StopCombatHard(actor);
-			TFD::AntiAggro::SheatheIfNeeded(actor);
-			actor->EvaluatePackage(true);
-		}
-
-		void RestoreActor(RE::Actor* actor)
-		{
-			if (!actor) {
-				return;
-			}
-
-			if (g_preCombatTruceFaction) {
-				TFD::AntiAggro::RemoveFactionIfPresent(actor, g_preCombatTruceFaction);
-			}
-
-			if (g_session.originalAggression >= 0) {
-				TFD::AntiAggro::SetAggression(actor, g_session.originalAggression);
-			}
-
-			TFD::AntiAggro::StopCombatHard(actor);
-			actor->EvaluatePackage(true);
 		}
 
 		void BeginRestore()
@@ -236,42 +150,101 @@ namespace TFD::PreCombat
 		void FinishRestore()
 		{
 			auto* actor = GetTarget();
-			if (actor) {
+
+			if (g_session.pacifySessionId != 0) {
+				TFD::Pacify::ReleaseSession(g_session.pacifySessionId);
+			}
+
+			if (actor && g_session.sentAssignEvent) {
 				SendModEvent("TFDPreCombatClear", actor);
-				RestoreActor(actor);
 			}
 
 			g_session = {};
 			g_session.state = State::Idle;
 		}
 
-		bool StartClaim(RE::Actor* actor)
+		bool StartSessionFromResult(RE::Actor* actor, const TFD::InteractionRouter::ExecuteResult& result)
 		{
-			if (!IsActorStillValid(actor)) {
+			if (!actor) {
 				return false;
 			}
 
-			if (IsCaptiveLikeBlocked()) {
+			if (!result.executed || result.sessionId == 0) {
 				return false;
 			}
 
-			if (g_session.state != State::Idle) {
-				return false;
-			}
-
+			g_session = {};
 			g_session.target = actor->GetHandle();
+			g_session.pacifySessionId = result.sessionId;
 			g_session.state = State::Claimed;
-			g_session.originalAggression = TFD::AntiAggro::GetAggression(actor);
+			g_session.action = result.action;
 			g_session.started = Clock::now();
-			g_session.lastEnforce = Clock::time_point{};
+			g_session.dialogueRequested = result.dialogueRequested;
 			g_session.sawDialogueOpen = false;
+			g_session.sentAssignEvent = false;
 
-			ApplyLock(actor);
-			SendModEvent("TFDPreCombatAssign", actor);
+			if (result.dialogueRequested) {
+				if (!TFD::Pacify::CanOpenDialogue(actor)) {
+					spdlog::warn(
+						"[TFD][PreCombat] router requested dialogue but CanOpenDialogue=false actor={:08X}",
+						actor->GetFormID());
 
-			spdlog::info("[TFD][PreCombat] claim actor={:08X}", actor->GetFormID());
+					TFD::Pacify::ReleaseSession(result.sessionId);
+					g_session = {};
+					g_session.state = State::Idle;
+					return false;
+				}
+
+				SendModEvent("TFDPreCombatAssign", actor);
+				g_session.sentAssignEvent = true;
+			}
+
+			spdlog::info(
+				"[TFD][PreCombat] started action={} target={:08X} dialogueRequested={}",
+				TFD::InteractionRouter::ToString(result.action),
+				actor->GetFormID(),
+				result.dialogueRequested ? 1 : 0);
+
 			return true;
 		}
+
+		class HitSink : public RE::BSTEventSink<RE::TESHitEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESHitEvent* e, RE::BSTEventSource<RE::TESHitEvent>*) override
+			{
+				if (!e || g_session.state == State::Idle) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				auto* claimed = GetTarget();
+				if (!player || !claimed) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* target = e->target.get();
+				auto* cause = e->cause.get();
+				if (!target || !cause) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* causeActor = cause->As<RE::Actor>();
+				if (!causeActor) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (causeActor->GetFormID() == player->GetFormID() &&
+					target->GetFormID() == claimed->GetFormID()) {
+					spdlog::info("[TFD][PreCombat] player attacked active target -> restore");
+					BeginRestore();
+				}
+
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		HitSink g_hitSink{};
 
 		void PollHotkeyAndMaybeStart()
 		{
@@ -312,12 +285,14 @@ namespace TFD::PreCombat
 
 			PollHotkeyAndMaybeStart();
 
+			TFD::Pacify::Update(NowSec());
+
 			if (g_session.state == State::Idle) {
 				return;
 			}
 
 			if (IsCaptiveLikeBlocked() && g_session.state != State::InDialogue) {
-				spdlog::info("[TFD][PreCombat] blocked by captive-like state -> restore");
+				spdlog::info("[TFD][PreCombat] captive-like blocked -> restore");
 				BeginRestore();
 			}
 
@@ -333,31 +308,35 @@ namespace TFD::PreCombat
 				return;
 			}
 
+			if (g_session.state != State::Restoring && actor && !TFD::Pacify::IsPacified(actor)) {
+				BeginRestore();
+			}
+
 			switch (g_session.state) {
 			case State::Claimed:
 			{
-				const auto now = Clock::now();
-
-				if (now - g_session.lastEnforce >= std::chrono::milliseconds(g_cfg.enforceTickMs)) {
-					ApplyLock(actor);
-					g_session.lastEnforce = now;
-				}
-
-				if (IsDialogueOpen()) {
-					g_session.sawDialogueOpen = true;
-					g_session.state = State::InDialogue;
-					spdlog::info("[TFD][PreCombat] dialogue opened");
+				if (!actor) {
+					BeginRestore();
 					break;
 				}
 
-				if (now - g_session.started > std::chrono::milliseconds(g_cfg.claimTimeoutMs)) {
-					spdlog::info("[TFD][PreCombat] claim timeout -> restore");
-					BeginRestore();
+				if (g_session.dialogueRequested) {
+					if (IsDialogueOpen()) {
+						g_session.sawDialogueOpen = true;
+						g_session.state = State::InDialogue;
+						spdlog::info("[TFD][PreCombat] dialogue opened");
+					}
+				}
+				else {
+					// V1 Tame path: kalau creature sudah balik combat, lepas session lokal.
+					if (actor->IsInCombat()) {
+						spdlog::info("[TFD][PreCombat] tame target entered combat -> restore");
+						BeginRestore();
+					}
 				}
 				break;
 			}
 			case State::InDialogue:
-				ApplyLock(actor);
 				if (!IsDialogueOpen()) {
 					spdlog::info("[TFD][PreCombat] dialogue closed -> restore");
 					BeginRestore();
@@ -383,8 +362,9 @@ namespace TFD::PreCombat
 				if (auto* tasks = SKSE::GetTaskInterface()) {
 					tasks->AddUITask([]() {
 						TickUI();
-					});
-				} else {
+						});
+				}
+				else {
 					g_tickPending.clear(std::memory_order_release);
 				}
 			}
@@ -396,8 +376,6 @@ namespace TFD::PreCombat
 		if (g_installed.exchange(true, std::memory_order_acq_rel)) {
 			return;
 		}
-
-		ResolveForms();
 
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
 			scripts->AddEventSink<RE::TESHitEvent>(&g_hitSink);
@@ -416,6 +394,8 @@ namespace TFD::PreCombat
 		if (g_worker.joinable()) {
 			g_worker.join();
 		}
+
+		TFD::Pacify::ReleaseAll();
 
 		g_installed.store(false, std::memory_order_release);
 		spdlog::info("[TFD][PreCombat] shutdown");
@@ -442,13 +422,39 @@ namespace TFD::PreCombat
 			return false;
 		}
 
-		auto* target = TFD::ActorScan::PickBestWarnTarget(g_cfg.claimRadius);
-		if (!target) {
-			spdlog::info("[TFD][PreCombat] no warn target");
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) {
 			return false;
 		}
 
-		return StartClaim(target);
+		auto* target = TFD::ActorScan::GetBestPreCombatCandidate();
+		if (!target) {
+			spdlog::info("[TFD][PreCombat] no precombat candidate");
+			return false;
+		}
+
+		const double nowSec = NowSec();
+		const bool isCaptivePhase = false;  // V1: CallingCaptor belum masuk jalur ini.
+
+		const auto result = TFD::InteractionRouter::HandleHotkeyPress(
+			player,
+			target,
+			isCaptivePhase,
+			nowSec);
+
+		spdlog::info(
+			"[TFD][PreCombat] H target={:08X} action={} executed={} dialogueRequested={} fail={}",
+			target->GetFormID(),
+			TFD::InteractionRouter::ToString(result.action),
+			result.executed ? 1 : 0,
+			result.dialogueRequested ? 1 : 0,
+			TFD::InteractionRouter::ToString(result.failReason));
+
+		if (!result.executed) {
+			return false;
+		}
+
+		return StartSessionFromResult(target, result);
 	}
 
 	void CancelAndRestore()

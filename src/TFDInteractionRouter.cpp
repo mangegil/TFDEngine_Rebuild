@@ -86,7 +86,6 @@ namespace TFD::InteractionRouter
 
         result.playerId = player->GetFormID();
 
-        // V1 belum dukung CallingCaptor.
         if (isCaptivePhase) {
             result.valid = false;
             result.failReason = FailReason::NoUsableAction;
@@ -129,6 +128,12 @@ namespace TFD::InteractionRouter
             return result;
 
         case TFD::TargetClassifier::InteractionIntent::Truce:
+            if (!TFD::Pacify::CanStartTruce(target)) {
+                result.valid = false;
+                result.failReason = FailReason::TruceUnavailable;
+                return result;
+            }
+
             result.action = targetInCombat ? Action::TruceInCombat : Action::TrucePreCombat;
             result.valid = true;
             result.failReason = FailReason::None;
@@ -248,6 +253,8 @@ namespace TFD::InteractionRouter
             return "NoUsableAction";
         case FailReason::TargetRejected:
             return "TargetRejected";
+        case FailReason::TruceUnavailable:
+            return "TruceUnavailable";
         case FailReason::SessionBeginFailed:
             return "SessionBeginFailed";
         default:
