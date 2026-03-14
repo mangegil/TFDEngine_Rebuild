@@ -121,6 +121,31 @@ namespace TFD::Location
 			return false;
 		}
 
+		static RE::BGSLocation* ResolveMostRecentCachedSafeLocation()
+		{
+			const SafeCheckpoint* best = nullptr;
+
+			for (const auto& [_, cp] : g_safeCheckpointByLocation) {
+				if (cp.safeLocationId == 0) {
+					continue;
+				}
+				if (!best || cp.visitSerial > best->visitSerial) {
+					best = &cp;
+				}
+			}
+
+			if (!best) {
+				return nullptr;
+			}
+
+			auto* loc = RE::TESForm::LookupByID<RE::BGSLocation>(best->safeLocationId);
+			if (!loc) {
+				return nullptr;
+			}
+
+			return loc;
+		}
+
 
 		static RE::PlayerCharacter* Player()
 		{
@@ -553,7 +578,9 @@ namespace TFD::Location
 			int bestTier = std::numeric_limits<int>::min();
 			int bestScore = std::numeric_limits<int>::min();
 			double bestDistSq = std::numeric_limits<double>::max();
-			bool bestHasOwner = false;
+			bool bestHasAnyOwner = false;
+			bool bestHasActorOwner = false;
+			bool bestHasFactionOwner = false;
 
 			cell->ForEachReferenceInRange(origin, kCheckpointBedScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
 				if (!candidate || candidate == scanRef) {
@@ -574,16 +601,21 @@ namespace TFD::Location
 					return RE::BSContainer::ForEachResult::kContinue;
 				}
 
-				const bool hasOwner = candidate->GetOwner() != nullptr;
-				const int tier = hasOwner ? 0 : 1;  // ownerless first, owned as fallback
+				auto* ownerForm = candidate->GetOwner();
+				const bool hasActorOwner = ownerForm && ownerForm->As<RE::TESNPC>();
+				const bool hasFactionOwner = ownerForm && ownerForm->As<RE::TESFaction>();
+				const bool hasAnyOwner = ownerForm != nullptr;
+				const int tier = hasActorOwner ? 0 : (hasFactionOwner ? 2 : 1);  // faction/no-actor-owner first, actor-owned fallback
 
 				int score = 0;
 				auto* candidateLoc = GetLocationFromRef(candidate);
 				if (candidateLoc == safeLoc) {
 					score += 200;
-				} else if (LocationChainContains(candidateLoc, safeLoc) || LocationChainContains(safeLoc, candidateLoc)) {
+				}
+				else if (LocationChainContains(candidateLoc, safeLoc) || LocationChainContains(safeLoc, candidateLoc)) {
 					score += 120;
-				} else if (candidateLoc) {
+				}
+				else if (candidateLoc) {
 					score -= 200;
 				}
 
@@ -591,8 +623,14 @@ namespace TFD::Location
 					score += 300;
 				}
 
-				if (!hasOwner) {
+				if (hasFactionOwner) {
+					score += 180;
+				}
+				else if (!hasAnyOwner) {
 					score += 100;
+				}
+				else if (hasActorOwner) {
+					score -= 300;
 				}
 
 				const auto cp = candidate->GetPosition();
@@ -615,7 +653,9 @@ namespace TFD::Location
 					bestTier = tier;
 					bestScore = score;
 					bestDistSq = distSq;
-					bestHasOwner = hasOwner;
+					bestHasAnyOwner = hasAnyOwner;
+					bestHasActorOwner = hasActorOwner;
+					bestHasFactionOwner = hasFactionOwner;
 				}
 
 				return RE::BSContainer::ForEachResult::kContinue;
@@ -623,16 +663,19 @@ namespace TFD::Location
 
 			if (best) {
 				spdlog::info(
-					"[TFD][Location] Auto checkpoint bed hit loc={:08X} marker={:08X} bed={:08X} cell={:08X} owner={} tier={} score={} distSq={:.1f}",
+					"[TFD][Location] Auto checkpoint bed hit loc={:08X} marker={:08X} bed={:08X} cell={:08X} owner={} actorOwner={} factionOwner={} tier={} score={} distSq={:.1f}",
 					safeLoc->GetFormID(),
 					preferredMarker ? preferredMarker->GetFormID() : 0,
 					best->GetFormID(),
 					best->GetParentCell() ? best->GetParentCell()->GetFormID() : 0,
-					bestHasOwner ? 1 : 0,
+					bestHasAnyOwner ? 1 : 0,
+					bestHasActorOwner ? 1 : 0,
+					bestHasFactionOwner ? 1 : 0,
 					bestTier,
 					bestScore,
 					bestDistSq);
-			} else {
+			}
+			else {
 				spdlog::info(
 					"[TFD][Location] Auto checkpoint bed miss loc={:08X} marker={:08X} cell={:08X}",
 					safeLoc->GetFormID(),
@@ -785,8 +828,24 @@ namespace TFD::Location
 	RE::BGSLocation* ResolveRescueTargetLocation(RE::BGSLocation* startLoc)
 	{
 		if (!startLoc) {
+			if (auto* cached = ResolveMostRecentCachedSafeLocation()) {
+				if (ShouldEmitDistinctResolveLog(
+					g_lastResolveSuccessLog,
+					g_lastResolveSuccessStartId,
+					g_lastResolveSuccessResultId,
+					0,
+					cached->GetFormID(),
+					std::chrono::milliseconds(5000))) {
+					spdlog::info(
+						"[TFD][Location] Rescue target fallback from cache start=00000000 -> result={:08X} '{}'",
+						cached->GetFormID(),
+						TFD::Util::GetEditorId(cached).c_str());
+				}
+				return cached;
+			}
+
 			if (ShouldEmitThrottledLog(g_lastResolveNullLog, std::chrono::milliseconds(5000))) {
-				spdlog::info("[TFD][Location] Rescue target not found: startLoc=null");
+				spdlog::info("[TFD][Location] Rescue target not found: startLoc=null and no cached fallback");
 			}
 			return nullptr;
 		}
@@ -1077,137 +1136,137 @@ namespace TFD::Location
 	}
 
 
-    void ClearRescueCache()
-    {
-        g_safeCheckpointByLocation.clear();
-        g_approvedBedByLocation.clear();
-        g_checkpointVisitSerial = 0;
-        g_bedUseSerial = 0;
-        g_rescueResolveMemo = {};
-        spdlog::info("[TFD][Location] Rescue cache cleared");
-    }
+	void ClearRescueCache()
+	{
+		g_safeCheckpointByLocation.clear();
+		g_approvedBedByLocation.clear();
+		g_checkpointVisitSerial = 0;
+		g_bedUseSerial = 0;
+		g_rescueResolveMemo = {};
+		spdlog::info("[TFD][Location] Rescue cache cleared");
+	}
 
-    bool SaveRescueCache(SKSE::SerializationInterface* intfc)
-    {
-        if (!intfc) {
-            return false;
-        }
+	bool SaveRescueCache(SKSE::SerializationInterface* intfc)
+	{
+		if (!intfc) {
+			return false;
+		}
 
-        RescueCacheHeader header{};
-        header.checkpointCount = static_cast<std::uint32_t>(g_safeCheckpointByLocation.size());
-        header.bedCount = static_cast<std::uint32_t>(g_approvedBedByLocation.size());
-        header.checkpointVisitSerial = g_checkpointVisitSerial;
-        header.bedUseSerial = g_bedUseSerial;
+		RescueCacheHeader header{};
+		header.checkpointCount = static_cast<std::uint32_t>(g_safeCheckpointByLocation.size());
+		header.bedCount = static_cast<std::uint32_t>(g_approvedBedByLocation.size());
+		header.checkpointVisitSerial = g_checkpointVisitSerial;
+		header.bedUseSerial = g_bedUseSerial;
 
-        if (!intfc->WriteRecordData(&header, sizeof(header))) {
-            spdlog::error("[TFD][Location] SaveRescueCache -> header write failed");
-            return false;
-        }
+		if (!intfc->WriteRecordData(&header, sizeof(header))) {
+			spdlog::error("[TFD][Location] SaveRescueCache -> header write failed");
+			return false;
+		}
 
-        for (const auto& [_, cp] : g_safeCheckpointByLocation) {
-            if (!intfc->WriteRecordData(&cp, sizeof(cp))) {
-                spdlog::error("[TFD][Location] SaveRescueCache -> checkpoint write failed loc={:08X}", cp.safeLocationId);
-                return false;
-            }
-        }
+		for (const auto& [_, cp] : g_safeCheckpointByLocation) {
+			if (!intfc->WriteRecordData(&cp, sizeof(cp))) {
+				spdlog::error("[TFD][Location] SaveRescueCache -> checkpoint write failed loc={:08X}", cp.safeLocationId);
+				return false;
+			}
+		}
 
-        for (const auto& [_, bed] : g_approvedBedByLocation) {
-            if (!intfc->WriteRecordData(&bed, sizeof(bed))) {
-                spdlog::error("[TFD][Location] SaveRescueCache -> bed write failed loc={:08X}", bed.safeLocationId);
-                return false;
-            }
-        }
+		for (const auto& [_, bed] : g_approvedBedByLocation) {
+			if (!intfc->WriteRecordData(&bed, sizeof(bed))) {
+				spdlog::error("[TFD][Location] SaveRescueCache -> bed write failed loc={:08X}", bed.safeLocationId);
+				return false;
+			}
+		}
 
-        spdlog::info(
-            "[TFD][Location] SaveRescueCache -> checkpoints={} beds={} cpSerial={} bedSerial={}",
-            header.checkpointCount,
-            header.bedCount,
-            header.checkpointVisitSerial,
-            header.bedUseSerial);
+		spdlog::info(
+			"[TFD][Location] SaveRescueCache -> checkpoints={} beds={} cpSerial={} bedSerial={}",
+			header.checkpointCount,
+			header.bedCount,
+			header.checkpointVisitSerial,
+			header.bedUseSerial);
 
-        return true;
-    }
+		return true;
+	}
 
-    bool LoadRescueCache(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length)
-    {
-        ClearRescueCache();
+	bool LoadRescueCache(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length)
+	{
+		ClearRescueCache();
 
-        if (!intfc) {
-            spdlog::warn("[TFD][Location] LoadRescueCache -> interface null");
-            return false;
-        }
+		if (!intfc) {
+			spdlog::warn("[TFD][Location] LoadRescueCache -> interface null");
+			return false;
+		}
 
-        if (version != kRescueCacheVersion) {
-            spdlog::warn("[TFD][Location] LoadRescueCache -> unsupported version={} length={}", version, length);
-            if (length > 0) {
-                std::string skip(length, '\0');
-                intfc->ReadRecordData(skip.data(), length);
-            }
-            return false;
-        }
+		if (version != kRescueCacheVersion) {
+			spdlog::warn("[TFD][Location] LoadRescueCache -> unsupported version={} length={}", version, length);
+			if (length > 0) {
+				std::string skip(length, '\0');
+				intfc->ReadRecordData(skip.data(), length);
+			}
+			return false;
+		}
 
-        if (length < sizeof(RescueCacheHeader)) {
-            spdlog::warn("[TFD][Location] LoadRescueCache -> short record length={}", length);
-            if (length > 0) {
-                std::string skip(length, '\0');
-                intfc->ReadRecordData(skip.data(), length);
-            }
-            return false;
-        }
+		if (length < sizeof(RescueCacheHeader)) {
+			spdlog::warn("[TFD][Location] LoadRescueCache -> short record length={}", length);
+			if (length > 0) {
+				std::string skip(length, '\0');
+				intfc->ReadRecordData(skip.data(), length);
+			}
+			return false;
+		}
 
-        RescueCacheHeader header{};
-        if (!intfc->ReadRecordData(&header, static_cast<std::uint32_t>(sizeof(header)))) {
-            spdlog::error("[TFD][Location] LoadRescueCache -> header read failed");
-            return false;
-        }
+		RescueCacheHeader header{};
+		if (!intfc->ReadRecordData(&header, static_cast<std::uint32_t>(sizeof(header)))) {
+			spdlog::error("[TFD][Location] LoadRescueCache -> header read failed");
+			return false;
+		}
 
-        std::uint32_t bytesRead = static_cast<std::uint32_t>(sizeof(header));
+		std::uint32_t bytesRead = static_cast<std::uint32_t>(sizeof(header));
 
-        for (std::uint32_t i = 0; i < header.checkpointCount; ++i) {
-            SafeCheckpoint cp{};
-            if (bytesRead + sizeof(cp) > length || !intfc->ReadRecordData(&cp, static_cast<std::uint32_t>(sizeof(cp)))) {
-                spdlog::error("[TFD][Location] LoadRescueCache -> checkpoint read failed index={}", i);
-                ClearRescueCache();
-                return false;
-            }
-            bytesRead += static_cast<std::uint32_t>(sizeof(cp));
-            if (cp.safeLocationId != 0) {
-                g_safeCheckpointByLocation[cp.safeLocationId] = cp;
-                g_checkpointVisitSerial = (std::max)(g_checkpointVisitSerial, cp.visitSerial);
-            }
-        }
+		for (std::uint32_t i = 0; i < header.checkpointCount; ++i) {
+			SafeCheckpoint cp{};
+			if (bytesRead + sizeof(cp) > length || !intfc->ReadRecordData(&cp, static_cast<std::uint32_t>(sizeof(cp)))) {
+				spdlog::error("[TFD][Location] LoadRescueCache -> checkpoint read failed index={}", i);
+				ClearRescueCache();
+				return false;
+			}
+			bytesRead += static_cast<std::uint32_t>(sizeof(cp));
+			if (cp.safeLocationId != 0) {
+				g_safeCheckpointByLocation[cp.safeLocationId] = cp;
+				g_checkpointVisitSerial = (std::max)(g_checkpointVisitSerial, cp.visitSerial);
+			}
+		}
 
-        for (std::uint32_t i = 0; i < header.bedCount; ++i) {
-            ApprovedBed bed{};
-            if (bytesRead + sizeof(bed) > length || !intfc->ReadRecordData(&bed, static_cast<std::uint32_t>(sizeof(bed)))) {
-                spdlog::error("[TFD][Location] LoadRescueCache -> bed read failed index={}", i);
-                ClearRescueCache();
-                return false;
-            }
-            bytesRead += static_cast<std::uint32_t>(sizeof(bed));
-            if (bed.safeLocationId != 0) {
-                g_approvedBedByLocation[bed.safeLocationId] = bed;
-                g_bedUseSerial = (std::max)(g_bedUseSerial, bed.useSerial);
-            }
-        }
+		for (std::uint32_t i = 0; i < header.bedCount; ++i) {
+			ApprovedBed bed{};
+			if (bytesRead + sizeof(bed) > length || !intfc->ReadRecordData(&bed, static_cast<std::uint32_t>(sizeof(bed)))) {
+				spdlog::error("[TFD][Location] LoadRescueCache -> bed read failed index={}", i);
+				ClearRescueCache();
+				return false;
+			}
+			bytesRead += static_cast<std::uint32_t>(sizeof(bed));
+			if (bed.safeLocationId != 0) {
+				g_approvedBedByLocation[bed.safeLocationId] = bed;
+				g_bedUseSerial = (std::max)(g_bedUseSerial, bed.useSerial);
+			}
+		}
 
-        g_checkpointVisitSerial = (std::max)(g_checkpointVisitSerial, header.checkpointVisitSerial);
-        g_bedUseSerial = (std::max)(g_bedUseSerial, header.bedUseSerial);
+		g_checkpointVisitSerial = (std::max)(g_checkpointVisitSerial, header.checkpointVisitSerial);
+		g_bedUseSerial = (std::max)(g_bedUseSerial, header.bedUseSerial);
 
-        if (length > bytesRead) {
-            std::string skip(length - bytesRead, '\0');
-            intfc->ReadRecordData(skip.data(), static_cast<std::uint32_t>(skip.size()));
-        }
+		if (length > bytesRead) {
+			std::string skip(length - bytesRead, '\0');
+			intfc->ReadRecordData(skip.data(), static_cast<std::uint32_t>(skip.size()));
+		}
 
-        spdlog::info(
-            "[TFD][Location] LoadRescueCache -> checkpoints={} beds={} cpSerial={} bedSerial={}",
-            g_safeCheckpointByLocation.size(),
-            g_approvedBedByLocation.size(),
-            g_checkpointVisitSerial,
-            g_bedUseSerial);
+		spdlog::info(
+			"[TFD][Location] LoadRescueCache -> checkpoints={} beds={} cpSerial={} bedSerial={}",
+			g_safeCheckpointByLocation.size(),
+			g_approvedBedByLocation.size(),
+			g_checkpointVisitSerial,
+			g_bedUseSerial);
 
-        return true;
-    }
+		return true;
+	}
 
 	void DumpRescueCacheToLog()
 	{
@@ -1345,4 +1404,4 @@ namespace TFD::Location
 
 		return true;
 	}
-}
+}.
