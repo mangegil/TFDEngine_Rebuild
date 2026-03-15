@@ -11,7 +11,7 @@ namespace TFD
 		if (!_door) {
 			return nullptr;
 		}
-		auto refPtr = _door.get();  // NiPointer<TESObjectREFR>
+		auto refPtr = _door.get();
 		return refPtr.get();
 	}
 
@@ -80,27 +80,21 @@ namespace TFD
 			return;
 		}
 
-		// restore base lock level + key + leveled flag
 		lock->baseLevel = a_snap.baseLevel;
 
 		if (a_snap.keyFormID != 0) {
 			lock->key = RE::TESForm::LookupByID<RE::TESKey>(a_snap.keyFormID);
-		}
-		else {
+		} else {
 			lock->key = nullptr;
 		}
 
 		if (a_snap.leveled) {
 			lock->flags.set(RE::REFR_LOCK::Flag::kLeveled);
-		}
-		else {
+		} else {
 			lock->flags.reset(RE::REFR_LOCK::Flag::kLeveled);
 		}
 
-		// restore locked
 		lock->SetLocked(a_snap.locked);
-
-		// optional: reset attempts
 		lock->numTries = 0;
 
 		spdlog::info("[TFD][CaptiveDoor] Restored lock door={:08X} baseLevel={} leveled={} locked={} key={:08X}",
@@ -136,19 +130,47 @@ namespace TFD
 			return;
 		}
 
-		// ignore watcher briefly while we force close/lock (prevents false escape trigger)
-		_ignoreUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+		_ignoreUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
 
-		// close first (so it doesn't stay open)
 		SetOpen(door, false, a_snapClose);
 
-		// restore exact initial lock settings (level/key/flags/locked)
-		RestoreLockFromSnapshot(door, _snap);
+		auto* lock = door->GetLock();
+		if (lock) {
+			lock->baseLevel = _snap.baseLevel;
+
+			if (_snap.keyFormID != 0) {
+				lock->key = RE::TESForm::LookupByID<RE::TESKey>(_snap.keyFormID);
+			} else {
+				lock->key = nullptr;
+			}
+
+			if (_snap.leveled) {
+				lock->flags.set(RE::REFR_LOCK::Flag::kLeveled);
+			} else {
+				lock->flags.reset(RE::REFR_LOCK::Flag::kLeveled);
+			}
+
+			// Important: during captive/recapture we always force the door locked,
+			// even if the original snapshot was unlocked.
+			lock->SetLocked(true);
+			lock->numTries = 0;
+		}
+
+		// Some persisted refs can remain visually open after the first close.
+		if (IsOpenOrOpening(door)) {
+			SetOpen(door, false, true);
+		}
 
 		_prevLocked = IsLocked(door);
 		_prevOpenOrOpening = IsOpenOrOpening(door);
 
-		spdlog::info("[TFD][CaptiveDoor] Sealed to initial door={:08X}", door->GetFormID());
+		spdlog::info("[TFD][CaptiveDoor] Resealed captive door={:08X} baseLevel={} leveled={} initialLocked={} forcedLocked={} key={:08X}",
+			door->GetFormID(),
+			static_cast<int>(_snap.baseLevel),
+			_snap.leveled ? 1 : 0,
+			_snap.locked ? 1 : 0,
+			_prevLocked ? 1 : 0,
+			_snap.keyFormID);
 	}
 
 	void CaptiveDoorController::UnlockForRelease(double ignoreSeconds, bool a_openDoor, bool a_snapOpen)
@@ -158,12 +180,23 @@ namespace TFD
 			return;
 		}
 
-		// ignore watcher during programmatic unlock/open
 		const auto ms = static_cast<int>(ignoreSeconds * 1000.0);
 		_ignoreUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 
 		if (auto* lock = door->GetLock(); lock) {
+			lock->baseLevel = _snap.baseLevel;
+			if (_snap.keyFormID != 0) {
+				lock->key = RE::TESForm::LookupByID<RE::TESKey>(_snap.keyFormID);
+			} else {
+				lock->key = nullptr;
+			}
+			if (_snap.leveled) {
+				lock->flags.set(RE::REFR_LOCK::Flag::kLeveled);
+			} else {
+				lock->flags.reset(RE::REFR_LOCK::Flag::kLeveled);
+			}
 			lock->SetLocked(false);
+			lock->numTries = 0;
 		}
 
 		if (a_openDoor) {
@@ -189,7 +222,6 @@ namespace TFD
 		const bool curLocked = IsLocked(door);
 		const bool curOpenOrOpening = IsOpenOrOpening(door);
 
-		// Update cached states regardless
 		const bool lockJustBroke = (_prevLocked && !curLocked);
 		const bool openedNow = (!_prevOpenOrOpening && curOpenOrOpening);
 
@@ -200,7 +232,6 @@ namespace TFD
 			return false;
 		}
 
-		// Treat either unlock (lockpick) OR open as escape start
 		if (lockJustBroke || openedNow) {
 			spdlog::info("[TFD][CaptiveDoor] Escape-trigger door={:08X} (unlockEvent={}, openEvent={})",
 				door->GetFormID(),
