@@ -88,6 +88,13 @@ namespace TFD::Pacify
     bool HasSpentTruce(RE::Actor* actor);
     bool WasTruceBetrayed(RE::Actor* actor);
 
+    std::optional<RE::FormID> BeginCellTruceBurst(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec,
+        float radius);
+
     void ReleaseSession(RE::FormID sessionId, ReleaseReason reason = ReleaseReason::Generic);
     void ReleaseAll();
 

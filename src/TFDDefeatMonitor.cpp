@@ -1,4 +1,4 @@
-﻿#include "TFDDefeatMonitor.h"
+#include "TFDDefeatMonitor.h"
 
 #include <atomic>
 #include <chrono>
@@ -10,6 +10,8 @@
 #include <string>
 #include <cstring>
 
+#include <type_traits>
+#include <RE/A/ActorValues.h>
 #include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
 #include <SKSE/SKSE.h>
@@ -66,11 +68,15 @@ namespace TFD::DefeatMonitor
 
 		std::atomic_bool g_inBleedState{ false };
 		float g_minHp{ 0.0f };
+		bool g_playerBleedImmuneForced = false;
+		bool g_playerWasEssential = false;
+		bool g_playerWasInvulnerable = false;
 
 		std::chrono::steady_clock::time_point g_bleedStart{};
 		int g_bleedLastSeconds = -1;
 		bool g_bleedPaused = false;
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
+		std::chrono::steady_clock::time_point g_bleedLastCalmPulse{};
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -109,6 +115,30 @@ namespace TFD::DefeatMonitor
 		static RE::PlayerCharacter* Player()
 		{
 			return RE::PlayerCharacter::GetSingleton();
+		}
+
+		static void SetPlayerBleedImmune(bool enable)
+		{
+			if (enable) {
+				if (g_playerBleedImmuneForced) {
+					return;
+				}
+
+				g_playerBleedImmuneForced = true;
+				g_playerWasEssential = false;
+				g_playerWasInvulnerable = false;
+				spdlog::info("[TFD][Defeat] player bleed soft-guard enabled");
+				return;
+			}
+
+			if (!g_playerBleedImmuneForced) {
+				return;
+			}
+
+			g_playerBleedImmuneForced = false;
+			g_playerWasEssential = false;
+			g_playerWasInvulnerable = false;
+			spdlog::info("[TFD][Defeat] player bleed soft-guard released");
 		}
 
 		static RE::BGSKeyword* LookupKeyword(const char* editorID)
@@ -262,8 +292,7 @@ namespace TFD::DefeatMonitor
 					if (!outSender && senderFormID != 0) {
 						outSender = RE::TESForm::LookupByID(senderFormID);
 					}
-				}
-				else if (senderFormID != 0) {
+				} else if (senderFormID != 0) {
 					outSender = RE::TESForm::LookupByID(senderFormID);
 				}
 
@@ -280,7 +309,7 @@ namespace TFD::DefeatMonitor
 					name,
 					senderFormID,
 					outSender ? outSender->GetFormID() : 0u);
-				});
+			});
 
 			return true;
 		}
@@ -310,6 +339,7 @@ namespace TFD::DefeatMonitor
 			g_bleedPendingNonCaptiveOutcome = false;
 			g_bleedPaused = false;
 			g_bleedPauseStarted = {};
+			g_bleedLastCalmPulse = {};
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
 		}
@@ -1247,6 +1277,25 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
+		static bool CanUseCaptiveFallbackHeuristic(RE::Actor* player, RE::Actor* aggressor, bool hasCaptiveOutcome, float& outDistance)
+		{
+			outDistance = 99999.0f;
+			if (!hasCaptiveOutcome || !player || !aggressor) {
+				return false;
+			}
+
+			if (!IsReasonableBleedoutSpeaker(aggressor, player, 768.0f, &outDistance)) {
+				return false;
+			}
+
+			auto* marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!marker) {
+				return false;
+			}
+
+			return true;
+		}
+
 		static RE::Actor* FindBestAggressor(float radius)
 		{
 			auto* player = Player();
@@ -1277,17 +1326,46 @@ namespace TFD::DefeatMonitor
 
 		static void ApplyCalmBubble(float radius)
 		{
-			TFD::AntiAggro::SweepOnce(radius, true);
-			TFD::AntiAggro::ScheduleWaves(radius, true, 10, 140);
-			TFD::ActorScan::Rescan(radius, true);
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+
+			auto* pCell = player->GetParentCell();
+			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
+			TFD::AntiAggro::SweepOnce(sweepRadius, true);
+			TFD::AntiAggro::ScheduleWaves(sweepRadius, true, 12, 120);
+			TFD::ActorScan::Rescan(sweepRadius, false);
 			const auto n = TFD::ActorScan::GetCount();
+			std::size_t applied = 0;
 			for (int i = 0; i < n; ++i) {
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto sp = e.actor.get();
 				auto* a = sp.get();
-				if (!a || a->IsDead()) continue;
+				if (!a || a->IsDead() || a->IsDisabled()) continue;
+				if (!a->Is3DLoaded()) continue;
+				if (a->GetFormID() == player->GetFormID()) continue;
+				if (pCell && a->GetParentCell() != pCell) continue;
+				if (!e.hostile && !e.inCombat && !a->IsInCombat()) continue;
+
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					const bool runDetection = process->runDetection;
+					process->runDetection = false;
+					process->ClearCachedFactionFightReactions();
+					process->StopCombatAndAlarmOnActor(a, false);
+					process->runDetection = runDetection;
+				}
+
 				TFD::AggressionClamp::Apply(a);
+				a->StopCombat();
+				if (a->IsWeaponDrawn()) {
+					a->DrawWeaponMagicHands(false);
+				}
+				a->EvaluatePackage(true, false);
+				++applied;
 			}
+
+			spdlog::info("[TFD][Defeat] calm bubble same-cell applied={} radius={:.0f}", applied, sweepRadius);
 		}
 
 		static void RecoverPlayerAfterTeleport()
@@ -1306,6 +1384,7 @@ namespace TFD::DefeatMonitor
 			}
 			if (p->IsInCombat()) p->StopCombat();
 			p->DrawWeaponMagicHands(false);
+			SetPlayerBleedImmune(false);
 		}
 
 		static void RecoverPlayerForTransition()
@@ -1329,6 +1408,7 @@ namespace TFD::DefeatMonitor
 			restoreToPct(RE::ActorValue::kMagicka, 0.95f, 25.0f);
 			if (p->IsInCombat()) p->StopCombat();
 			p->DrawWeaponMagicHands(false);
+			SetPlayerBleedImmune(false);
 		}
 
 		static void TickLeftForDeadCooldown()
@@ -1367,14 +1447,16 @@ namespace TFD::DefeatMonitor
 			g_bleedLastSeconds = -1;
 			g_bleedPaused = false;
 			g_bleedPauseStarted = {};
+			g_bleedLastCalmPulse = {};
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
 			const float minHp = (std::max)(1.0f, maxHp * 0.02f);
 			g_minHp = minHp;
+			SetPlayerBleedImmune(true);
 			ClampHealth(player, g_minHp);
 			player->NotifyAnimationGraph("BleedoutStart");
 
-			const float radius = (std::max)(2000.0f, TFD::Settings::GetSweepRadius());
+			const float radius = (std::max)(12000.0f, TFD::Settings::GetSweepRadius());
 			const float maxSpeakerDist = 900.0f;
 			aggressor = FindBestBleedoutSpeaker(radius, maxSpeakerDist, aggressor);
 			if (aggressor) {
@@ -1396,14 +1478,29 @@ namespace TFD::DefeatMonitor
 					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> keep bleed hold pending=noncaptive", aggressor->GetFormID());
 				}
 				else {
-					const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
-					if (!captiveSupported) {
+					const bool allowlistSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
+					const bool hasCaptiveOutcome = ResolveCaptiveMarkerForOutcome();
+					float fallbackDistance = 99999.0f;
+					const bool fallbackSupported = !allowlistSupported &&
+						CanUseCaptiveFallbackHeuristic(player, aggressor, hasCaptiveOutcome, fallbackDistance);
+
+					if (!allowlistSupported && fallbackSupported) {
+						spdlog::info(
+							"[TFD][Defeat] captive fallback accepted via marker+speaker heuristic actor={:08X} dist={:.1f}",
+							aggressor->GetFormID(),
+							fallbackDistance);
+					}
+
+					if (!allowlistSupported && !fallbackSupported) {
 						g_bleedPendingCaptiveOutcome = false;
 						g_bleedPendingNonCaptiveOutcome = true;
-						spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> keep bleed hold pending=noncaptive", aggressor->GetFormID());
+						spdlog::info(
+							"[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction and fallback rejected (marker={} dist={:.1f}) -> keep bleed hold pending=noncaptive",
+							aggressor->GetFormID(),
+							hasCaptiveOutcome ? 1 : 0,
+							fallbackDistance);
 					}
 					else {
-						const bool hasCaptiveOutcome = ResolveCaptiveMarkerForOutcome();
 						g_bleedPendingCaptiveOutcome = hasCaptiveOutcome;
 						g_bleedPendingNonCaptiveOutcome = !hasCaptiveOutcome;
 
@@ -1478,6 +1575,7 @@ namespace TFD::DefeatMonitor
 				actor->EvaluatePackage(true, false);
 			}
 
+			SetPlayerBleedImmune(false);
 			QueueNonCaptiveChoiceRequest(reason);
 			spdlog::warn("[TFD][Transition] non-captive choice armed reason={}", reason ? reason : "unknown");
 		}
@@ -1617,7 +1715,14 @@ namespace TFD::DefeatMonitor
 			}
 			if (IsGraceActive()) return;
 			if (g_inBleedState.load(std::memory_order_acquire)) {
-				if (g_minHp > 0.0f) ClampHealth(player, g_minHp);
+				if (g_minHp > 0.0f) {
+					SetPlayerBleedImmune(true);
+					ClampHealth(player, g_minHp);
+				}
+				if (g_bleedLastCalmPulse.time_since_epoch().count() == 0 || (Now() - g_bleedLastCalmPulse) >= std::chrono::milliseconds(350)) {
+					ApplyCalmBubble((std::max)(12000.0f, TFD::Settings::GetSweepRadius()));
+					g_bleedLastCalmPulse = Now();
+				}
 				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 				const bool dOpen = IsDialogueOpen();
 				if (dOpen) {
@@ -1726,6 +1831,7 @@ namespace TFD::DefeatMonitor
 		g_prevDialogueOpen = false;
 		ResetLockpickWatch();
 		ClearEscapeContext();
+		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
 		ClearBleedoutBridgeAliases(nullptr, "install");
 		TFD::FactionMask::Initialize();
@@ -1745,6 +1851,7 @@ namespace TFD::DefeatMonitor
 		g_hasQueuedProgressState = false;
 		g_queuedCaptiveState = false;
 		g_queuedCaptivePhase = CaptivePhaseValue::None;
+		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
 		ClearBleedoutBridgeAliases(nullptr, "shutdown");
 		g_loadTransition.store(false, std::memory_order_release);
@@ -1809,6 +1916,7 @@ namespace TFD::DefeatMonitor
 			ResetLockpickWatch();
 			ClearEscapeContext();
 		}
+		SetPlayerBleedImmune(false);
 		ClearBleedoutBridgeAliases(nullptr, "apply_queued_state");
 		UpdatePreCombatState();
 		spdlog::info("[TFD][Defeat] ApplyQueuedProgressState state={} phase={}", g_queuedCaptiveState ? 1 : 0, static_cast<int>(g_queuedCaptivePhase));
@@ -1817,6 +1925,7 @@ namespace TFD::DefeatMonitor
 	void ResetForLoad()
 	{
 		g_grace.store(false, std::memory_order_release);
+		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
 		ClearBleedoutBridgeAliases(nullptr, "reset_for_load");
 		g_lastAggressor = RE::ActorHandle{};
@@ -1835,7 +1944,8 @@ namespace TFD::DefeatMonitor
 	{
 		g_loadTransition.store(active, std::memory_order_release);
 		if (active) {
-			ClearBleedoutBridgeAliases(nullptr, "set_load_transition");
+			SetPlayerBleedImmune(false);
+		ClearBleedoutBridgeAliases(nullptr, "set_load_transition");
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
 			spdlog::info("[TFD][Defeat] SetLoadTransition(true)");

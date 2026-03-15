@@ -612,6 +612,58 @@ namespace TFDMenu
 			return best;
 		}
 
+		static void ApplyCellHotkeyCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
+		{
+			if (!player || !primaryTarget) {
+				return;
+			}
+
+			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
+			TFD::AntiAggro::SweepOnce(sweepRadius, true);
+			TFD::AntiAggro::ScheduleWaves(sweepRadius, true, 10, 120);
+			TFD::ActorScan::Rescan(sweepRadius, false);
+
+			auto* pCell = player->GetParentCell();
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (!actor->Is3DLoaded()) {
+					continue;
+				}
+				if (actor->GetFormID() == player->GetFormID()) {
+					continue;
+				}
+				if (pCell && actor->GetParentCell() != pCell) {
+					continue;
+				}
+				if (actor->GetFormID() != primaryTarget->GetFormID() &&
+					!entry.hostile &&
+					!entry.inCombat) {
+					continue;
+				}
+
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					const bool runDetection = process->runDetection;
+					process->runDetection = false;
+					process->ClearCachedFactionFightReactions();
+					process->StopCombatAndAlarmOnActor(actor, false);
+					process->runDetection = runDetection;
+				}
+				actor->StopCombat();
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(true, false);
+			}
+
+			spdlog::info("[TFD][Hotkey] cell calm bubble primary={:08X} radius={:.0f}", primaryTarget->GetFormID(), sweepRadius);
+		}
+
+
 		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist)
 		{
 			if (!a || !player) {
@@ -1007,6 +1059,7 @@ namespace TFDMenu
 							continue;
 						}
 
+						ApplyCellHotkeyCalmBubble(player, captor, 12000.0f);
 						SendBridgeEvent("TFDCaptiveClearAll");
 						SendBridgeAssignActor("TFDCaptiveAssign", captor);
 						TFD::ForceGreet::BeginCaptiveMarker(captor);

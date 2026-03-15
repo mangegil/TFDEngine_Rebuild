@@ -49,31 +49,10 @@ namespace TFD::PreCombatGreet
 		std::unordered_map<std::uint32_t, Pending> gPending;
 		std::unordered_map<std::uint32_t, double> gCooldownUntil;
 		Clock::time_point gT0 = Clock::now();
-		RE::ActorHandle gRecentActor{};
-		double gRecentActorCachedAtSec = 0.0;
-		double gRecentActorUntilSec = 0.0;
 
 		double NowSec()
 		{
 			return std::chrono::duration<double>(Clock::now() - gT0).count();
-		}
-
-		void CacheRecentActor(RE::Actor* actor, double holdSec, const char* reason = nullptr)
-		{
-			if (!actor) {
-				return;
-			}
-
-			const double now = NowSec();
-			gRecentActor = actor->GetHandle();
-			gRecentActorCachedAtSec = now;
-			gRecentActorUntilSec = now + (holdSec > 0.0 ? holdSec : 0.0);
-
-			spdlog::info(
-				"[TFD][PreCombatGreet] recent actor cached actor={:08X} hold={:.1f}s reason={}",
-				actor->GetFormID(),
-				holdSec,
-				reason ? reason : "none");
 		}
 
 		std::uint32_t GetHandleId(RE::Actor* actor)
@@ -135,6 +114,31 @@ namespace TFD::PreCombatGreet
 				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
 				src->SendEvent(&ev);
 				});
+		}
+
+		struct BridgeEventNames
+		{
+			const char* assign{ nullptr };
+			const char* clear{ nullptr };
+			const char* clearAll{ nullptr };
+		};
+
+		BridgeEventNames GetBridgeEventNames(TFD::InteractionRouter::Action action)
+		{
+			switch (action) {
+			case TFD::InteractionRouter::Action::TrucePreCombat:
+				return { "TFDPreCombatAssign", "TFDPreCombatClear", "TFDPreCombatClearAll" };
+			case TFD::InteractionRouter::Action::TruceInCombat:
+				return { "TFDInCombatAssign", "TFDInCombatClear", "TFDInCombatClearAll" };
+			default:
+				return {};
+			}
+		}
+
+		void ClearAllBridgeAliases()
+		{
+			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
+			SendBridgeEvent("TFDInCombatClearAll", nullptr);
 		}
 
 		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -204,12 +208,14 @@ namespace TFD::PreCombatGreet
 			}
 
 			if (pending.assignSent) {
-				SendBridgeEvent("TFDPreCombatClear", actor);
+				const auto bridge = GetBridgeEventNames(pending.action);
+				if (bridge.clear) {
+					SendBridgeEvent(bridge.clear, actor);
+				}
 				pending.assignSent = false;
 			}
 
 			if (actor) {
-				CacheRecentActor(actor, 12.0, reason);
 				gCooldownUntil[GetHandleId(actor)] = NowSec() + cooldownSec;
 
 				spdlog::info(
@@ -228,7 +234,7 @@ namespace TFD::PreCombatGreet
 
 		void ClearAllPendingLocked()
 		{
-			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
+			ClearAllBridgeAliases();
 
 			for (auto& [handle, pending] : gPending) {
 				auto sp = RE::Actor::LookupByHandle(handle);
@@ -240,7 +246,10 @@ namespace TFD::PreCombatGreet
 				}
 
 				if (pending.assignSent) {
-					SendBridgeEvent("TFDPreCombatClear", actor);
+					const auto bridge = GetBridgeEventNames(pending.action);
+					if (bridge.clear) {
+						SendBridgeEvent(bridge.clear, actor);
+					}
 					pending.assignSent = false;
 				}
 			}
@@ -455,9 +464,6 @@ namespace TFD::PreCombatGreet
 			std::scoped_lock lk(gLock);
 			ClearAllPendingLocked();
 			gCooldownUntil.clear();
-			gRecentActor = RE::ActorHandle{};
-			gRecentActorCachedAtSec = 0.0;
-			gRecentActorUntilSec = 0.0;
 		}
 
 		gSuspended.store(false, std::memory_order_release);
@@ -529,8 +535,6 @@ namespace TFD::PreCombatGreet
 			ClearAllPendingLocked();
 		}
 
-		CacheRecentActor(actor, 12.0, "begin");
-
 		Pending pending{};
 		pending.pacifySessionId = result.sessionId;
 		pending.action = result.action;
@@ -545,8 +549,17 @@ namespace TFD::PreCombatGreet
 				return false;
 			}
 
-			SendBridgeEvent("TFDPreCombatAssign", actor);
-			pending.assignSent = true;
+			const auto bridge = GetBridgeEventNames(result.action);
+			if (bridge.assign) {
+				if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
+					if (player->IsInCombat()) {
+						player->StopCombat();
+					}
+				}
+
+				SendBridgeEvent(bridge.assign, actor);
+				pending.assignSent = true;
+			}
 		}
 
 		gPending.emplace(handle, pending);
@@ -576,33 +589,7 @@ namespace TFD::PreCombatGreet
 		std::scoped_lock lk(gLock);
 		ClearAllPendingLocked();
 		gCooldownUntil.clear();
-		gRecentActor = RE::ActorHandle{};
-		gRecentActorCachedAtSec = 0.0;
-		gRecentActorUntilSec = 0.0;
 
 		spdlog::info("[TFD][PreCombatGreet] CancelAll");
-	}
-
-	RE::Actor* GetRecentActor(double maxAgeSec)
-	{
-		std::scoped_lock lk(gLock);
-
-		const double now = NowSec();
-		if (gRecentActorUntilSec <= 0.0 || now > gRecentActorUntilSec) {
-			gRecentActor = RE::ActorHandle{};
-			gRecentActorCachedAtSec = 0.0;
-			gRecentActorUntilSec = 0.0;
-			return nullptr;
-		}
-
-		if (maxAgeSec > 0.0) {
-			const double age = now - gRecentActorCachedAtSec;
-			if (age > maxAgeSec) {
-				return nullptr;
-			}
-		}
-
-		auto sp = gRecentActor.get();
-		return sp.get();
 	}
 }
