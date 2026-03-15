@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cfloat>
 #include <cstdint>
 #include <mutex>
 
@@ -45,10 +46,24 @@ namespace TFD::ForceGreet
 		double dialogueOpenedAtSec{ 0.0 };
 		double suppressUntilSec{ 0.0 };
 
-		constexpr float kCaptiveApproachDistance = 140.0f;
+		constexpr float kCaptiveApproachDistance = 220.0f;
 		constexpr float kCaptiveApproachDistanceSq = kCaptiveApproachDistance * kCaptiveApproachDistance;
+		constexpr float kBleedoutApproachDistance = 220.0f;
+		constexpr float kBleedoutApproachDistanceSq = kBleedoutApproachDistance * kBleedoutApproachDistance;
 		constexpr double kCaptiveSuppressSeconds = 6.0;
 		constexpr double kNormalSuppressSeconds = 1.5;
+
+		enum class DialogueGateFail
+		{
+			None = 0,
+			NoPlayer,
+			NoSpeaker,
+			DeadSpeaker,
+			NotLoaded,
+			DifferentCell,
+			TooFar,
+			NoLOS
+		};
 
 		double NowSec()
 		{
@@ -90,8 +105,22 @@ namespace TFD::ForceGreet
 			if (!handle) {
 				return nullptr;
 			}
+
 			auto sp = RE::Actor::LookupByHandle(handle);
 			return sp.get();
+		}
+
+		bool IsSpeakerUsable(RE::Actor* speaker)
+		{
+			if (!speaker) {
+				return false;
+			}
+
+			if (speaker->IsDead()) {
+				return false;
+			}
+
+			return true;
 		}
 
 		void SendModEvent(const char* eventName, RE::Actor* sender)
@@ -114,11 +143,14 @@ namespace TFD::ForceGreet
 			SendModEvent("TFDCaptiveClearAll", speaker);
 
 			if (speaker) {
-				spdlog::info("[TFD][ForceGreet] CaptiveClearAll reason={} speaker={:08X}",
-					reason ? reason : "unknown", speaker->GetFormID());
+				spdlog::info(
+					"[TFD][ForceGreet] CaptiveClearAll reason={} speaker={:08X}",
+					reason ? reason : "unknown",
+					speaker->GetFormID());
 			}
 			else {
-				spdlog::info("[TFD][ForceGreet] CaptiveClearAll reason={} speaker=<none>",
+				spdlog::info(
+					"[TFD][ForceGreet] CaptiveClearAll reason={} speaker=<none>",
 					reason ? reason : "unknown");
 			}
 		}
@@ -139,6 +171,47 @@ namespace TFD::ForceGreet
 			return (dx * dx) + (dy * dy) + (dz * dz);
 		}
 
+		DialogueGateFail CanStartDialogueNow(RE::Actor* speaker, Mode mode, float& outDist)
+		{
+			outDist = 99999.0f;
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return DialogueGateFail::NoPlayer;
+			}
+			if (!speaker) {
+				return DialogueGateFail::NoSpeaker;
+			}
+			if (speaker->IsDead()) {
+				return DialogueGateFail::DeadSpeaker;
+			}
+
+			if (!speaker->Is3DLoaded() || !player->Is3DLoaded()) {
+				return DialogueGateFail::NotLoaded;
+			}
+
+			if (speaker->GetParentCell() != player->GetParentCell()) {
+				return DialogueGateFail::DifferentCell;
+			}
+
+			const float distSq = DistanceSq3D(speaker, player);
+			outDist = (distSq > 0.0f) ? std::sqrt(distSq) : 0.0f;
+
+			const float maxDistSq =
+				(mode == Mode::CaptiveMarker) ? kCaptiveApproachDistanceSq : kBleedoutApproachDistanceSq;
+
+			if (distSq > maxDistSq) {
+				return DialogueGateFail::TooFar;
+			}
+
+			bool los = false;
+			if (!speaker->HasLineOfSight(player, los)) {
+				return DialogueGateFail::NoLOS;
+			}
+
+			return DialogueGateFail::None;
+		}
+
 		void NudgeApproach(RE::Actor* speaker)
 		{
 			if (!speaker) {
@@ -149,7 +222,6 @@ namespace TFD::ForceGreet
 				speaker->StopCombat();
 			}
 			speaker->DrawWeaponMagicHands(false);
-
 			speaker->EvaluatePackage(true, false);
 		}
 
@@ -163,7 +235,6 @@ namespace TFD::ForceGreet
 				speaker->StopCombat();
 			}
 			speaker->DrawWeaponMagicHands(false);
-
 			speaker->SetDialogueWithPlayer(false, false, nullptr);
 
 			if (mode == Mode::Bleedout) {
@@ -189,6 +260,18 @@ namespace TFD::ForceGreet
 				return false;
 			}
 
+			float dist = 99999.0f;
+			const auto gate = CanStartDialogueNow(speaker, mode, dist);
+			if (gate != DialogueGateFail::None) {
+				spdlog::info(
+					"[TFD][ForceGreet] TryStartDialogue blocked speaker={:08X} mode={} reason={} dist={:.1f}",
+					speaker->GetFormID(),
+					static_cast<int>(mode),
+					static_cast<int>(gate),
+					dist);
+				return false;
+			}
+
 			if (speaker->IsInCombat()) {
 				speaker->StopCombat();
 			}
@@ -200,8 +283,13 @@ namespace TFD::ForceGreet
 				speaker->EvaluatePackage(true, false);
 			}
 
-			spdlog::info("[TFD][ForceGreet] TryStartDialogue speaker={:08X} mode={} ok={}",
-				speaker->GetFormID(), static_cast<int>(mode), ok ? "true" : "false");
+			spdlog::info(
+				"[TFD][ForceGreet] TryStartDialogue speaker={:08X} mode={} ok={} dist={:.1f}",
+				speaker->GetFormID(),
+				static_cast<int>(mode),
+				ok ? "true" : "false",
+				dist);
+
 			return ok;
 		}
 
@@ -228,8 +316,12 @@ namespace TFD::ForceGreet
 				job.success = false;
 			}
 
-			spdlog::info("[TFD][ForceGreet] Begin speaker={:08X} mode={} window={}s immediate={}",
-				speaker->GetFormID(), static_cast<int>(mode), windowSeconds, immediateStart ? "true" : "false");
+			spdlog::info(
+				"[TFD][ForceGreet] Begin speaker={:08X} mode={} window={}s immediate={}",
+				speaker->GetFormID(),
+				static_cast<int>(mode),
+				windowSeconds,
+				immediateStart ? "true" : "false");
 
 			if (immediateStart) {
 				TryStartDialogue(speaker, mode);
@@ -246,7 +338,9 @@ namespace TFD::ForceGreet
 		class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
 		{
 		public:
-			RE::BSEventNotifyControl ProcessEvent(const RE::MenuOpenCloseEvent* e, RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
+			RE::BSEventNotifyControl ProcessEvent(
+				const RE::MenuOpenCloseEvent* e,
+				RE::BSTEventSource<RE::MenuOpenCloseEvent>*) override
 			{
 				if (!e) {
 					return RE::BSEventNotifyControl::kContinue;
@@ -313,7 +407,9 @@ namespace TFD::ForceGreet
 		class InputSink : public RE::BSTEventSink<RE::InputEvent*>
 		{
 		public:
-			RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const*, RE::BSTEventSource<RE::InputEvent*>*) override
+			RE::BSEventNotifyControl ProcessEvent(
+				RE::InputEvent* const*,
+				RE::BSTEventSource<RE::InputEvent*>*) override
 			{
 				TFD::ForceGreet::Tick();
 				return RE::BSEventNotifyControl::kContinue;
@@ -433,7 +529,7 @@ namespace TFD::ForceGreet
 		}
 
 		auto* speaker = ResolveSpeaker(snap.speakerHandle);
-		if (!speaker) {
+		if (!IsSpeakerUsable(speaker)) {
 			const bool wasCaptive = (snap.mode == Mode::CaptiveMarker);
 
 			{
@@ -451,31 +547,29 @@ namespace TFD::ForceGreet
 			return;
 		}
 
+		float dist = 99999.0f;
+		const auto gate = CanStartDialogueNow(speaker, snap.mode, dist);
+
+		if (gate != DialogueGateFail::None) {
+			if (snap.mode == Mode::CaptiveMarker &&
+				(gate == DialogueGateFail::DifferentCell || gate == DialogueGateFail::TooFar)) {
+				NudgeApproach(speaker);
+			}
+
+			spdlog::info(
+				"[TFD][ForceGreet] Waiting speaker={:08X} mode={} reason={} dist={:.1f}",
+				speaker->GetFormID(),
+				static_cast<int>(snap.mode),
+				static_cast<int>(gate),
+				dist);
+			return;
+		}
+
 		if (snap.mode == Mode::CaptiveMarker) {
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player) {
-				return;
-			}
-
-			if (speaker->GetParentCell() != player->GetParentCell()) {
-				NudgeApproach(speaker);
-				spdlog::info("[TFD][ForceGreet] Captive approach waiting same cell speaker={:08X}",
-					speaker->GetFormID());
-				return;
-			}
-
-			const float distSq = DistanceSq3D(speaker, player);
-
-			if (distSq > kCaptiveApproachDistanceSq) {
-				NudgeApproach(speaker);
-
-				spdlog::info("[TFD][ForceGreet] Captive approach dist={:.1f} speaker={:08X}",
-					std::sqrt(distSq), speaker->GetFormID());
-				return;
-			}
-
-			spdlog::info("[TFD][ForceGreet] Captive close enough -> start dialogue dist={:.1f} speaker={:08X}",
-				std::sqrt(distSq), speaker->GetFormID());
+			spdlog::info(
+				"[TFD][ForceGreet] Captive close enough -> start dialogue dist={:.1f} speaker={:08X}",
+				dist,
+				speaker->GetFormID());
 		}
 
 		TryStartDialogue(speaker, snap.mode);

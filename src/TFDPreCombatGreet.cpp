@@ -1,18 +1,21 @@
 #include "TFDPreCombatGreet.h"
 
-#include <RE/Skyrim.h>
-#include <SKSE/SKSE.h>
-#include <spdlog/spdlog.h>
-
 #include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
+#include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
+#include <spdlog/spdlog.h>
+
+#include "TFDDefeatMonitor.h"
 #include "TFDFactionMask.h"
+#include "TFDInteractionRouter.h"
+#include "TFDPacify.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -20,30 +23,26 @@ namespace TFD::PreCombatGreet
 	{
 		using Clock = std::chrono::steady_clock;
 
-		constexpr double kManualWindowSec = 12.0;
+		constexpr double kManualWindowSec = 120.0;
 		constexpr double kCooldownAfterDoneSec = 120.0;
 		constexpr double kCooldownAfterFailSec = 5.0;
 		constexpr double kCooldownAfterPlayerAttackSec = 1.0;
 
 		struct Pending
 		{
+			RE::FormID pacifySessionId{ 0 };
+			TFD::InteractionRouter::Action action{ TFD::InteractionRouter::Action::None };
+
 			double expiresSec{ 0.0 };
-
-			bool savedAgg{ false };
-			float origAgg{ 0.0f };
-			bool aggZero{ false };
-
-			bool truceApplied{ false };
-
-			bool pkgAssigned{ false };
+			bool dialogueRequested{ false };
 			bool dialogSeen{ false };
+			bool assignSent{ false };
 		};
 
 		std::atomic_bool gInstalled{ false };
 		std::atomic_bool gSuspended{ false };
 		std::atomic_bool gRunning{ false };
 		std::atomic_flag gTickPending = ATOMIC_FLAG_INIT;
-
 		std::thread gWorker{};
 
 		std::mutex gLock;
@@ -51,13 +50,14 @@ namespace TFD::PreCombatGreet
 		std::unordered_map<std::uint32_t, double> gCooldownUntil;
 		Clock::time_point gT0 = Clock::now();
 
-		RE::TESFaction* gTruceFaction = nullptr;
-		bool gLoggedTruceFound = false;
-		bool gLoggedTruceMissing = false;
-
 		double NowSec()
 		{
 			return std::chrono::duration<double>(Clock::now() - gT0).count();
+		}
+
+		std::uint32_t GetHandleId(RE::Actor* actor)
+		{
+			return actor ? actor->GetHandle().native_handle() : 0;
 		}
 
 		bool IsDialogueOpen()
@@ -72,23 +72,9 @@ namespace TFD::PreCombatGreet
 			if (!player) {
 				return false;
 			}
-			auto* st = player->AsActorState();
-			return st && st->IsBleedingOut();
-		}
 
-		void ResolveTruceFaction()
-		{
-			if (!gTruceFaction) {
-				gTruceFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPreCombatTruceFaction");
-				if (gTruceFaction && !gLoggedTruceFound) {
-					gLoggedTruceFound = true;
-					spdlog::info("[TFD][PreCombat] Truce faction resolved {:08X}", gTruceFaction->GetFormID());
-				}
-				if (!gTruceFaction && !gLoggedTruceMissing) {
-					gLoggedTruceMissing = true;
-					spdlog::warn("[TFD][PreCombat] TFDPreCombatTruceFaction not found");
-				}
-			}
+			auto* state = player->AsActorState();
+			return state && state->IsBleedingOut();
 		}
 
 		void SendBridgeEvent(const char* eventName, RE::TESForm* sender)
@@ -105,12 +91,13 @@ namespace TFD::PreCombatGreet
 			const std::string name{ eventName };
 			std::uint32_t handle = 0;
 
-			if (auto* a = sender ? sender->As<RE::Actor>() : nullptr) {
-				handle = a->GetHandle().native_handle();
+			if (auto* actor = sender ? sender->As<RE::Actor>() : nullptr) {
+				handle = actor->GetHandle().native_handle();
 			}
 
 			task->AddTask([name, handle]() {
 				RE::TESForm* outSender = nullptr;
+
 				if (handle != 0) {
 					auto sp = RE::Actor::LookupByHandle(handle);
 					outSender = sp.get();
@@ -124,224 +111,124 @@ namespace TFD::PreCombatGreet
 					return;
 				}
 
-				SKSE::ModCallbackEvent e{ name.c_str(), "", 0.0f, outSender };
-				src->SendEvent(&e);
+				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
+				src->SendEvent(&ev);
 				});
 		}
 
-		void SetAggressionZero(RE::Actor* a, Pending& p)
+		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
 		{
-			if (!a) {
-				return;
-			}
-
-			auto* avo = a->AsActorValueOwner();
-			if (!avo) {
-				return;
-			}
-
-			if (!p.savedAgg) {
-				p.origAgg = avo->GetActorValue(RE::ActorValue::kAggression);
-				p.savedAgg = true;
-			}
-
-			if (p.aggZero) {
-				return;
-			}
-
-			avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
-			p.aggZero = true;
-
-			spdlog::info("[TFD][PreCombat] Aggression forced to 0 actor={:08X}", a->GetFormID());
-		}
-
-		void RestoreAggression(RE::Actor* a, Pending& p)
-		{
-			if (!a || !p.savedAgg || !p.aggZero) {
-				return;
-			}
-
-			auto* avo = a->AsActorValueOwner();
-			if (!avo) {
-				return;
-			}
-
-			avo->SetActorValue(RE::ActorValue::kAggression, p.origAgg);
-			p.aggZero = false;
-
-			spdlog::info("[TFD][PreCombat] Aggression restored actor={:08X} value={}", a->GetFormID(), p.origAgg);
-		}
-
-		bool EnsureTruceFaction(RE::Actor* a, Pending& p)
-		{
-			if (!a) {
-				p.truceApplied = false;
+			if (!actor || !player) {
 				return false;
 			}
 
-			ResolveTruceFaction();
-			if (!gTruceFaction) {
-				p.truceApplied = false;
-				spdlog::warn("[TFD][PreCombat] Truce faction resolve failed actor={:08X}", a->GetFormID());
+			if (actor->IsDead() || actor->IsDisabled()) {
 				return false;
 			}
 
-			const int beforeRank = a->GetFactionRank(gTruceFaction, false);
-			int rank = beforeRank;
-
-			if (rank != 1) {
-				if (rank != -2) {
-					a->RemoveFromFaction(gTruceFaction);
-				}
-
-				a->AddToFaction(gTruceFaction, 1);
-				rank = a->GetFactionRank(gTruceFaction, false);
-			}
-
-			if (rank == 1) {
-				if (!p.truceApplied || beforeRank != 1) {
-					spdlog::info("[TFD][PreCombat] Truce faction applied actor={:08X} beforeRank={} afterRank=1",
-						a->GetFormID(), beforeRank);
-				}
-				p.truceApplied = true;
-				return true;
-			}
-
-			p.truceApplied = false;
-			spdlog::warn("[TFD][PreCombat] Truce faction apply failed actor={:08X} beforeRank={} afterRank={}",
-				a->GetFormID(), beforeRank, rank);
-			return false;
-		}
-
-		void ClearTruceFaction(RE::Actor* a, Pending& p)
-		{
-			if (!a) {
-				return;
-			}
-
-			ResolveTruceFaction();
-			if (gTruceFaction) {
-				const int rank = a->GetFactionRank(gTruceFaction, false);
-				if (rank != -2) {
-					a->RemoveFromFaction(gTruceFaction);
-				}
-			}
-
-			if (p.truceApplied) {
-				spdlog::info("[TFD][PreCombat] Truce faction cleared actor={:08X}", a->GetFormID());
-			}
-			p.truceApplied = false;
-		}
-
-		void StopCombatAndRelax(RE::Actor* a)
-		{
-			if (!a) {
-				return;
-			}
-
-			if (a->IsInCombat()) {
-				a->StopCombat();
-			}
-		}
-
-		bool IsCandidate(RE::Actor* a, RE::PlayerCharacter* player)
-		{
-			if (!a || !player) {
+			if (!actor->Is3DLoaded()) {
 				return false;
 			}
-			if (a->IsDead() || a->IsDisabled()) {
+
+			if (actor->GetFormID() == player->GetFormID()) {
 				return false;
 			}
-			if (!a->Is3DLoaded()) {
-				return false;
-			}
-			if (a->GetFormID() == player->GetFormID()) {
-				return false;
-			}
+
 			if (TFD::FactionMask::IsActive()) {
 				return false;
 			}
+
+			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+				return false;
+			}
+
 			if (IsPlayerDown()) {
 				return false;
 			}
+
 			return true;
 		}
 
-		void CleanupOne(RE::Actor* a, Pending& p, double cooldownSec, const char* reason)
+		bool IsActorStillValid(RE::Actor* actor)
 		{
-			if (!a) {
-				return;
+			if (!actor) {
+				return false;
 			}
 
-			if (p.pkgAssigned) {
-				SendBridgeEvent("TFDPreCombatClear", a);
-				p.pkgAssigned = false;
+			if (actor->IsDead()) {
+				return false;
 			}
 
-			ClearTruceFaction(a, p);
-			RestoreAggression(a, p);
+			if (actor->IsDisabled()) {
+				return false;
+			}
 
-			gCooldownUntil[a->GetHandle().native_handle()] = NowSec() + cooldownSec;
+			if (!actor->Is3DLoaded()) {
+				return false;
+			}
 
-			spdlog::info("[TFD][PreCombat] cleanup reason={} actor={:08X}",
-				reason ? reason : "unknown", a->GetFormID());
+			return true;
 		}
 
-		void ClearAllPending()
+		void CleanupOne(
+			RE::Actor* actor,
+			Pending& pending,
+			double cooldownSec,
+			const char* reason,
+			TFD::Pacify::ReleaseReason pacifyReason)
+		{
+			if (pending.pacifySessionId != 0) {
+				TFD::Pacify::ReleaseSession(pending.pacifySessionId, pacifyReason);
+				pending.pacifySessionId = 0;
+			}
+
+			if (pending.assignSent) {
+				SendBridgeEvent("TFDPreCombatClear", actor);
+				pending.assignSent = false;
+			}
+
+			if (actor) {
+				gCooldownUntil[GetHandleId(actor)] = NowSec() + cooldownSec;
+
+				spdlog::info(
+					"[TFD][PreCombatGreet] cleanup reason={} actor={:08X} action={}",
+					reason ? reason : "unknown",
+					actor->GetFormID(),
+					TFD::InteractionRouter::ToString(pending.action));
+			}
+			else {
+				spdlog::info(
+					"[TFD][PreCombatGreet] cleanup reason={} actor=<none> action={}",
+					reason ? reason : "unknown",
+					TFD::InteractionRouter::ToString(pending.action));
+			}
+		}
+
+		void ClearAllPendingLocked()
 		{
 			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
 
-			for (auto& it : gPending) {
-				auto sp = RE::Actor::LookupByHandle(it.first);
-				if (auto* a = sp.get()) {
-					ClearTruceFaction(a, it.second);
-					RestoreAggression(a, it.second);
+			for (auto& [handle, pending] : gPending) {
+				auto sp = RE::Actor::LookupByHandle(handle);
+				auto* actor = sp.get();
+
+				if (pending.pacifySessionId != 0) {
+					TFD::Pacify::ReleaseSession(pending.pacifySessionId, TFD::Pacify::ReleaseReason::Generic);
+					pending.pacifySessionId = 0;
+				}
+
+				if (pending.assignSent) {
+					SendBridgeEvent("TFDPreCombatClear", actor);
+					pending.assignSent = false;
 				}
 			}
 
 			gPending.clear();
 		}
 
-		void ForceImmediateHostileReacquire(RE::Actor* a)
+		void AbortOnPlayerAttack(const RE::TESHitEvent* ev)
 		{
-			if (!a) {
-				return;
-			}
-
-			const auto handle = a->GetHandle().native_handle();
-
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				return;
-			}
-
-			// chain task biar bridge clear sempat jalan dulu
-			task->AddTask([handle]() {
-				auto* task2 = SKSE::GetTaskInterface();
-				if (!task2) {
-					return;
-				}
-
-				task2->AddUITask([handle]() {
-					auto sp = RE::Actor::LookupByHandle(handle);
-					auto* actor = sp.get();
-					auto* player = RE::PlayerCharacter::GetSingleton();
-					if (!actor || !player) {
-						return;
-					}
-
-					actor->SetBeenAttacked(true);
-					actor->EvaluatePackage(true, true);
-					actor->UpdateCombat();
-
-					spdlog::info("[TFD][PreCombat] Forced hostile reacquire actor={:08X}", actor->GetFormID());
-					});
-				});
-		}
-
-		void AbortOnPlayerAttack(const RE::TESHitEvent* e)
-		{
-			if (!e) {
+			if (!ev) {
 				return;
 			}
 
@@ -350,8 +237,8 @@ namespace TFD::PreCombatGreet
 				return;
 			}
 
-			auto* targetRef = e->target.get();
-			auto* causeRef = e->cause.get();
+			auto* targetRef = ev->target.get();
+			auto* causeRef = ev->cause.get();
 			if (!targetRef || !causeRef) {
 				return;
 			}
@@ -362,33 +249,26 @@ namespace TFD::PreCombatGreet
 				return;
 			}
 
-			// versi sempit: hit langsung player
 			if (causeActor->GetFormID() != player->GetFormID()) {
 				return;
 			}
 
-			const auto h = targetActor->GetHandle().native_handle();
+			const auto handle = GetHandleId(targetActor);
 
 			std::scoped_lock lk(gLock);
 
-			auto it = gPending.find(h);
+			auto it = gPending.find(handle);
 			if (it == gPending.end()) {
 				return;
 			}
 
-			spdlog::info("[TFD][PreCombat] Player attacked claimed actor -> abort actor={:08X}",
+			spdlog::info(
+				"[TFD][PreCombatGreet] player attacked active target -> abort actor={:08X}",
 				targetActor->GetFormID());
 
-			// actor di alias harus langsung hilang, jadi nuke bridge precombat sekalian
 			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
-			it->second.pkgAssigned = false;
 
-			ClearTruceFaction(targetActor, it->second);
-			RestoreAggression(targetActor, it->second);
-			gCooldownUntil[h] = NowSec() + kCooldownAfterPlayerAttackSec;
-
-			ForceImmediateHostileReacquire(targetActor);
-
+			CleanupOne(targetActor, it->second, kCooldownAfterPlayerAttackSec, "player_attack", TFD::Pacify::ReleaseReason::PlayerAggression);
 			gPending.erase(it);
 		}
 
@@ -396,10 +276,10 @@ namespace TFD::PreCombatGreet
 		{
 		public:
 			RE::BSEventNotifyControl ProcessEvent(
-				const RE::TESHitEvent* e,
+				const RE::TESHitEvent* ev,
 				RE::BSTEventSource<RE::TESHitEvent>*) override
 			{
-				AbortOnPlayerAttack(e);
+				AbortOnPlayerAttack(ev);
 				return RE::BSEventNotifyControl::kContinue;
 			}
 		};
@@ -408,62 +288,82 @@ namespace TFD::PreCombatGreet
 
 		void TickUI()
 		{
-			struct Guard {
-				~Guard() { gTickPending.clear(std::memory_order_release); }
+			struct Guard
+			{
+				~Guard()
+				{
+					gTickPending.clear(std::memory_order_release);
+				}
 			} guard;
 
 			if (gSuspended.load(std::memory_order_acquire)) {
 				std::scoped_lock lk(gLock);
-				ClearAllPending();
+				ClearAllPendingLocked();
+				return;
+			}
+
+			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+				std::scoped_lock lk(gLock);
+				ClearAllPendingLocked();
 				return;
 			}
 
 			if (TFD::FactionMask::IsActive() || IsPlayerDown()) {
 				std::scoped_lock lk(gLock);
-				ClearAllPending();
+				ClearAllPendingLocked();
 				return;
 			}
 
 			const bool dialogueOpen = IsDialogueOpen();
+			const double now = NowSec();
+
+			TFD::Pacify::Update(now);
 
 			std::scoped_lock lk(gLock);
 
 			for (auto it = gPending.begin(); it != gPending.end();) {
 				auto sp = RE::Actor::LookupByHandle(it->first);
-				auto* a = sp.get();
-				auto& p = it->second;
+				auto* actor = sp.get();
+				auto& pending = it->second;
 
-				if (!a) {
+				if (!IsActorStillValid(actor)) {
+					if (pending.pacifySessionId != 0) {
+						TFD::Pacify::ReleaseSession(pending.pacifySessionId, TFD::Pacify::ReleaseReason::Generic);
+					}
 					it = gPending.erase(it);
 					continue;
 				}
 
-				SetAggressionZero(a, p);
-				if (!EnsureTruceFaction(a, p)) {
-					CleanupOne(a, p, kCooldownAfterFailSec, "truce_rank1_failed");
+				if (!TFD::Pacify::IsPacified(actor)) {
+					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::Pacify::ReleaseReason::Generic);
 					it = gPending.erase(it);
 					continue;
 				}
 
-				if (a->IsInCombat()) {
-					StopCombatAndRelax(a);
+				if (pending.dialogueRequested) {
+					if (dialogueOpen) {
+						pending.dialogSeen = true;
+						++it;
+						continue;
+					}
+
+					if (pending.dialogSeen) {
+						CleanupOne(actor, pending, kCooldownAfterDoneSec, "dialogue_closed", TFD::Pacify::ReleaseReason::DialogueClosed);
+						it = gPending.erase(it);
+						continue;
+					}
+				}
+				else {
+					// Tame path: no dialogue. Kalau target sudah balik full combat, lepaskan.
+					if (actor->IsInCombat()) {
+						CleanupOne(actor, pending, kCooldownAfterFailSec, "tame_broken", TFD::Pacify::ReleaseReason::TameBroken);
+						it = gPending.erase(it);
+						continue;
+					}
 				}
 
-				if (!p.pkgAssigned) {
-					SendBridgeEvent("TFDPreCombatAssign", a);
-					p.pkgAssigned = true;
-					p.dialogSeen = false;
-					spdlog::info("[TFD][PreCombat] assign actor={:08X}", a->GetFormID());
-				}
-
-				if (dialogueOpen) {
-					p.dialogSeen = true;
-					++it;
-					continue;
-				}
-
-				if (p.dialogSeen && !dialogueOpen) {
-					CleanupOne(a, p, kCooldownAfterDoneSec, "dialogue_closed");
+				if (now >= pending.expiresSec) {
+					CleanupOne(actor, pending, kCooldownAfterFailSec, "hidden_failsafe_expired", TFD::Pacify::ReleaseReason::HardFailsafeExpired);
 					it = gPending.erase(it);
 					continue;
 				}
@@ -502,17 +402,15 @@ namespace TFD::PreCombatGreet
 			return;
 		}
 
-		ResolveTruceFaction();
-
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
-			scripts->AddEventSink<RE::TESHitEvent>(&gHitSink);
+			scripts->AddEventSink(&gHitSink);
 		}
 
-		gSuspended.store(false);
-		gRunning.store(true);
+		gSuspended.store(false, std::memory_order_release);
+		gRunning.store(true, std::memory_order_release);
 		gWorker = std::thread(WorkerLoop);
 
-		spdlog::info("[TFD][PreCombat] Install");
+		spdlog::info("[TFD][PreCombatGreet] Install");
 	}
 
 	void Shutdown()
@@ -522,22 +420,24 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
-			scripts->RemoveEventSink<RE::TESHitEvent>(&gHitSink);
+			scripts->RemoveEventSink(&gHitSink);
 		}
 
-		gRunning.store(false);
+		gRunning.store(false, std::memory_order_release);
+
 		if (gWorker.joinable()) {
 			gWorker.join();
 		}
 
 		{
 			std::scoped_lock lk(gLock);
-			ClearAllPending();
+			ClearAllPendingLocked();
 			gCooldownUntil.clear();
 		}
 
-		gSuspended.store(false);
-		spdlog::info("[TFD][PreCombat] Shutdown");
+		gSuspended.store(false, std::memory_order_release);
+
+		spdlog::info("[TFD][PreCombatGreet] Shutdown");
 	}
 
 	void SetSuspended(bool suspended)
@@ -546,7 +446,7 @@ namespace TFD::PreCombatGreet
 
 		if (suspended) {
 			std::scoped_lock lk(gLock);
-			ClearAllPending();
+			ClearAllPendingLocked();
 		}
 	}
 
@@ -558,64 +458,81 @@ namespace TFD::PreCombatGreet
 	bool BeginForActor(RE::Actor* actor)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
+
+		if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+			return false;
+		}
+
 		if (!IsCandidate(actor, player)) {
 			return false;
 		}
 
-		const auto h = actor->GetHandle().native_handle();
+		const auto handle = GetHandleId(actor);
 		const double now = NowSec();
 
 		std::scoped_lock lk(gLock);
 
-		auto ct = gCooldownUntil.find(h);
-		if (ct != gCooldownUntil.end() && now < ct->second) {
+		auto cooldownIt = gCooldownUntil.find(handle);
+		if (cooldownIt != gCooldownUntil.end() && now < cooldownIt->second) {
 			return false;
 		}
 
-		auto existing = gPending.find(h);
-		if (existing != gPending.end()) {
+		if (gPending.find(handle) != gPending.end()) {
 			return true;
 		}
 
-		if (!gPending.empty()) {
-			ClearAllPending();
-		}
+		const bool isCaptivePhase = false;
+		const auto result = TFD::InteractionRouter::HandleHotkeyPress(
+			player,
+			actor,
+			isCaptivePhase,
+			now);
 
-		auto& p = gPending[h];
-		p.expiresSec = now + kManualWindowSec;
-		p.pkgAssigned = false;
-		p.dialogSeen = false;
-		p.savedAgg = false;
-		p.origAgg = 0.0f;
-		p.aggZero = false;
-		p.truceApplied = false;
+		spdlog::info(
+			"[TFD][PreCombatGreet] BeginForActor actor={:08X} action={} executed={} dialogueRequested={} fail={}",
+			actor->GetFormID(),
+			TFD::InteractionRouter::ToString(result.action),
+			result.executed ? 1 : 0,
+			result.dialogueRequested ? 1 : 0,
+			TFD::InteractionRouter::ToString(result.failReason));
 
-		SetAggressionZero(actor, p);
-		if (!EnsureTruceFaction(actor, p)) {
-			RestoreAggression(actor, p);
-			gPending.erase(h);
-			spdlog::warn("[TFD][PreCombat] BeginForActor abort: truce rank1 failed actor={:08X}", actor->GetFormID());
+		if (!result.executed || result.sessionId == 0) {
 			return false;
 		}
 
-		StopCombatAndRelax(actor);
-		SendBridgeEvent("TFDPreCombatAssign", actor);
-		p.pkgAssigned = true;
-		p.dialogSeen = false;
+		if (!gPending.empty()) {
+			ClearAllPendingLocked();
+		}
 
-		spdlog::info("[TFD][PreCombat] BeginForActor actor={:08X} window={:.1f}s",
-			actor->GetFormID(), kManualWindowSec);
+		Pending pending{};
+		pending.pacifySessionId = result.sessionId;
+		pending.action = result.action;
+		pending.expiresSec = now + kManualWindowSec;
+		pending.dialogueRequested = result.dialogueRequested;
+		pending.dialogSeen = false;
+		pending.assignSent = false;
 
+		if (result.dialogueRequested) {
+			if (!TFD::Pacify::CanOpenDialogue(actor)) {
+				TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+				return false;
+			}
+
+			SendBridgeEvent("TFDPreCombatAssign", actor);
+			pending.assignSent = true;
+		}
+
+		gPending.emplace(handle, pending);
 		return true;
 	}
-
 
 	void OnPreLoadGame()
 	{
 		SetSuspended(true);
 		CancelAll();
 		gTickPending.clear(std::memory_order_release);
-		spdlog::info("[TFD][PreCombat] OnPreLoadGame -> suspended + cleared");
+
+		spdlog::info("[TFD][PreCombatGreet] OnPreLoadGame -> suspended + cleared");
 	}
 
 	void OnPostLoadGame()
@@ -623,14 +540,16 @@ namespace TFD::PreCombatGreet
 		CancelAll();
 		SetSuspended(false);
 		gTickPending.clear(std::memory_order_release);
-		spdlog::info("[TFD][PreCombat] OnPostLoadGame -> resumed clean");
+
+		spdlog::info("[TFD][PreCombatGreet] OnPostLoadGame -> resumed clean");
 	}
 
 	void CancelAll()
 	{
 		std::scoped_lock lk(gLock);
-		ClearAllPending();
+		ClearAllPendingLocked();
 		gCooldownUntil.clear();
-		spdlog::info("[TFD][PreCombat] CancelAll");
+
+		spdlog::info("[TFD][PreCombatGreet] CancelAll");
 	}
 }

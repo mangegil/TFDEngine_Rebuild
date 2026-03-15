@@ -142,13 +142,17 @@ namespace TFD
 		// close first (so it doesn't stay open)
 		SetOpen(door, false, a_snapClose);
 
-		// restore exact initial lock settings (level/key/flags/locked)
+		// restore baseline level/key/flags from snapshot, but during captive we always force locked.
 		RestoreLockFromSnapshot(door, _snap);
+		if (auto* lock = door->GetLock(); lock) {
+			lock->SetLocked(true);
+			lock->numTries = 0;
+		}
 
 		_prevLocked = IsLocked(door);
 		_prevOpenOrOpening = IsOpenOrOpening(door);
 
-		spdlog::info("[TFD][CaptiveDoor] Sealed to initial door={:08X}", door->GetFormID());
+		spdlog::info("[TFD][CaptiveDoor] Sealed captive door={:08X} forcedLocked=1 initialLocked={}", door->GetFormID(), _snap.locked ? 1 : 0);
 	}
 
 	void CaptiveDoorController::UnlockForRelease(double ignoreSeconds, bool a_openDoor, bool a_snapOpen)
