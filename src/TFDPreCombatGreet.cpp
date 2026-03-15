@@ -49,10 +49,31 @@ namespace TFD::PreCombatGreet
 		std::unordered_map<std::uint32_t, Pending> gPending;
 		std::unordered_map<std::uint32_t, double> gCooldownUntil;
 		Clock::time_point gT0 = Clock::now();
+		RE::ActorHandle gRecentActor{};
+		double gRecentActorCachedAtSec = 0.0;
+		double gRecentActorUntilSec = 0.0;
 
 		double NowSec()
 		{
 			return std::chrono::duration<double>(Clock::now() - gT0).count();
+		}
+
+		void CacheRecentActor(RE::Actor* actor, double holdSec, const char* reason = nullptr)
+		{
+			if (!actor) {
+				return;
+			}
+
+			const double now = NowSec();
+			gRecentActor = actor->GetHandle();
+			gRecentActorCachedAtSec = now;
+			gRecentActorUntilSec = now + (holdSec > 0.0 ? holdSec : 0.0);
+
+			spdlog::info(
+				"[TFD][PreCombatGreet] recent actor cached actor={:08X} hold={:.1f}s reason={}",
+				actor->GetFormID(),
+				holdSec,
+				reason ? reason : "none");
 		}
 
 		std::uint32_t GetHandleId(RE::Actor* actor)
@@ -188,6 +209,7 @@ namespace TFD::PreCombatGreet
 			}
 
 			if (actor) {
+				CacheRecentActor(actor, 12.0, reason);
 				gCooldownUntil[GetHandleId(actor)] = NowSec() + cooldownSec;
 
 				spdlog::info(
@@ -433,6 +455,9 @@ namespace TFD::PreCombatGreet
 			std::scoped_lock lk(gLock);
 			ClearAllPendingLocked();
 			gCooldownUntil.clear();
+			gRecentActor = RE::ActorHandle{};
+			gRecentActorCachedAtSec = 0.0;
+			gRecentActorUntilSec = 0.0;
 		}
 
 		gSuspended.store(false, std::memory_order_release);
@@ -504,6 +529,8 @@ namespace TFD::PreCombatGreet
 			ClearAllPendingLocked();
 		}
 
+		CacheRecentActor(actor, 12.0, "begin");
+
 		Pending pending{};
 		pending.pacifySessionId = result.sessionId;
 		pending.action = result.action;
@@ -549,7 +576,33 @@ namespace TFD::PreCombatGreet
 		std::scoped_lock lk(gLock);
 		ClearAllPendingLocked();
 		gCooldownUntil.clear();
+		gRecentActor = RE::ActorHandle{};
+		gRecentActorCachedAtSec = 0.0;
+		gRecentActorUntilSec = 0.0;
 
 		spdlog::info("[TFD][PreCombatGreet] CancelAll");
+	}
+
+	RE::Actor* GetRecentActor(double maxAgeSec)
+	{
+		std::scoped_lock lk(gLock);
+
+		const double now = NowSec();
+		if (gRecentActorUntilSec <= 0.0 || now > gRecentActorUntilSec) {
+			gRecentActor = RE::ActorHandle{};
+			gRecentActorCachedAtSec = 0.0;
+			gRecentActorUntilSec = 0.0;
+			return nullptr;
+		}
+
+		if (maxAgeSec > 0.0) {
+			const double age = now - gRecentActorCachedAtSec;
+			if (age > maxAgeSec) {
+				return nullptr;
+			}
+		}
+
+		auto sp = gRecentActor.get();
+		return sp.get();
 	}
 }

@@ -16,4 +16,6 @@ namespace TFD::PreCombatGreet
 	void OnPostLoadGame();
 
 	void CancelAll();
+
+	RE::Actor* GetRecentActor(double maxAgeSec = 0.0);
 }

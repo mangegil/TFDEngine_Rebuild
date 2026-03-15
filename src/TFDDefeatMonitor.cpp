@@ -1,4 +1,4 @@
-#include "TFDDefeatMonitor.h"
+﻿#include "TFDDefeatMonitor.h"
 
 #include <atomic>
 #include <chrono>
@@ -23,6 +23,7 @@
 #include "TFDForceGreet.h"
 #include "TFDActorScan.h"
 #include "TFDAggressionClamp.h"
+#include "TFDPreCombatGreet.h"
 
 namespace TFD::DefeatMonitor
 {
@@ -273,6 +274,7 @@ namespace TFD::DefeatMonitor
 
 		static RE::Actor* ResolveAggressor();
 		static RE::Actor* FindBestAggressor(float radius);
+		static RE::Actor* ResolveRecentPreCombatAggressor(float radius);
 		static void SetGraceSeconds(int seconds);
 		static void RecoverPlayerForTransition();
 		static void UpdatePreCombatState();
@@ -880,6 +882,24 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+		static bool BreakEscapeOnDefeatThreshold(RE::Actor* player)
+		{
+			if (!player) return false;
+			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Escape) return false;
+			const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
+			const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
+			const float pct = (hpNow / hpMax) * 100.0f;
+			const float thresh = TFD::Settings::GetDefeatThresholdPct();
+			if (pct > thresh) return false;
+
+			g_lastAggressor.reset();
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
+			ClearEscapeContext();
+			UpdatePreCombatState();
+			spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> clear stale aggressor", pct, thresh);
+			return true;
+		}
+
 		static void NormalizeInvalidCaptivePair()
 		{
 			if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) {
@@ -913,12 +933,59 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
+		static RE::Actor* ResolveRecentPreCombatAggressor(float radius)
+		{
+			auto* player = Player();
+			if (!player) {
+				return nullptr;
+			}
+
+			auto* actor = TFD::PreCombatGreet::GetRecentActor(12.0);
+			if (!actor) {
+				return nullptr;
+			}
+
+			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return nullptr;
+			}
+
+			if (!IsCaptiveSupportedAggressor(actor)) {
+				return nullptr;
+			}
+
+			auto* pCell = player->GetParentCell();
+			if (pCell && actor->GetParentCell() != pCell) {
+				return nullptr;
+			}
+
+			const auto pp = player->GetPosition();
+			const auto ap = actor->GetPosition();
+			const float dx = ap.x - pp.x;
+			const float dy = ap.y - pp.y;
+			const float dz = ap.z - pp.z;
+			const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if (dist > radius) {
+				return nullptr;
+			}
+
+			spdlog::info("[TFD][Defeat] using recent precombat actor {:08X} as defeat aggressor dist={:.1f}", actor->GetFormID(), dist);
+			return actor;
+		}
+
 		static RE::Actor* ResolveAggressor()
 		{
 			if (g_lastAggressor) {
 				auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
-				return sp.get();
+				if (auto* actor = sp.get(); actor && !actor->IsDead() && !actor->IsDisabled() && actor->Is3DLoaded()) {
+					return actor;
+				}
 			}
+
+			if (auto* recent = ResolveRecentPreCombatAggressor((std::max)(2400.0f, TFD::Settings::GetSweepRadius()))) {
+				g_lastAggressor = recent->GetHandle();
+				return recent;
+			}
+
 			return nullptr;
 		}
 
@@ -1229,6 +1296,7 @@ namespace TFD::DefeatMonitor
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
 			TFD::ForceGreet::Cancel();
+			g_lastAggressor.reset();
 			RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
 			if (!ResolveCaptiveMarkerForOutcome()) {
 				EnterNonCaptiveChoice("marker_not_found");
@@ -1336,6 +1404,9 @@ namespace TFD::DefeatMonitor
 			}
 			else if (g_captiveState && g_captivePhase == CaptivePhaseValue::Escape) {
 				TryResolveEscapeByLocation();
+				if (g_captiveState && g_captivePhase == CaptivePhaseValue::Escape && !BreakEscapeOnDefeatThreshold(Player())) {
+					return;
+				}
 			}
 
 			if (g_captiveState) {
@@ -1418,7 +1489,13 @@ namespace TFD::DefeatMonitor
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
 			if (pct <= thresh) {
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
-				auto* aggressor = FindBestAggressor(scanRadius);
+				auto* aggressor = ResolveAggressor();
+				if (!aggressor) {
+					aggressor = FindBestAggressor(scanRadius);
+				}
+				if (aggressor) {
+					g_lastAggressor = aggressor->GetHandle();
+				}
 				if (!aggressor) {
 					if (ResolveCaptiveMarkerForOutcome()) {
 						spdlog::info("[TFD][Defeat] no valid NPC aggressor but captive marker exists -> captive blackout");
