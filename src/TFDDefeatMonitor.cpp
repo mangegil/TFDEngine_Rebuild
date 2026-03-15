@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <cmath>
 
 #include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
@@ -61,6 +62,10 @@ namespace TFD::DefeatMonitor
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
 
+		bool g_leftForDeadActive = false;
+		std::chrono::steady_clock::time_point g_leftForDeadUntil{};
+		std::chrono::steady_clock::time_point g_leftForDeadNextPulse{};
+
 		RE::ActorHandle g_lastAggressor{};
 		bool g_bleedSawDialogue = false;
 
@@ -77,25 +82,178 @@ namespace TFD::DefeatMonitor
 		RE::FormID g_captiveLocationFormID = 0;
 		bool g_escapeRadiusActive = false;
 		std::chrono::steady_clock::time_point g_escapeRadiusSince{};
+		RE::ObjectRefHandle g_boundEscapeDoor{};
+
+		static constexpr double kCaptiveEscapeDoorRadius = 512.0;
 
 		bool g_hasQueuedProgressState = false;
 		bool g_queuedCaptiveState = false;
 		CaptivePhaseValue g_queuedCaptivePhase = CaptivePhaseValue::None;
 
+		static RE::PlayerCharacter* Player()
+		{
+			return RE::PlayerCharacter::GetSingleton();
+		}
+
+		static RE::BGSKeyword* LookupKeyword(const char* editorID)
+		{
+			if (!editorID || !editorID[0]) {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
+		}
+
+		static bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto* kw = LookupKeyword(editorID);
+			return kw && actor->HasKeyword(kw);
+		}
+
+		static bool IsCaptiveSupportedAggressor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return true;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeCreature")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeAnimal")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeDragon")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeDaedra")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeGhost")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeUndead")) {
+				return false;
+			}
+
+			return false;
+		}
+
+		static void FinishLeftForDeadRecovery()
+		{
+			TFD::AggressionClamp::Clear();
+			TFD::FactionMask::Clear();
+			g_leftForDeadActive = false;
+			g_leftForDeadUntil = {};
+			g_leftForDeadNextPulse = {};
+			spdlog::info("[TFD][Defeat] LeftForDead recovery finished");
+		}
+
+		static bool IsLeftForDeadCooldownActive()
+		{
+			if (!g_leftForDeadActive) {
+				return false;
+			}
+			const auto now = Now();
+			if (now >= g_leftForDeadUntil) {
+				FinishLeftForDeadRecovery();
+				return false;
+			}
+			return true;
+		}
+
+		static void ClearLeftForDeadCooldown()
+		{
+			if (g_leftForDeadActive) {
+				FinishLeftForDeadRecovery();
+				return;
+			}
+			g_leftForDeadActive = false;
+			g_leftForDeadUntil = {};
+			g_leftForDeadNextPulse = {};
+		}
+
+		static void BeginLeftForDeadCooldown(int seconds)
+		{
+			if (seconds <= 0) {
+				ClearLeftForDeadCooldown();
+				return;
+			}
+			const auto now = Now();
+			g_leftForDeadActive = true;
+			g_leftForDeadUntil = now + std::chrono::seconds(seconds);
+			g_leftForDeadNextPulse = now;
+		}
+
+		static void ShowBlackoutFader()
+		{
+			auto* queue = RE::UIMessageQueue::GetSingleton();
+			auto* strings = RE::InterfaceStrings::GetSingleton();
+			if (!queue || !strings) {
+				return;
+			}
+			queue->AddMessage(strings->faderMenu, RE::UI_MESSAGE_TYPE::kShow, nullptr);
+			queue->ProcessCommands();
+		}
+
+		static void HideBlackoutFader()
+		{
+			auto* queue = RE::UIMessageQueue::GetSingleton();
+			auto* strings = RE::InterfaceStrings::GetSingleton();
+			if (!queue || !strings) {
+				return;
+			}
+			queue->AddMessage(strings->faderMenu, RE::UI_MESSAGE_TYPE::kHide, nullptr);
+			queue->ProcessCommands();
+		}
+
+		static void AdvanceGameHoursSoft(float hours)
+		{
+			if (hours <= 0.0f) {
+				return;
+			}
+			auto* calendar = RE::Calendar::GetSingleton();
+			if (!calendar) {
+				return;
+			}
+			const float dayDelta = hours / 24.0f;
+			calendar->rawDaysPassed += dayDelta;
+			if (calendar->gameDaysPassed) {
+				calendar->gameDaysPassed->value = calendar->rawDaysPassed;
+			}
+			if (calendar->gameHour) {
+				float hour = std::fmod(calendar->gameHour->value + hours, 24.0f);
+				if (hour < 0.0f) {
+					hour += 24.0f;
+				}
+				calendar->gameHour->value = hour;
+			}
+		}
+
+		static void BlackoutAndAdvanceHours(float hours, int holdMs, const char* reason)
+		{
+			ShowBlackoutFader();
+			std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			AdvanceGameHoursSoft(hours);
+			if (holdMs > 0) {
+				std::this_thread::sleep_for(std::chrono::milliseconds(holdMs));
+			}
+			HideBlackoutFader();
+			spdlog::info("[TFD][Defeat] blackout advance reason={} hours={:.2f}", reason ? reason : "unknown", hours);
+		}
 
 		static CaptivePhaseValue PhaseFromRaw(std::uint32_t raw)
 		{
 			switch (raw) {
-			case 1:
-				return CaptivePhaseValue::Captive;
-			case 2:
-				return CaptivePhaseValue::Escape;
-			case 3:
-				return CaptivePhaseValue::ReleasedWork;
-			case 4:
-				return CaptivePhaseValue::Scene;
-			default:
-				return CaptivePhaseValue::None;
+			case 1: return CaptivePhaseValue::Captive;
+			case 2: return CaptivePhaseValue::Escape;
+			case 3: return CaptivePhaseValue::ReleasedWork;
+			case 4: return CaptivePhaseValue::Scene;
+			default: return CaptivePhaseValue::None;
 			}
 		}
 
@@ -108,7 +266,6 @@ namespace TFD::DefeatMonitor
 					spdlog::info("[TFD][Defeat] TFDCaptiveState resolved {:08X}", g_captiveStateGlobal->GetFormID());
 				}
 			}
-
 			if (!g_captivePhaseGlobal) {
 				g_captivePhaseGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptivePhase");
 				if (g_captivePhaseGlobal && !g_loggedCaptivePhaseGlobal) {
@@ -116,7 +273,6 @@ namespace TFD::DefeatMonitor
 					spdlog::info("[TFD][Defeat] TFDCaptivePhase resolved {:08X}", g_captivePhaseGlobal->GetFormID());
 				}
 			}
-
 			if (!g_preCombatStateGlobal) {
 				g_preCombatStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDPreCombatState");
 				if (g_preCombatStateGlobal && !g_loggedPreCombatStateGlobal) {
@@ -157,37 +313,20 @@ namespace TFD::DefeatMonitor
 			SyncCaptiveGlobals(stateActive, phase);
 		}
 
-		static RE::PlayerCharacter* Player()
-		{
-			return RE::PlayerCharacter::GetSingleton();
-		}
-
 		static void UpdatePreCombatState()
 		{
 			auto* player = Player();
-
 			bool preCombat = false;
 			if (player) {
 				preCombat = true;
-				if (g_loadTransition.load(std::memory_order_acquire)) {
-					preCombat = false;
-				}
-				if (g_inBleedState.load(std::memory_order_acquire)) {
-					preCombat = false;
-				}
-				if (g_captiveState) {
-					preCombat = false;
-				}
-				if (player->IsInCombat()) {
-					preCombat = false;
-				}
-
+				if (g_loadTransition.load(std::memory_order_acquire)) preCombat = false;
+				if (g_inBleedState.load(std::memory_order_acquire)) preCombat = false;
+				if (g_captiveState) preCombat = false;
+				if (player->IsInCombat()) preCombat = false;
+				if (g_leftForDeadActive) preCombat = false;
 				auto* st = player->AsActorState();
-				if (st && st->IsBleedingOut()) {
-					preCombat = false;
-				}
+				if (st && st->IsBleedingOut()) preCombat = false;
 			}
-
 			SyncPreCombatGlobal(preCombat);
 		}
 
@@ -212,26 +351,33 @@ namespace TFD::DefeatMonitor
 
 		static bool IsDoorRef(RE::TESObjectREFR* ref)
 		{
-			if (!ref) {
-				return false;
-			}
-
+			if (!ref) return false;
 			auto* base = ref->GetBaseObject();
-			if (!base) {
-				return false;
-			}
-
+			if (!base) return false;
 			return base->GetFormType() == RE::FormType::Door;
 		}
 
 		static bool IsRefLocked(RE::TESObjectREFR* ref)
 		{
-			if (!ref) {
-				return false;
-			}
+			if (!ref) return false;
 			auto* lock = ref->GetLock();
 			return lock && lock->IsLocked();
 		}
+
+		static RE::TESObjectREFR* ResolveBoundEscapeDoor()
+		{
+			if (!g_boundEscapeDoor) return nullptr;
+			auto ptr = g_boundEscapeDoor.get();
+			return ptr.get();
+		}
+
+		static void BindCaptiveDoor(RE::TESObjectREFR* door)
+		{
+			if (!door) return;
+			g_captiveDoor.Bind(door);
+			g_boundEscapeDoor = door->GetHandle();
+		}
+
 		static RE::TESObjectCELL* GetParentCell(RE::TESObjectREFR* ref)
 		{
 			return ref ? ref->GetParentCell() : nullptr;
@@ -250,43 +396,27 @@ namespace TFD::DefeatMonitor
 				auto ptr = g_captiveMarker.get();
 				marker = ptr.get();
 			}
-			if (!marker) {
-				marker = TFD::Location::GetCachedCaptiveMarker();
-			}
-			if (!marker) {
-				return nullptr;
-			}
-
+			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!marker) return nullptr;
 			auto* cell = marker->GetParentCell();
-			if (!cell) {
-				return nullptr;
-			}
-
+			if (!cell) return nullptr;
 			const auto mp = marker->GetPosition();
 			RE::TESObjectREFR* best = nullptr;
-			double bestDistSq = 384.0 * 384.0;
-
-			cell->ForEachReferenceInRange(mp, 384.0f,
-				[&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
-					if (!candidate || candidate == marker) {
-						return RE::BSContainer::ForEachResult::kContinue;
-					}
-					if (!IsDoorRef(candidate)) {
-						return RE::BSContainer::ForEachResult::kContinue;
-					}
-
-					const auto rp = candidate->GetPosition();
-					const double dx = static_cast<double>(rp.x - mp.x);
-					const double dy = static_cast<double>(rp.y - mp.y);
-					const double dz = static_cast<double>(rp.z - mp.z);
-					const double distSq = dx * dx + dy * dy + dz * dz;
-					if (distSq <= bestDistSq) {
-						bestDistSq = distSq;
-						best = candidate;
-					}
-					return RE::BSContainer::ForEachResult::kContinue;
+			double bestDistSq = kCaptiveEscapeDoorRadius * kCaptiveEscapeDoorRadius;
+			cell->ForEachReferenceInRange(mp, static_cast<float>(kCaptiveEscapeDoorRadius), [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+				if (!candidate || candidate == marker) return RE::BSContainer::ForEachResult::kContinue;
+				if (!IsDoorRef(candidate)) return RE::BSContainer::ForEachResult::kContinue;
+				const auto rp = candidate->GetPosition();
+				const double dx = static_cast<double>(rp.x - mp.x);
+				const double dy = static_cast<double>(rp.y - mp.y);
+				const double dz = static_cast<double>(rp.z - mp.z);
+				const double distSq = dx * dx + dy * dy + dz * dz;
+				if (distSq <= bestDistSq) {
+					bestDistSq = distSq;
+					best = candidate;
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
 				});
-
 			return best;
 		}
 
@@ -297,22 +427,19 @@ namespace TFD::DefeatMonitor
 			g_captiveLocationFormID = 0;
 			g_escapeRadiusActive = false;
 			g_escapeRadiusSince = {};
+			g_boundEscapeDoor.reset();
 			g_captiveDoor.Reset();
 		}
 
 		static void ArmEscapeContextFromCurrentState()
 		{
 			auto* player = Player();
-			if (!player) {
-				return;
-			}
-
+			if (!player) return;
 			auto* marker = TFD::Location::GetCachedCaptiveMarker();
 			if (!marker) {
 				TFD::Location::RescanCaptiveMarker();
 				marker = TFD::Location::GetCachedCaptiveMarker();
 			}
-
 			g_captiveMarker = marker ? marker->GetHandle() : RE::ObjectRefHandle{};
 			auto* cell = player->GetParentCell();
 			g_captiveCellFormID = cell ? cell->GetFormID() : 0;
@@ -320,68 +447,73 @@ namespace TFD::DefeatMonitor
 			g_captiveLocationFormID = loc ? loc->GetFormID() : 0;
 			g_escapeRadiusActive = false;
 			g_escapeRadiusSince = {};
-
 			if (!g_captiveDoor.HasDoor()) {
 				if (auto* door = FindNearestDoorNearCaptiveMarker()) {
-					g_captiveDoor.Bind(door);
+					BindCaptiveDoor(door);
 					spdlog::info("[TFD][Captive] Bound nearest captive door {:08X} on captive enter", door->GetFormID());
 				}
 			}
-
-			spdlog::info("[TFD][Captive] Escape context armed marker={:08X} cell={:08X} loc={:08X}",
-				marker ? marker->GetFormID() : 0,
-				g_captiveCellFormID,
-				g_captiveLocationFormID);
+			spdlog::info("[TFD][Captive] Escape context armed marker={:08X} cell={:08X} loc={:08X}", marker ? marker->GetFormID() : 0, g_captiveCellFormID, g_captiveLocationFormID);
 		}
 
 		static bool IsDoorNearCaptiveMarker(RE::TESObjectREFR* door)
 		{
-			if (!door || !IsDoorRef(door)) {
-				return false;
-			}
+			if (!door || !IsDoorRef(door)) return false;
 			RE::TESObjectREFR* marker = nullptr;
 			if (g_captiveMarker) {
 				auto ptr = g_captiveMarker.get();
 				marker = ptr.get();
 			}
-			if (!marker) {
-				marker = TFD::Location::GetCachedCaptiveMarker();
-			}
-			if (!marker) {
-				return true;
-			}
+			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!marker) return true;
 			const auto dp = door->GetPosition();
 			const auto mp = marker->GetPosition();
 			const double dx = static_cast<double>(dp.x - mp.x);
 			const double dy = static_cast<double>(dp.y - mp.y);
 			const double dz = static_cast<double>(dp.z - mp.z);
 			const double distSq = dx * dx + dy * dy + dz * dz;
-			return distSq <= (384.0 * 384.0);
+			return distSq <= (kCaptiveEscapeDoorRadius * kCaptiveEscapeDoorRadius);
+		}
+
+		static RE::Actor* ResolveAggressor();
+		static RE::Actor* FindBestAggressor(float radius);
+
+		static RE::TESObjectREFR* ResolveLockpickDoorCandidate(RE::TESObjectREFR* target)
+		{
+			if (target && IsDoorRef(target) && IsDoorNearCaptiveMarker(target)) return target;
+			auto* boundDoor = ResolveBoundEscapeDoor();
+			if (boundDoor && IsDoorRef(boundDoor) && IsDoorNearCaptiveMarker(boundDoor)) return boundDoor;
+			return nullptr;
 		}
 
 		static void EnterEscapeCommit(const char* reason, RE::TESObjectREFR* door)
 		{
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) {
-				return;
-			}
-
+			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) return;
 			TFD::ForceGreet::Cancel();
 			TFD::FactionMask::Clear();
 			TFD::AggressionClamp::Clear();
 			g_grace.store(false, std::memory_order_release);
-
 			SetCaptiveRuntime(true, CaptivePhaseValue::Escape);
 			UpdatePreCombatState();
 			ResetLockpickWatch();
 			g_prevDialogueOpen = false;
-
-			if (door) {
-				g_captiveDoor.Bind(door);
+			if (door) BindCaptiveDoor(door); else door = ResolveBoundEscapeDoor();
+			auto* player = Player();
+			if (player) player->EvaluatePackage(true, false);
+			RE::Actor* aggressor = ResolveAggressor();
+			if (!aggressor) {
+				const float radius = (std::max)(1800.0f, TFD::Settings::GetSweepRadius());
+				aggressor = FindBestAggressor(radius);
+				if (aggressor) g_lastAggressor = aggressor->GetHandle();
 			}
-
-			spdlog::info("[TFD][Captive] EscapeCommit reason={} door={:08X}",
-				reason ? reason : "unknown",
-				door ? door->GetFormID() : 0);
+			if (aggressor) {
+				aggressor->EvaluatePackage(true, false);
+				spdlog::info("[TFD][Captive] Escape aggro nudge actor={:08X}", aggressor->GetFormID());
+			}
+			else {
+				spdlog::info("[TFD][Captive] Escape aggro nudge skipped (no aggressor)");
+			}
+			spdlog::info("[TFD][Captive] EscapeCommit reason={} door={:08X}", reason ? reason : "unknown", door ? door->GetFormID() : 0);
 		}
 
 		static void TryCommitEscapeByRadius()
@@ -390,24 +522,15 @@ namespace TFD::DefeatMonitor
 				g_escapeRadiusActive = false;
 				return;
 			}
-
 			auto* player = Player();
-			if (!player) {
-				return;
-			}
-
+			if (!player) return;
 			RE::TESObjectREFR* marker = nullptr;
 			if (g_captiveMarker) {
 				auto ptr = g_captiveMarker.get();
 				marker = ptr.get();
 			}
-			if (!marker) {
-				marker = TFD::Location::GetCachedCaptiveMarker();
-			}
-			if (!marker) {
-				return;
-			}
-
+			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!marker) return;
 			const auto pp = player->GetPosition();
 			const auto mp = marker->GetPosition();
 			const double dx = static_cast<double>(pp.x - mp.x);
@@ -415,18 +538,15 @@ namespace TFD::DefeatMonitor
 			const double dz = static_cast<double>(pp.z - mp.z);
 			const double distSq = dx * dx + dy * dy + dz * dz;
 			const bool outside = distSq > (512.0 * 512.0);
-
 			if (!outside) {
 				g_escapeRadiusActive = false;
 				return;
 			}
-
 			if (!g_escapeRadiusActive) {
 				g_escapeRadiusActive = true;
 				g_escapeRadiusSince = Now();
 				return;
 			}
-
 			const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(Now() - g_escapeRadiusSince).count();
 			if (held >= 2000) {
 				EnterEscapeCommit("marker_radius", nullptr);
@@ -436,18 +556,11 @@ namespace TFD::DefeatMonitor
 
 		static void TryResolveEscapeByLocation()
 		{
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Escape) {
-				return;
-			}
-
+			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Escape) return;
 			auto* player = Player();
-			if (!player) {
-				return;
-			}
-
+			if (!player) return;
 			auto* loc = GetLocationFromRef(player);
 			const auto curLoc = loc ? loc->GetFormID() : 0;
-
 			if (g_captiveLocationFormID != 0 && curLoc != 0 && curLoc != g_captiveLocationFormID) {
 				SetCaptiveRuntime(false, CaptivePhaseValue::None);
 				ClearEscapeContext();
@@ -466,10 +579,7 @@ namespace TFD::DefeatMonitor
 
 		static void ClampHealth(RE::Actor* actor, float minHp)
 		{
-			if (!actor) {
-				return;
-			}
-
+			if (!actor) return;
 			const float hp = actor->GetActorValue(RE::ActorValue::kHealth);
 			if (hp < minHp) {
 				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (minHp - hp));
@@ -484,9 +594,7 @@ namespace TFD::DefeatMonitor
 
 		static bool IsGraceActive()
 		{
-			if (!g_grace.load(std::memory_order_acquire)) {
-				return false;
-			}
+			if (!g_grace.load(std::memory_order_acquire)) return false;
 			if (Now() >= g_graceUntil) {
 				g_grace.store(false, std::memory_order_release);
 				return false;
@@ -506,32 +614,22 @@ namespace TFD::DefeatMonitor
 		static RE::Actor* FindBestAggressor(float radius)
 		{
 			auto* player = Player();
-			if (!player) {
-				return nullptr;
-			}
-
+			if (!player) return nullptr;
 			TFD::ActorScan::Rescan(radius, true);
-
 			RE::Actor* best = nullptr;
 			float bestDist = 1.0e30f;
-
 			const auto n = TFD::ActorScan::GetCount();
 			for (int i = 0; i < n; ++i) {
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto sp = e.actor.get();
 				auto* a = sp.get();
-				if (!a || a->IsDead()) {
-					continue;
-				}
-				if (!e.inCombat && !e.hostile) {
-					continue;
-				}
+				if (!a || a->IsDead()) continue;
+				if (!e.inCombat && !e.hostile) continue;
 				if (e.dist < bestDist) {
 					bestDist = e.dist;
 					best = a;
 				}
 			}
-
 			return best;
 		}
 
@@ -539,16 +637,13 @@ namespace TFD::DefeatMonitor
 		{
 			TFD::AntiAggro::SweepOnce(radius, true);
 			TFD::AntiAggro::ScheduleWaves(radius, true, 10, 140);
-
 			TFD::ActorScan::Rescan(radius, true);
 			const auto n = TFD::ActorScan::GetCount();
 			for (int i = 0; i < n; ++i) {
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto sp = e.actor.get();
 				auto* a = sp.get();
-				if (!a || a->IsDead()) {
-					continue;
-				}
+				if (!a || a->IsDead()) continue;
 				TFD::AggressionClamp::Apply(a);
 			}
 		}
@@ -556,62 +651,102 @@ namespace TFD::DefeatMonitor
 		static void RecoverPlayerAfterTeleport()
 		{
 			auto* p = Player();
-			if (!p) {
-				return;
-			}
-
+			if (!p) return;
 			p->NotifyAnimationGraph("BleedoutStop");
 			p->NotifyAnimationGraph("GetUpStart");
-
 			const float hpMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kHealth));
 			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
 			const float safePct = std::clamp(threshPct + 0.15f, 0.35f, 0.85f);
 			const float target = (std::max)(25.0f, hpMax * safePct);
-
 			const float hpNow = p->GetActorValue(RE::ActorValue::kHealth);
 			if (hpNow < target) {
 				p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (target - hpNow));
 			}
-
-			if (p->IsInCombat()) {
-				p->StopCombat();
-			}
+			if (p->IsInCombat()) p->StopCombat();
 			p->DrawWeaponMagicHands(false);
 		}
 
+		static void RecoverPlayerForLeftForDead()
+		{
+			auto* p = Player();
+			if (!p) return;
+			p->NotifyAnimationGraph("BleedoutStop");
+			p->NotifyAnimationGraph("GetUpStart");
+			auto restoreToPct = [&](RE::ActorValue av, float pct, float minValue) {
+				const float maxValue = (std::max)(1.0f, p->GetPermanentActorValue(av));
+				const float target = (std::max)(minValue, maxValue * pct);
+				const float nowValue = p->GetActorValue(av);
+				if (nowValue < target) {
+					p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, av, (target - nowValue));
+				}
+				};
+			restoreToPct(RE::ActorValue::kHealth, 0.90f, 40.0f);
+			restoreToPct(RE::ActorValue::kStamina, 0.85f, 35.0f);
+			restoreToPct(RE::ActorValue::kMagicka, 0.85f, 25.0f);
+			if (p->IsInCombat()) p->StopCombat();
+			p->DrawWeaponMagicHands(false);
+		}
+
+		static void TickLeftForDeadCooldown()
+		{
+			if (!IsLeftForDeadCooldownActive()) return;
+			const auto now = Now();
+			if (g_leftForDeadNextPulse.time_since_epoch().count() != 0 && now < g_leftForDeadNextPulse) return;
+			const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
+			TFD::AntiAggro::SweepOnce(radius, true);
+			TFD::AntiAggro::ScheduleWaves(radius, true, 8, 120);
+			RecoverPlayerForLeftForDead();
+			TFD::FactionMask::Clear();
+			g_leftForDeadNextPulse = now + std::chrono::seconds(2);
+		}
+
+		static void EnterLeftForDeadFallback(const char* reason);
+
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
 		{
-			if (!player) {
-				return;
-			}
-
+			if (!player) return;
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
-
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
-
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
 			const float minHp = (std::max)(1.0f, maxHp * 0.02f);
 			g_minHp = minHp;
-
 			ClampHealth(player, g_minHp);
 			player->NotifyAnimationGraph("BleedoutStart");
-
 			const float radius = (std::max)(2000.0f, TFD::Settings::GetSweepRadius());
 			ApplyCalmBubble(radius);
-
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();
-				TFD::FactionMask::ApplyFromAggressor(aggressor);
+				if (!IsCaptiveSupportedAggressor(aggressor)) {
+					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> LeftForDead", aggressor->GetFormID());
+					g_inBleedState.store(false, std::memory_order_release);
+					g_minHp = 0.0f;
+					g_bleedSawDialogue = false;
+					g_bleedLastSeconds = -1;
+					TFD::ForceGreet::Cancel();
+					TFD::FactionMask::Clear();
+					EnterLeftForDeadFallback("unsupported_aggressor_nonhumanoid");
+					return;
+				}
+				const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
+				if (!captiveSupported) {
+					spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> LeftForDead", aggressor->GetFormID());
+					g_inBleedState.store(false, std::memory_order_release);
+					g_minHp = 0.0f;
+					g_bleedSawDialogue = false;
+					g_bleedLastSeconds = -1;
+					TFD::ForceGreet::Cancel();
+					TFD::FactionMask::Clear();
+					EnterLeftForDeadFallback("unsupported_aggressor_allowlist");
+					return;
+				}
 				TFD::ForceGreet::BeginBleedout(aggressor);
 			}
-
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 			char msg[96]{};
 			std::snprintf(msg, sizeof(msg), "TFDEngine: Bleeding... (%ds)", bleedSeconds);
 			RE::DebugNotification(msg);
-
 			spdlog::info("[TFD][Defeat] bleed window started ({}s)", bleedSeconds);
 		}
 
@@ -620,41 +755,69 @@ namespace TFD::DefeatMonitor
 			EnterEscapeCommit("lockpick", door);
 		}
 
+		static void EnterLeftForDeadFallback(const char* reason)
+		{
+			RE::DebugNotification("TFDEngine: LeftForDead fallback");
+			const auto failCell = g_captiveCellFormID;
+			const auto failLoc = g_captiveLocationFormID;
+			TFD::ForceGreet::Cancel();
+			TFD::FactionMask::Clear();
+			ClearEscapeContext();
+			ResetLockpickWatch();
+			g_leftForDeadActive = false;
+			g_leftForDeadUntil = {};
+			g_leftForDeadNextPulse = {};
+			g_grace.store(false, std::memory_order_release);
+			g_lastAggressor.reset();
+			g_prevDialogueOpen = false;
+			g_prevLockpickOpen = false;
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
+			RecoverPlayerForLeftForDead();
+			const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
+			TFD::AntiAggro::SweepOnce(radius, true);
+			TFD::AntiAggro::ScheduleWaves(radius, true, 32, 220);
+			BeginLeftForDeadCooldown(45);
+			SetGraceSeconds(20);
+			UpdatePreCombatState();
+			spdlog::warn("[TFD][Defeat] LeftForDead fallback reason={} cell={:08X} loc={:08X} cooldown=45s (clamp held)", reason ? reason : "unknown", failCell, failLoc);
+		}
+
 		static void DoBlackoutTeleport()
 		{
 			auto* aggressor = ResolveAggressor();
-
 			g_inBleedState.store(false, std::memory_order_release);
 			g_minHp = 0.0f;
 			g_bleedSawDialogue = false;
-
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
-
-			RE::DebugNotification("TFDEngine: Blackout -> Captive");
-
+			RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
+			bool resolved = false;
 			if (aggressor) {
-				TFD::Location::RescanCaptiveMarkerWithAggressor(aggressor, true);
-			} else {
-				TFD::Location::RescanCaptiveMarker();
+				resolved = TFD::Location::RescanCaptiveMarkerWithAggressor(aggressor, true);
+				if (!resolved) resolved = TFD::Location::RescanCaptiveMarkerWithAggressor(aggressor, false);
 			}
-
-			TFD::Location::TeleportToCaptiveMarker();
+			else {
+				resolved = TFD::Location::RescanCaptiveMarker();
+			}
+			auto* marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!resolved || !marker) {
+				EnterLeftForDeadFallback(!resolved ? "marker_not_found" : "marker_null");
+				return;
+			}
+			BlackoutAndAdvanceHours(1.0f, 500, "captured_transfer");
+			if (!TFD::Location::TeleportToCaptiveMarker()) {
+				EnterLeftForDeadFallback("teleport_failed");
+				return;
+			}
 			RecoverPlayerAfterTeleport();
-
-			if (g_captiveDoor.HasDoor()) {
-				g_captiveDoor.SealToInitial(true);
-			}
-
+			if (g_captiveDoor.HasDoor()) g_captiveDoor.SealToInitial(true);
 			SetGraceSeconds(5);
 			SetCaptiveRuntime(true, CaptivePhaseValue::Captive);
 			g_prevDialogueOpen = IsDialogueOpen();
 			g_prevLockpickOpen = IsLockpickingOpen();
 			ResetLockpickWatch();
 			ArmEscapeContextFromCurrentState();
-
 			ApplyCalmBubble((std::max)(2000.0f, TFD::Settings::GetSweepRadius()));
-
 			spdlog::info("[TFD][Captive] entered captivePhase");
 		}
 
@@ -664,49 +827,45 @@ namespace TFD::DefeatMonitor
 				ResetLockpickWatch();
 				return;
 			}
-
 			const bool lockOpen = IsLockpickingOpen();
-
 			if (lockOpen && !g_prevLockpickOpen) {
-				auto* target = RE::LockpickingMenu::GetTargetReference();
-				if (target && IsDoorRef(target) && IsDoorNearCaptiveMarker(target)) {
+				auto* rawTarget = RE::LockpickingMenu::GetTargetReference();
+				auto* target = ResolveLockpickDoorCandidate(rawTarget);
+				if (target) {
 					g_lockpickDoorCandidate = target->GetHandle();
 					g_lockpickDoorWasLocked = IsRefLocked(target);
-					if (g_lockpickDoorWasLocked) {
-						g_captiveDoor.Bind(target);
-					}
-					spdlog::info("[TFD][Captive] lockpick opened on door {:08X} wasLocked={} nearMarker=1",
-						target->GetFormID(), g_lockpickDoorWasLocked ? 1 : 0);
-				} else {
+					if (g_lockpickDoorWasLocked) BindCaptiveDoor(target);
+					spdlog::info("[TFD][Captive] lockpick opened on door {:08X} wasLocked={} nearMarker=1 rawTarget={:08X}", target->GetFormID(), g_lockpickDoorWasLocked ? 1 : 0, rawTarget ? rawTarget->GetFormID() : 0);
+				}
+				else {
 					g_lockpickDoorCandidate.reset();
 					g_lockpickDoorWasLocked = false;
-					if (target) {
-						spdlog::info("[TFD][Captive] lockpick target {:08X} ignored (door={} nearMarker={})",
-							target->GetFormID(),
-							IsDoorRef(target) ? 1 : 0,
-							IsDoorNearCaptiveMarker(target) ? 1 : 0);
+					auto* boundDoor = ResolveBoundEscapeDoor();
+					if (rawTarget) {
+						spdlog::info("[TFD][Captive] lockpick target {:08X} ignored (door={} nearMarker={} fallbackBoundDoor={:08X})", rawTarget->GetFormID(), IsDoorRef(rawTarget) ? 1 : 0, IsDoorNearCaptiveMarker(rawTarget) ? 1 : 0, boundDoor ? boundDoor->GetFormID() : 0);
+					}
+					else {
+						spdlog::info("[TFD][Captive] lockpick target null (fallbackBoundDoor={:08X})", boundDoor ? boundDoor->GetFormID() : 0);
 					}
 				}
 			}
-
 			if (g_captiveDoor.HasDoor() && g_captiveDoor.UpdateWatcher()) {
 				EnterEscapeCommit("door_watch", nullptr);
 			}
-
 			if (!lockOpen && g_prevLockpickOpen) {
 				RE::TESObjectREFR* door = nullptr;
 				if (g_lockpickDoorCandidate) {
 					auto ptr = g_lockpickDoorCandidate.get();
 					door = ptr.get();
 				}
-
+				if (!door) door = ResolveBoundEscapeDoor();
 				if (door && IsDoorRef(door) && g_lockpickDoorWasLocked && !IsRefLocked(door)) {
 					EnterEscapeFromLockpick(door);
-				} else {
+				}
+				else {
 					ResetLockpickWatch();
 				}
 			}
-
 			g_prevLockpickOpen = lockOpen;
 		}
 
@@ -715,20 +874,11 @@ namespace TFD::DefeatMonitor
 			struct Guard {
 				~Guard() { g_tickPending.clear(std::memory_order_release); }
 			} guard;
-
-			if (!TFD::Settings::GetEnabled()) {
-				return;
-			}
-
-			if (g_loadTransition.load(std::memory_order_acquire)) {
-				return;
-			}
-
+			if (!TFD::Settings::GetEnabled()) return;
+			if (g_loadTransition.load(std::memory_order_acquire)) return;
 			auto* ui = RE::UI::GetSingleton();
 			TFD::ForceGreet::Tick();
-
 			NormalizeInvalidCaptivePair();
-
 			if (g_captiveState && g_captivePhase == CaptivePhaseValue::Captive) {
 				const bool dialogOpen = IsDialogueOpen();
 				if (!dialogOpen && g_prevDialogueOpen) {
@@ -736,42 +886,31 @@ namespace TFD::DefeatMonitor
 					spdlog::info("[TFD][Captive] Dialogue closed -> calm burst");
 				}
 				g_prevDialogueOpen = dialogOpen;
-
 				UpdateLockpickEscapeWatch();
 				TryCommitEscapeByRadius();
-			} else if (g_captiveState && g_captivePhase == CaptivePhaseValue::Escape) {
+			}
+			else if (g_captiveState && g_captivePhase == CaptivePhaseValue::Escape) {
 				TryResolveEscapeByLocation();
 			}
-
-			if (ui && ui->GameIsPaused()) {
-				return;
-			}
-
+			if (ui && ui->GameIsPaused()) return;
 			auto* player = Player();
 			if (!player) {
 				SyncPreCombatGlobal(false);
 				return;
 			}
-
 			UpdatePreCombatState();
-
-			if (IsGraceActive()) {
+			if (IsLeftForDeadCooldownActive()) {
+				TickLeftForDeadCooldown();
 				return;
 			}
-
+			if (IsGraceActive()) return;
 			if (g_inBleedState.load(std::memory_order_acquire)) {
-				if (g_minHp > 0.0f) {
-					ClampHealth(player, g_minHp);
-				}
-
+				if (g_minHp > 0.0f) ClampHealth(player, g_minHp);
 				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 				const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(Now() - g_bleedStart).count();
 				const int remain = bleedSeconds - static_cast<int>(elapsed);
-
 				const bool dOpen = IsDialogueOpen();
-				if (dOpen) {
-					g_bleedSawDialogue = true;
-				}
+				if (dOpen) g_bleedSawDialogue = true;
 				if (g_bleedSawDialogue && !dOpen) {
 					g_bleedStart = Now();
 					g_bleedLastSeconds = -1;
@@ -779,7 +918,6 @@ namespace TFD::DefeatMonitor
 					DoBlackoutTeleport();
 					return;
 				}
-
 				if (remain != g_bleedLastSeconds) {
 					g_bleedLastSeconds = remain;
 					if (remain > 0) {
@@ -788,21 +926,17 @@ namespace TFD::DefeatMonitor
 						RE::DebugNotification(msg);
 					}
 				}
-
 				if (remain <= 0) {
 					g_bleedStart = Now();
 					g_bleedLastSeconds = -1;
 					DoBlackoutTeleport();
 				}
-
 				return;
 			}
-
 			const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
 			const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
 			const float pct = (hpNow / hpMax) * 100.0f;
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
-
 			if (pct <= thresh) {
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 				auto* aggressor = FindBestAggressor(scanRadius);
@@ -817,11 +951,8 @@ namespace TFD::DefeatMonitor
 			while (g_running.load(std::memory_order_acquire)) {
 				if (!g_tickPending.test_and_set(std::memory_order_acq_rel)) {
 					auto* task = SKSE::GetTaskInterface();
-					if (task) {
-						task->AddTask([]() { TickUI(); });
-					}
+					if (task) task->AddTask([]() { TickUI(); });
 				}
-
 				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			}
 		}
@@ -829,47 +960,30 @@ namespace TFD::DefeatMonitor
 
 	void Install()
 	{
-		if (g_installed.exchange(true, std::memory_order_acq_rel)) {
-			return;
-		}
-
+		if (g_installed.exchange(true, std::memory_order_acq_rel)) return;
 		g_running.store(true, std::memory_order_release);
 		g_loadTransition.store(false, std::memory_order_release);
-
 		SetCaptiveRuntimeOnly(false, CaptivePhaseValue::None);
 		g_prevDialogueOpen = false;
 		ResetLockpickWatch();
 		ClearEscapeContext();
-
 		g_inBleedState.store(false, std::memory_order_release);
 		g_minHp = 0.0f;
-
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
-
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
 		TFD::ForceGreet::Install();
-
 		g_worker = std::thread([]() { WorkerLoop(); });
-
 		TFD::DefeatMonitor::ApplyQueuedProgressState();
-
 		spdlog::info("[TFD][Defeat] monitor installed");
 	}
 
 	void Shutdown()
 	{
-		if (!g_installed.exchange(false, std::memory_order_acq_rel)) {
-			return;
-		}
-
+		if (!g_installed.exchange(false, std::memory_order_acq_rel)) return;
 		g_running.store(false, std::memory_order_release);
-
-		if (g_worker.joinable()) {
-			g_worker.join();
-		}
-
+		if (g_worker.joinable()) g_worker.join();
 		SetCaptiveRuntime(false, CaptivePhaseValue::None);
 		g_hasQueuedProgressState = false;
 		g_queuedCaptiveState = false;
@@ -878,13 +992,14 @@ namespace TFD::DefeatMonitor
 		g_loadTransition.store(false, std::memory_order_release);
 		ResetLockpickWatch();
 		ClearEscapeContext();
-
+		ClearLeftForDeadCooldown();
 		spdlog::info("[TFD][Defeat] monitor shutdown");
 	}
 
 	void ResetGrace()
 	{
 		g_grace.store(false, std::memory_order_release);
+		ClearLeftForDeadCooldown();
 	}
 
 	bool GetCaptiveStateForSave()
@@ -894,10 +1009,7 @@ namespace TFD::DefeatMonitor
 
 	std::uint32_t GetCaptivePhaseForSave()
 	{
-		if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) {
-			return 2u;
-		}
-
+		if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) return 2u;
 		return static_cast<std::uint32_t>(static_cast<int>(g_captivePhase));
 	}
 
@@ -905,18 +1017,10 @@ namespace TFD::DefeatMonitor
 	{
 		g_hasQueuedProgressState = true;
 		g_queuedCaptiveState = stateActive;
-
 		CaptivePhaseValue phase = stateActive ? PhaseFromRaw(phaseRaw) : CaptivePhaseValue::None;
-		if (stateActive && phase == CaptivePhaseValue::None) {
-			phase = CaptivePhaseValue::Escape;
-		}
-
+		if (stateActive && phase == CaptivePhaseValue::None) phase = CaptivePhaseValue::Escape;
 		g_queuedCaptivePhase = phase;
-
-		spdlog::info("[TFD][Defeat] QueueLoadedProgressState state={} phase={} normalized={}",
-			stateActive ? 1 : 0,
-			phaseRaw,
-			static_cast<int>(g_queuedCaptivePhase));
+		spdlog::info("[TFD][Defeat] QueueLoadedProgressState state={} phase={} normalized={}", stateActive ? 1 : 0, phaseRaw, static_cast<int>(g_queuedCaptivePhase));
 	}
 
 	void QueueDefaultProgressState()
@@ -934,27 +1038,21 @@ namespace TFD::DefeatMonitor
 
 	void ApplyQueuedProgressState()
 	{
-		if (!g_hasQueuedProgressState) {
-			QueueDefaultProgressState();
-		}
-
+		if (!g_hasQueuedProgressState) QueueDefaultProgressState();
+		ClearLeftForDeadCooldown();
 		SetCaptiveRuntime(g_queuedCaptiveState, g_queuedCaptivePhase);
 		g_prevDialogueOpen = IsDialogueOpen();
 		g_prevLockpickOpen = IsLockpickingOpen();
-
 		if (g_queuedCaptiveState && g_queuedCaptivePhase == CaptivePhaseValue::Captive) {
 			TFD::Location::RescanCaptiveMarker();
 			ArmEscapeContextFromCurrentState();
-		} else {
+		}
+		else {
 			ResetLockpickWatch();
 			ClearEscapeContext();
 		}
-
 		UpdatePreCombatState();
-
-		spdlog::info("[TFD][Defeat] ApplyQueuedProgressState state={} phase={}",
-			g_queuedCaptiveState ? 1 : 0,
-			static_cast<int>(g_queuedCaptivePhase));
+		spdlog::info("[TFD][Defeat] ApplyQueuedProgressState state={} phase={}", g_queuedCaptiveState ? 1 : 0, static_cast<int>(g_queuedCaptivePhase));
 	}
 
 	void ResetForLoad()
@@ -963,21 +1061,17 @@ namespace TFD::DefeatMonitor
 		g_inBleedState.store(false, std::memory_order_release);
 		g_minHp = 0.0f;
 		g_bleedSawDialogue = false;
-
 		g_bleedStart = Now();
 		g_bleedLastSeconds = -1;
-
 		g_lastAggressor = RE::ActorHandle{};
-
 		SetCaptiveRuntimeOnly(false, CaptivePhaseValue::None);
 		g_prevDialogueOpen = false;
 		ResetLockpickWatch();
 		ClearEscapeContext();
-
 		TFD::FactionMask::Clear();
 		TFD::AggressionClamp::Clear();
 		TFD::ForceGreet::Cancel();
-
+		ClearLeftForDeadCooldown();
 		spdlog::info("[TFD][Defeat] ResetForLoad -> runtime only");
 	}
 
@@ -988,9 +1082,15 @@ namespace TFD::DefeatMonitor
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
 			spdlog::info("[TFD][Defeat] SetLoadTransition(true)");
-		} else {
+		}
+		else {
 			spdlog::info("[TFD][Defeat] SetLoadTransition(false)");
 		}
+	}
+
+	bool IsLeftForDeadRecoveryActive()
+	{
+		return g_leftForDeadActive;
 	}
 
 	bool IsCaptivePhase()
