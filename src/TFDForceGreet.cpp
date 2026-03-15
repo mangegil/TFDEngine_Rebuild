@@ -551,7 +551,7 @@ namespace TFD::ForceGreet
 		const auto gate = CanStartDialogueNow(speaker, snap.mode, dist);
 
 		if (gate != DialogueGateFail::None) {
-			if (snap.mode == Mode::CaptiveMarker &&
+			if ((snap.mode == Mode::CaptiveMarker || snap.mode == Mode::Bleedout) &&
 				(gate == DialogueGateFail::DifferentCell || gate == DialogueGateFail::TooFar)) {
 				NudgeApproach(speaker);
 			}

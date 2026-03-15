@@ -82,6 +82,8 @@ namespace TFD::DefeatMonitor
 
 		RE::ActorHandle g_lastAggressor{};
 		bool g_bleedSawDialogue = false;
+		bool g_bleedPendingCaptiveOutcome = false;
+		bool g_bleedPendingNonCaptiveOutcome = false;
 
 		bool g_captiveState = false;
 		CaptivePhaseValue g_captivePhase = CaptivePhaseValue::None;
@@ -224,6 +226,20 @@ namespace TFD::DefeatMonitor
 			queue->AddMessage(strings->faderMenu, RE::UI_MESSAGE_TYPE::kHide, nullptr);
 			queue->ProcessCommands();
 		}
+
+		static void ResetBleedRuntimeState()
+		{
+			g_inBleedState.store(false, std::memory_order_release);
+			g_minHp = 0.0f;
+			g_bleedSawDialogue = false;
+			g_bleedPendingCaptiveOutcome = false;
+			g_bleedPendingNonCaptiveOutcome = false;
+			g_bleedPaused = false;
+			g_bleedPauseStarted = {};
+			g_bleedStart = Now();
+			g_bleedLastSeconds = -1;
+		}
+
 
 		static void AdvanceGameHoursSoft(float hours)
 		{
@@ -1035,7 +1051,7 @@ namespace TFD::DefeatMonitor
 			const float dz = pb.z - pa.z;
 			outDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-			if (!IsActorCloseAndFront(aggressor, player, 220.0f)) {
+			if (outDistance > 220.0f) {
 				return false;
 			}
 
@@ -1159,6 +1175,8 @@ namespace TFD::DefeatMonitor
 
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
+			g_bleedPendingCaptiveOutcome = false;
+			g_bleedPendingNonCaptiveOutcome = false;
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
 			g_bleedPaused = false;
@@ -1177,53 +1195,38 @@ namespace TFD::DefeatMonitor
 				g_lastAggressor = aggressor->GetHandle();
 
 				if (!IsCaptiveSupportedAggressor(aggressor)) {
-					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> LeftForDead", aggressor->GetFormID());
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
-					TFD::ForceGreet::Cancel();
-					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("unsupported_aggressor_nonhumanoid");
-					return;
+					g_bleedPendingCaptiveOutcome = false;
+					g_bleedPendingNonCaptiveOutcome = true;
+					spdlog::info("[TFD][Defeat] aggressor {:08X} not captive-supported (non-humanoid) -> keep bleed hold pending=noncaptive", aggressor->GetFormID());
 				}
-
-				const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
-				if (!captiveSupported) {
-					spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> LeftForDead", aggressor->GetFormID());
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
-					TFD::ForceGreet::Cancel();
-					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("unsupported_aggressor_allowlist");
-					return;
-				}
-
-				float greetDistance = 99999.0f;
-				if (!CanUseAggressorForBleedoutGreet(player, aggressor, greetDistance)) {
-					if (ResolveCaptiveMarkerForOutcome()) {
-						spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} but captive marker exists -> captive blackout",
-							aggressor->GetFormID(), greetDistance);
-						DoBlackoutTeleport();
-						SetGraceSeconds(4);
-						return;
+				else {
+					const bool captiveSupported = TFD::FactionMask::ApplyFromAggressor(aggressor);
+					if (!captiveSupported) {
+						g_bleedPendingCaptiveOutcome = false;
+						g_bleedPendingNonCaptiveOutcome = true;
+						spdlog::info("[TFD][Defeat] aggressor {:08X} has no captive-supported allowlist faction -> keep bleed hold pending=noncaptive", aggressor->GetFormID());
 					}
+					else {
+						const bool hasCaptiveOutcome = ResolveCaptiveMarkerForOutcome();
+						g_bleedPendingCaptiveOutcome = hasCaptiveOutcome;
+						g_bleedPendingNonCaptiveOutcome = !hasCaptiveOutcome;
 
-					spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable in-place dist={:.1f} -> noncaptive fallback",
-						aggressor->GetFormID(), greetDistance);
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					g_bleedLastSeconds = -1;
-					TFD::ForceGreet::Cancel();
-					TFD::FactionMask::Clear();
-					EnterNonCaptiveChoice("aggressor_not_greetable");
-					return;
+						float greetDistance = 99999.0f;
+						const bool greetableNow = CanUseAggressorForBleedoutGreet(player, aggressor, greetDistance);
+						if (!greetableNow) {
+							spdlog::info("[TFD][Defeat] aggressor {:08X} not greetable now dist={:.1f} -> keep bleed hold pending={}",
+								aggressor->GetFormID(), greetDistance, hasCaptiveOutcome ? "captive" : "noncaptive");
+						}
+
+						TFD::ForceGreet::BeginBleedout(aggressor);
+					}
 				}
-
-				TFD::ForceGreet::BeginBleedout(aggressor);
+			}
+			else {
+				const bool hasCaptiveOutcome = ResolveCaptiveMarkerForOutcome();
+				g_bleedPendingCaptiveOutcome = hasCaptiveOutcome;
+				g_bleedPendingNonCaptiveOutcome = !hasCaptiveOutcome;
+				spdlog::info("[TFD][Defeat] no speaker -> keep bleed hold pending={}", hasCaptiveOutcome ? "captive" : "noncaptive");
 			}
 
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
@@ -1246,12 +1249,7 @@ namespace TFD::DefeatMonitor
 			ResetLockpickWatch();
 			g_grace.store(false, std::memory_order_release);
 			g_lastAggressor.reset();
-			g_bleedPaused = false;
-			g_bleedPauseStarted = {};
-			g_inBleedState.store(false, std::memory_order_release);
-			g_minHp = 0.0f;
-			g_bleedSawDialogue = false;
-			g_bleedLastSeconds = -1;
+			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
@@ -1288,13 +1286,7 @@ namespace TFD::DefeatMonitor
 
 		static void DoBlackoutTeleport()
 		{
-			g_inBleedState.store(false, std::memory_order_release);
-			g_minHp = 0.0f;
-			g_bleedSawDialogue = false;
-			g_bleedPaused = false;
-			g_bleedPauseStarted = {};
-			g_bleedStart = Now();
-			g_bleedLastSeconds = -1;
+			ResetBleedRuntimeState();
 			TFD::ForceGreet::Cancel();
 			g_lastAggressor.reset();
 			RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
@@ -1474,12 +1466,17 @@ namespace TFD::DefeatMonitor
 					}
 				}
 				if (remain <= 0) {
-					g_bleedStart = Now();
-					g_bleedLastSeconds = -1;
-					g_inBleedState.store(false, std::memory_order_release);
-					g_minHp = 0.0f;
-					g_bleedSawDialogue = false;
-					EnterNonCaptiveChoice("bleed_timeout");
+					const bool pendingCaptive = g_bleedPendingCaptiveOutcome;
+					ResetBleedRuntimeState();
+					if (pendingCaptive && ResolveCaptiveMarkerForOutcome()) {
+						spdlog::info("[TFD][Defeat] bleed timeout -> captive blackout");
+						DoBlackoutTeleport();
+						SetGraceSeconds(4);
+					}
+					else {
+						spdlog::info("[TFD][Defeat] bleed timeout -> noncaptive fallback");
+						EnterNonCaptiveChoice("bleed_timeout");
+					}
 				}
 				return;
 			}
@@ -1497,15 +1494,8 @@ namespace TFD::DefeatMonitor
 					g_lastAggressor = aggressor->GetHandle();
 				}
 				if (!aggressor) {
-					if (ResolveCaptiveMarkerForOutcome()) {
-						spdlog::info("[TFD][Defeat] no valid NPC aggressor but captive marker exists -> captive blackout");
-						DoBlackoutTeleport();
-						SetGraceSeconds(4);
-						return;
-					}
-
-					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> LeftForDead");
-					EnterNonCaptiveChoice("no_valid_npc");
+					spdlog::info("[TFD][Defeat] no valid NPC aggressor -> force bleed hold");
+					StartBleedWindow(player, nullptr);
 					SetGraceSeconds(1);
 					return;
 				}
@@ -1536,10 +1526,7 @@ namespace TFD::DefeatMonitor
 		g_prevDialogueOpen = false;
 		ResetLockpickWatch();
 		ClearEscapeContext();
-		g_inBleedState.store(false, std::memory_order_release);
-		g_minHp = 0.0f;
-		g_bleedStart = Now();
-		g_bleedLastSeconds = -1;
+		ResetBleedRuntimeState();
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
 		TFD::ForceGreet::Install();
@@ -1557,7 +1544,7 @@ namespace TFD::DefeatMonitor
 		g_hasQueuedProgressState = false;
 		g_queuedCaptiveState = false;
 		g_queuedCaptivePhase = CaptivePhaseValue::None;
-		g_inBleedState.store(false, std::memory_order_release);
+		ResetBleedRuntimeState();
 		g_loadTransition.store(false, std::memory_order_release);
 		ResetLockpickWatch();
 		ClearEscapeContext();
@@ -1627,11 +1614,7 @@ namespace TFD::DefeatMonitor
 	void ResetForLoad()
 	{
 		g_grace.store(false, std::memory_order_release);
-		g_inBleedState.store(false, std::memory_order_release);
-		g_minHp = 0.0f;
-		g_bleedSawDialogue = false;
-		g_bleedStart = Now();
-		g_bleedLastSeconds = -1;
+		ResetBleedRuntimeState();
 		g_lastAggressor = RE::ActorHandle{};
 		SetCaptiveRuntimeOnly(false, CaptivePhaseValue::None);
 		g_prevDialogueOpen = false;

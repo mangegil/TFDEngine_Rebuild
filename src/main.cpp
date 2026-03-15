@@ -16,6 +16,7 @@
 #include "TFDLocation.h"
 #include "TFDFactionMask.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDPacify.h"
 #include "TFDPacifyHooks.h"
 
 #if !defined(TFDEnableSmf)
@@ -73,10 +74,11 @@ static void QueueHud(const char* text)
 static void ResetTransientStateForLoad()
 {
     TFD::PreCombatGreet::CancelAll();
+    TFD::Pacify::Reset();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
 
-    spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only)");
+    spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, pacify cleared)");
 }
 
 static constexpr std::uint32_t kSerializationID = 'TFDE';
