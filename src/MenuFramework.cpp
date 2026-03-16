@@ -702,69 +702,93 @@ namespace TFDMenu
 		};
 
 		static float ScoreHotkeyCandidate(
-			RE::Actor* actor,
-			RE::PlayerCharacter* player,
-			const TFD::ActorScan::Entry& entry,
-			HotkeyPickMode* outMode)
-		{
-			if (outMode) {
-				*outMode = HotkeyPickMode::None;
-			}
+            RE::Actor* actor,
+            RE::PlayerCharacter* player,
+            const TFD::ActorScan::Entry& entry,
+            HotkeyPickMode* outMode)
+        {
+            if (outMode) {
+                *outMode = HotkeyPickMode::None;
+            }
 
-			if (!actor || !player) {
-				return -1.0e30f;
-			}
+            if (!actor || !player) {
+                return -1.0e30f;
+            }
 
-			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-			const bool inCombat = actor->IsInCombat();
-			const bool negotiable = TFD::TargetClassifier::IsNegotiable(actor);
-			const bool creature = TFD::TargetClassifier::IsCreature(actor);
-			const bool weaponDrawn = actor->IsWeaponDrawn();
+            const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
+            const bool inCombat = actor->IsInCombat();
+            const bool weaponDrawn = actor->IsWeaponDrawn();
 
-			if (negotiable && !inCombat && front && entry.dist <= 1150.0f) {
-				if (outMode) {
-					*outMode = HotkeyPickMode::TrucePreCombat;
-				}
+            const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+                player,
+                actor,
+                false,
+                inCombat,
+                entry.dist);
 
-				float score = 50000.0f;
-				score -= entry.dist;
-				if (weaponDrawn) {
-					score += 900.0f;
-				}
-				if (entry.hostile) {
-					score += 350.0f;
-				}
-				return score;
-			}
+            if (!classify.valid) {
+                return -1.0e30f;
+            }
 
-			if (creature && !inCombat && front && entry.dist <= 768.0f) {
-				if (outMode) {
-					*outMode = HotkeyPickMode::Tame;
-				}
+            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce &&
+                !inCombat &&
+                front &&
+                entry.dist <= 1150.0f) {
+                if (outMode) {
+                    *outMode = HotkeyPickMode::TrucePreCombat;
+                }
 
-				float score = 30000.0f;
-				score -= entry.dist;
-				if (weaponDrawn) {
-					score += 350.0f;
-				}
-				return score;
-			}
+                float score = 50000.0f;
+                score -= entry.dist;
+                if (weaponDrawn) {
+                    score += 900.0f;
+                }
+                if (entry.hostile) {
+                    score += 350.0f;
+                }
+                if (classify.allowDialogue) {
+                    score += 250.0f;
+                }
+                return score;
+            }
 
-			if (negotiable && inCombat && entry.dist <= 1400.0f) {
-				if (outMode) {
-					*outMode = HotkeyPickMode::TruceInCombat;
-				}
+            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Tame &&
+                !inCombat &&
+                front &&
+                entry.dist <= 768.0f) {
+                if (outMode) {
+                    *outMode = HotkeyPickMode::Tame;
+                }
 
-				float score = 20000.0f;
-				score -= entry.dist;
-				if (front) {
-					score += 500.0f;
-				}
-				return score;
-			}
+                float score = 30000.0f;
+                score -= entry.dist;
+                if (weaponDrawn) {
+                    score += 350.0f;
+                }
+                return score;
+            }
 
-			return -1.0e30f;
-		}
+            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce &&
+                inCombat &&
+                entry.dist <= 1400.0f) {
+                if (outMode) {
+                    *outMode = HotkeyPickMode::TruceInCombat;
+                }
+
+                float score = 20000.0f;
+                score -= entry.dist;
+                if (front) {
+                    score += 500.0f;
+                }
+                if (classify.allowDialogue) {
+                    score += 250.0f;
+                }
+                return score;
+            }
+
+            return -1.0e30f;
+        }
+
 
 		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius, HotkeyPickMode* outMode)
 		{

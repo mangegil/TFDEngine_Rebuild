@@ -478,6 +478,9 @@ namespace TFD::Pacify
         double nowSec,
         bool allowDialogue)
     {
+        const bool applyCellBubble = allowDialogue;
+        const float cellBubbleRadius = allowDialogue ? 12000.0f : 0.0f;
+
         return BeginSessionCommon(
             player,
             primaryTarget,
@@ -485,8 +488,8 @@ namespace TFD::Pacify
             nowSec,
             kTruceHiddenFailsafeSec,
             allowDialogue,
-            true,
-            12000.0f);
+            applyCellBubble,
+            cellBubbleRadius);
     }
 
 
