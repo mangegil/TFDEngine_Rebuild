@@ -4,7 +4,6 @@
 #include "TFDSettings.h"
 
 #include <algorithm>
-
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -26,11 +25,18 @@ namespace TFD::Pacify
         std::unordered_map<RE::FormID, TruceState> g_truceState;
         RE::FormID g_nextSessionId = 1;
 
-        constexpr double kTameDurationSec = 10.0;
+        constexpr double kTameDurationSec = 60.0;
         constexpr double kTruceHiddenFailsafeSec = 120.0;
 
         constexpr double kPacifyApplyIntervalSec = 0.25;
         constexpr double kPackageEvalIntervalSec = 1.0;
+
+        constexpr double kArmedGraceSec = 1.25;
+        constexpr double kArmedDebounceSec = 0.50;
+        constexpr double kTooFarDebounceSec = 1.25;
+
+        constexpr float kTameMaxDistance = 1400.0f;
+        constexpr float kTruceNonDialogueMaxDistance = 2200.0f;
 
         RE::Actor* ResolveActor(RE::FormID actorId)
         {
@@ -63,6 +69,81 @@ namespace TFD::Pacify
             return mode == Mode::TrucePreCombat || mode == Mode::TruceInCombat;
         }
 
+        constexpr float kLocalHostileSplashRadiusMin = 1000.0f;
+        constexpr float kLocalHostileSplashRadiusMax = 1800.0f;
+
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
+        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
+
+        float GetLocalHostileSplashRadius()
+        {
+            const float settingsRadius = TFD::Settings::GetSweepRadius();
+            return std::clamp(settingsRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
+        }
+
+        bool IsEligibleLocalSplashActor(
+            RE::Actor* actor,
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            const TFD::ActorScan::Entry& scanEntry,
+            float radius)
+        {
+            if (!IsActorStillValid(actor) || !player || !primaryTarget) {
+                return false;
+            }
+
+            if (actor->GetFormID() == player->GetFormID()) {
+                return false;
+            }
+
+            if (actor->GetFormID() == primaryTarget->GetFormID()) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+
+            auto* pCell = player->GetParentCell();
+            if (!pCell || actor->GetParentCell() != pCell || primaryTarget->GetParentCell() != pCell) {
+                return false;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            return distToPrimary <= radius;
+        }
+
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+        {
+            if (!actor) {
+                return nullptr;
+            }
+
+            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            return targetSp.get();
+        }
+
+        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor)
+        {
+            if (!player || !actor) {
+                return false;
+            }
+
+            if (actor->IsHostileToActor(player)) {
+                return true;
+            }
+
+            auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            if (combatTarget && combatTarget->GetFormID() == player->GetFormID()) {
+                return true;
+            }
+
+            return false;
+        }
 
         float GetCellBubbleRadius(float requestedRadius)
         {
@@ -97,10 +178,10 @@ namespace TFD::Pacify
                 return true;
             }
 
-            return scanEntry.hostile || scanEntry.inCombat || actor->IsInCombat();
+            return IsEnemyToPlayer(player, actor);
         }
 
-        bool IsPlayerArmedForTruce(RE::Actor* player)
+        bool IsPlayerArmedForPacify(RE::Actor* player)
         {
             if (!player) {
                 return true;
@@ -116,16 +197,6 @@ namespace TFD::Pacify
             }
 
             return false;
-        }
-
-        void MarkTruceSpent(RE::Actor* actor)
-        {
-            if (!actor) {
-                return;
-            }
-
-            auto& state = g_truceState[actor->GetFormID()];
-            state.spent = true;
         }
 
         void MarkTruceBetrayed(RE::Actor* actor)
@@ -151,26 +222,35 @@ namespace TFD::Pacify
             }
         }
 
-        ReleaseReason ComputeInvalidReason(Session& session, double nowSec)
+        Session* FindActivePrimarySessionForPlayer(RE::FormID playerId)
         {
-            auto* player = ResolveActor(session.playerId);
-            auto* primaryTarget = ResolveActor(session.primaryTargetId);
-
-            if (!IsActorStillValid(player) || !IsActorStillValid(primaryTarget)) {
-                return ReleaseReason::InvalidActor;
+            for (auto& [sessionId, session] : g_sessions) {
+                if (session.finished) {
+                    continue;
+                }
+                if (session.playerId != playerId) {
+                    continue;
+                }
+                return &session;
             }
+            return nullptr;
+        }
 
-            if (!IsTruceMode(session.primaryMode)) {
-                session.invalidSinceSec = 0.0;
-                return ReleaseReason::Generic;
-            }
-
-            if (IsPlayerArmedForTruce(player)) {
-                return ReleaseReason::PlayerArmed;
-            }
-
+        void RefreshSessionEntries(Session& session, double nowSec, double durationSec)
+        {
+            session.startTimeSec = nowSec;
+            session.endTimeSec = nowSec + durationSec;
             session.invalidSinceSec = 0.0;
-            return ReleaseReason::Generic;
+            session.armedSinceSec = 0.0;
+            session.tooFarSinceSec = 0.0;
+
+            for (auto& [actorId, entry] : g_entries) {
+                if (entry.sessionId != session.sessionId) {
+                    continue;
+                }
+                entry.startTimeSec = nowSec;
+                entry.endTimeSec = nowSec + durationSec;
+            }
         }
 
         void ApplyPacify(RE::Actor* actor, Entry& entry, double nowSec)
@@ -247,6 +327,53 @@ namespace TFD::Pacify
             return true;
         }
 
+        ReleaseReason ComputeInvalidReason(Session& session, double nowSec)
+        {
+            auto* player = ResolveActor(session.playerId);
+            auto* primaryTarget = ResolveActor(session.primaryTargetId);
+
+            if (!IsActorStillValid(player) || !IsActorStillValid(primaryTarget)) {
+                return ReleaseReason::InvalidActor;
+            }
+
+            // Armed applies to all non-captive pacify modes, but use grace + debounce.
+            if ((nowSec - session.startTimeSec) >= kArmedGraceSec && IsPlayerArmedForPacify(player)) {
+                if (session.armedSinceSec <= 0.0) {
+                    session.armedSinceSec = nowSec;
+                } else if ((nowSec - session.armedSinceSec) >= kArmedDebounceSec) {
+                    return ReleaseReason::PlayerArmed;
+                }
+            } else {
+                session.armedSinceSec = 0.0;
+            }
+
+            // Creature/non-dialogue sessions should not drift forever across cell or huge distance.
+            if (!session.dialogueRequested) {
+                const auto sameCell = player->GetParentCell() &&
+                                      primaryTarget->GetParentCell() &&
+                                      player->GetParentCell() == primaryTarget->GetParentCell();
+                const float distance = player->GetPosition().GetDistance(primaryTarget->GetPosition());
+                const float maxDistance = session.primaryMode == Mode::Tame ?
+                    kTameMaxDistance :
+                    kTruceNonDialogueMaxDistance;
+
+                if (!sameCell || distance > maxDistance) {
+                    if (session.tooFarSinceSec <= 0.0) {
+                        session.tooFarSinceSec = nowSec;
+                    } else if ((nowSec - session.tooFarSinceSec) >= kTooFarDebounceSec) {
+                        return ReleaseReason::TooFar;
+                    }
+                } else {
+                    session.tooFarSinceSec = 0.0;
+                }
+            } else {
+                session.tooFarSinceSec = 0.0;
+            }
+
+            session.invalidSinceSec = 0.0;
+            return ReleaseReason::Generic;
+        }
+
         std::optional<RE::FormID> BeginSessionCommon(
             RE::Actor* player,
             RE::Actor* primaryTarget,
@@ -262,21 +389,59 @@ namespace TFD::Pacify
             }
 
             if (IsTruceMode(mode)) {
-                if (!CanStartTruce(primaryTarget)) {
+                auto it = g_truceState.find(primaryTarget->GetFormID());
+                if (it != g_truceState.end() && it->second.spent) {
                     spdlog::info(
                         "TFDPacify: reject session mode={} target={:08X} reason=truce_spent",
                         ToString(mode),
                         primaryTarget->GetFormID());
                     return std::nullopt;
                 }
+            }
 
-                if (IsPlayerArmedForTruce(player)) {
+            if (IsPlayerArmedForPacify(player)) {
+                spdlog::info(
+                    "TFDPacify: reject session mode={} target={:08X} reason=player_armed",
+                    ToString(mode),
+                    primaryTarget->GetFormID());
+                return std::nullopt;
+            }
+
+            if (Session* active = FindActivePrimarySessionForPlayer(player->GetFormID())) {
+                if (active->primaryTargetId == primaryTarget->GetFormID() &&
+                    active->primaryMode == mode &&
+                    active->dialogueRequested == allowDialogue) {
+                    RefreshSessionEntries(*active, nowSec, durationSec);
                     spdlog::info(
-                        "TFDPacify: reject session mode={} target={:08X} reason=player_armed",
+                        "TFDPacify: refresh session id={} mode={} target={:08X}",
+                        active->sessionId,
                         ToString(mode),
                         primaryTarget->GetFormID());
-                    return std::nullopt;
+                    return active->sessionId;
                 }
+
+                auto targetEntryIt = g_entries.find(primaryTarget->GetFormID());
+                if (targetEntryIt != g_entries.end() &&
+                    targetEntryIt->second.sessionId == active->sessionId &&
+                    active->primaryMode == mode &&
+                    active->dialogueRequested == allowDialogue) {
+                    RefreshSessionEntries(*active, nowSec, durationSec);
+                    spdlog::info(
+                        "TFDPacify: refresh session id={} mode={} target={:08X} reason=target_already_in_active_group",
+                        active->sessionId,
+                        ToString(mode),
+                        primaryTarget->GetFormID());
+                    return active->sessionId;
+                }
+
+                spdlog::info(
+                    "TFDPacify: reject session mode={} target={:08X} reason=busy_existing_session activeId={} activeMode={} activeTarget={:08X}",
+                    ToString(mode),
+                    primaryTarget->GetFormID(),
+                    active->sessionId,
+                    ToString(active->primaryMode),
+                    active->primaryTargetId);
+                return std::nullopt;
             }
 
             const RE::FormID sessionId = g_nextSessionId++;
@@ -292,6 +457,8 @@ namespace TFD::Pacify
             session.startTimeSec = nowSec;
             session.endTimeSec = nowSec + durationSec;
             session.invalidSinceSec = 0.0;
+            session.armedSinceSec = 0.0;
+            session.tooFarSinceSec = 0.0;
             session.dialogueRequested = allowDialogue;
             session.dialogueOpened = false;
             session.finished = false;
@@ -309,6 +476,7 @@ namespace TFD::Pacify
             }
 
             std::size_t cellBubbleCount = 0;
+            std::size_t localSplashCount = 0;
             if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
                 TFD::ActorScan::Rescan(scanRadius, false);
@@ -335,6 +503,32 @@ namespace TFD::Pacify
 
                     ++cellBubbleCount;
                 }
+            } else if (!allowDialogue && (mode == Mode::Tame || mode == Mode::TruceInCombat)) {
+                const float splashRadius = GetLocalHostileSplashRadius();
+                const float scanRadius = splashRadius + 256.0f;
+                TFD::ActorScan::Rescan(scanRadius, false);
+                const auto count = TFD::ActorScan::GetCount();
+                for (int i = 0; i < count; ++i) {
+                    auto scanEntry = TFD::ActorScan::GetEntry(i);
+                    auto* actor = TFD::ActorScan::GetActor(i);
+                    if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, splashRadius)) {
+                        continue;
+                    }
+
+                    if (!AddOrRefreshEntry(
+                            actor,
+                            mode,
+                            sessionId,
+                            targetId,
+                            nowSec,
+                            nowSec + durationSec,
+                            false,
+                            false)) {
+                        continue;
+                    }
+
+                    ++localSplashCount;
+                }
             }
 
             g_sessions[sessionId] = session;
@@ -358,11 +552,13 @@ namespace TFD::Pacify
             }
 
             spdlog::info(
-                "TFDPacify: begin session id={} mode={} target={:08X} cellBubble={}",
+                "TFDPacify: begin session id={} mode={} target={:08X} cellBubble={} localSplash={} allowDialogue={}",
                 sessionId,
                 ToString(mode),
                 targetId,
-                static_cast<unsigned int>(cellBubbleCount));
+                static_cast<unsigned int>(cellBubbleCount),
+                static_cast<unsigned int>(localSplashCount),
+                allowDialogue ? 1 : 0);
 
             return sessionId;
         }
@@ -491,7 +687,6 @@ namespace TFD::Pacify
             applyCellBubble,
             cellBubbleRadius);
     }
-
 
     std::optional<RE::FormID> BeginCellTruceBurst(
         RE::Actor* player,

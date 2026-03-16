@@ -56,6 +56,8 @@ namespace TFD::Pacify
         double startTimeSec{ 0.0 };
         double endTimeSec{ 0.0 };
         double invalidSinceSec{ 0.0 };
+        double armedSinceSec{ 0.0 };
+        double tooFarSinceSec{ 0.0 };
 
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };

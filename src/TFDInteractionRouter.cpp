@@ -33,6 +33,34 @@ namespace TFD::InteractionRouter
             return target && target->IsInCombat();
         }
 
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+        {
+            if (!actor) {
+                return nullptr;
+            }
+
+            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            return targetSp.get();
+        }
+
+        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* target)
+        {
+            if (!player || !target) {
+                return false;
+            }
+
+            if (target->IsHostileToActor(player)) {
+                return true;
+            }
+
+            auto* combatTarget = ResolveCurrentCombatTarget(target);
+            if (combatTarget && combatTarget->GetFormID() == player->GetFormID()) {
+                return true;
+            }
+
+            return false;
+        }
+
         float GetDistance(RE::Actor* a, RE::Actor* b)
         {
             if (!a || !b) {
@@ -107,13 +135,15 @@ namespace TFD::InteractionRouter
             isCaptivePhase,
             targetInCombat,
             distanceToPlayer);
+        const bool enemyToPlayer = IsEnemyToPlayer(player, target);
 
         result.classify = classify;
 
         spdlog::info(
-            "[TFD][Router] classify target={:08X} inCombat={} dist={:.1f} class={} kind={} intent={} allowDialogue={} valid={} reject={}",
+            "[TFD][Router] classify target={:08X} inCombat={} hostileToPlayer={} dist={:.1f} class={} kind={} intent={} allowDialogue={} valid={} reject={}",
             target->GetFormID(),
             targetInCombat ? 1 : 0,
+            enemyToPlayer ? 1 : 0,
             distanceToPlayer,
             TFD::TargetClassifier::ToString(classify.creatureClass),
             TFD::TargetClassifier::ToString(classify.kind),
@@ -125,6 +155,15 @@ namespace TFD::InteractionRouter
         if (!classify.valid) {
             result.valid = false;
             result.failReason = TranslateClassifierReject(classify.rejectReason);
+            return result;
+        }
+
+        if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce && !enemyToPlayer) {
+            spdlog::info(
+                "[TFD][Router] reject target={:08X} reason=not_enemy_to_player",
+                target->GetFormID());
+            result.valid = false;
+            result.failReason = FailReason::TargetRejected;
             return result;
         }
 

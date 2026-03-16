@@ -254,6 +254,39 @@ namespace TFD::ForceGreet
 			}
 		}
 
+		RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+		{
+			if (!actor) {
+				return nullptr;
+			}
+
+			auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+			return targetSp.get();
+		}
+
+		bool IsDialogueEnemyStillValid(RE::Actor* speaker, Mode mode)
+		{
+			if (!speaker || mode != Mode::InCombatTruce) {
+				return true;
+			}
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return false;
+			}
+
+			if (speaker->IsHostileToActor(player)) {
+				return true;
+			}
+
+			auto* combatTarget = ResolveCurrentCombatTarget(speaker);
+			if (combatTarget && combatTarget->GetFormID() == player->GetFormID()) {
+				return true;
+			}
+
+			return false;
+		}
+
 		bool TryStartDialogue(RE::Actor* speaker, Mode mode)
 		{
 			if (!speaker) {
@@ -269,6 +302,14 @@ namespace TFD::ForceGreet
 			}
 
 			if (speaker->IsDead()) {
+				return false;
+			}
+
+			if (!IsDialogueEnemyStillValid(speaker, mode)) {
+				spdlog::info(
+					"[TFD][ForceGreet] TryStartDialogue blocked speaker={:08X} mode={} reason=not_enemy_to_player",
+					speaker->GetFormID(),
+					static_cast<int>(mode));
 				return false;
 			}
 
@@ -561,6 +602,21 @@ namespace TFD::ForceGreet
 			if (wasCaptive) {
 				ClearCaptiveAliases(nullptr, "speaker_lost");
 			}
+			return;
+		}
+
+		if (!IsDialogueEnemyStillValid(speaker, snap.mode)) {
+			{
+				std::scoped_lock lk(lock);
+				job.active = false;
+				job.mode = Mode::None;
+				job.speakerHandle = 0;
+			}
+
+			spdlog::info(
+				"[TFD][ForceGreet] Speaker no longer enemy to player -> cancel speaker={:08X} mode={}",
+				speaker->GetFormID(),
+				static_cast<int>(snap.mode));
 			return;
 		}
 

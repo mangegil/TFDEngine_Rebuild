@@ -102,29 +102,6 @@ namespace TFD::TargetClassifier
             return false;
         }
 
-        bool IsNpcLikeFallback(RE::Actor* actor)
-        {
-            if (!actor) {
-                return false;
-            }
-
-            if (HasSafeNpcKeyword(actor)) {
-                return true;
-            }
-
-            auto* base = GetActorBase(actor);
-            if (!base) {
-                return false;
-            }
-
-            auto* race = base->GetRace();
-            if (!race) {
-                return false;
-            }
-
-            return true;
-        }
-
         bool IsDistanceTooFarForTame(float distanceToPlayer)
         {
             return distanceToPlayer > kMaxTameDistance;
@@ -351,10 +328,8 @@ namespace TFD::TargetClassifier
             return CreatureClass::FullDialogue;
         }
 
-        if (IsNpcLikeFallback(actor)) {
-            return CreatureClass::FullDialogue;
-        }
-
+        // Non-listed actors must NOT auto-promote to FullDialogue.
+        // Dialogue authority now comes only from explicit actor/race lists.
         return CreatureClass::UnknownFallback;
     }
 
