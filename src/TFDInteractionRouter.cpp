@@ -1,5 +1,7 @@
 #include "TFDInteractionRouter.h"
 
+#include <spdlog/spdlog.h>
+
 namespace TFD::InteractionRouter
 {
 	namespace
@@ -108,6 +110,18 @@ namespace TFD::InteractionRouter
 
 		result.classify = classify;
 
+		spdlog::info(
+			"[TFD][Router] classify target={:08X} inCombat={} dist={:.1f} class={} kind={} intent={} allowDialogue={} valid={} reject={} ",
+			target->GetFormID(),
+			targetInCombat ? 1 : 0,
+			distanceToPlayer,
+			TFD::TargetClassifier::ToString(classify.creatureClass),
+			TFD::TargetClassifier::ToString(classify.kind),
+			TFD::TargetClassifier::ToString(classify.intent),
+			classify.allowDialogue ? 1 : 0,
+			classify.valid ? 1 : 0,
+			TFD::TargetClassifier::ToString(classify.rejectReason));
+
 		if (!classify.valid) {
 			result.valid = false;
 			result.failReason = TranslateClassifierReject(classify.rejectReason);
@@ -178,7 +192,7 @@ namespace TFD::InteractionRouter
 			break;
 
 		case Action::TruceInCombat:
-			sessionId = TFD::Pacify::BeginTruceInCombatSession(player, target, nowSec);
+			sessionId = TFD::Pacify::BeginTruceInCombatSession(player, target, nowSec, resolved.shouldOpenDialogue);
 			break;
 
 		case Action::None:

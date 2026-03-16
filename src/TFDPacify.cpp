@@ -475,7 +475,8 @@ namespace TFD::Pacify
     std::optional<RE::FormID> BeginTruceInCombatSession(
         RE::Actor* player,
         RE::Actor* primaryTarget,
-        double nowSec)
+        double nowSec,
+        bool allowDialogue)
     {
         return BeginSessionCommon(
             player,
@@ -483,7 +484,7 @@ namespace TFD::Pacify
             Mode::TruceInCombat,
             nowSec,
             kTruceHiddenFailsafeSec,
-            true,
+            allowDialogue,
             true,
             12000.0f);
     }

@@ -78,7 +78,8 @@ namespace TFD::Pacify
     std::optional<RE::FormID> BeginTruceInCombatSession(
         RE::Actor* player,
         RE::Actor* primaryTarget,
-        double nowSec);
+        double nowSec,
+        bool allowDialogue);
 
     bool IsPacified(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
