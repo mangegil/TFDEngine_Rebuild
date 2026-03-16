@@ -1,3 +1,4 @@
+
 #include "TFDPreCombatGreet.h"
 
 #include <atomic>
@@ -14,6 +15,7 @@
 
 #include "TFDDefeatMonitor.h"
 #include "TFDFactionMask.h"
+#include "TFDForceGreet.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPacify.h"
 
@@ -27,6 +29,7 @@ namespace TFD::PreCombatGreet
 		constexpr double kCooldownAfterDoneSec = 120.0;
 		constexpr double kCooldownAfterFailSec = 5.0;
 		constexpr double kCooldownAfterPlayerAttackSec = 1.0;
+		constexpr double kRecentActorHoldSec = 12.0;
 
 		struct Pending
 		{
@@ -37,6 +40,8 @@ namespace TFD::PreCombatGreet
 			bool dialogueRequested{ false };
 			bool dialogSeen{ false };
 			bool assignSent{ false };
+			bool forceGreetStarted{ false };
+			double nextDebugLogSec{ 0.0 };
 		};
 
 		std::atomic_bool gInstalled{ false };
@@ -49,6 +54,10 @@ namespace TFD::PreCombatGreet
 		std::unordered_map<std::uint32_t, Pending> gPending;
 		std::unordered_map<std::uint32_t, double> gCooldownUntil;
 		Clock::time_point gT0 = Clock::now();
+
+		std::uint32_t gRecentActorHandle = 0;
+		double gRecentActorCachedAtSec = 0.0;
+		double gRecentActorUntilSec = 0.0;
 
 		double NowSec()
 		{
@@ -75,6 +84,39 @@ namespace TFD::PreCombatGreet
 
 			auto* state = player->AsActorState();
 			return state && state->IsBleedingOut();
+		}
+
+		void CacheRecentActor(RE::Actor* actor, double holdSec, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			gRecentActorHandle = actor->GetHandle().native_handle();
+			gRecentActorCachedAtSec = NowSec();
+			gRecentActorUntilSec = gRecentActorCachedAtSec + holdSec;
+
+			spdlog::info(
+				"[TFD][PreCombatGreet] recent actor cached actor={:08X} hold={:.1f}s reason={}",
+				actor->GetFormID(),
+				holdSec,
+				reason ? reason : "unknown");
+		}
+
+		void ClearRecentActor(const char* reason)
+		{
+			if (gRecentActorHandle == 0) {
+				return;
+			}
+
+			spdlog::info(
+				"[TFD][PreCombatGreet] recent actor cleared actorHandle={:08X} reason={}",
+				gRecentActorHandle,
+				reason ? reason : "unknown");
+
+			gRecentActorHandle = 0;
+			gRecentActorCachedAtSec = 0.0;
+			gRecentActorUntilSec = 0.0;
 		}
 
 		void SendBridgeEvent(const char* eventName, RE::TESForm* sender)
@@ -113,7 +155,7 @@ namespace TFD::PreCombatGreet
 
 				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
 				src->SendEvent(&ev);
-				});
+			});
 		}
 
 		struct BridgeEventNames
@@ -195,6 +237,33 @@ namespace TFD::PreCombatGreet
 			return true;
 		}
 
+		void LogInCombatDialogueState(const char* tag, RE::Actor* actor, bool dialogueOpen)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!actor || !player) {
+				return;
+			}
+
+			auto* actorCell = actor->GetParentCell();
+			auto* playerCell = player->GetParentCell();
+			const bool sameCell = actorCell && playerCell && actorCell == playerCell;
+			const float dist = actor->GetPosition().GetDistance(player->GetPosition());
+			const bool hostile = actor->IsHostileToActor(player);
+
+			spdlog::info(
+				"[TFD][InCombatDebug] {} actor={:08X} inCombat={} weaponDrawn={} hostile={} loaded={} sameCell={} pacified={} dialogueOpen={} dist={:.1f}",
+				tag ? tag : "state",
+				actor->GetFormID(),
+				actor->IsInCombat() ? 1 : 0,
+				actor->IsWeaponDrawn() ? 1 : 0,
+				hostile ? 1 : 0,
+				actor->Is3DLoaded() ? 1 : 0,
+				sameCell ? 1 : 0,
+				TFD::Pacify::IsPacified(actor) ? 1 : 0,
+				dialogueOpen ? 1 : 0,
+				dist);
+		}
+
 		void CleanupOne(
 			RE::Actor* actor,
 			Pending& pending,
@@ -202,6 +271,11 @@ namespace TFD::PreCombatGreet
 			const char* reason,
 			TFD::Pacify::ReleaseReason pacifyReason)
 		{
+			if (pending.forceGreetStarted && pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
+				TFD::ForceGreet::Cancel();
+				pending.forceGreetStarted = false;
+			}
+
 			if (pending.pacifySessionId != 0) {
 				TFD::Pacify::ReleaseSession(pending.pacifySessionId, pacifyReason);
 				pending.pacifySessionId = 0;
@@ -297,7 +371,7 @@ namespace TFD::PreCombatGreet
 				"[TFD][PreCombatGreet] player attacked active target -> abort actor={:08X}",
 				targetActor->GetFormID());
 
-			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
+			ClearAllBridgeAliases();
 
 			CleanupOne(targetActor, it->second, kCooldownAfterPlayerAttackSec, "player_attack", TFD::Pacify::ReleaseReason::PlayerAggression);
 			gPending.erase(it);
@@ -365,10 +439,30 @@ namespace TFD::PreCombatGreet
 					continue;
 				}
 
+				if (pending.action == TFD::InteractionRouter::Action::TruceInCombat && now >= pending.nextDebugLogSec) {
+					LogInCombatDialogueState("tick", actor, dialogueOpen);
+					pending.nextDebugLogSec = now + 0.75;
+				}
+
 				if (!TFD::Pacify::IsPacified(actor)) {
+					if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
+						LogInCombatDialogueState("pacify_lost", actor, dialogueOpen);
+					}
 					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::Pacify::ReleaseReason::Generic);
 					it = gPending.erase(it);
 					continue;
+				}
+
+				if (pending.action == TFD::InteractionRouter::Action::TruceInCombat &&
+					pending.dialogueRequested && !pending.forceGreetStarted && !dialogueOpen) {
+					auto* player = RE::PlayerCharacter::GetSingleton();
+					const bool sameCell = player && actor->GetParentCell() && player->GetParentCell() && actor->GetParentCell() == player->GetParentCell();
+					const float dist = player ? actor->GetPosition().GetDistance(player->GetPosition()) : 99999.0f;
+					if (sameCell && dist <= 220.0f && !TFD::ForceGreet::IsActive() && TFD::Pacify::CanOpenDialogue(actor)) {
+						LogInCombatDialogueState("forcegreet_begin", actor, dialogueOpen);
+						TFD::ForceGreet::BeginInCombatTruce(actor);
+						pending.forceGreetStarted = true;
+					}
 				}
 
 				if (pending.dialogueRequested) {
@@ -379,14 +473,20 @@ namespace TFD::PreCombatGreet
 					}
 
 					if (pending.dialogSeen) {
+						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
+							LogInCombatDialogueState("dialogue_closed", actor, dialogueOpen);
+						}
+						CacheRecentActor(actor, kRecentActorHoldSec, "dialogue_closed");
 						CleanupOne(actor, pending, kCooldownAfterDoneSec, "dialogue_closed", TFD::Pacify::ReleaseReason::DialogueClosed);
 						it = gPending.erase(it);
 						continue;
 					}
 				}
 				else {
-					// Tame path: no dialogue. Kalau target sudah balik full combat, lepaskan.
 					if (actor->IsInCombat()) {
+						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
+							LogInCombatDialogueState("tame_broken", actor, dialogueOpen);
+						}
 						CleanupOne(actor, pending, kCooldownAfterFailSec, "tame_broken", TFD::Pacify::ReleaseReason::TameBroken);
 						it = gPending.erase(it);
 						continue;
@@ -464,6 +564,7 @@ namespace TFD::PreCombatGreet
 			std::scoped_lock lk(gLock);
 			ClearAllPendingLocked();
 			gCooldownUntil.clear();
+			ClearRecentActor("shutdown");
 		}
 
 		gSuspended.store(false, std::memory_order_release);
@@ -478,6 +579,7 @@ namespace TFD::PreCombatGreet
 		if (suspended) {
 			std::scoped_lock lk(gLock);
 			ClearAllPendingLocked();
+			ClearRecentActor("suspend");
 		}
 	}
 
@@ -542,6 +644,17 @@ namespace TFD::PreCombatGreet
 		pending.dialogueRequested = result.dialogueRequested;
 		pending.dialogSeen = false;
 		pending.assignSent = false;
+		pending.forceGreetStarted = false;
+		pending.nextDebugLogSec = now;
+
+		if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
+			LogInCombatDialogueState("begin_after_router", actor, IsDialogueOpen());
+			spdlog::info(
+				"[TFD][InCombatDebug] begin session actor={:08X} sessionId={} canOpenDialogue={}",
+				actor->GetFormID(),
+				result.sessionId,
+				TFD::Pacify::CanOpenDialogue(actor) ? 1 : 0);
+		}
 
 		if (result.dialogueRequested) {
 			if (!TFD::Pacify::CanOpenDialogue(actor)) {
@@ -559,11 +672,49 @@ namespace TFD::PreCombatGreet
 
 				SendBridgeEvent(bridge.assign, actor);
 				pending.assignSent = true;
+
+				if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
+					LogInCombatDialogueState("assign_sent", actor, IsDialogueOpen());
+				}
 			}
+		}
+
+		if (result.dialogueRequested) {
+			CacheRecentActor(actor, kRecentActorHoldSec, "begin");
 		}
 
 		gPending.emplace(handle, pending);
 		return true;
+	}
+
+	RE::Actor* GetRecentActor(double maxAgeSec)
+	{
+		std::scoped_lock lk(gLock);
+
+		if (gRecentActorHandle == 0) {
+			return nullptr;
+		}
+
+		const double now = NowSec();
+
+		if (gRecentActorUntilSec > 0.0 && now > gRecentActorUntilSec) {
+			ClearRecentActor("expired");
+			return nullptr;
+		}
+
+		if (maxAgeSec > 0.0 && (now - gRecentActorCachedAtSec) > maxAgeSec) {
+			ClearRecentActor("age_limit");
+			return nullptr;
+		}
+
+		auto sp = RE::Actor::LookupByHandle(gRecentActorHandle);
+		auto* actor = sp.get();
+		if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			ClearRecentActor("invalid_actor");
+			return nullptr;
+		}
+
+		return actor;
 	}
 
 	void OnPreLoadGame()
@@ -571,6 +722,11 @@ namespace TFD::PreCombatGreet
 		SetSuspended(true);
 		CancelAll();
 		gTickPending.clear(std::memory_order_release);
+
+		{
+			std::scoped_lock lk(gLock);
+			ClearRecentActor("pre_load");
+		}
 
 		spdlog::info("[TFD][PreCombatGreet] OnPreLoadGame -> suspended + cleared");
 	}
@@ -581,6 +737,11 @@ namespace TFD::PreCombatGreet
 		SetSuspended(false);
 		gTickPending.clear(std::memory_order_release);
 
+		{
+			std::scoped_lock lk(gLock);
+			ClearRecentActor("post_load");
+		}
+
 		spdlog::info("[TFD][PreCombatGreet] OnPostLoadGame -> resumed clean");
 	}
 
@@ -589,6 +750,7 @@ namespace TFD::PreCombatGreet
 		std::scoped_lock lk(gLock);
 		ClearAllPendingLocked();
 		gCooldownUntil.clear();
+		ClearRecentActor("cancel_all");
 
 		spdlog::info("[TFD][PreCombatGreet] CancelAll");
 	}

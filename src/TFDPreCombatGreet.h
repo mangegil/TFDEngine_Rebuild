@@ -1,6 +1,6 @@
 #pragma once
 
-#include <RE/Skyrim.h>
+#include "RE/Skyrim.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -11,11 +11,10 @@ namespace TFD::PreCombatGreet
 	bool IsSuspended();
 
 	bool BeginForActor(RE::Actor* actor);
+	void CancelAll();
 
 	void OnPreLoadGame();
 	void OnPostLoadGame();
 
-	void CancelAll();
-
-	RE::Actor* GetRecentActor(double maxAgeSec = 0.0);
+	RE::Actor* GetRecentActor(double maxAgeSec);
 }

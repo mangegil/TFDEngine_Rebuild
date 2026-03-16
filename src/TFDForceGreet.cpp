@@ -1,4 +1,4 @@
-﻿#include "TFDForceGreet.h"
+#include "TFDForceGreet.h"
 #include "TFDSettings.h"
 
 #include <RE/Skyrim.h>
@@ -50,6 +50,8 @@ namespace TFD::ForceGreet
 		constexpr float kCaptiveApproachDistanceSq = kCaptiveApproachDistance * kCaptiveApproachDistance;
 		constexpr float kBleedoutApproachDistance = 220.0f;
 		constexpr float kBleedoutApproachDistanceSq = kBleedoutApproachDistance * kBleedoutApproachDistance;
+		constexpr float kInCombatApproachDistance = 220.0f;
+		constexpr float kInCombatApproachDistanceSq = kInCombatApproachDistance * kInCombatApproachDistance;
 		constexpr double kCaptiveSuppressSeconds = 6.0;
 		constexpr double kNormalSuppressSeconds = 1.5;
 
@@ -197,11 +199,21 @@ namespace TFD::ForceGreet
 			const float distSq = DistanceSq3D(speaker, player);
 			outDist = (distSq > 0.0f) ? std::sqrt(distSq) : 0.0f;
 
-			const float maxDistSq =
-				(mode == Mode::CaptiveMarker) ? kCaptiveApproachDistanceSq : kBleedoutApproachDistanceSq;
+			float maxDistSq = kBleedoutApproachDistanceSq;
+			if (mode == Mode::CaptiveMarker) {
+				maxDistSq = kCaptiveApproachDistanceSq;
+			} else if (mode == Mode::InCombatTruce) {
+				maxDistSq = kInCombatApproachDistanceSq;
+			}
 
 			if (distSq > maxDistSq) {
 				return DialogueGateFail::TooFar;
+			}
+
+			// InCombatTruce is intentionally more permissive:
+			// same-cell + close-enough is sufficient even if LOS is flaky.
+			if (mode == Mode::InCombatTruce) {
+				return DialogueGateFail::None;
 			}
 
 			bool los = false;
@@ -237,7 +249,7 @@ namespace TFD::ForceGreet
 			speaker->DrawWeaponMagicHands(false);
 			speaker->SetDialogueWithPlayer(false, false, nullptr);
 
-			if (mode == Mode::Bleedout) {
+			if (mode == Mode::Bleedout || mode == Mode::InCombatTruce) {
 				speaker->EvaluatePackage(true, false);
 			}
 		}
@@ -279,7 +291,7 @@ namespace TFD::ForceGreet
 
 			const bool ok = speaker->SetDialogueWithPlayer(true, true, nullptr);
 
-			if (mode != Mode::CaptiveMarker) {
+			if (mode == Mode::Bleedout || mode == Mode::InCombatTruce) {
 				speaker->EvaluatePackage(true, false);
 			}
 
@@ -480,6 +492,11 @@ namespace TFD::ForceGreet
 		Tick();
 	}
 
+	void BeginInCombatTruce(RE::Actor* speaker)
+	{
+		BeginInternal(speaker, Mode::InCombatTruce, 12, true);
+	}
+
 	void Tick()
 	{
 		Job snap;
@@ -551,8 +568,8 @@ namespace TFD::ForceGreet
 		const auto gate = CanStartDialogueNow(speaker, snap.mode, dist);
 
 		if (gate != DialogueGateFail::None) {
-			if ((snap.mode == Mode::CaptiveMarker || snap.mode == Mode::Bleedout) &&
-				(gate == DialogueGateFail::DifferentCell || gate == DialogueGateFail::TooFar)) {
+			if ((snap.mode == Mode::CaptiveMarker || snap.mode == Mode::InCombatTruce) &&
+				(gate == DialogueGateFail::DifferentCell || gate == DialogueGateFail::TooFar || gate == DialogueGateFail::NoLOS)) {
 				NudgeApproach(speaker);
 			}
 
@@ -568,6 +585,11 @@ namespace TFD::ForceGreet
 		if (snap.mode == Mode::CaptiveMarker) {
 			spdlog::info(
 				"[TFD][ForceGreet] Captive close enough -> start dialogue dist={:.1f} speaker={:08X}",
+				dist,
+				speaker->GetFormID());
+		} else if (snap.mode == Mode::InCombatTruce) {
+			spdlog::info(
+				"[TFD][ForceGreet] InCombat close enough -> start dialogue dist={:.1f} speaker={:08X}",
 				dist,
 				speaker->GetFormID());
 		}
