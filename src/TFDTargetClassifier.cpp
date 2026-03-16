@@ -1,377 +1,509 @@
 #include "TFDTargetClassifier.h"
 
-#include <string_view>
+#include <RE/B/BGSKeyword.h>
+#include <RE/B/BGSListForm.h>
+#include <RE/T/TESDataHandler.h>
+#include <RE/T/TESFile.h>
+#include <RE/T/TESForm.h>
+
+#include <cstdint>
+#include <mutex>
 
 namespace TFD::TargetClassifier
 {
-    namespace
-    {
-        constexpr float kMaxTameDistance = 768.0f;
-        constexpr float kMaxTruceDistance = 1024.0f;
+	namespace
+	{
+		constexpr float kMaxTameDistance = 768.0f;
+		constexpr float kMaxTruceDistance = 1024.0f;
 
-        bool ContainsInsensitive(std::string_view text, std::string_view needle)
-        {
-            if (needle.empty() || text.size() < needle.size()) {
-                return false;
-            }
+		constexpr const char* kPluginName = "TFDEngine.esp";
 
-            for (std::size_t i = 0; i + needle.size() <= text.size(); ++i) {
-                bool match = true;
-                for (std::size_t j = 0; j < needle.size(); ++j) {
-                    char a = text[i + j];
-                    char b = needle[j];
+		// Local FormIDs from TFDEngine.esp
+		constexpr std::uint32_t kDialogueCapableRacesLocalID = 0x00047618;
+		constexpr std::uint32_t kDialogueCapableActorsLocalID = 0x00047619;
+		constexpr std::uint32_t kSimpleCommandRacesLocalID = 0x0004761A;
+		constexpr std::uint32_t kNonverbalIntelligentRacesLocalID = 0x0004761B;
+		constexpr std::uint32_t kBeastRacesLocalID = 0x0004761C;
 
-                    if (a >= 'A' && a <= 'Z') {
-                        a = static_cast<char>(a - 'A' + 'a');
-                    }
-                    if (b >= 'A' && b <= 'Z') {
-                        b = static_cast<char>(b - 'A' + 'a');
-                    }
+		// Skyrim.esm: ActorTypeNPC
+		constexpr RE::FormID kActorTypeNpcFormID = 0x00013794;
 
-                    if (a != b) {
-                        match = false;
-                        break;
-                    }
-                }
+		struct FormLists
+		{
+			RE::BGSListForm* dialogueCapableRaces{ nullptr };
+			RE::BGSListForm* dialogueCapableActors{ nullptr };
+			RE::BGSListForm* simpleCommandRaces{ nullptr };
+			RE::BGSListForm* nonverbalIntelligentRaces{ nullptr };
+			RE::BGSListForm* beastRaces{ nullptr };
+			bool resolved{ false };
+		};
 
-                if (match) {
-                    return true;
-                }
-            }
+		RE::TESNPC* GetActorBase(RE::Actor* actor)
+		{
+			if (!actor) {
+				return nullptr;
+			}
 
-            return false;
-        }
+			return actor->GetActorBase();
+		}
 
-        bool RaceNameContains(RE::Actor* actor, std::string_view needle)
-        {
-            if (!actor) {
-                return false;
-            }
+		RE::TESRace* GetRace(RE::Actor* actor)
+		{
+			auto* base = GetActorBase(actor);
+			if (!base) {
+				return nullptr;
+			}
 
-            auto* base = actor->GetActorBase();
-            if (!base) {
-                return false;
-            }
+			return base->GetRace();
+		}
 
-            auto* race = base->GetRace();
-            if (!race) {
-                return false;
-            }
+		bool IsIgnoredActor(RE::Actor* actor)
+		{
+			return !actor || actor->IsPlayerRef();
+		}
 
-            const char* raceName = race->GetName();
-            if (!raceName) {
-                return false;
-            }
+		RE::BGSKeyword* GetActorTypeNpcKeyword()
+		{
+			static RE::BGSKeyword* cached = nullptr;
+			static bool tried = false;
 
-            return ContainsInsensitive(raceName, needle);
-        }
+			if (tried) {
+				return cached;
+			}
 
-        bool IsIgnoredActor(RE::Actor* actor)
-        {
-            if (!actor) {
-                return true;
-            }
+			tried = true;
+			cached = RE::TESForm::LookupByID<RE::BGSKeyword>(kActorTypeNpcFormID);
+			return cached;
+		}
 
-            if (actor->IsPlayerRef()) {
-                return true;
-            }
+		bool HasSafeNpcKeyword(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
 
-            return false;
-        }
+			auto* kwNpc = GetActorTypeNpcKeyword();
+			if (!kwNpc) {
+				return false;
+			}
 
-        bool IsDragonActor(RE::Actor* actor)
-        {
-            return RaceNameContains(actor, "dragon");
-        }
+			if (auto* race = GetRace(actor); race && race->HasKeyword(kwNpc)) {
+				return true;
+			}
 
-        bool IsGiantActor(RE::Actor* actor)
-        {
-            return RaceNameContains(actor, "giant");
-        }
+			if (auto* base = GetActorBase(actor); base && base->HasKeyword(kwNpc)) {
+				return true;
+			}
 
-        bool IsHumanoidNegotiable(RE::Actor* actor)
-        {
-            if (!actor) {
-                return false;
-            }
+			if (actor->HasKeyword(kwNpc)) {
+				return true;
+			}
 
-            if (IsDragonActor(actor) || IsGiantActor(actor)) {
-                return false;
-            }
+			return false;
+		}
 
-            const bool looksCreature =
-                RaceNameContains(actor, "wolf") ||
-                RaceNameContains(actor, "bear") ||
-                RaceNameContains(actor, "sabre") ||
-                RaceNameContains(actor, "troll") ||
-                RaceNameContains(actor, "spider") ||
-                RaceNameContains(actor, "chaurus") ||
-                RaceNameContains(actor, "atronach") ||
-                RaceNameContains(actor, "hound") ||
-                RaceNameContains(actor, "skeever");
+		bool IsNpcLikeFallback(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
 
-            return !looksCreature;
-        }
+			// Primary safe path: ActorTypeNPC keyword checks
+			if (HasSafeNpcKeyword(actor)) {
+				return true;
+			}
 
-        bool IsNonNegotiableCreature(RE::Actor* actor)
-        {
-            if (!actor) {
-                return false;
-            }
+			// Conservative structural fallback:
+			// if actor has a valid NPC base + race, treat as dialogue-capable.
+			auto* base = GetActorBase(actor);
+			if (!base) {
+				return false;
+			}
 
-            if (IsDragonActor(actor) || IsGiantActor(actor) || IsHumanoidNegotiable(actor)) {
-                return false;
-            }
+			auto* race = base->GetRace();
+			if (!race) {
+				return false;
+			}
 
-            return
-                RaceNameContains(actor, "wolf") ||
-                RaceNameContains(actor, "bear") ||
-                RaceNameContains(actor, "sabre") ||
-                RaceNameContains(actor, "troll") ||
-                RaceNameContains(actor, "spider") ||
-                RaceNameContains(actor, "chaurus") ||
-                RaceNameContains(actor, "skeever") ||
-                RaceNameContains(actor, "atronach") ||
-                RaceNameContains(actor, "hound");
-        }
+			return true;
+		}
 
-        bool IsDistanceTooFarForTame(float distanceToPlayer)
-        {
-            return distanceToPlayer > kMaxTameDistance;
-        }
+		bool IsDistanceTooFarForTame(float distanceToPlayer)
+		{
+			return distanceToPlayer > kMaxTameDistance;
+		}
 
-        bool IsDistanceTooFarForTruce(float distanceToPlayer)
-        {
-            return distanceToPlayer > kMaxTruceDistance;
-        }
-    }
+		bool IsDistanceTooFarForTruce(float distanceToPlayer)
+		{
+			return distanceToPlayer > kMaxTruceDistance;
+		}
 
-    bool IsValidActor(RE::Actor* actor)
-    {
-        if (!actor) {
-            return false;
-        }
+		RE::FormID ResolveRuntimeFormID(std::uint32_t localFormID)
+		{
+			auto* dataHandler = RE::TESDataHandler::GetSingleton();
+			if (!dataHandler) {
+				return 0;
+			}
 
-        if (actor->IsPlayerRef()) {
-            return false;
-        }
+			auto* mod = dataHandler->LookupLoadedModByName(kPluginName);
+			if (!mod) {
+				return 0;
+			}
 
-        if (actor->IsDead()) {
-            return false;
-        }
+			localFormID &= 0x00FFFFFF;
 
-        if (IsIgnoredActor(actor)) {
-            return false;
-        }
+			// Regular plugin
+			if (mod->compileIndex != static_cast<std::uint32_t>(-1) &&
+				mod->compileIndex != 0xFF) {
+				return (static_cast<RE::FormID>(mod->compileIndex) << 24) | localFormID;
+			}
 
-        return true;
-    }
+			// Light plugin / ESL-style slot
+			if (mod->smallFileCompileIndex != static_cast<std::uint32_t>(-1) &&
+				mod->smallFileCompileIndex != 0xFFFF) {
+				return 0xFE000000 |
+					((static_cast<RE::FormID>(mod->smallFileCompileIndex) & 0xFFF) << 12) |
+					(localFormID & 0x00000FFF);
+			}
 
-    bool IsNegotiable(RE::Actor* actor)
-    {
-        if (!IsValidActor(actor)) {
-            return false;
-        }
+			return 0;
+		}
 
-        if (IsDragonActor(actor)) {
-            return true;
-        }
+		template <class T>
+		T* LookupOwnForm(std::uint32_t localFormID)
+		{
+			const auto runtimeFormID = ResolveRuntimeFormID(localFormID);
+			if (!runtimeFormID) {
+				return nullptr;
+			}
 
-        if (IsGiantActor(actor)) {
-            return true;
-        }
+			return RE::TESForm::LookupByID<T>(runtimeFormID);
+		}
 
-        if (IsHumanoidNegotiable(actor)) {
-            return true;
-        }
+		bool ListHasForm(RE::BGSListForm* list, RE::TESForm* form)
+		{
+			return list && form && list->HasForm(form);
+		}
 
-        return false;
-    }
+		bool ListHasActor(RE::BGSListForm* list, RE::Actor* actor)
+		{
+			if (!list || !actor) {
+				return false;
+			}
 
-    bool IsCreature(RE::Actor* actor)
-    {
-        if (!IsValidActor(actor)) {
-            return false;
-        }
+			if (list->HasForm(actor)) {
+				return true;
+			}
 
-        if (IsNegotiable(actor)) {
-            return false;
-        }
+			auto* base = GetActorBase(actor);
+			if (base && list->HasForm(base)) {
+				return true;
+			}
 
-        if (IsNonNegotiableCreature(actor)) {
-            return true;
-        }
+			return false;
+		}
 
-        return false;
-    }
+		FormLists& GetFormLists()
+		{
+			static FormLists lists;
+			static std::once_flag initFlag;
 
-    bool CanUseTruce(RE::Actor* actor)
-    {
-        if (!IsValidActor(actor)) {
-            return false;
-        }
+			std::call_once(initFlag, []() {
+				lists.dialogueCapableRaces =
+					LookupOwnForm<RE::BGSListForm>(kDialogueCapableRacesLocalID);
+				lists.dialogueCapableActors =
+					LookupOwnForm<RE::BGSListForm>(kDialogueCapableActorsLocalID);
+				lists.simpleCommandRaces =
+					LookupOwnForm<RE::BGSListForm>(kSimpleCommandRacesLocalID);
+				lists.nonverbalIntelligentRaces =
+					LookupOwnForm<RE::BGSListForm>(kNonverbalIntelligentRacesLocalID);
+				lists.beastRaces =
+					LookupOwnForm<RE::BGSListForm>(kBeastRacesLocalID);
 
-        if (!IsNegotiable(actor)) {
-            return false;
-        }
+				lists.resolved = true;
+				});
 
-        return true;
-    }
+			return lists;
+		}
 
-    bool CanUseTame(RE::Actor* actor)
-    {
-        if (!IsValidActor(actor)) {
-            return false;
-        }
+		CreatureClass GetByExplicitLists(RE::Actor* actor)
+		{
+			if (!actor) {
+				return CreatureClass::None;
+			}
 
-        if (!IsCreature(actor)) {
-            return false;
-        }
+			auto& lists = GetFormLists();
 
-        return true;
-    }
+			if (ListHasActor(lists.dialogueCapableActors, actor)) {
+				return CreatureClass::FullDialogue;
+			}
 
-    ClassifyResult ClassifyForHotkey(
-        RE::Actor* player,
-        RE::Actor* target,
-        bool isCaptivePhase,
-        bool targetInCombat,
-        float distanceToPlayer)
-    {
-        ClassifyResult result{};
+			auto* race = GetRace(actor);
+			if (!race) {
+				return CreatureClass::None;
+			}
 
-        if (!player || !target) {
-            result.valid = false;
-            result.rejectReason = RejectReason::InvalidActor;
-            return result;
-        }
+			if (ListHasForm(lists.dialogueCapableRaces, race)) {
+				return CreatureClass::FullDialogue;
+			}
 
-        if (isCaptivePhase) {
-            result.valid = false;
-            result.rejectReason = RejectReason::CaptiveOnlyMode;
-            return result;
-        }
+			if (ListHasForm(lists.simpleCommandRaces, race)) {
+				return CreatureClass::SimpleCommand;
+			}
 
-        if (!IsValidActor(target)) {
-            result.valid = false;
-            result.rejectReason = RejectReason::InvalidActor;
-            return result;
-        }
+			if (ListHasForm(lists.nonverbalIntelligentRaces, race)) {
+				return CreatureClass::NonverbalIntelligent;
+			}
 
-        if (IsNegotiable(target)) {
-            if (!CanUseTruce(target)) {
-                result.valid = false;
-                result.rejectReason = RejectReason::NotNegotiable;
-                return result;
-            }
+			if (ListHasForm(lists.beastRaces, race)) {
+				return CreatureClass::Beast;
+			}
 
-            if (IsDistanceTooFarForTruce(distanceToPlayer)) {
-                result.valid = false;
-                result.rejectReason = RejectReason::TooFar;
-                return result;
-            }
+			return CreatureClass::None;
+		}
+	}
 
-            result.kind = TargetKind::Negotiable;
-            result.intent = InteractionIntent::Truce;
-            result.rejectReason = RejectReason::None;
-            result.valid = true;
-            result.negotiable = true;
-            result.tameable = false;
-            result.allowDialogue = true;
-            result.requiresPreCombat = false;
-            result.allowsInCombat = true;
-            return result;
-        }
+	bool IsValidActor(RE::Actor* actor)
+	{
+		if (!actor) {
+			return false;
+		}
 
-        if (IsCreature(target)) {
-            if (!CanUseTame(target)) {
-                result.valid = false;
-                result.rejectReason = RejectReason::NotCreature;
-                return result;
-            }
+		if (actor->IsDead()) {
+			return false;
+		}
 
-            if (targetInCombat) {
-                result.valid = false;
-                result.rejectReason = RejectReason::TameRequiresPreCombat;
-                return result;
-            }
+		if (IsIgnoredActor(actor)) {
+			return false;
+		}
 
-            if (IsDistanceTooFarForTame(distanceToPlayer)) {
-                result.valid = false;
-                result.rejectReason = RejectReason::TooFar;
-                return result;
-            }
+		return true;
+	}
 
-            result.kind = TargetKind::Creature;
-            result.intent = InteractionIntent::Tame;
-            result.rejectReason = RejectReason::None;
-            result.valid = true;
-            result.negotiable = false;
-            result.tameable = true;
-            result.allowDialogue = false;
-            result.requiresPreCombat = true;
-            result.allowsInCombat = false;
-            return result;
-        }
+	CreatureClass GetCreatureClass(RE::Actor* actor)
+	{
+		if (!IsValidActor(actor)) {
+			return CreatureClass::None;
+		}
 
-        result.kind = TargetKind::Ignore;
-        result.intent = InteractionIntent::None;
-        result.rejectReason = RejectReason::UnsafeState;
-        result.valid = false;
-        return result;
-    }
+		const auto listedClass = GetByExplicitLists(actor);
+		if (listedClass != CreatureClass::None) {
+			return listedClass;
+		}
 
-    const char* ToString(TargetKind value)
-    {
-        switch (value) {
-        case TargetKind::None:
-            return "None";
-        case TargetKind::Negotiable:
-            return "Negotiable";
-        case TargetKind::Creature:
-            return "Creature";
-        case TargetKind::Ignore:
-            return "Ignore";
-        default:
-            return "Unknown";
-        }
-    }
+		// Safe fallback only.
+		// DO NOT call actor->IsHumanoid() here; it can crash on some live actors.
+		if (IsNpcLikeFallback(actor)) {
+			return CreatureClass::FullDialogue;
+		}
 
-    const char* ToString(InteractionIntent value)
-    {
-        switch (value) {
-        case InteractionIntent::None:
-            return "None";
-        case InteractionIntent::Tame:
-            return "Tame";
-        case InteractionIntent::Truce:
-            return "Truce";
-        default:
-            return "Unknown";
-        }
-    }
+		return CreatureClass::UnknownFallback;
+	}
 
-    const char* ToString(RejectReason value)
-    {
-        switch (value) {
-        case RejectReason::None:
-            return "None";
-        case RejectReason::InvalidActor:
-            return "InvalidActor";
-        case RejectReason::NotNegotiable:
-            return "NotNegotiable";
-        case RejectReason::NotCreature:
-            return "NotCreature";
-        case RejectReason::TameRequiresPreCombat:
-            return "TameRequiresPreCombat";
-        case RejectReason::TooFar:
-            return "TooFar";
-        case RejectReason::UnsafeState:
-            return "UnsafeState";
-        case RejectReason::CaptiveOnlyMode:
-            return "CaptiveOnlyMode";
-        default:
-            return "Unknown";
-        }
-    }
+	bool IsNegotiable(RE::Actor* actor)
+	{
+		return GetCreatureClass(actor) == CreatureClass::FullDialogue;
+	}
+
+	bool IsCreature(RE::Actor* actor)
+	{
+		switch (GetCreatureClass(actor)) {
+		case CreatureClass::SimpleCommand:
+		case CreatureClass::NonverbalIntelligent:
+		case CreatureClass::Beast:
+		case CreatureClass::UnknownFallback:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	bool CanUseTruce(RE::Actor* actor)
+	{
+		if (!IsValidActor(actor)) {
+			return false;
+		}
+
+		return GetCreatureClass(actor) != CreatureClass::None;
+	}
+
+	bool CanUseTame(RE::Actor* actor)
+	{
+		if (!IsValidActor(actor)) {
+			return false;
+		}
+
+		return IsCreature(actor);
+	}
+
+	ClassifyResult ClassifyForHotkey(
+		RE::Actor* player,
+		RE::Actor* target,
+		bool isCaptivePhase,
+		bool targetInCombat,
+		float distanceToPlayer)
+	{
+		ClassifyResult result{};
+
+		if (!player || !target) {
+			result.valid = false;
+			result.rejectReason = RejectReason::InvalidActor;
+			return result;
+		}
+
+		if (isCaptivePhase) {
+			result.valid = false;
+			result.rejectReason = RejectReason::CaptiveOnlyMode;
+			return result;
+		}
+
+		if (!IsValidActor(target)) {
+			result.valid = false;
+			result.rejectReason = RejectReason::InvalidActor;
+			return result;
+		}
+
+		result.creatureClass = GetCreatureClass(target);
+
+		if (result.creatureClass == CreatureClass::FullDialogue) {
+			if (IsDistanceTooFarForTruce(distanceToPlayer)) {
+				result.valid = false;
+				result.rejectReason = RejectReason::TooFar;
+				return result;
+			}
+
+			result.kind = TargetKind::Negotiable;
+			result.intent = InteractionIntent::Truce;
+			result.rejectReason = RejectReason::None;
+			result.valid = true;
+			result.negotiable = true;
+			result.tameable = false;
+			result.allowDialogue = true;
+			result.requiresPreCombat = false;
+			result.allowsInCombat = true;
+			return result;
+		}
+
+		if (result.creatureClass == CreatureClass::SimpleCommand ||
+			result.creatureClass == CreatureClass::NonverbalIntelligent ||
+			result.creatureClass == CreatureClass::Beast ||
+			result.creatureClass == CreatureClass::UnknownFallback) {
+
+			if (targetInCombat) {
+				if (IsDistanceTooFarForTruce(distanceToPlayer)) {
+					result.valid = false;
+					result.rejectReason = RejectReason::TooFar;
+					return result;
+				}
+
+				result.kind = TargetKind::Creature;
+				result.intent = InteractionIntent::Truce;
+				result.rejectReason = RejectReason::None;
+				result.valid = true;
+				result.negotiable = false;
+				result.tameable = true;
+				result.allowDialogue = false;
+				result.requiresPreCombat = false;
+				result.allowsInCombat = true;
+				return result;
+			}
+
+			if (IsDistanceTooFarForTame(distanceToPlayer)) {
+				result.valid = false;
+				result.rejectReason = RejectReason::TooFar;
+				return result;
+			}
+
+			result.kind = TargetKind::Creature;
+			result.intent = InteractionIntent::Tame;
+			result.rejectReason = RejectReason::None;
+			result.valid = true;
+			result.negotiable = false;
+			result.tameable = true;
+			result.allowDialogue = false;
+			result.requiresPreCombat = true;
+			result.allowsInCombat = false;
+			return result;
+		}
+
+		result.kind = TargetKind::Ignore;
+		result.intent = InteractionIntent::None;
+		result.rejectReason = RejectReason::UnsafeState;
+		result.valid = false;
+		return result;
+	}
+
+	const char* ToString(TargetKind value)
+	{
+		switch (value) {
+		case TargetKind::None:
+			return "None";
+		case TargetKind::Negotiable:
+			return "Negotiable";
+		case TargetKind::Creature:
+			return "Creature";
+		case TargetKind::Ignore:
+			return "Ignore";
+		default:
+			return "Unknown";
+		}
+	}
+
+	const char* ToString(InteractionIntent value)
+	{
+		switch (value) {
+		case InteractionIntent::None:
+			return "None";
+		case InteractionIntent::Tame:
+			return "Tame";
+		case InteractionIntent::Truce:
+			return "Truce";
+		default:
+			return "Unknown";
+		}
+	}
+
+	const char* ToString(RejectReason value)
+	{
+		switch (value) {
+		case RejectReason::None:
+			return "None";
+		case RejectReason::InvalidActor:
+			return "InvalidActor";
+		case RejectReason::NotNegotiable:
+			return "NotNegotiable";
+		case RejectReason::NotCreature:
+			return "NotCreature";
+		case RejectReason::TameRequiresPreCombat:
+			return "TameRequiresPreCombat";
+		case RejectReason::TooFar:
+			return "TooFar";
+		case RejectReason::UnsafeState:
+			return "UnsafeState";
+		case RejectReason::CaptiveOnlyMode:
+			return "CaptiveOnlyMode";
+		default:
+			return "Unknown";
+		}
+	}
+
+	const char* ToString(CreatureClass value)
+	{
+		switch (value) {
+		case CreatureClass::None:
+			return "None";
+		case CreatureClass::FullDialogue:
+			return "FullDialogue";
+		case CreatureClass::SimpleCommand:
+			return "SimpleCommand";
+		case CreatureClass::NonverbalIntelligent:
+			return "NonverbalIntelligent";
+		case CreatureClass::Beast:
+			return "Beast";
+		case CreatureClass::UnknownFallback:
+			return "UnknownFallback";
+		default:
+			return "Unknown";
+		}
+	}
 }

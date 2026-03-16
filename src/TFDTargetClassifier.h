@@ -33,11 +33,22 @@ namespace TFD::TargetClassifier
         CaptiveOnlyMode
     };
 
+    enum class CreatureClass : std::uint8_t
+    {
+        None = 0,
+        FullDialogue,
+        SimpleCommand,
+        NonverbalIntelligent,
+        Beast,
+        UnknownFallback
+    };
+
     struct ClassifyResult
     {
         TargetKind kind{ TargetKind::None };
         InteractionIntent intent{ InteractionIntent::None };
         RejectReason rejectReason{ RejectReason::None };
+        CreatureClass creatureClass{ CreatureClass::None };
 
         bool valid{ false };
         bool negotiable{ false };
@@ -53,6 +64,8 @@ namespace TFD::TargetClassifier
     bool IsNegotiable(RE::Actor* actor);
     bool IsCreature(RE::Actor* actor);
 
+    CreatureClass GetCreatureClass(RE::Actor* actor);
+
     bool CanUseTruce(RE::Actor* actor);
     bool CanUseTame(RE::Actor* actor);
 
@@ -66,4 +79,5 @@ namespace TFD::TargetClassifier
     const char* ToString(TargetKind value);
     const char* ToString(InteractionIntent value);
     const char* ToString(RejectReason value);
+    const char* ToString(CreatureClass value);
 }
