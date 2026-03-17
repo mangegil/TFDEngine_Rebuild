@@ -588,9 +588,13 @@ namespace TFD::PreCombatGreet
 		return gSuspended.load(std::memory_order_acquire);
 	}
 
-	bool BeginForActor(RE::Actor* actor)
+	bool BeginForActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
+
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::None;
+		}
 
 		if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
 			return false;
@@ -610,7 +614,11 @@ namespace TFD::PreCombatGreet
 			return false;
 		}
 
-		if (gPending.find(handle) != gPending.end()) {
+		auto existingIt = gPending.find(handle);
+		if (existingIt != gPending.end()) {
+			if (outAction) {
+				*outAction = existingIt->second.action;
+			}
 			return true;
 		}
 
@@ -628,6 +636,10 @@ namespace TFD::PreCombatGreet
 			result.executed ? 1 : 0,
 			result.dialogueRequested ? 1 : 0,
 			TFD::InteractionRouter::ToString(result.failReason));
+
+		if (outAction) {
+			*outAction = result.action;
+		}
 
 		if (!result.executed || result.sessionId == 0) {
 			return false;

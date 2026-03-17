@@ -420,19 +420,38 @@ namespace TFD::TargetClassifier
 
         if (CreatureClassSupportsDialogueOverlay(result.creatureClass)) {
             if (targetInCombat) {
-                if (IsDistanceTooFarForTruce(distanceToPlayer)) {
+                if (allowDialogue) {
+                    if (IsDistanceTooFarForTruce(distanceToPlayer)) {
+                        result.valid = false;
+                        result.rejectReason = RejectReason::TooFar;
+                        return result;
+                    }
+
+                    result.kind = TargetKind::Creature;
+                    result.intent = InteractionIntent::Truce;
+                    result.rejectReason = RejectReason::None;
+                    result.valid = true;
+                    result.negotiable = true;
+                    result.tameable = true;
+                    result.allowDialogue = true;
+                    result.requiresPreCombat = false;
+                    result.allowsInCombat = true;
+                    return result;
+                }
+
+                if (IsDistanceTooFarForTame(distanceToPlayer)) {
                     result.valid = false;
                     result.rejectReason = RejectReason::TooFar;
                     return result;
                 }
 
                 result.kind = TargetKind::Creature;
-                result.intent = InteractionIntent::Truce;
+                result.intent = InteractionIntent::Tame;
                 result.rejectReason = RejectReason::None;
                 result.valid = true;
-                result.negotiable = allowDialogue;
+                result.negotiable = false;
                 result.tameable = true;
-                result.allowDialogue = allowDialogue;
+                result.allowDialogue = false;
                 result.requiresPreCombat = false;
                 result.allowsInCombat = true;
                 return result;

@@ -753,15 +753,19 @@ namespace TFDMenu
             }
 
             if (classify.intent == TFD::TargetClassifier::InteractionIntent::Tame &&
-                !inCombat &&
-                front &&
                 entry.dist <= 768.0f) {
                 if (outMode) {
                     *outMode = HotkeyPickMode::Tame;
                 }
 
-                float score = 30000.0f;
+                float score = inCombat ? 32000.0f : 30000.0f;
                 score -= entry.dist;
+                if (front) {
+                    score += 300.0f;
+                }
+                if (entry.hostile) {
+                    score += 250.0f;
+                }
                 if (weaponDrawn) {
                     score += 350.0f;
                 }

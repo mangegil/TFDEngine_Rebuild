@@ -1,6 +1,3 @@
-#include "TFDForceGreet.h"
-#include "TFDSettings.h"
-
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 
@@ -12,6 +9,9 @@
 #include <mutex>
 
 #include <spdlog/spdlog.h>
+#include "TFDForceGreet.h"
+#include "TFDSettings.h"
+#include "TFDPacify.h"
 
 namespace TFD::ForceGreet
 {
@@ -273,6 +273,10 @@ namespace TFD::ForceGreet
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			if (!player) {
 				return false;
+			}
+
+			if (TFD::Pacify::IsPacified(speaker) && TFD::Pacify::CanOpenDialogue(speaker)) {
+				return true;
 			}
 
 			if (speaker->IsHostileToActor(player)) {

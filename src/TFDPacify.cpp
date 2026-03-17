@@ -34,8 +34,10 @@ namespace TFD::Pacify
         constexpr double kArmedGraceSec = 1.25;
         constexpr double kArmedDebounceSec = 0.50;
         constexpr double kTooFarDebounceSec = 1.25;
+        constexpr double kTameTooFarDebounceSec = 3.00;
+        constexpr double kTameInitialTooFarGraceSec = 2.50;
 
-        constexpr float kTameMaxDistance = 1400.0f;
+        constexpr float kTameMaxDistance = 2200.0f;
         constexpr float kTruceNonDialogueMaxDistance = 2200.0f;
 
         RE::Actor* ResolveActor(RE::FormID actorId)
@@ -358,9 +360,15 @@ namespace TFD::Pacify
                     kTruceNonDialogueMaxDistance;
 
                 if (!sameCell || distance > maxDistance) {
-                    if (session.tooFarSinceSec <= 0.0) {
+                    const bool isTame = session.primaryMode == Mode::Tame;
+                    const double debounceSec = isTame ? kTameTooFarDebounceSec : kTooFarDebounceSec;
+                    const double initialGraceSec = isTame ? kTameInitialTooFarGraceSec : 0.0;
+
+                    if (isTame && (nowSec - session.startTimeSec) < initialGraceSec) {
+                        session.tooFarSinceSec = 0.0;
+                    } else if (session.tooFarSinceSec <= 0.0) {
                         session.tooFarSinceSec = nowSec;
-                    } else if ((nowSec - session.tooFarSinceSec) >= kTooFarDebounceSec) {
+                    } else if ((nowSec - session.tooFarSinceSec) >= debounceSec) {
                         return ReleaseReason::TooFar;
                     }
                 } else {

@@ -2,6 +2,8 @@
 
 #include "RE/Skyrim.h"
 
+#include "TFDInteractionRouter.h"
+
 namespace TFD::PreCombatGreet
 {
 	void Install();
@@ -10,7 +12,7 @@ namespace TFD::PreCombatGreet
 	void SetSuspended(bool suspended);
 	bool IsSuspended();
 
-	bool BeginForActor(RE::Actor* actor);
+	bool BeginForActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction = nullptr);
 	void CancelAll();
 
 	void OnPreLoadGame();
