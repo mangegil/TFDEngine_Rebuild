@@ -26,6 +26,8 @@ namespace TFD::ForceGreet
 
 			double endTimeSec{ 0.0 };
 			double nextTrySec{ 0.0 };
+			double pendingOpenUntilSec{ 0.0 };
+			bool pendingOpen{ false };
 
 			bool active{ false };
 			bool success{ false };
@@ -54,6 +56,8 @@ namespace TFD::ForceGreet
 		constexpr float kInCombatApproachDistanceSq = kInCombatApproachDistance * kInCombatApproachDistance;
 		constexpr double kCaptiveSuppressSeconds = 6.0;
 		constexpr double kNormalSuppressSeconds = 1.5;
+		constexpr double kBleedoutPendingOpenRetrySeconds = 1.20;
+		constexpr double kInCombatPendingOpenRetrySeconds = 0.85;
 
 		enum class DialogueGateFail
 		{
@@ -254,6 +258,33 @@ namespace TFD::ForceGreet
 			}
 		}
 
+		double PendingOpenRetrySeconds(Mode mode)
+		{
+			switch (mode) {
+			case Mode::Bleedout:
+				return kBleedoutPendingOpenRetrySeconds;
+			case Mode::InCombatTruce:
+				return kInCombatPendingOpenRetrySeconds;
+			default:
+				return 0.0;
+			}
+		}
+
+		void ArmPendingOpenRetry(RE::Actor* speaker, Mode mode, double now)
+		{
+			const double delay = PendingOpenRetrySeconds(mode);
+			if (delay <= 0.0) {
+				return;
+			}
+
+			std::scoped_lock lk(lock);
+			if (job.active && speaker && job.speakerHandle == speaker->GetHandle().native_handle() && job.mode == mode) {
+				job.pendingOpen = true;
+				job.pendingOpenUntilSec = now + delay;
+				job.nextTrySec = now + delay;
+			}
+		}
+
 		RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
 		{
 			if (!actor) {
@@ -369,6 +400,8 @@ namespace TFD::ForceGreet
 				job.mode = mode;
 				job.endTimeSec = now + static_cast<double>(windowSeconds);
 				job.nextTrySec = now;
+				job.pendingOpenUntilSec = 0.0;
+				job.pendingOpen = false;
 				job.active = true;
 				job.success = false;
 			}
@@ -381,7 +414,10 @@ namespace TFD::ForceGreet
 				immediateStart ? "true" : "false");
 
 			if (immediateStart) {
-				TryStartDialogue(speaker, mode);
+				const bool started = TryStartDialogue(speaker, mode);
+				if (started) {
+					ArmPendingOpenRetry(speaker, mode, now);
+				}
 			}
 		}
 
@@ -390,6 +426,8 @@ namespace TFD::ForceGreet
 			job.success = true;
 			job.active = false;
 			job.mode = Mode::None;
+			job.pendingOpen = false;
+			job.pendingOpenUntilSec = 0.0;
 		}
 
 		class MenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
@@ -440,15 +478,12 @@ namespace TFD::ForceGreet
 							else {
 								suppressUntilSec = now + kNormalSuppressSeconds;
 								spdlog::info("[TFD][ForceGreet] Dialogue closed -> suppress");
-
-								if (stickyMode == Mode::InCombatTruce) {
+								if (stickyMode == Mode::InCombatTruce && speaker) {
 									const bool released = TFD::Pacify::ReleaseActiveTruceSessionForActor(
 										speaker,
-										TFD::Pacify::ReleaseReason::DialogueClosed);
-									spdlog::info(
-										"[TFD][ForceGreet] Truce dialogue closed -> release={} speaker={:08X}",
-										released ? 1 : 0,
-										speaker ? speaker->GetFormID() : 0);
+										TFD::Pacify::ReleaseReason::DialogueClosed,
+										true);
+									spdlog::info("[TFD][ForceGreet] Truce dialogue closed -> release={}", released ? 1 : 0);
 								}
 							}
 						}
@@ -582,6 +617,8 @@ namespace TFD::ForceGreet
 				job.active = false;
 				job.mode = Mode::None;
 				job.speakerHandle = 0;
+				job.pendingOpen = false;
+				job.pendingOpenUntilSec = 0.0;
 			}
 
 			spdlog::info("[TFD][ForceGreet] Timed out mode={}", static_cast<int>(snap.mode));
@@ -590,6 +627,19 @@ namespace TFD::ForceGreet
 				ClearCaptiveAliases(speaker, "timeout");
 			}
 			return;
+		}
+
+		if (snap.pendingOpen) {
+			if (now < snap.pendingOpenUntilSec) {
+				return;
+			}
+			std::scoped_lock lk(lock);
+			if (job.active && job.speakerHandle == snap.speakerHandle && job.mode == snap.mode) {
+				job.pendingOpen = false;
+				if (job.nextTrySec < now) {
+					job.nextTrySec = now;
+				}
+			}
 		}
 
 		if (now < snap.nextTrySec) {
@@ -610,6 +660,8 @@ namespace TFD::ForceGreet
 				job.active = false;
 				job.mode = Mode::None;
 				job.speakerHandle = 0;
+				job.pendingOpen = false;
+				job.pendingOpenUntilSec = 0.0;
 			}
 
 			spdlog::info("[TFD][ForceGreet] Speaker lost -> cancel");
@@ -626,6 +678,8 @@ namespace TFD::ForceGreet
 				job.active = false;
 				job.mode = Mode::None;
 				job.speakerHandle = 0;
+				job.pendingOpen = false;
+				job.pendingOpenUntilSec = 0.0;
 			}
 
 			spdlog::info(
@@ -665,7 +719,10 @@ namespace TFD::ForceGreet
 				speaker->GetFormID());
 		}
 
-		TryStartDialogue(speaker, snap.mode);
+		const bool started = TryStartDialogue(speaker, snap.mode);
+		if (started) {
+			ArmPendingOpenRetry(speaker, snap.mode, now);
+		}
 	}
 
 	void Cancel()

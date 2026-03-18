@@ -24,8 +24,7 @@ namespace TFD::Pacify
         PlayerArmed,
         DialogueClosed,
         TooFar,
-        TameBroken,
-        TruceClusterLost
+        TameBroken
     };
 
     struct Entry
@@ -105,7 +104,10 @@ namespace TFD::Pacify
         float radius);
 
     void ReleaseSession(RE::FormID sessionId, ReleaseReason reason = ReleaseReason::Generic);
-    bool ReleaseActiveTruceSessionForActor(RE::Actor* actor, ReleaseReason reason = ReleaseReason::DialogueClosed);
+    bool ReleaseActiveTruceSessionForActor(
+        RE::Actor* actor,
+        ReleaseReason reason = ReleaseReason::DialogueClosed,
+        bool onlyIfStillHostile = false);
     void ReleaseAll();
 
     const char* ToString(Mode mode);

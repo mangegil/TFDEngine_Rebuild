@@ -2,7 +2,6 @@
 
 #include "TFDActorScan.h"
 #include "TFDSettings.h"
-#include "TFDTargetClassifier.h"
 
 #include <algorithm>
 #include <chrono>
@@ -30,8 +29,6 @@ namespace TFD::Pacify
         std::unordered_map<RE::FormID, Session> g_sessions;
         std::unordered_map<RE::FormID, TruceState> g_truceState;
         RE::FormID g_nextSessionId = 1;
-
-        RE::Actor* ResolveActor(RE::FormID actorId);
 
         const char* GetAssignEventName(Mode mode)
         {
@@ -74,81 +71,6 @@ namespace TFD::Pacify
             src->SendEvent(&e);
         }
 
-        std::vector<RE::FormID> CollectSessionActorIds(RE::FormID sessionId, RE::FormID primaryTargetId)
-        {
-            std::vector<RE::FormID> actorIds;
-            actorIds.reserve(g_entries.size());
-
-            for (const auto& [actorId, entry] : g_entries) {
-                if (entry.sessionId == sessionId) {
-                    actorIds.push_back(actorId);
-                }
-            }
-
-            std::sort(actorIds.begin(), actorIds.end(), [primaryTargetId](RE::FormID a, RE::FormID b) {
-                if (a == primaryTargetId) {
-                    return true;
-                }
-                if (b == primaryTargetId) {
-                    return false;
-                }
-                return a < b;
-            });
-
-            return actorIds;
-        }
-
-        std::size_t DispatchEventsToActors(const char* eventName, const std::vector<RE::FormID>& actorIds)
-        {
-            if (!eventName || actorIds.empty()) {
-                return 0;
-            }
-
-            std::size_t sent = 0;
-            for (RE::FormID actorId : actorIds) {
-                if (auto* actor = ResolveActor(actorId)) {
-                    SendModEvent(eventName, actor);
-                    ++sent;
-                }
-            }
-            return sent;
-        }
-
-        void DispatchAssignEventsForSession(Mode mode, RE::FormID sessionId, RE::FormID primaryTargetId)
-        {
-            const char* eventName = GetAssignEventName(mode);
-            if (!eventName) {
-                return;
-            }
-
-            const auto actorIds = CollectSessionActorIds(sessionId, primaryTargetId);
-            if (actorIds.empty()) {
-                return;
-            }
-
-            const auto sent = DispatchEventsToActors(eventName, actorIds);
-            spdlog::info("TFDPacify: assign events event={} session={} sent={} primary={:08X}",
-                eventName,
-                sessionId,
-                sent,
-                primaryTargetId);
-        }
-
-        void DispatchUnassignEventsForSession(Mode mode, RE::FormID sessionId, const std::vector<RE::FormID>& actorIds, RE::FormID primaryTargetId)
-        {
-            const char* eventName = GetUnassignEventName(mode);
-            if (!eventName) {
-                return;
-            }
-
-            const auto sent = DispatchEventsToActors(eventName, actorIds);
-            spdlog::info("TFDPacify: unassign events event={} session={} sent={} primary={:08X}",
-                eventName,
-                sessionId,
-                sent,
-                primaryTargetId);
-        }
-
 
         double PacifyNowSec()
         {
@@ -170,8 +92,11 @@ namespace TFD::Pacify
         constexpr float kTameStartleDistance = 180.0f;
         constexpr float kTameStartleRushSpeedPerSec = 260.0f;
         constexpr float kTruceNonDialogueMaxDistance = 2200.0f;
-        constexpr float kTruceClusterRadiusMin = 1800.0f;
-        constexpr float kTruceClusterRadiusMax = 4096.0f;
+        constexpr double kTameStartleGraceSec = 2.5;
+        constexpr std::size_t kCrowdAliasCap = 10;
+
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
+        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
 
         RE::Actor* ResolveActor(RE::FormID actorId)
         {
@@ -180,6 +105,81 @@ namespace TFD::Pacify
             }
 
             return RE::TESForm::LookupByID<RE::Actor>(actorId);
+        }
+
+        std::size_t SendModEventToActors(const char* eventName, const std::vector<RE::FormID>& actorIds)
+        {
+            if (!eventName) {
+                return 0;
+            }
+
+            std::size_t sent = 0;
+            for (RE::FormID actorId : actorIds) {
+                if (auto* actor = ResolveActor(actorId)) {
+                    SendModEvent(eventName, actor);
+                    ++sent;
+                }
+            }
+            return sent;
+        }
+
+        std::vector<RE::FormID> SelectCrowdEventTargets(
+            const std::vector<RE::FormID>& actorIds,
+            RE::Actor* player,
+            RE::FormID primaryTargetId)
+        {
+            if (actorIds.empty()) {
+                return {};
+            }
+
+            struct Candidate
+            {
+                RE::FormID actorId{ 0 };
+                bool isPrimary{ false };
+                bool targetingPlayer{ false };
+                float distanceToPlayer{ 999999.0f };
+            };
+
+            std::vector<Candidate> candidates;
+            candidates.reserve(actorIds.size());
+            for (auto actorId : actorIds) {
+                auto* actor = ResolveActor(actorId);
+                if (!actor) {
+                    continue;
+                }
+
+                Candidate c;
+                c.actorId = actorId;
+                c.isPrimary = actorId == primaryTargetId;
+                c.targetingPlayer = player && IsEnemyToPlayer(player, actor);
+                if (player) {
+                    c.distanceToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+                }
+                candidates.push_back(c);
+            }
+
+            std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) {
+                if (a.isPrimary != b.isPrimary) {
+                    return a.isPrimary > b.isPrimary;
+                }
+                if (a.targetingPlayer != b.targetingPlayer) {
+                    return a.targetingPlayer > b.targetingPlayer;
+                }
+                if (a.distanceToPlayer != b.distanceToPlayer) {
+                    return a.distanceToPlayer < b.distanceToPlayer;
+                }
+                return a.actorId < b.actorId;
+            });
+
+            std::vector<RE::FormID> result;
+            result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
+            for (const auto& c : candidates) {
+                if (result.size() >= kCrowdAliasCap) {
+                    break;
+                }
+                result.push_back(c.actorId);
+            }
+            return result;
         }
 
         bool IsActorStillValid(RE::Actor* actor)
@@ -207,46 +207,16 @@ namespace TFD::Pacify
         constexpr float kLocalHostileSplashRadiusMin = 1000.0f;
         constexpr float kLocalHostileSplashRadiusMax = 1800.0f;
 
-        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
-        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
-
         float GetLocalHostileSplashRadius()
         {
             const float settingsRadius = TFD::Settings::GetSweepRadius();
             return std::clamp(settingsRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
         }
 
-        float GetTruceClusterRadius()
-        {
-            const float settingsRadius = TFD::Settings::GetSweepRadius();
-            return std::clamp(settingsRadius, kTruceClusterRadiusMin, kTruceClusterRadiusMax);
-        }
-
-        bool AreMutuallyNonHostile(RE::Actor* a, RE::Actor* b)
-        {
-            if (!a || !b) {
-                return false;
-            }
-
-            return !a->IsHostileToActor(b) && !b->IsHostileToActor(a);
-        }
-
-        bool SharesCurrentCombatTarget(RE::Actor* a, RE::Actor* b)
-        {
-            auto* aTarget = ResolveCurrentCombatTarget(a);
-            auto* bTarget = ResolveCurrentCombatTarget(b);
-            if (!aTarget || !bTarget) {
-                return false;
-            }
-
-            return aTarget->GetFormID() == bTarget->GetFormID();
-        }
-
         bool IsEligibleLocalSplashActor(
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            Mode mode,
             const TFD::ActorScan::Entry& scanEntry,
             float radius)
         {
@@ -267,7 +237,16 @@ namespace TFD::Pacify
             }
 
             auto* pCell = player->GetParentCell();
-            if (!pCell || actor->GetParentCell() != pCell || primaryTarget->GetParentCell() != pCell) {
+            auto* aCell = actor->GetParentCell();
+            auto* tCell = primaryTarget->GetParentCell();
+            const bool sameCell = pCell && aCell && tCell && aCell == pCell && tCell == pCell;
+
+            auto* pWs = player->GetWorldspace();
+            auto* aWs = actor->GetWorldspace();
+            auto* tWs = primaryTarget->GetWorldspace();
+            const bool sameWorldspace = pWs && aWs && tWs && aWs == pWs && tWs == pWs;
+
+            if (!sameCell && !sameWorldspace) {
                 return false;
             }
 
@@ -276,116 +255,8 @@ namespace TFD::Pacify
             }
 
             const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
-            if (distToPrimary > radius) {
-                return false;
-            }
-
-            if (mode != Mode::Tame) {
-                return true;
-            }
-
-            if (!AreMutuallyNonHostile(actor, primaryTarget)) {
-                return false;
-            }
-
-            if (SharesCurrentCombatTarget(actor, primaryTarget)) {
-                return true;
-            }
-
-            auto* primaryCombatTarget = ResolveCurrentCombatTarget(primaryTarget);
-            if (primaryCombatTarget && primaryCombatTarget->GetFormID() == player->GetFormID()) {
-                return true;
-            }
-
-            auto* actorCombatTarget = ResolveCurrentCombatTarget(actor);
-            if (actorCombatTarget && actorCombatTarget->GetFormID() == player->GetFormID()) {
-                return true;
-            }
-
-            return false;
-        }
-
-        bool IsSameTruceLoadedArea(RE::Actor* player, RE::Actor* actor)
-        {
-            if (!player || !actor) {
-                return false;
-            }
-
-            auto* playerCell = player->GetParentCell();
-            auto* actorCell = actor->GetParentCell();
-            if (!playerCell || !actorCell) {
-                return false;
-            }
-
-            auto* playerWs = player->GetWorldspace();
-            auto* actorWs = actor->GetWorldspace();
-            const bool inInterior = (playerWs == nullptr);
-            if (inInterior) {
-                return actorCell == playerCell;
-            }
-
-            return actorWs == playerWs;
-        }
-
-        bool IsEligibleTruceClusterActor(
-            RE::Actor* actor,
-            RE::Actor* player,
-            RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry,
-            float radius)
-        {
-            if (!IsActorStillValid(actor) || !player || !primaryTarget) {
-                return false;
-            }
-
-            if (actor->GetFormID() == player->GetFormID()) {
-                return false;
-            }
-
-            if (actor->GetFormID() == primaryTarget->GetFormID()) {
-                return false;
-            }
-
-            if (!actor->Is3DLoaded()) {
-                return false;
-            }
-
-            if (!IsSameTruceLoadedArea(player, actor) || !IsSameTruceLoadedArea(player, primaryTarget)) {
-                return false;
-            }
-
-            if (!TFD::TargetClassifier::IsNegotiable(actor)) {
-                return false;
-            }
-
-            if (!IsEnemyToPlayer(player, actor)) {
-                return false;
-            }
-
-            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
-            if (distToPrimary > radius) {
-                return false;
-            }
-
-            if (!AreMutuallyNonHostile(actor, primaryTarget)) {
-                return false;
-            }
-
-            if (SharesCurrentCombatTarget(actor, primaryTarget)) {
-                return true;
-            }
-
-            auto* primaryCombatTarget = ResolveCurrentCombatTarget(primaryTarget);
-            if (primaryCombatTarget && primaryCombatTarget->GetFormID() == player->GetFormID()) {
-                return true;
-            }
-
-            auto* actorCombatTarget = ResolveCurrentCombatTarget(actor);
-            if (actorCombatTarget && actorCombatTarget->GetFormID() == player->GetFormID()) {
-                return true;
-            }
-
-            return scanEntry.inCombat;
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            return distToPrimary <= radius || distToPlayer <= radius;
         }
 
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
@@ -450,6 +321,49 @@ namespace TFD::Pacify
             }
 
             return IsEnemyToPlayer(player, actor);
+        }
+
+        bool IsEligibleTruceClusterActor(
+            RE::Actor* actor,
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            const TFD::ActorScan::Entry& scanEntry)
+        {
+            if (!IsActorStillValid(actor) || !player || !primaryTarget) {
+                return false;
+            }
+
+            if (actor->GetFormID() == player->GetFormID()) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+
+            if (actor->GetFormID() == primaryTarget->GetFormID()) {
+                return true;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            auto* playerCell = player->GetParentCell();
+            auto* actorCell = actor->GetParentCell();
+            auto* primaryCell = primaryTarget->GetParentCell();
+            if (playerCell && actorCell && primaryCell && actorCell == playerCell && primaryCell == playerCell) {
+                return true;
+            }
+
+            auto* playerWs = player->GetWorldspace();
+            auto* actorWs = actor->GetWorldspace();
+            auto* primaryWs = primaryTarget->GetWorldspace();
+            if (playerWs && actorWs && primaryWs && actorWs == playerWs && primaryWs == playerWs) {
+                return true;
+            }
+
+            return false;
         }
 
         bool IsPlayerArmedForPacify(RE::Actor* player)
@@ -521,11 +435,6 @@ namespace TFD::Pacify
             }
 
             return std::addressof(sessionIt->second);
-        }
-
-        Session* FindActiveSessionForActor(RE::Actor* actor)
-        {
-            return actor ? FindActiveSessionForTarget(actor->GetFormID()) : nullptr;
         }
 
         void RefreshSessionEntries(Session& session, double nowSec, double durationSec)
@@ -663,30 +572,25 @@ namespace TFD::Pacify
             session.hasPlayerSample = true;
             session.tooFarSinceSec = 0.0;
 
-            if (session.primaryMode == Mode::Tame) {
-                const bool startled =
-                    distance <= kTameStartleDistance &&
-                    playerSpeedPerSec >= kTameStartleRushSpeedPerSec;
+            const bool canStartle =
+                session.primaryMode == Mode::Tame &&
+                (nowSec - session.startTimeSec) >= kTameStartleGraceSec;
 
-                if (startled) {
-                    if (session.tameStartleSinceSec <= 0.0) {
-                        session.tameStartleSinceSec = nowSec;
-                    }
-                    else if ((nowSec - session.tameStartleSinceSec) >= kTameStartleDebounceSec) {
-                        return ReleaseReason::TameBroken;
-                    }
+            const bool startled =
+                canStartle &&
+                distance <= kTameStartleDistance &&
+                playerSpeedPerSec >= kTameStartleRushSpeedPerSec;
+
+            if (startled) {
+                if (session.tameStartleSinceSec <= 0.0) {
+                    session.tameStartleSinceSec = nowSec;
                 }
-                else {
-                    session.tameStartleSinceSec = 0.0;
+                else if ((nowSec - session.tameStartleSinceSec) >= kTameStartleDebounceSec) {
+                    return ReleaseReason::TameBroken;
                 }
             }
             else {
                 session.tameStartleSinceSec = 0.0;
-
-                if (session.primaryMode == Mode::TruceInCombat &&
-                    !IsSameTruceLoadedArea(player, primaryTarget)) {
-                    return ReleaseReason::TruceClusterLost;
-                }
             }
 
             session.invalidSinceSec = 0.0;
@@ -796,21 +700,24 @@ namespace TFD::Pacify
 
             std::size_t cellBubbleCount = 0;
             std::size_t localSplashCount = 0;
-            bool scanReady = false;
-            int scanCount = 0;
-
+            std::size_t truceClusterCount = 0;
             if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
-                scanCount = TFD::ActorScan::Rescan(scanRadius, false);
-                scanReady = true;
-                for (int i = 0; i < scanCount; ++i) {
+                TFD::ActorScan::Rescan(scanRadius, false);
+                const auto count = TFD::ActorScan::GetCount();
+                for (int i = 0; i < count; ++i) {
                     auto scanEntry = TFD::ActorScan::GetEntry(i);
                     auto* actor = TFD::ActorScan::GetActor(i);
                     if (!IsEligibleCellBubbleActor(actor, player, primaryTarget, scanEntry)) {
                         continue;
                     }
 
-                    const auto actorId = actor ? actor->GetFormID() : 0;
+                    const RE::FormID actorId = actor->GetFormID();
+                    const bool existedInSession = [&]() {
+                        auto it = g_entries.find(actorId);
+                        return it != g_entries.end() && it->second.sessionId == sessionId;
+                    }();
+
                     const bool isPrimary = actorId == targetId;
                     if (!AddOrRefreshEntry(
                         actor,
@@ -824,29 +731,29 @@ namespace TFD::Pacify
                         continue;
                     }
 
-                    ++cellBubbleCount;
+                    if (!existedInSession) {
+                        ++cellBubbleCount;
+                    }
                 }
             }
 
             if (mode == Mode::Tame) {
                 const float splashRadius = GetLocalHostileSplashRadius();
                 const float scanRadius = splashRadius + 256.0f;
-                if (!scanReady) {
-                    scanCount = TFD::ActorScan::Rescan(scanRadius, false);
-                    scanReady = true;
-                }
-                for (int i = 0; i < scanCount; ++i) {
+                TFD::ActorScan::Rescan(scanRadius, false);
+                const auto count = TFD::ActorScan::GetCount();
+                for (int i = 0; i < count; ++i) {
                     auto scanEntry = TFD::ActorScan::GetEntry(i);
                     auto* actor = TFD::ActorScan::GetActor(i);
-                    if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, mode, scanEntry, splashRadius)) {
+                    if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, splashRadius)) {
                         continue;
                     }
 
-                    const auto actorId = actor ? actor->GetFormID() : 0;
-                    auto existingIt = g_entries.find(actorId);
-                    if (existingIt != g_entries.end() && existingIt->second.sessionId == sessionId) {
-                        continue;
-                    }
+                    const RE::FormID actorId = actor->GetFormID();
+                    const bool existedInSession = [&]() {
+                        auto it = g_entries.find(actorId);
+                        return it != g_entries.end() && it->second.sessionId == sessionId;
+                    }();
 
                     if (!AddOrRefreshEntry(
                         actor,
@@ -860,29 +767,30 @@ namespace TFD::Pacify
                         continue;
                     }
 
-                    ++localSplashCount;
+                    if (!existedInSession) {
+                        ++localSplashCount;
+                    }
                 }
             }
-            else if (mode == Mode::TruceInCombat && allowDialogue) {
-                const float clusterRadius = GetTruceClusterRadius();
-                const float scanRadius = clusterRadius + 256.0f;
-                if (!scanReady) {
-                    scanCount = TFD::ActorScan::Rescan(scanRadius, false);
-                    scanReady = true;
-                }
-                for (int i = 0; i < scanCount; ++i) {
+
+            if (mode == Mode::TruceInCombat) {
+                const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), 24000.0f);
+                TFD::ActorScan::Rescan(scanRadius, false);
+                const auto count = TFD::ActorScan::GetCount();
+                for (int i = 0; i < count; ++i) {
                     auto scanEntry = TFD::ActorScan::GetEntry(i);
                     auto* actor = TFD::ActorScan::GetActor(i);
-                    if (!IsEligibleTruceClusterActor(actor, player, primaryTarget, scanEntry, clusterRadius)) {
+                    if (!IsEligibleTruceClusterActor(actor, player, primaryTarget, scanEntry)) {
                         continue;
                     }
 
-                    const auto actorId = actor ? actor->GetFormID() : 0;
-                    auto existingIt = g_entries.find(actorId);
-                    if (existingIt != g_entries.end() && existingIt->second.sessionId == sessionId) {
-                        continue;
-                    }
+                    const RE::FormID actorId = actor->GetFormID();
+                    const bool existedInSession = [&]() {
+                        auto it = g_entries.find(actorId);
+                        return it != g_entries.end() && it->second.sessionId == sessionId;
+                    }();
 
+                    const bool isPrimary = actorId == targetId;
                     if (!AddOrRefreshEntry(
                         actor,
                         mode,
@@ -890,18 +798,28 @@ namespace TFD::Pacify
                         targetId,
                         nowSec,
                         0.0,
-                        false,
-                        false)) {
+                        allowDialogue,
+                        isPrimary)) {
                         continue;
                     }
 
-                    ++localSplashCount;
+                    if (!existedInSession) {
+                        ++truceClusterCount;
+                    }
                 }
             }
 
             g_sessions[sessionId] = session;
 
-            auto applyIds = CollectSessionActorIds(sessionId, targetId);
+            std::vector<RE::FormID> applyIds;
+            applyIds.reserve(g_entries.size());
+            for (const auto& [actorId, entry] : g_entries) {
+                if (entry.sessionId == sessionId) {
+                    applyIds.push_back(actorId);
+                }
+            }
+
+            std::sort(applyIds.begin(), applyIds.end());
 
             for (RE::FormID actorId : applyIds) {
                 auto it = g_entries.find(actorId);
@@ -913,17 +831,25 @@ namespace TFD::Pacify
                 }
             }
 
+            const std::size_t packSize = applyIds.size();
             spdlog::info(
                 "TFDPacify: begin session id={} mode={} target={:08X} cellBubble={} localSplash={} packSize={} allowDialogue={}",
                 sessionId,
                 ToString(mode),
                 targetId,
                 static_cast<unsigned int>(cellBubbleCount),
-                static_cast<unsigned int>(localSplashCount),
-                static_cast<unsigned int>(applyIds.size()),
+                static_cast<unsigned int>(localSplashCount + truceClusterCount),
+                static_cast<unsigned int>(packSize),
                 allowDialogue ? 1 : 0);
 
-            DispatchAssignEventsForSession(mode, sessionId, targetId);
+            const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
+            const auto sent = SendModEventToActors(GetAssignEventName(mode), eventIds);
+            spdlog::info(
+                "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
+                GetAssignEventName(mode) ? GetAssignEventName(mode) : "<none>",
+                sessionId,
+                static_cast<unsigned int>(sent),
+                targetId);
             return sessionId;
         }
     }
@@ -1151,7 +1077,14 @@ namespace TFD::Pacify
             primaryMode = sessionIt->second.primaryMode;
         }
 
-        auto actorIds = CollectSessionActorIds(sessionId, primaryTargetId);
+        std::vector<RE::FormID> actorIds;
+        actorIds.reserve(g_entries.size());
+
+        for (const auto& [actorId, entry] : g_entries) {
+            if (entry.sessionId == sessionId) {
+                actorIds.push_back(actorId);
+            }
+        }
 
         RE::Actor* player = nullptr;
         if (sessionIt != g_sessions.end()) {
@@ -1196,7 +1129,14 @@ namespace TFD::Pacify
             }
         }
 
-        DispatchUnassignEventsForSession(primaryMode, sessionId, actorIds, primaryTargetId);
+        const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);
+        const auto sent = SendModEventToActors(GetUnassignEventName(primaryMode), eventIds);
+        spdlog::info(
+            "TFDPacify: unassign events event={} session={} sent={} primary={:08X}",
+            GetUnassignEventName(primaryMode) ? GetUnassignEventName(primaryMode) : "<none>",
+            sessionId,
+            static_cast<unsigned int>(sent),
+            primaryTargetId);
 
         spdlog::info(
             "TFDPacify: release session id={} reason={} mode={} target={:08X} packSize={}",
@@ -1207,28 +1147,40 @@ namespace TFD::Pacify
             static_cast<unsigned int>(actorIds.size()));
     }
 
-    bool ReleaseActiveTruceSessionForActor(RE::Actor* actor, ReleaseReason reason)
+    bool ReleaseActiveTruceSessionForActor(RE::Actor* actor, ReleaseReason reason, bool onlyIfStillHostile)
     {
         if (!actor) {
             return false;
         }
 
-        auto* session = FindActiveSessionForActor(actor);
-        if (!session) {
+        auto entryIt = g_entries.find(actor->GetFormID());
+        if (entryIt == g_entries.end()) {
             return false;
         }
 
-        if (!IsTruceMode(session->primaryMode)) {
+        const auto sessionId = entryIt->second.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
             return false;
+        }
+
+        if (!IsTruceMode(sessionIt->second.primaryMode)) {
+            return false;
+        }
+
+        if (onlyIfStillHostile) {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
         }
 
         spdlog::info(
             "TFDPacify: release active truce actor={:08X} session={} reason={}",
             actor->GetFormID(),
-            session->sessionId,
+            sessionId,
             ToString(reason));
-
-        ReleaseSession(session->sessionId, reason);
+        ReleaseSession(sessionId, reason);
         return true;
     }
 
@@ -1287,8 +1239,6 @@ namespace TFD::Pacify
             return "TooFar";
         case ReleaseReason::TameBroken:
             return "TameBroken";
-        case ReleaseReason::TruceClusterLost:
-            return "TruceClusterLost";
         default:
             return "Unknown";
         }

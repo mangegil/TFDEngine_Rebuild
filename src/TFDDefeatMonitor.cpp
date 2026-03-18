@@ -9,6 +9,7 @@
 #include <cmath>
 #include <string>
 #include <cstring>
+#include <vector>
 
 #include <type_traits>
 #include <RE/A/ActorValues.h>
@@ -77,6 +78,9 @@ namespace TFD::DefeatMonitor
 		bool g_bleedPaused = false;
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
 		std::chrono::steady_clock::time_point g_bleedLastCalmPulse{};
+		std::chrono::steady_clock::time_point g_bleedLastCrowdAssign{};
+
+		std::vector<RE::FormID> g_bleedCrowdAssigned{};
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -107,6 +111,7 @@ namespace TFD::DefeatMonitor
 		RE::ObjectRefHandle g_boundEscapeDoor{};
 
 		static constexpr double kCaptiveEscapeDoorRadius = 512.0;
+		static constexpr std::size_t kBleedBridgeMaxActors = 10;
 
 		bool g_hasQueuedProgressState = false;
 		bool g_queuedCaptiveState = false;
@@ -330,6 +335,139 @@ namespace TFD::DefeatMonitor
 			spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
 		}
 
+		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
+
+		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred)
+		{
+			std::vector<std::pair<float, RE::Actor*>> scored;
+
+			auto* player = Player();
+			if (!player) {
+				return {};
+			}
+
+			auto* pCell = player->GetParentCell();
+			if (!pCell) {
+				return {};
+			}
+
+			const float scanRadius = (std::max)(radius, 2000.0f);
+			TFD::ActorScan::Rescan(scanRadius, false);
+			const auto n = TFD::ActorScan::GetCount();
+			for (int i = 0; i < n; ++i) {
+				auto e = TFD::ActorScan::GetEntry(i);
+				auto sp = e.actor.get();
+				auto* actor = sp.get();
+				if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
+				if (!actor->Is3DLoaded()) continue;
+				if (actor->GetFormID() == player->GetFormID()) continue;
+				if (actor->GetParentCell() != pCell) continue;
+				if (!IsCaptiveSupportedAggressor(actor)) continue;
+				if (!e.hostile && !e.inCombat && !actor->IsInCombat()) continue;
+				if (e.dist > scanRadius) continue;
+
+				float score = e.dist;
+				if (actor == preferred) score -= 1000.0f;
+				if (e.hostile) score -= 80.0f;
+				if (e.inCombat) score -= 60.0f;
+				if (IsActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
+				scored.emplace_back(score, actor);
+			}
+
+			std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+				if (a.first != b.first) {
+					return a.first < b.first;
+				}
+				if (!a.second || !b.second) {
+					return a.second != nullptr;
+				}
+				return a.second->GetFormID() < b.second->GetFormID();
+			});
+
+			std::vector<RE::Actor*> result;
+			result.reserve((std::min)(scored.size(), kBleedBridgeMaxActors));
+			for (const auto& [score, actor] : scored) {
+				(void)score;
+				if (!actor) {
+					continue;
+				}
+				const auto id = actor->GetFormID();
+				bool seen = false;
+				for (auto* existing : result) {
+					if (existing && existing->GetFormID() == id) {
+						seen = true;
+						break;
+					}
+				}
+				if (seen) {
+					continue;
+				}
+				result.push_back(actor);
+				if (result.size() >= kBleedBridgeMaxActors) {
+					break;
+				}
+			}
+
+			if (preferred) {
+				const auto preferredId = preferred->GetFormID();
+				auto it = std::find_if(result.begin(), result.end(), [preferredId](RE::Actor* actor) {
+					return actor && actor->GetFormID() == preferredId;
+				});
+				if (it == result.end()) {
+					if (result.size() >= kBleedBridgeMaxActors) {
+						result.pop_back();
+					}
+					result.insert(result.begin(), preferred);
+				} else if (it != result.begin()) {
+					std::rotate(result.begin(), it, it + 1);
+				}
+			}
+
+			return result;
+		}
+
+		static void AssignBleedoutBridgeCrowd(const std::vector<RE::Actor*>& actors)
+		{
+			std::size_t sent = 0;
+			for (auto* actor : actors) {
+				if (!actor) {
+					continue;
+				}
+				const bool queued = SendBridgeModEvent("TFDBleedoutAssign", actor);
+				if (queued) {
+					++sent;
+				}
+				spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
+			}
+
+			spdlog::info("[TFD][BleedBridge] Assign crowd sent={} size={} primary={:08X}",
+				sent,
+				actors.size(),
+				!actors.empty() && actors.front() ? actors.front()->GetFormID() : 0u);
+		}
+
+		static void RefreshBleedoutBridgeCrowd(float radius, RE::Actor* preferred, bool forceClear)
+		{
+			auto crowd = CollectBleedoutCrowd(radius, preferred);
+			std::vector<RE::FormID> next;
+			next.reserve(crowd.size());
+			for (auto* actor : crowd) {
+				if (actor) {
+					next.push_back(actor->GetFormID());
+				}
+			}
+
+			const bool changed = forceClear || next != g_bleedCrowdAssigned;
+			if (changed) {
+				ClearBleedoutBridgeAliases(preferred, forceClear ? "bleed_crowd_force_refresh" : "bleed_crowd_refresh");
+				if (!crowd.empty()) {
+					AssignBleedoutBridgeCrowd(crowd);
+				}
+				g_bleedCrowdAssigned = std::move(next);
+			}
+			g_bleedLastCrowdAssign = Now();
+		}
+
 		static void ResetBleedRuntimeState()
 		{
 			g_inBleedState.store(false, std::memory_order_release);
@@ -340,6 +478,8 @@ namespace TFD::DefeatMonitor
 			g_bleedPaused = false;
 			g_bleedPauseStarted = {};
 			g_bleedLastCalmPulse = {};
+			g_bleedLastCrowdAssign = {};
+			g_bleedCrowdAssigned.clear();
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
 		}
@@ -631,7 +771,6 @@ namespace TFD::DefeatMonitor
 			}
 
 			auto* safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
-			const auto initialSafeLocId = safeLoc ? safeLoc->GetFormID() : 0;
 			auto* dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
 
 			if ((!safeLoc || !dest)) {
@@ -649,28 +788,14 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			if (!dest) {
-				if (auto* fallbackDest = TFD::Location::ResolveMostRecentCachedRescueDestination(true)) {
-					if (!safeLoc) {
-						safeLoc = TFD::Location::GetMostRecentCachedSafeLocation();
-					}
-					spdlog::info("[TFD][Transition] rescue fallback to recent destination reason={} currentLoc={:08X} fallbackLoc={:08X} dest={:08X}",
-						reason ? reason : "unknown",
-						initialSafeLocId,
-						safeLoc ? safeLoc->GetFormID() : 0,
-						fallbackDest->GetFormID());
-					dest = fallbackDest;
-				}
-			}
-
-			if (!safeLoc && !dest) {
+			if (!safeLoc) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_safe_location", reason ? reason : "unknown");
 				return false;
 			}
 
 			if (!dest) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} safeLoc={:08X} cause=no_destination",
-					reason ? reason : "unknown", safeLoc ? safeLoc->GetFormID() : 0);
+					reason ? reason : "unknown", safeLoc->GetFormID());
 				return false;
 			}
 
@@ -1463,6 +1588,8 @@ namespace TFD::DefeatMonitor
 			g_bleedPaused = false;
 			g_bleedPauseStarted = {};
 			g_bleedLastCalmPulse = {};
+			g_bleedLastCrowdAssign = {};
+			g_bleedCrowdAssigned.clear();
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
 			const float minHp = (std::max)(1.0f, maxHp * 0.02f);
@@ -1483,6 +1610,7 @@ namespace TFD::DefeatMonitor
 				spdlog::info("[TFD][Defeat] no local bleed speaker within {:.0f} -> hold without greet", maxSpeakerDist);
 			}
 			ApplyCalmBubble(radius);
+			RefreshBleedoutBridgeCrowd(radius, aggressor, true);
 
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();
@@ -1526,8 +1654,9 @@ namespace TFD::DefeatMonitor
 								aggressor->GetFormID(), greetDistance, hasCaptiveOutcome ? "captive" : "noncaptive");
 						}
 
-						AssignBleedoutBridgeActor(aggressor);
-						TFD::ForceGreet::BeginBleedout(aggressor);
+						if (greetableNow) {
+							TFD::ForceGreet::BeginBleedout(aggressor);
+						}
 					}
 				}
 			}
@@ -1738,8 +1867,35 @@ namespace TFD::DefeatMonitor
 					ApplyCalmBubble((std::max)(12000.0f, TFD::Settings::GetSweepRadius()));
 					g_bleedLastCalmPulse = Now();
 				}
-				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 				const bool dOpen = IsDialogueOpen();
+				if (!dOpen) {
+					const auto nowBleed = Now();
+					if (g_bleedLastCrowdAssign.time_since_epoch().count() == 0 || (nowBleed - g_bleedLastCrowdAssign) >= std::chrono::milliseconds(900)) {
+						const float bleedRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+						RE::Actor* preferredSpeaker = nullptr;
+						if (g_lastAggressor) {
+							auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
+							preferredSpeaker = sp.get();
+						}
+						RefreshBleedoutBridgeCrowd(bleedRadius, preferredSpeaker, false);
+
+						const bool greetActive = TFD::ForceGreet::IsActive() && TFD::ForceGreet::GetMode() == TFD::ForceGreet::Mode::Bleedout;
+						if (!greetActive) {
+							auto* speaker = FindBestBleedoutSpeaker(bleedRadius, 900.0f, preferredSpeaker);
+							if (speaker) {
+								float greetDistance = 99999.0f;
+								if (CanUseAggressorForBleedoutGreet(player, speaker, greetDistance)) {
+									g_lastAggressor = speaker->GetHandle();
+									spdlog::info("[TFD][Defeat] bleed speaker reselect {:08X} dist={:.1f}", speaker->GetFormID(), greetDistance);
+									TFD::ForceGreet::BeginBleedout(speaker);
+								} else {
+									spdlog::info("[TFD][Defeat] bleed speaker still not greetable {:08X} dist={:.1f}", speaker->GetFormID(), greetDistance);
+								}
+							}
+						}
+					}
+				}
+				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 				if (dOpen) {
 					g_bleedSawDialogue = true;
 					if (!g_bleedPaused) {
