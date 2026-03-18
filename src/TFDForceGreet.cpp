@@ -440,6 +440,16 @@ namespace TFD::ForceGreet
 							else {
 								suppressUntilSec = now + kNormalSuppressSeconds;
 								spdlog::info("[TFD][ForceGreet] Dialogue closed -> suppress");
+
+								if (stickyMode == Mode::InCombatTruce) {
+									const bool released = TFD::Pacify::ReleaseActiveTruceSessionForActor(
+										speaker,
+										TFD::Pacify::ReleaseReason::DialogueClosed);
+									spdlog::info(
+										"[TFD][ForceGreet] Truce dialogue closed -> release={} speaker={:08X}",
+										released ? 1 : 0,
+										speaker ? speaker->GetFormID() : 0);
+								}
 							}
 						}
 
