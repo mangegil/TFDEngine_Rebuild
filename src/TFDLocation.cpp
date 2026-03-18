@@ -146,6 +146,38 @@ namespace TFD::Location
 			return loc;
 		}
 
+		static const SafeCheckpoint* ResolveMostRecentSafeCheckpointEntry()
+		{
+			const SafeCheckpoint* best = nullptr;
+
+			for (const auto& [_, cp] : g_safeCheckpointByLocation) {
+				if (cp.safeLocationId == 0) {
+					continue;
+				}
+				if (!best || cp.visitSerial > best->visitSerial) {
+					best = &cp;
+				}
+			}
+
+			return best;
+		}
+
+		static const ApprovedBed* ResolveMostRecentApprovedBedEntry()
+		{
+			const ApprovedBed* best = nullptr;
+
+			for (const auto& [_, bed] : g_approvedBedByLocation) {
+				if (bed.safeLocationId == 0 || bed.bedRefId == 0) {
+					continue;
+				}
+				if (!best || bed.useSerial > best->useSerial) {
+					best = &bed;
+				}
+			}
+
+			return best;
+		}
+
 
 		static RE::PlayerCharacter* Player()
 		{
@@ -1115,6 +1147,44 @@ namespace TFD::Location
 	RE::BGSLocation* GetMostRecentCachedSafeLocation()
 	{
 		return ResolveMostRecentCachedSafeLocation();
+	}
+
+	RE::TESObjectREFR* ResolveMostRecentCachedRescueDestination(bool preferInterior)
+	{
+		if (const auto* bed = ResolveMostRecentApprovedBedEntry()) {
+			if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(bed->bedRefId)) {
+				return ref;
+			}
+		}
+
+		if (const auto* cp = ResolveMostRecentSafeCheckpointEntry()) {
+			if (cp->insideEntranceRefId != 0) {
+				if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(cp->insideEntranceRefId)) {
+					return ref;
+				}
+			}
+			if (cp->centerMarkerRefId != 0) {
+				if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(cp->centerMarkerRefId)) {
+					return ref;
+				}
+			}
+			if (cp->entryDoorRefId != 0) {
+				if (auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(cp->entryDoorRefId)) {
+					return ref;
+				}
+			}
+			if (auto* safeLoc = RE::TESForm::LookupByID<RE::BGSLocation>(cp->safeLocationId)) {
+				if (auto* ref = ResolvePreferredRescueDestination(safeLoc, preferInterior)) {
+					return ref;
+				}
+			}
+		}
+
+		if (auto* safeLoc = ResolveMostRecentCachedSafeLocation()) {
+			return ResolvePreferredRescueDestination(safeLoc, preferInterior);
+		}
+
+		return nullptr;
 	}
 
 	RE::TESObjectREFR* ResolvePreferredRescueDestination(RE::BGSLocation* safeLoc, bool preferInterior)

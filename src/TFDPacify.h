@@ -58,6 +58,10 @@ namespace TFD::Pacify
         double invalidSinceSec{ 0.0 };
         double armedSinceSec{ 0.0 };
         double tooFarSinceSec{ 0.0 };
+        double tameStartleSinceSec{ 0.0 };
+        double lastPlayerSampleSec{ 0.0 };
+        RE::NiPoint3 lastPlayerPos{};
+        bool hasPlayerSample{ false };
 
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
@@ -70,7 +74,8 @@ namespace TFD::Pacify
     std::optional<RE::FormID> BeginTameSession(
         RE::Actor* player,
         RE::Actor* primaryTarget,
-        double nowSec);
+        double nowSec,
+        bool allowDialogue = false);
 
     std::optional<RE::FormID> BeginTrucePreCombatSession(
         RE::Actor* player,

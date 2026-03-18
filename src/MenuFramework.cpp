@@ -24,6 +24,7 @@
 #include "TFDPreCombatGreet.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDTargetClassifier.h"
+#include "TFDInteractionRouter.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -47,6 +48,12 @@ namespace TFDMenu
 	namespace
 	{
 		using Clock = std::chrono::steady_clock;
+
+		static double NowSec()
+		{
+			static const auto t0 = Clock::now();
+			return std::chrono::duration<double>(Clock::now() - t0).count();
+		}
 
 		static bool started = false;
 		static bool menuRegistered = false;
@@ -1100,26 +1107,38 @@ namespace TFDMenu
 					HotkeyPickMode pickMode = HotkeyPickMode::None;
 					auto* target = PickPreCombatTargetSameCellLoaded(3500.0f, &pickMode);
 					if (!target || pickMode == HotkeyPickMode::None) {
-						RE::DebugNotification("TFD: No Truce Target");
+						RE::DebugNotification("TFD: No Valid Target");
 						continue;
 					}
 
-					if (!TFD::PreCombatGreet::BeginForActor(target)) {
-						RE::DebugNotification("TFD: Truce Failed");
+					const auto exec = TFD::InteractionRouter::HandleHotkeyPress(
+						player,
+						target,
+						false,
+						NowSec());
+
+					if (!exec.executed) {
+						RE::DebugNotification("TFD: Interaction Failed");
 						continue;
 					}
 
-					switch (pickMode) {
-					case HotkeyPickMode::TrucePreCombat:
+					if (exec.dialogueRequested &&
+						(exec.action == TFD::InteractionRouter::Action::TrucePreCombat ||
+						 exec.action == TFD::InteractionRouter::Action::TruceInCombat)) {
+						TFD::ForceGreet::BeginInCombatTruce(target);
+					}
+
+					switch (exec.action) {
+					case TFD::InteractionRouter::Action::TrucePreCombat:
 						RE::DebugNotification("TFD: PreCombat Truce");
 						break;
-					case HotkeyPickMode::Tame:
+					case TFD::InteractionRouter::Action::Tame:
 						RE::DebugNotification("TFD: Tame");
 						break;
-					case HotkeyPickMode::TruceInCombat:
+					case TFD::InteractionRouter::Action::TruceInCombat:
 						RE::DebugNotification("TFD: InCombat Truce");
 						break;
-					case HotkeyPickMode::None:
+					case TFD::InteractionRouter::Action::None:
 					default:
 						RE::DebugNotification("TFD: Truce Started");
 						break;

@@ -50,7 +50,7 @@ namespace TFD::ForceGreet
 		constexpr float kCaptiveApproachDistanceSq = kCaptiveApproachDistance * kCaptiveApproachDistance;
 		constexpr float kBleedoutApproachDistance = 220.0f;
 		constexpr float kBleedoutApproachDistanceSq = kBleedoutApproachDistance * kBleedoutApproachDistance;
-		constexpr float kInCombatApproachDistance = 220.0f;
+		constexpr float kInCombatApproachDistance = 1400.0f;
 		constexpr float kInCombatApproachDistanceSq = kInCombatApproachDistance * kInCombatApproachDistance;
 		constexpr double kCaptiveSuppressSeconds = 6.0;
 		constexpr double kNormalSuppressSeconds = 1.5;
@@ -539,7 +539,8 @@ namespace TFD::ForceGreet
 
 	void BeginInCombatTruce(RE::Actor* speaker)
 	{
-		BeginInternal(speaker, Mode::InCombatTruce, 12, true);
+		BeginInternal(speaker, Mode::InCombatTruce, 20, true);
+		Tick();
 	}
 
 	void Tick()
@@ -587,7 +588,7 @@ namespace TFD::ForceGreet
 
 		{
 			std::scoped_lock lk(lock);
-			job.nextTrySec = now + 0.50;
+			job.nextTrySec = now + 0.20;
 		}
 
 		auto* speaker = ResolveSpeaker(snap.speakerHandle);

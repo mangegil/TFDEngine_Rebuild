@@ -256,34 +256,18 @@ namespace TFD::TargetClassifier
             return CreatureClass::None;
         }
 
-        bool CreatureClassSupportsDialogueOverlay(CreatureClass value)
-        {
-            switch (value) {
-            case CreatureClass::SimpleCommand:
-            case CreatureClass::NonverbalIntelligent:
-            case CreatureClass::Beast:
-            case CreatureClass::UnknownFallback:
-                return true;
-            default:
-                return false;
-            }
-        }
-
         bool AllowsDialogueForClass(RE::Actor* actor, CreatureClass value)
         {
             if (!actor) {
                 return false;
             }
 
-            if (value == CreatureClass::FullDialogue) {
+            switch (value) {
+            case CreatureClass::FullDialogue:
                 return true;
+            default:
+                return false;
             }
-
-            if (CreatureClassSupportsDialogueOverlay(value)) {
-                return HasExplicitDialogueCapability(actor);
-            }
-
-            return false;
         }
     }
 
@@ -316,20 +300,25 @@ namespace TFD::TargetClassifier
             return CreatureClass::FullDialogue;
         }
 
-        // Second layer: creature family comes from creature race lists.
-        // Dialogue capability is handled separately later.
+        // Second layer: any safe ActorTypeNPC should always behave as full dialogue.
+        // This keeps humanoid NPCs on the dialogue path even if they are not in explicit lists.
+        if (HasSafeNpcKeyword(actor)) {
+            return CreatureClass::FullDialogue;
+        }
+
+        // Third layer: explicit dialogue-capable races should stay on the full dialogue path
+        // even if they also belong to one of the creature family lists.
+        if (IsDialogueRaceListed(actor)) {
+            return CreatureClass::FullDialogue;
+        }
+
+        // Fourth layer: creature family comes from creature race lists.
         const auto listedCreatureClass = GetBaseCreatureClassFromLists(actor);
         if (listedCreatureClass != CreatureClass::None) {
             return listedCreatureClass;
         }
 
-        // Dialogue-capable races that are not creature-listed are full dialogue.
-        if (IsDialogueRaceListed(actor)) {
-            return CreatureClass::FullDialogue;
-        }
-
-        // Non-listed actors must NOT auto-promote to FullDialogue.
-        // Dialogue authority now comes only from explicit actor/race lists.
+        // Final fallback stays creature-like, but NPCs should have been promoted above.
         return CreatureClass::UnknownFallback;
     }
 
@@ -397,7 +386,15 @@ namespace TFD::TargetClassifier
         }
 
         result.creatureClass = GetCreatureClass(target);
-        const bool allowDialogue = AllowsDialogueForClass(target, result.creatureClass);
+        result.allowDialogue = AllowsDialogueForClass(target, result.creatureClass);
+
+        if (result.creatureClass == CreatureClass::None) {
+            result.kind = TargetKind::Ignore;
+            result.intent = InteractionIntent::None;
+            result.rejectReason = RejectReason::UnsafeState;
+            result.valid = false;
+            return result;
+        }
 
         if (result.creatureClass == CreatureClass::FullDialogue) {
             if (IsDistanceTooFarForTruce(distanceToPlayer)) {
@@ -418,90 +415,26 @@ namespace TFD::TargetClassifier
             return result;
         }
 
-        if (CreatureClassSupportsDialogueOverlay(result.creatureClass)) {
-            if (targetInCombat) {
-                if (allowDialogue) {
-                    if (IsDistanceTooFarForTruce(distanceToPlayer)) {
-                        result.valid = false;
-                        result.rejectReason = RejectReason::TooFar;
-                        return result;
-                    }
-
-                    result.kind = TargetKind::Creature;
-                    result.intent = InteractionIntent::Truce;
-                    result.rejectReason = RejectReason::None;
-                    result.valid = true;
-                    result.negotiable = true;
-                    result.tameable = true;
-                    result.allowDialogue = true;
-                    result.requiresPreCombat = false;
-                    result.allowsInCombat = true;
-                    return result;
-                }
-
-                if (IsDistanceTooFarForTame(distanceToPlayer)) {
-                    result.valid = false;
-                    result.rejectReason = RejectReason::TooFar;
-                    return result;
-                }
-
-                result.kind = TargetKind::Creature;
-                result.intent = InteractionIntent::Tame;
-                result.rejectReason = RejectReason::None;
-                result.valid = true;
-                result.negotiable = false;
-                result.tameable = true;
-                result.allowDialogue = false;
-                result.requiresPreCombat = false;
-                result.allowsInCombat = true;
-                return result;
-            }
-
-            if (allowDialogue) {
-                if (IsDistanceTooFarForTruce(distanceToPlayer)) {
-                    result.valid = false;
-                    result.rejectReason = RejectReason::TooFar;
-                    return result;
-                }
-
-                result.kind = TargetKind::Creature;
-                result.intent = InteractionIntent::Truce;
-                result.rejectReason = RejectReason::None;
-                result.valid = true;
-                result.negotiable = true;
-                result.tameable = true;
-                result.allowDialogue = true;
-                result.requiresPreCombat = false;
-                result.allowsInCombat = false;
-                return result;
-            }
-
-            if (IsDistanceTooFarForTame(distanceToPlayer)) {
-                result.valid = false;
-                result.rejectReason = RejectReason::TooFar;
-                return result;
-            }
-
-            result.kind = TargetKind::Creature;
-            result.intent = InteractionIntent::Tame;
-            result.rejectReason = RejectReason::None;
-            result.valid = true;
-            result.negotiable = false;
-            result.tameable = true;
-            result.allowDialogue = false;
-            result.requiresPreCombat = true;
-            result.allowsInCombat = false;
+        if (IsDistanceTooFarForTame(distanceToPlayer)) {
+            result.valid = false;
+            result.rejectReason = RejectReason::TooFar;
             return result;
         }
 
-        result.kind = TargetKind::Ignore;
-        result.intent = InteractionIntent::None;
-        result.rejectReason = RejectReason::UnsafeState;
-        result.valid = false;
+        result.kind = TargetKind::Creature;
+        result.intent = InteractionIntent::Tame;
+        result.rejectReason = RejectReason::None;
+        result.valid = true;
+        result.negotiable = true;
+        result.tameable = true;
+        result.allowDialogue = AllowsDialogueForClass(target, result.creatureClass);
+        result.requiresPreCombat = !targetInCombat;
+        result.allowsInCombat = true;
         return result;
     }
 
     const char* ToString(TargetKind value)
+
     {
         switch (value) {
         case TargetKind::None:

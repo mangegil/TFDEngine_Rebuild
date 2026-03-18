@@ -631,6 +631,7 @@ namespace TFD::DefeatMonitor
 			}
 
 			auto* safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
+			const auto initialSafeLocId = safeLoc ? safeLoc->GetFormID() : 0;
 			auto* dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
 
 			if ((!safeLoc || !dest)) {
@@ -648,14 +649,28 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			if (!safeLoc) {
+			if (!dest) {
+				if (auto* fallbackDest = TFD::Location::ResolveMostRecentCachedRescueDestination(true)) {
+					if (!safeLoc) {
+						safeLoc = TFD::Location::GetMostRecentCachedSafeLocation();
+					}
+					spdlog::info("[TFD][Transition] rescue fallback to recent destination reason={} currentLoc={:08X} fallbackLoc={:08X} dest={:08X}",
+						reason ? reason : "unknown",
+						initialSafeLocId,
+						safeLoc ? safeLoc->GetFormID() : 0,
+						fallbackDest->GetFormID());
+					dest = fallbackDest;
+				}
+			}
+
+			if (!safeLoc && !dest) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_safe_location", reason ? reason : "unknown");
 				return false;
 			}
 
 			if (!dest) {
 				spdlog::info("[TFD][Transition] rescue unavailable reason={} safeLoc={:08X} cause=no_destination",
-					reason ? reason : "unknown", safeLoc->GetFormID());
+					reason ? reason : "unknown", safeLoc ? safeLoc->GetFormID() : 0);
 				return false;
 			}
 

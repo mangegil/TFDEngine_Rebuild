@@ -65,6 +65,8 @@ namespace TFD::Location
 	bool GetBestApprovedBedForLocation(RE::BGSLocation* loc, ApprovedBed& outBed);
 	RE::BGSLocation* GetMostRecentCachedSafeLocation();
 
+RE::TESObjectREFR* ResolveMostRecentCachedRescueDestination(bool preferInterior = true);
+
 	RE::TESObjectREFR* ResolvePreferredRescueDestination(RE::BGSLocation* safeLoc, bool preferInterior = true);
 
 	void ClearRescueCache();

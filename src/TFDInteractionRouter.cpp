@@ -173,7 +173,7 @@ namespace TFD::InteractionRouter
             result.valid = true;
             result.failReason = FailReason::None;
             result.shouldBeginSession = true;
-            result.shouldOpenDialogue = false;
+            result.shouldOpenDialogue = classify.allowDialogue;
             return result;
 
         case TFD::TargetClassifier::InteractionIntent::Truce:
@@ -223,7 +223,11 @@ namespace TFD::InteractionRouter
 
         switch (resolved.action) {
         case Action::Tame:
-            sessionId = TFD::Pacify::BeginTameSession(player, target, nowSec);
+            sessionId = TFD::Pacify::BeginTameSession(
+                player,
+                target,
+                nowSec,
+                resolved.shouldOpenDialogue);
             break;
 
         case Action::TrucePreCombat:
