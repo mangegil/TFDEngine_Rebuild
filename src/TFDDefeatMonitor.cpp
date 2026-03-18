@@ -10,6 +10,7 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <unordered_set>
 
 #include <type_traits>
 #include <RE/A/ActorValues.h>
@@ -194,6 +195,28 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		static bool IsBleedCrowdSupportedAggressor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeGhost")) {
+				return false;
+			}
+
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeUndead") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra")) {
+				return true;
+			}
+
+			return false;
+		}
+
 		static void FinishLeftForDeadRecovery()
 		{
 			TFD::AggressionClamp::Clear();
@@ -337,7 +360,7 @@ namespace TFD::DefeatMonitor
 
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 
-		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred)
+		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred, bool preserveAssigned = false)
 		{
 			std::vector<std::pair<float, RE::Actor*>> scored;
 
@@ -351,6 +374,11 @@ namespace TFD::DefeatMonitor
 				return {};
 			}
 
+			std::unordered_set<RE::FormID> preservedIds;
+			if (preserveAssigned) {
+				preservedIds.insert(g_bleedCrowdAssigned.begin(), g_bleedCrowdAssigned.end());
+			}
+
 			const float scanRadius = (std::max)(radius, 2000.0f);
 			TFD::ActorScan::Rescan(scanRadius, false);
 			const auto n = TFD::ActorScan::GetCount();
@@ -362,14 +390,19 @@ namespace TFD::DefeatMonitor
 				if (!actor->Is3DLoaded()) continue;
 				if (actor->GetFormID() == player->GetFormID()) continue;
 				if (actor->GetParentCell() != pCell) continue;
-				if (!IsCaptiveSupportedAggressor(actor)) continue;
-				if (!e.hostile && !e.inCombat && !actor->IsInCombat()) continue;
+				if (!IsBleedCrowdSupportedAggressor(actor)) continue;
 				if (e.dist > scanRadius) continue;
+
+				const bool targetingPlayer = e.hostile || e.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
+				const bool preserved = preserveAssigned && preservedIds.find(actor->GetFormID()) != preservedIds.end();
+				if (!targetingPlayer && !preserved && actor != preferred) continue;
 
 				float score = e.dist;
 				if (actor == preferred) score -= 1000.0f;
+				if (targetingPlayer) score -= 140.0f;
 				if (e.hostile) score -= 80.0f;
-				if (e.inCombat) score -= 60.0f;
+				if (e.inCombat || actor->IsInCombat()) score -= 60.0f;
+				if (preserved) score -= 90.0f;
 				if (IsActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
 				scored.emplace_back(score, actor);
 			}
@@ -446,9 +479,9 @@ namespace TFD::DefeatMonitor
 				!actors.empty() && actors.front() ? actors.front()->GetFormID() : 0u);
 		}
 
-		static void RefreshBleedoutBridgeCrowd(float radius, RE::Actor* preferred, bool forceClear)
+		static void RefreshBleedoutBridgeCrowd(float radius, RE::Actor* preferred, bool forceClear, std::vector<RE::Actor*>* explicitCrowd = nullptr)
 		{
-			auto crowd = CollectBleedoutCrowd(radius, preferred);
+			std::vector<RE::Actor*> crowd = explicitCrowd ? *explicitCrowd : CollectBleedoutCrowd(radius, preferred, !forceClear);
 			std::vector<RE::FormID> next;
 			next.reserve(crowd.size());
 			for (auto* actor : crowd) {
@@ -1609,8 +1642,9 @@ namespace TFD::DefeatMonitor
 			else {
 				spdlog::info("[TFD][Defeat] no local bleed speaker within {:.0f} -> hold without greet", maxSpeakerDist);
 			}
+			auto initialCrowd = CollectBleedoutCrowd(radius, aggressor, false);
 			ApplyCalmBubble(radius);
-			RefreshBleedoutBridgeCrowd(radius, aggressor, true);
+			RefreshBleedoutBridgeCrowd(radius, aggressor, true, &initialCrowd);
 
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();

@@ -23,11 +23,24 @@ namespace TFD::Pacify
             bool betrayed{ false };
         };
 
+        struct RehostileRequest
+        {
+            RE::FormID actorId{ 0 };
+            RE::FormID playerId{ 0 };
+            RE::FormID sessionId{ 0 };
+            ReleaseReason reason{ ReleaseReason::Generic };
+            double nextAttemptSec{ 0.0 };
+            double expireSec{ 0.0 };
+            std::uint8_t attemptsRemaining{ 0 };
+            bool drawWeapon{ true };
+        };
+
         using Clock = std::chrono::steady_clock;
 
         std::unordered_map<RE::FormID, Entry> g_entries;
         std::unordered_map<RE::FormID, Session> g_sessions;
         std::unordered_map<RE::FormID, TruceState> g_truceState;
+        std::unordered_map<RE::FormID, RehostileRequest> g_rehostileRequests;
         RE::FormID g_nextSessionId = 1;
 
         const char* GetAssignEventName(Mode mode)
@@ -84,6 +97,11 @@ namespace TFD::Pacify
         constexpr double kPacifyApplyIntervalSec = 0.25;
         constexpr double kPackageEvalIntervalSec = 1.0;
 
+        constexpr double kRehostileRetryDelaySec = 0.20;
+        constexpr double kRehostileRetryExtendSec = 0.35;
+        constexpr double kRehostileRetryLifetimeSec = 1.60;
+        constexpr std::uint8_t kRehostileRetryCount = 4;
+
         constexpr double kArmedGraceSec = 1.25;
         constexpr double kArmedDebounceSec = 0.50;
         constexpr double kTooFarDebounceSec = 1.25;
@@ -94,9 +112,14 @@ namespace TFD::Pacify
         constexpr float kTruceNonDialogueMaxDistance = 2200.0f;
         constexpr double kTameStartleGraceSec = 2.5;
         constexpr std::size_t kCrowdAliasCap = 10;
+        constexpr float kTruceActiveCombatRadius = 3500.0f;
+        constexpr float kTrucePrimaryLinkRadius = 2400.0f;
 
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
+        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon);
+        void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon);
+        void ProcessRehostileRetries(double nowSec);
 
         RE::Actor* ResolveActor(RE::FormID actorId)
         {
@@ -169,7 +192,7 @@ namespace TFD::Pacify
                     return a.distanceToPlayer < b.distanceToPlayer;
                 }
                 return a.actorId < b.actorId;
-            });
+                });
 
             std::vector<RE::FormID> result;
             result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
@@ -178,6 +201,136 @@ namespace TFD::Pacify
                     break;
                 }
                 result.push_back(c.actorId);
+            }
+            return result;
+        }
+
+        bool IsActorStillValid(RE::Actor* actor);
+
+        struct TruceCandidate
+        {
+            RE::Actor* actor{ nullptr };
+            RE::FormID actorId{ 0 };
+            bool isPrimary{ false };
+            bool targetingPlayer{ false };
+            float distanceToPlayer{ 999999.0f };
+            float distanceToPrimary{ 999999.0f };
+        };
+
+        bool IsEligibleActiveTruceCombatant(
+            RE::Actor* actor,
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            const TFD::ActorScan::Entry& scanEntry)
+        {
+            (void)scanEntry;
+            if (!IsActorStillValid(actor) || !player || !primaryTarget) {
+                return false;
+            }
+
+            if (actor->GetFormID() == player->GetFormID()) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+
+            if (actor->GetFormID() == primaryTarget->GetFormID()) {
+                return true;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            auto* playerCell = player->GetParentCell();
+            auto* actorCell = actor->GetParentCell();
+            auto* primaryCell = primaryTarget->GetParentCell();
+            const bool sameCell = playerCell && actorCell && primaryCell && actorCell == playerCell && primaryCell == playerCell;
+
+            auto* playerWs = player->GetWorldspace();
+            auto* actorWs = actor->GetWorldspace();
+            auto* primaryWs = primaryTarget->GetWorldspace();
+            const bool sameWorldspace = playerWs && actorWs && primaryWs && actorWs == playerWs && primaryWs == playerWs;
+
+            if (!sameCell && !sameWorldspace) {
+                return false;
+            }
+
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            if (distToPlayer > kTruceActiveCombatRadius && distToPrimary > kTrucePrimaryLinkRadius) {
+                return false;
+            }
+
+            auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+            return targetingPlayer || distToPlayer <= 1800.0f || distToPrimary <= 1400.0f;
+        }
+
+        std::vector<RE::FormID> BuildTruceInCombatMemberIds(
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            float scanRadius,
+            std::size_t& cellBubbleCount,
+            std::size_t& truceClusterCount)
+        {
+            std::vector<TruceCandidate> candidates;
+            TFD::ActorScan::Rescan(scanRadius, false);
+            const auto count = TFD::ActorScan::GetCount();
+            candidates.reserve(count);
+
+            auto* playerCell = player ? player->GetParentCell() : nullptr;
+            auto* primaryCell = primaryTarget ? primaryTarget->GetParentCell() : nullptr;
+
+            for (int i = 0; i < count; ++i) {
+                auto scanEntry = TFD::ActorScan::GetEntry(i);
+                auto* actor = TFD::ActorScan::GetActor(i);
+                if (!IsEligibleActiveTruceCombatant(actor, player, primaryTarget, scanEntry)) {
+                    continue;
+                }
+
+                TruceCandidate c;
+                c.actor = actor;
+                c.actorId = actor->GetFormID();
+                c.isPrimary = c.actorId == primaryTarget->GetFormID();
+                auto* combatTarget = ResolveCurrentCombatTarget(actor);
+                c.targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+                c.distanceToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+                c.distanceToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+                candidates.push_back(c);
+            }
+
+            std::stable_sort(candidates.begin(), candidates.end(), [](const TruceCandidate& a, const TruceCandidate& b) {
+                if (a.isPrimary != b.isPrimary) {
+                    return a.isPrimary > b.isPrimary;
+                }
+                if (a.targetingPlayer != b.targetingPlayer) {
+                    return a.targetingPlayer > b.targetingPlayer;
+                }
+                if (a.distanceToPlayer != b.distanceToPlayer) {
+                    return a.distanceToPlayer < b.distanceToPlayer;
+                }
+                if (a.distanceToPrimary != b.distanceToPrimary) {
+                    return a.distanceToPrimary < b.distanceToPrimary;
+                }
+                return a.actorId < b.actorId;
+                });
+
+            std::vector<RE::FormID> result;
+            result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
+            for (const auto& c : candidates) {
+                if (result.size() >= kCrowdAliasCap) {
+                    break;
+                }
+                result.push_back(c.actorId);
+                if (playerCell && primaryCell && c.actor && c.actor->GetParentCell() == playerCell && primaryCell == playerCell) {
+                    ++cellBubbleCount;
+                }
+                else {
+                    ++truceClusterCount;
+                }
             }
             return result;
         }
@@ -466,12 +619,21 @@ namespace TFD::Pacify
                 return;
             }
 
+            const bool preserveThreatMemory = IsTruceMode(entry.mode);
+
             if ((nowSec - entry.lastPacifyApplySec) >= kPacifyApplyIntervalSec) {
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     const bool runDetection = process->runDetection;
                     process->runDetection = false;
-                    process->ClearCachedFactionFightReactions();
-                    process->StopCombatAndAlarmOnActor(actor, false);
+
+                    // Truce should hold combat temporarily without erasing the actor's
+                    // alarm/hostility context. Repeated StopCombatAndAlarmOnActor()
+                    // was causing hostile-but-blind behavior after dialogue closed.
+                    if (!preserveThreatMemory) {
+                        process->ClearCachedFactionFightReactions();
+                        process->StopCombatAndAlarmOnActor(actor, false);
+                    }
+
                     process->runDetection = runDetection;
                 }
 
@@ -504,6 +666,132 @@ namespace TFD::Pacify
             (void)entry;
         }
 
+        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                return false;
+            }
+
+            if (g_entries.find(actor->GetFormID()) != g_entries.end()) {
+                return false;
+            }
+
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->ClearCachedFactionFightReactions();
+            }
+
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+
+            actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            if (drawWeapon && !actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(true);
+            }
+
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+            actor->UpdateCombat();
+            player->UpdateCombat();
+
+            const auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            const bool inCombat = actor->IsInCombat();
+            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+            const bool hostile = IsEnemyToPlayer(player, actor);
+
+            spdlog::info(
+                "TFDPacify: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
+                actor->GetFormID(),
+                player->GetFormID(),
+                ToString(reason),
+                hostile ? 1 : 0,
+                inCombat ? 1 : 0,
+                targetingPlayer ? 1 : 0);
+
+            return inCombat || targetingPlayer;
+        }
+
+        void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon)
+        {
+            if (!actor || !player) {
+                return;
+            }
+
+            RehostileRequest req;
+            req.actorId = actor->GetFormID();
+            req.playerId = player->GetFormID();
+            req.sessionId = sessionId;
+            req.reason = reason;
+            req.nextAttemptSec = nowSec + kRehostileRetryDelaySec;
+            req.expireSec = nowSec + kRehostileRetryLifetimeSec;
+            req.attemptsRemaining = kRehostileRetryCount;
+            req.drawWeapon = drawWeapon;
+
+            g_rehostileRequests[req.actorId] = req;
+
+            spdlog::info(
+                "TFDPacify: queue rehostile actor={:08X} player={:08X} session={} reason={} attempts={}",
+                req.actorId,
+                req.playerId,
+                sessionId,
+                ToString(reason),
+                static_cast<unsigned int>(req.attemptsRemaining));
+        }
+
+        void ProcessRehostileRetries(double nowSec)
+        {
+            if (g_rehostileRequests.empty()) {
+                return;
+            }
+
+            std::vector<RE::FormID> toErase;
+            toErase.reserve(g_rehostileRequests.size());
+
+            for (auto& [actorId, req] : g_rehostileRequests) {
+                if (req.attemptsRemaining == 0 || nowSec >= req.expireSec) {
+                    toErase.push_back(actorId);
+                    continue;
+                }
+
+                if (nowSec < req.nextAttemptSec) {
+                    continue;
+                }
+
+                auto* actor = ResolveActor(req.actorId);
+                auto* player = ResolveActor(req.playerId);
+                if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                    toErase.push_back(actorId);
+                    continue;
+                }
+
+                if (g_entries.find(actorId) != g_entries.end()) {
+                    req.nextAttemptSec = nowSec + kRehostileRetryDelaySec;
+                    continue;
+                }
+
+                const bool satisfied = ForceRehostile(actor, player, req.reason, req.drawWeapon);
+                if (satisfied) {
+                    toErase.push_back(actorId);
+                    continue;
+                }
+
+                if (req.attemptsRemaining > 0) {
+                    --req.attemptsRemaining;
+                }
+                if (req.attemptsRemaining == 0) {
+                    toErase.push_back(actorId);
+                    continue;
+                }
+
+                req.nextAttemptSec = nowSec + kRehostileRetryDelaySec + (kRehostileRetryExtendSec * (kRehostileRetryCount - req.attemptsRemaining));
+            }
+
+            for (auto actorId : toErase) {
+                g_rehostileRequests.erase(actorId);
+            }
+        }
+
         bool AddOrRefreshEntry(
             RE::Actor* actor,
             Mode mode,
@@ -530,6 +818,7 @@ namespace TFD::Pacify
             entry.allowDialogue = allowDialogue;
             entry.isPrimaryTarget = isPrimaryTarget;
 
+            g_rehostileRequests.erase(entry.actorId);
             g_entries[entry.actorId] = entry;
             return true;
         }
@@ -701,7 +990,28 @@ namespace TFD::Pacify
             std::size_t cellBubbleCount = 0;
             std::size_t localSplashCount = 0;
             std::size_t truceClusterCount = 0;
-            if (applyCellBubble) {
+            std::vector<RE::FormID> curatedTruceIds;
+            if (mode == Mode::TruceInCombat) {
+                const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), 6000.0f);
+                curatedTruceIds = BuildTruceInCombatMemberIds(player, primaryTarget, scanRadius, cellBubbleCount, truceClusterCount);
+                for (auto actorId : curatedTruceIds) {
+                    auto* actor = ResolveActor(actorId);
+                    if (!actor) {
+                        continue;
+                    }
+                    const bool isPrimary = actorId == targetId;
+                    AddOrRefreshEntry(
+                        actor,
+                        mode,
+                        sessionId,
+                        targetId,
+                        nowSec,
+                        0.0,
+                        allowDialogue,
+                        isPrimary);
+                }
+            }
+            else if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
                 TFD::ActorScan::Rescan(scanRadius, false);
                 const auto count = TFD::ActorScan::GetCount();
@@ -716,7 +1026,7 @@ namespace TFD::Pacify
                     const bool existedInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
-                    }();
+                        }();
 
                     const bool isPrimary = actorId == targetId;
                     if (!AddOrRefreshEntry(
@@ -753,7 +1063,7 @@ namespace TFD::Pacify
                     const bool existedInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
-                    }();
+                        }();
 
                     if (!AddOrRefreshEntry(
                         actor,
@@ -773,53 +1083,22 @@ namespace TFD::Pacify
                 }
             }
 
-            if (mode == Mode::TruceInCombat) {
-                const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), 24000.0f);
-                TFD::ActorScan::Rescan(scanRadius, false);
-                const auto count = TFD::ActorScan::GetCount();
-                for (int i = 0; i < count; ++i) {
-                    auto scanEntry = TFD::ActorScan::GetEntry(i);
-                    auto* actor = TFD::ActorScan::GetActor(i);
-                    if (!IsEligibleTruceClusterActor(actor, player, primaryTarget, scanEntry)) {
-                        continue;
-                    }
-
-                    const RE::FormID actorId = actor->GetFormID();
-                    const bool existedInSession = [&]() {
-                        auto it = g_entries.find(actorId);
-                        return it != g_entries.end() && it->second.sessionId == sessionId;
-                    }();
-
-                    const bool isPrimary = actorId == targetId;
-                    if (!AddOrRefreshEntry(
-                        actor,
-                        mode,
-                        sessionId,
-                        targetId,
-                        nowSec,
-                        0.0,
-                        allowDialogue,
-                        isPrimary)) {
-                        continue;
-                    }
-
-                    if (!existedInSession) {
-                        ++truceClusterCount;
-                    }
-                }
-            }
 
             g_sessions[sessionId] = session;
 
             std::vector<RE::FormID> applyIds;
-            applyIds.reserve(g_entries.size());
-            for (const auto& [actorId, entry] : g_entries) {
-                if (entry.sessionId == sessionId) {
-                    applyIds.push_back(actorId);
-                }
+            if (mode == Mode::TruceInCombat && !curatedTruceIds.empty()) {
+                applyIds = curatedTruceIds;
             }
-
-            std::sort(applyIds.begin(), applyIds.end());
+            else {
+                applyIds.reserve(g_entries.size());
+                for (const auto& [actorId, entry] : g_entries) {
+                    if (entry.sessionId == sessionId) {
+                        applyIds.push_back(actorId);
+                    }
+                }
+                std::sort(applyIds.begin(), applyIds.end());
+            }
 
             for (RE::FormID actorId : applyIds) {
                 auto it = g_entries.find(actorId);
@@ -842,7 +1121,7 @@ namespace TFD::Pacify
                 static_cast<unsigned int>(packSize),
                 allowDialogue ? 1 : 0);
 
-            const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
+            const auto eventIds = IsTruceMode(mode) ? applyIds : SelectCrowdEventTargets(applyIds, player, targetId);
             const auto sent = SendModEventToActors(GetAssignEventName(mode), eventIds);
             spdlog::info(
                 "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
@@ -917,6 +1196,8 @@ namespace TFD::Pacify
 
             g_entries.erase(it);
         }
+
+        ProcessRehostileRetries(nowSec);
     }
 
     std::optional<RE::FormID> BeginTameSession(
@@ -1091,6 +1372,8 @@ namespace TFD::Pacify
             player = ResolveActor(sessionIt->second.playerId);
         }
 
+        const double releaseNowSec = PacifyNowSec();
+
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);
             if (it == g_entries.end()) {
@@ -1101,14 +1384,27 @@ namespace TFD::Pacify
             if (auto* actor = ResolveActor(actorId)) {
                 RemovePacify(actor, releasedEntry);
 
-                const bool shouldRehostile =
+                const bool shouldRehostileTame =
                     releasedEntry.mode == Mode::Tame &&
                     player &&
                     (reason == ReleaseReason::PlayerArmed ||
                         reason == ReleaseReason::TameBroken);
 
-                if (shouldRehostile) {
+                const bool shouldRehostileTruce =
+                    IsTruceMode(releasedEntry.mode) &&
+                    player &&
+                    (reason == ReleaseReason::DialogueClosed ||
+                        reason == ReleaseReason::PlayerArmed);
+
+                if (shouldRehostileTame) {
                     actor->EvaluatePackage(false, true);
+                }
+                else if (shouldRehostileTruce) {
+                    const bool drawWeapon = true;
+                    const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
+                    if (!satisfied || !actor->IsInCombat()) {
+                        QueueRehostileRetry(actor, player, sessionId, reason, releaseNowSec, drawWeapon);
+                    }
                 }
             }
 
@@ -1129,7 +1425,7 @@ namespace TFD::Pacify
             }
         }
 
-        const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);
+        const auto eventIds = IsTruceMode(primaryMode) ? actorIds : SelectCrowdEventTargets(actorIds, player, primaryTargetId);
         const auto sent = SendModEventToActors(GetUnassignEventName(primaryMode), eventIds);
         spdlog::info(
             "TFDPacify: unassign events event={} session={} sent={} primary={:08X}",
@@ -1202,6 +1498,7 @@ namespace TFD::Pacify
 
         g_entries.clear();
         g_sessions.clear();
+        g_rehostileRequests.clear();
     }
 
     const char* ToString(Mode mode)
