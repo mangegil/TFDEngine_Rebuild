@@ -20,40 +20,9 @@ option(ENABLE_SKYRIM_AE "Build for Skyrim AE 1.6.x" OFF)
 option(ENABLE_SKYRIM_VR "Build for Skyrim VR" OFF)
 option(TFDEnableSmf "Build SKSE Menu Framework integration" ON)
 
-# ---- Dependencies (FetchContent) ----
-include(FetchContent)
-
-# fmt
-FetchContent_Declare(
-  fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-  GIT_TAG 11.0.2
-)
-set(FMT_DOC OFF CACHE BOOL "" FORCE)
-set(FMT_TEST OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(fmt)
-
-# spdlog (uses fmt above)
-FetchContent_Declare(
-  spdlog
-  GIT_REPOSITORY https://github.com/gabime/spdlog.git
-  GIT_TAG v1.14.1
-)
-set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
-set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
-set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(spdlog)
-
-# Help CommonLibSSE-NG find spdlog when it calls find_package(spdlog CONFIG REQUIRED)
-# (works even without vcpkg)
-if(DEFINED spdlog_BINARY_DIR)
-  set(spdlog_DIR "${spdlog_BINARY_DIR}" CACHE PATH "" FORCE)
-  list(PREPEND CMAKE_PREFIX_PATH
-    "${spdlog_BINARY_DIR}"
-    "${spdlog_BINARY_DIR}/lib/cmake/spdlog"
-  )
-endif()
+# ---- Dependencies (use installed packages / vcpkg) ----
+find_package(fmt CONFIG REQUIRED)
+find_package(spdlog CONFIG REQUIRED)
 
 # ---- CommonLibSSE-NG ----
 add_subdirectory(extern/CommonLibSSE-NG)
