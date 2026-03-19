@@ -221,6 +221,30 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+		{
+			if (!actor) {
+				return nullptr;
+			}
+
+			auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+			return targetSp.get();
+		}
+
+		bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor)
+		{
+			if (!player || !actor) {
+				return false;
+			}
+
+			if (actor->IsHostileToActor(player)) {
+				return true;
+			}
+
+			auto* combatTarget = ResolveCurrentCombatTarget(actor);
+			return combatTarget && combatTarget->GetFormID() == player->GetFormID();
+		}
+
 		static void WakeNearbyHostilesAfterCalm(float radius, bool sameCellOnly, const char* reason);
 		static void ResetTransitionCalmState();
 
@@ -442,20 +466,24 @@ namespace TFD::DefeatMonitor
 				if (!IsBleedCrowdSupportedAggressor(actor)) continue;
 				if (e.dist > scanRadius) continue;
 
-				const bool targetingPlayer = e.hostile || e.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
+				auto* combatTarget = ResolveCurrentCombatTarget(actor);
+				const bool combatTargetPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+				const bool combatTargetPreferred = preferred && combatTarget && combatTarget->GetFormID() == preferred->GetFormID();
+				const bool hostileFlag = e.hostile || actor->IsHostileToActor(player);
+				const bool targetingPlayer = hostileFlag || e.inCombat || actor->IsInCombat() || combatTargetPlayer;
 				const bool preserved = preserveAssigned && preservedIds.find(actor->GetFormID()) != preservedIds.end();
 				const bool weaponDrawn = actor->IsWeaponDrawn();
 				const bool nearPreferred = preferred && actor != preferred && actor->GetParentCell() == preferred->GetParentCell() && DistanceBetween(actor, preferred) <= 2600.0f;
 
 				bool include = targetingPlayer || preserved || actor == preferred;
 				if (lockSnapshotSeed && !include) {
-					if ((weaponDrawn && nearPreferred) || (weaponDrawn && actor->IsHostileToActor(player))) {
+					if (combatTargetPreferred || (weaponDrawn && nearPreferred) || (weaponDrawn && hostileFlag)) {
 						include = true;
 					}
 				}
 
 				if (!include) continue;
-				addCandidate(actor, e.dist, targetingPlayer, e.hostile, e.inCombat, preserved, weaponDrawn, nearPreferred);
+				addCandidate(actor, e.dist, targetingPlayer, hostileFlag, e.inCombat || combatTargetPlayer, preserved, weaponDrawn, nearPreferred || combatTargetPreferred);
 			}
 
 			if (lockSnapshotSeed) {
@@ -499,7 +527,10 @@ namespace TFD::DefeatMonitor
 						}
 
 						const bool preserved = preserveAssigned && preservedIds.find(id) != preservedIds.end();
-						const bool hostile = actor->IsHostileToActor(player);
+						auto* combatTarget = ResolveCurrentCombatTarget(actor);
+						const bool combatTargetPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+						const bool combatTargetPreferred = preferred && combatTarget && combatTarget->GetFormID() == preferred->GetFormID();
+						const bool hostile = actor->IsHostileToActor(player) || combatTargetPlayer;
 						const bool inCombat = actor->IsInCombat();
 						const bool weaponDrawn = actor->IsWeaponDrawn();
 						const bool nearPreferred = preferred && actor != preferred && actor->GetParentCell() == preferred->GetParentCell() && DistanceBetween(actor, preferred) <= 2600.0f;
@@ -515,12 +546,12 @@ namespace TFD::DefeatMonitor
 							}
 						}
 
-						const bool include = (actor == preferred) || preserved || hostile || inCombat || (weaponDrawn && nearPreferred) || (weaponDrawn && nearCluster);
+						const bool include = (actor == preferred) || preserved || hostile || inCombat || combatTargetPreferred || (weaponDrawn && nearPreferred) || (weaponDrawn && nearCluster);
 						if (!include) {
 							return RE::BSContainer::ForEachResult::kContinue;
 						}
 
-						addCandidate(actor, DistanceBetween(actor, player), hostile || inCombat, hostile, inCombat, preserved, weaponDrawn, nearPreferred || nearCluster);
+						addCandidate(actor, DistanceBetween(actor, player), hostile || inCombat || combatTargetPlayer, hostile, inCombat || combatTargetPlayer, preserved, weaponDrawn, nearPreferred || nearCluster || combatTargetPreferred);
 						++cellSeedAdded;
 						passAdded = true;
 						return scored.size() >= kBleedBridgeMaxActors ? RE::BSContainer::ForEachResult::kStop : RE::BSContainer::ForEachResult::kContinue;
