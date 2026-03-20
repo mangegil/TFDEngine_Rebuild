@@ -58,6 +58,7 @@ namespace TFD::ForceGreet
 		constexpr double kNormalSuppressSeconds = 1.5;
 		constexpr double kBleedoutPendingOpenRetrySeconds = 1.20;
 		constexpr double kInCombatPendingOpenRetrySeconds = 0.85;
+		constexpr double kPreCombatPendingOpenRetrySeconds = 0.85;
 
 		enum class DialogueGateFail
 		{
@@ -196,11 +197,20 @@ namespace TFD::ForceGreet
 				return DialogueGateFail::NotLoaded;
 			}
 
-			if (speaker->GetParentCell() != player->GetParentCell()) {
-				return DialogueGateFail::DifferentCell;
-			}
-
 			const float distSq = DistanceSq3D(speaker, player);
+
+			const bool sameCell = speaker->GetParentCell() == player->GetParentCell();
+			if (!sameCell) {
+				const bool permissiveWorldspace =
+					(mode == Mode::InCombatTruce || mode == Mode::PreCombatTruce) &&
+					speaker->GetWorldspace() &&
+					player->GetWorldspace() &&
+					speaker->GetWorldspace() == player->GetWorldspace();
+
+				if (!permissiveWorldspace) {
+					return DialogueGateFail::DifferentCell;
+				}
+			}
 			outDist = (distSq > 0.0f) ? std::sqrt(distSq) : 0.0f;
 
 			float maxDistSq = kBleedoutApproachDistanceSq;
@@ -208,15 +218,17 @@ namespace TFD::ForceGreet
 				maxDistSq = kCaptiveApproachDistanceSq;
 			} else if (mode == Mode::InCombatTruce) {
 				maxDistSq = kInCombatApproachDistanceSq;
+			} else if (mode == Mode::PreCombatTruce) {
+				maxDistSq = kCaptiveApproachDistanceSq;
 			}
 
 			if (distSq > maxDistSq) {
 				return DialogueGateFail::TooFar;
 			}
 
-			// InCombatTruce is intentionally more permissive:
-			// same-cell + close-enough is sufficient even if LOS is flaky.
-			if (mode == Mode::InCombatTruce) {
+			// Truce forcegreet is intentionally more permissive:
+			// close-enough is sufficient even if LOS/cell boundaries are flaky.
+			if (mode == Mode::InCombatTruce || mode == Mode::PreCombatTruce) {
 				return DialogueGateFail::None;
 			}
 
@@ -265,6 +277,8 @@ namespace TFD::ForceGreet
 				return kBleedoutPendingOpenRetrySeconds;
 			case Mode::InCombatTruce:
 				return kInCombatPendingOpenRetrySeconds;
+			case Mode::PreCombatTruce:
+				return kPreCombatPendingOpenRetrySeconds;
 			default:
 				return 0.0;
 			}
@@ -297,7 +311,7 @@ namespace TFD::ForceGreet
 
 		bool IsDialogueEnemyStillValid(RE::Actor* speaker, Mode mode)
 		{
-			if (!speaker || mode != Mode::InCombatTruce) {
+			if (!speaker || (mode != Mode::InCombatTruce && mode != Mode::PreCombatTruce)) {
 				return true;
 			}
 
@@ -364,6 +378,11 @@ namespace TFD::ForceGreet
 				speaker->StopCombat();
 			}
 			speaker->DrawWeaponMagicHands(false);
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (player && (mode == Mode::Bleedout || mode == Mode::CaptiveMarker) && player->IsWeaponDrawn()) {
+				player->DrawWeaponMagicHands(false);
+			}
 
 			const bool ok = speaker->SetDialogueWithPlayer(true, true, nullptr);
 
@@ -478,12 +497,16 @@ namespace TFD::ForceGreet
 							else {
 								suppressUntilSec = now + kNormalSuppressSeconds;
 								spdlog::info("[TFD][ForceGreet] Dialogue closed -> suppress");
-								if (stickyMode == Mode::InCombatTruce && speaker) {
+								if ((stickyMode == Mode::InCombatTruce || stickyMode == Mode::PreCombatTruce) && speaker) {
+									const bool onlyIfStillHostile = (stickyMode == Mode::InCombatTruce);
 									const bool released = TFD::Pacify::ReleaseActiveTruceSessionForActor(
 										speaker,
 										TFD::Pacify::ReleaseReason::DialogueClosed,
-										true);
-									spdlog::info("[TFD][ForceGreet] Truce dialogue closed -> release={}", released ? 1 : 0);
+										onlyIfStillHostile);
+									spdlog::info("[TFD][ForceGreet] Truce dialogue closed -> release={} mode={} onlyIfStillHostile={}",
+										released ? 1 : 0,
+										static_cast<int>(stickyMode),
+										onlyIfStillHostile ? 1 : 0);
 								}
 							}
 						}
@@ -585,6 +608,12 @@ namespace TFD::ForceGreet
 	void BeginInCombatTruce(RE::Actor* speaker)
 	{
 		BeginInternal(speaker, Mode::InCombatTruce, 20, true);
+		Tick();
+	}
+
+	void BeginPreCombatTruce(RE::Actor* speaker)
+	{
+		BeginInternal(speaker, Mode::PreCombatTruce, 20, true);
 		Tick();
 	}
 
@@ -693,7 +722,7 @@ namespace TFD::ForceGreet
 		const auto gate = CanStartDialogueNow(speaker, snap.mode, dist);
 
 		if (gate != DialogueGateFail::None) {
-			if ((snap.mode == Mode::CaptiveMarker || snap.mode == Mode::InCombatTruce) &&
+			if ((snap.mode == Mode::CaptiveMarker || snap.mode == Mode::InCombatTruce || snap.mode == Mode::PreCombatTruce) &&
 				(gate == DialogueGateFail::DifferentCell || gate == DialogueGateFail::TooFar || gate == DialogueGateFail::NoLOS)) {
 				NudgeApproach(speaker);
 			}
@@ -715,6 +744,11 @@ namespace TFD::ForceGreet
 		} else if (snap.mode == Mode::InCombatTruce) {
 			spdlog::info(
 				"[TFD][ForceGreet] InCombat close enough -> start dialogue dist={:.1f} speaker={:08X}",
+				dist,
+				speaker->GetFormID());
+		} else if (snap.mode == Mode::PreCombatTruce) {
+			spdlog::info(
+				"[TFD][ForceGreet] PreCombat close enough -> start dialogue dist={:.1f} speaker={:08X}",
 				dist,
 				speaker->GetFormID());
 		}

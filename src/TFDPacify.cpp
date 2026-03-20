@@ -49,6 +49,7 @@ namespace TFD::Pacify
             case Mode::Tame:
                 return "TFDTameAssign";
             case Mode::TrucePreCombat:
+                return "TFDPreCombatAssign";
             case Mode::TruceInCombat:
                 return "TFDTruceAssign";
             default:
@@ -62,8 +63,29 @@ namespace TFD::Pacify
             case Mode::Tame:
                 return "TFDTameUnassign";
             case Mode::TrucePreCombat:
+                return "TFDPreCombatClear";
             case Mode::TruceInCombat:
                 return "TFDTruceUnassign";
+            default:
+                return nullptr;
+            }
+        }
+
+        const char* GetSupplementalAssignEventName(Mode mode)
+        {
+            switch (mode) {
+            case Mode::TruceInCombat:
+                return "TFDInCombatAssign";
+            default:
+                return nullptr;
+            }
+        }
+
+        const char* GetSupplementalUnassignEventName(Mode mode)
+        {
+            switch (mode) {
+            case Mode::TruceInCombat:
+                return "TFDInCombatClear";
             default:
                 return nullptr;
             }
@@ -192,7 +214,7 @@ namespace TFD::Pacify
                     return a.distanceToPlayer < b.distanceToPlayer;
                 }
                 return a.actorId < b.actorId;
-                });
+            });
 
             std::vector<RE::FormID> result;
             result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
@@ -316,7 +338,7 @@ namespace TFD::Pacify
                     return a.distanceToPrimary < b.distanceToPrimary;
                 }
                 return a.actorId < b.actorId;
-                });
+            });
 
             std::vector<RE::FormID> result;
             result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
@@ -327,8 +349,7 @@ namespace TFD::Pacify
                 result.push_back(c.actorId);
                 if (playerCell && primaryCell && c.actor && c.actor->GetParentCell() == playerCell && primaryCell == playerCell) {
                     ++cellBubbleCount;
-                }
-                else {
+                } else {
                     ++truceClusterCount;
                 }
             }
@@ -619,21 +640,12 @@ namespace TFD::Pacify
                 return;
             }
 
-            const bool preserveThreatMemory = IsTruceMode(entry.mode);
-
             if ((nowSec - entry.lastPacifyApplySec) >= kPacifyApplyIntervalSec) {
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     const bool runDetection = process->runDetection;
                     process->runDetection = false;
-
-                    // Truce should hold combat temporarily without erasing the actor's
-                    // alarm/hostility context. Repeated StopCombatAndAlarmOnActor()
-                    // was causing hostile-but-blind behavior after dialogue closed.
-                    if (!preserveThreatMemory) {
-                        process->ClearCachedFactionFightReactions();
-                        process->StopCombatAndAlarmOnActor(actor, false);
-                    }
-
+                    process->ClearCachedFactionFightReactions();
+                    process->StopCombatAndAlarmOnActor(actor, false);
                     process->runDetection = runDetection;
                 }
 
@@ -1010,8 +1022,7 @@ namespace TFD::Pacify
                         allowDialogue,
                         isPrimary);
                 }
-            }
-            else if (applyCellBubble) {
+            } else if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
                 TFD::ActorScan::Rescan(scanRadius, false);
                 const auto count = TFD::ActorScan::GetCount();
@@ -1026,7 +1037,7 @@ namespace TFD::Pacify
                     const bool existedInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
-                        }();
+                    }();
 
                     const bool isPrimary = actorId == targetId;
                     if (!AddOrRefreshEntry(
@@ -1063,7 +1074,7 @@ namespace TFD::Pacify
                     const bool existedInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
-                        }();
+                    }();
 
                     if (!AddOrRefreshEntry(
                         actor,
@@ -1089,8 +1100,7 @@ namespace TFD::Pacify
             std::vector<RE::FormID> applyIds;
             if (mode == Mode::TruceInCombat && !curatedTruceIds.empty()) {
                 applyIds = curatedTruceIds;
-            }
-            else {
+            } else {
                 applyIds.reserve(g_entries.size());
                 for (const auto& [actorId, entry] : g_entries) {
                     if (entry.sessionId == sessionId) {
@@ -1129,6 +1139,16 @@ namespace TFD::Pacify
                 sessionId,
                 static_cast<unsigned int>(sent),
                 targetId);
+
+            if (const auto* supplementalAssign = GetSupplementalAssignEventName(mode)) {
+                const auto supplementalSent = SendModEventToActors(supplementalAssign, eventIds);
+                spdlog::info(
+                    "TFDPacify: supplemental assign event={} session={} sent={} primary={:08X}",
+                    supplementalAssign,
+                    sessionId,
+                    static_cast<unsigned int>(supplementalSent),
+                    targetId);
+            }
             return sessionId;
         }
     }
@@ -1396,10 +1416,19 @@ namespace TFD::Pacify
                     (reason == ReleaseReason::DialogueClosed ||
                         reason == ReleaseReason::PlayerArmed);
 
+                const bool immediateInCombatRehostile =
+                    releasedEntry.mode == Mode::TruceInCombat &&
+                    player &&
+                    reason == ReleaseReason::DialogueClosed;
+
+                if (immediateInCombatRehostile) {
+                    g_entries.erase(it);
+                    it = g_entries.end();
+                }
+
                 if (shouldRehostileTame) {
                     actor->EvaluatePackage(false, true);
-                }
-                else if (shouldRehostileTruce) {
+                } else if (shouldRehostileTruce) {
                     const bool drawWeapon = true;
                     const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
                     if (!satisfied || !actor->IsInCombat()) {
@@ -1408,7 +1437,9 @@ namespace TFD::Pacify
                 }
             }
 
-            g_entries.erase(it);
+            if (it != g_entries.end()) {
+                g_entries.erase(it);
+            }
         }
 
         if (sessionIt != g_sessions.end()) {
@@ -1433,6 +1464,16 @@ namespace TFD::Pacify
             sessionId,
             static_cast<unsigned int>(sent),
             primaryTargetId);
+
+        if (const auto* supplementalUnassign = GetSupplementalUnassignEventName(primaryMode)) {
+            const auto supplementalSent = SendModEventToActors(supplementalUnassign, eventIds);
+            spdlog::info(
+                "TFDPacify: supplemental unassign event={} session={} sent={} primary={:08X}",
+                supplementalUnassign,
+                sessionId,
+                static_cast<unsigned int>(supplementalSent),
+                primaryTargetId);
+        }
 
         spdlog::info(
             "TFDPacify: release session id={} reason={} mode={} target={:08X} packSize={}",
@@ -1465,9 +1506,14 @@ namespace TFD::Pacify
         }
 
         if (onlyIfStillHostile) {
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!IsEnemyToPlayer(player, actor)) {
-                return false;
+            const bool allowDialogueClosedInCombatRelease =
+                sessionIt->second.primaryMode == Mode::TruceInCombat &&
+                reason == ReleaseReason::DialogueClosed;
+            if (!allowDialogueClosedInCombatRelease) {
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!IsEnemyToPlayer(player, actor)) {
+                    return false;
+                }
             }
         }
 
@@ -1494,7 +1540,9 @@ namespace TFD::Pacify
         }
 
         SendModEvent("TFDTameClearAll", nullptr);
+        SendModEvent("TFDPreCombatClearAll", nullptr);
         SendModEvent("TFDTruceClearAll", nullptr);
+        SendModEvent("TFDInCombatClearAll", nullptr);
 
         g_entries.clear();
         g_sessions.clear();

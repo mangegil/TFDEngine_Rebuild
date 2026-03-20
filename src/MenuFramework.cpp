@@ -1122,10 +1122,12 @@ namespace TFDMenu
 						continue;
 					}
 
-					if (exec.dialogueRequested &&
-						(exec.action == TFD::InteractionRouter::Action::TrucePreCombat ||
-						 exec.action == TFD::InteractionRouter::Action::TruceInCombat)) {
-						TFD::ForceGreet::BeginInCombatTruce(target);
+					if (exec.dialogueRequested) {
+						if (exec.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+							TFD::ForceGreet::BeginPreCombatTruce(target);
+						} else if (exec.action == TFD::InteractionRouter::Action::TruceInCombat) {
+							TFD::ForceGreet::BeginInCombatTruce(target);
+						}
 					}
 
 					switch (exec.action) {
