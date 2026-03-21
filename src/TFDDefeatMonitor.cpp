@@ -29,6 +29,7 @@
 #include "TFDAggressionClamp.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDPacify.h"
+#include "EditorIdCache.h"
 
 namespace TFD::DefeatMonitor
 {
@@ -102,6 +103,32 @@ namespace TFD::DefeatMonitor
 		CaptivePhaseValue g_captivePhase = CaptivePhaseValue::None;
 		bool g_prevDialogueOpen = false;
 		bool g_prevLockpickOpen = false;
+
+		enum class NoMarkerFallbackBranch : std::uint32_t
+		{
+			None = 0,
+			RecoveryFollower = 1,
+			RecoveryPotion = 2,
+			RescueCached = 3,
+			LeftForDeadSolo = 4,
+			LeftForDeadWithFollower = 5
+		};
+
+		struct NoMarkerFallbackState
+		{
+			NoMarkerFallbackBranch branch{ NoMarkerFallbackBranch::None };
+			RE::ActorHandle follower{};
+			RE::ObjectRefHandle destination{};
+			RE::NiPoint3 fallbackPos{};
+			bool hasFallbackPos{ false };
+			float angleZ{ 0.0f };
+			RE::FormID potionFormId{ 0 };
+		};
+
+		NoMarkerFallbackState g_noMarkerFallback{};
+		RE::ActorHandle g_allyHoldFollower{};
+		bool g_allyHoldActive = false;
+		std::vector<RE::FormID> g_lockedFallbackCrowdIds{};
 
 		RE::ObjectRefHandle g_lockpickDoorCandidate{};
 		bool g_lockpickDoorWasLocked = false;
@@ -221,6 +248,9 @@ namespace TFD::DefeatMonitor
 
 		static RE::Actor* ResolveAggressor();
 		static RE::Actor* FindBestAggressor(float radius);
+		static void ClearNoMarkerFallbackState();
+		static void MaintainFollowerHold();
+		static void MaintainTransitionCalmWindow();
 
 		static void QueuePostRecoveryAggroKick(const char* reason)
 		{
@@ -333,6 +363,10 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadActive = false;
 			g_leftForDeadUntil = {};
 			g_leftForDeadNextPulse = {};
+			g_allyHoldFollower.reset();
+			g_allyHoldActive = false;
+			g_lockedFallbackCrowdIds.clear();
+			g_noMarkerFallback = {};
 			spdlog::info("[TFD][Defeat] Transition recovery finished");
 		}
 
@@ -359,6 +393,7 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadUntil = {};
 			g_leftForDeadNextPulse = {};
 			g_leftForDeadNeedsAggroKick = false;
+			ClearNoMarkerFallbackState();
 		}
 
 		static void BeginLeftForDeadCooldown(int seconds)
@@ -684,10 +719,12 @@ namespace TFD::DefeatMonitor
 		static RE::Actor* ResolveRecentPreCombatAggressor(float radius);
 		static void SetGraceSeconds(int seconds);
 		static void RecoverPlayerForTransition();
+		static void MaintainTransitionCalmWindow();
 		static void UpdatePreCombatState();
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID);
+		static RE::BGSLocation* GetLocationFromRef(RE::TESObjectREFR* ref);
 		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc);
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
@@ -711,6 +748,7 @@ namespace TFD::DefeatMonitor
 		static bool CompleteRescueTransitionNow(const char* reason);
 		static void CompleteRecoverTransitionNow(const char* reason);
 		static void EnterNonCaptiveChoice(const char* reason);
+		static bool BeginResolvedNoMarkerFallback(const char* reason);
 		static void RecoverPlayerAfterTeleport();
 		static void SetCaptiveRuntime(bool stateActive, CaptivePhaseValue phase);
 		static bool IsDialogueOpen();
@@ -718,6 +756,595 @@ namespace TFD::DefeatMonitor
 		static void ResetLockpickWatch();
 		static void ArmEscapeContextFromCurrentState();
 		static void ApplyCalmBubble(float radius);
+
+		static const char* NoMarkerBranchName(NoMarkerFallbackBranch branch)
+		{
+			switch (branch) {
+			case NoMarkerFallbackBranch::RecoveryFollower: return "recovery_follower";
+			case NoMarkerFallbackBranch::RecoveryPotion: return "recovery_potion";
+			case NoMarkerFallbackBranch::RescueCached: return "rescue_cached";
+			case NoMarkerFallbackBranch::LeftForDeadSolo: return "left_for_dead_solo";
+			case NoMarkerFallbackBranch::LeftForDeadWithFollower: return "left_for_dead_with_follower";
+			default: return "none";
+			}
+		}
+
+		static void ClearNoMarkerFallbackState()
+		{
+			g_noMarkerFallback = {};
+			g_allyHoldFollower.reset();
+			g_allyHoldActive = false;
+			g_lockedFallbackCrowdIds.clear();
+		}
+
+		static bool IsActorBleedingOut(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			if (auto* state = actor->AsActorState()) {
+				return state->IsBleedingOut();
+			}
+			return false;
+		}
+
+		static void ApplyFollowerHold(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+			if (actor->IsInCombat()) {
+				actor->StopCombat();
+			}
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->StopCombatAndAlarmOnActor(actor, false);
+			}
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+		}
+
+		static void MaintainFollowerHold()
+		{
+			if (!g_allyHoldActive || !g_allyHoldFollower) {
+				return;
+			}
+			auto sp = RE::Actor::LookupByHandle(g_allyHoldFollower.native_handle());
+			auto* actor = sp.get();
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				g_allyHoldFollower.reset();
+				g_allyHoldActive = false;
+				return;
+			}
+			ApplyFollowerHold(actor);
+		}
+
+		static void SetFollowerHold(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				g_allyHoldFollower.reset();
+				g_allyHoldActive = false;
+				return;
+			}
+			g_allyHoldFollower = actor->GetHandle();
+			g_allyHoldActive = true;
+			ApplyFollowerHold(actor);
+		}
+
+		static float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b)
+		{
+			const float dx = a.x - b.x;
+			const float dy = a.y - b.y;
+			const float dz = a.z - b.z;
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
+		static float ComputeYawFromVector(float dx, float dy)
+		{
+			return std::atan2(dx, dy);
+		}
+
+		static RE::NiPoint3 ComputeCrowdCenterPoint()
+		{
+			RE::NiPoint3 center{};
+			auto* player = Player();
+			if (player) {
+				center = player->GetPosition();
+			}
+
+			std::size_t count = 0;
+			for (auto id : g_lockedFallbackCrowdIds) {
+				auto* actorRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+				auto* actor = actorRef ? actorRef->As<RE::Actor>() : nullptr;
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				const auto pos = actor->GetPosition();
+				center.x += pos.x;
+				center.y += pos.y;
+				center.z += pos.z;
+				++count;
+			}
+
+			if (count > 0) {
+				const float denom = static_cast<float>(count + (player ? 1 : 0));
+				center.x /= denom;
+				center.y /= denom;
+				center.z /= denom;
+			}
+
+			return center;
+		}
+
+		static float MinDistanceToLockedCrowd(const RE::NiPoint3& pos)
+		{
+			float best = std::numeric_limits<float>::max();
+			for (auto id : g_lockedFallbackCrowdIds) {
+				auto* actorRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+				auto* actor = actorRef ? actorRef->As<RE::Actor>() : nullptr;
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				best = (std::min)(best, Distance3D(pos, actor->GetPosition()));
+			}
+			return best;
+		}
+
+		struct FollowerResolution
+		{
+			RE::Actor* standing{ nullptr };
+			RE::Actor* downed{ nullptr };
+		};
+
+		static FollowerResolution ResolveFollowerCandidates(float radius)
+		{
+			FollowerResolution result{};
+			auto* player = Player();
+			if (!player) {
+				return result;
+			}
+
+			const float scanRadius = (std::max)(radius, 5000.0f);
+			TFD::ActorScan::Rescan(scanRadius, false);
+
+			float bestStandingDist = std::numeric_limits<float>::max();
+			float bestDownedDist = std::numeric_limits<float>::max();
+
+			const auto n = TFD::ActorScan::GetCount();
+			for (int i = 0; i < n; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto sp = entry.actor.get();
+				auto* actor = sp.get();
+				if (!actor || actor == player) {
+					continue;
+				}
+				if (!actor->IsPlayerTeammate()) {
+					continue;
+				}
+				const bool downed = actor->IsDead() || IsActorBleedingOut(actor);
+				if (!downed) {
+					if (entry.dist < bestStandingDist) {
+						bestStandingDist = entry.dist;
+						result.standing = actor;
+					}
+				}
+				else if (entry.dist < bestDownedDist) {
+					bestDownedDist = entry.dist;
+					result.downed = actor;
+				}
+			}
+
+			return result;
+		}
+
+		static RE::AlchemyItem* ResolveRecoveryPotionCandidate()
+		{
+			auto* player = Player();
+			if (!player) {
+				return nullptr;
+			}
+
+			RE::AlchemyItem* bestPotion = nullptr;
+			const auto inv = player->GetInventory([](RE::TESBoundObject& obj) {
+				if (!obj.Is(RE::FormType::AlchemyItem)) {
+					return false;
+				}
+				auto* potion = obj.As<RE::AlchemyItem>();
+				return potion && potion->IsMedicine() && !potion->IsPoison() && !potion->IsFood();
+			}, true);
+
+			for (const auto& [item, invData] : inv) {
+				const auto& [count, entry] = invData;
+				(void)entry;
+				if (count <= 0) {
+					continue;
+				}
+				auto* potion = item->As<RE::AlchemyItem>();
+				if (!potion) {
+					continue;
+				}
+				if (!bestPotion || potion->GetFormID() < bestPotion->GetFormID()) {
+					bestPotion = potion;
+				}
+			}
+
+			return bestPotion;
+		}
+
+		static RE::TESObjectREFR* ResolveCachedRescueDestinationForFallback()
+		{
+			auto* player = Player();
+			const bool preferInterior = player && player->GetParentCell() ? player->GetParentCell()->IsInteriorCell() : true;
+			if (auto* dest = TFD::Location::ResolveMostRecentCachedRescueDestination(preferInterior)) {
+				return dest;
+			}
+			if (auto* dest = TFD::Location::ResolveMostRecentCachedRescueDestination(!preferInterior)) {
+				return dest;
+			}
+			return nullptr;
+		}
+
+		static RE::BGSLocationRefType* ResolveWETravelRefType()
+		{
+			static RE::BGSLocationRefType* cached = nullptr;
+			static bool tried = false;
+			if (tried) {
+				return cached;
+			}
+			tried = true;
+			cached = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>("WETravel");
+			if (!cached) {
+				cached = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>("WETravelMarker");
+			}
+			return cached;
+		}
+
+		static void AddLocationChainSimple(std::vector<RE::BGSLocation*>& list, RE::BGSLocation* start)
+		{
+			for (auto* cur = start; cur; cur = cur->parentLoc) {
+				bool seen = false;
+				for (auto* existing : list) {
+					if (existing == cur) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen) {
+					list.push_back(cur);
+				}
+			}
+		}
+
+		static bool IsGenericMarkerRef(RE::TESObjectREFR* ref, bool& heading)
+		{
+			heading = false;
+			if (!ref) {
+				return false;
+			}
+			auto* base = ref->GetBaseObject();
+			if (!base) {
+				return false;
+			}
+			const auto eid = TFD::Util::GetEditorId(base);
+			if (eid == "XMarkerHeading") {
+				heading = true;
+				return true;
+			}
+			return eid == "XMarker";
+		}
+
+		static void LockCurrentBleedCrowdSnapshot(RE::Actor* preferredSpeaker)
+		{
+			g_lockedFallbackCrowdIds.clear();
+			if (!g_bleedCrowdAssigned.empty()) {
+				g_lockedFallbackCrowdIds = g_bleedCrowdAssigned;
+			}
+			if (g_lockedFallbackCrowdIds.empty()) {
+				const float radius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+				auto crowd = CollectBleedoutCrowd(radius, preferredSpeaker, true);
+				for (auto* actor : crowd) {
+					if (actor) {
+						g_lockedFallbackCrowdIds.push_back(actor->GetFormID());
+					}
+				}
+			}
+			if (preferredSpeaker) {
+				const auto preferredId = preferredSpeaker->GetFormID();
+				if (std::find(g_lockedFallbackCrowdIds.begin(), g_lockedFallbackCrowdIds.end(), preferredId) == g_lockedFallbackCrowdIds.end()) {
+					g_lockedFallbackCrowdIds.insert(g_lockedFallbackCrowdIds.begin(), preferredId);
+				}
+			}
+		}
+
+		static void ApplyFallbackFacing(RE::Actor* actor, float angleZ)
+		{
+			if (!actor) {
+				return;
+			}
+			actor->data.angle.z = angleZ;
+		}
+
+		static void ComputeLocalLeftForDeadFallback(RE::NiPoint3& outPos, float& outAngleZ)
+		{
+			auto* player = Player();
+			if (!player) {
+				outPos = {};
+				outAngleZ = 0.0f;
+				return;
+			}
+			const auto playerPos = player->GetPosition();
+			auto crowdCenter = ComputeCrowdCenterPoint();
+			float dx = playerPos.x - crowdCenter.x;
+			float dy = playerPos.y - crowdCenter.y;
+			const float len = std::sqrt(dx * dx + dy * dy);
+			if (len < 1.0f) {
+				dx = -std::sin(player->GetAngleZ());
+				dy = -std::cos(player->GetAngleZ());
+			}
+			else {
+				dx /= len;
+				dy /= len;
+			}
+			const bool exterior = player->GetParentCell() ? player->GetParentCell()->IsExteriorCell() : true;
+			const float dist = exterior ? 2300.0f : 384.0f;
+			outPos = playerPos;
+			outPos.x += dx * dist;
+			outPos.y += dy * dist;
+			outAngleZ = ComputeYawFromVector(dx, dy);
+		}
+
+		static void ResolveLeftForDeadDestination(NoMarkerFallbackState& state)
+		{
+			state.destination.reset();
+			state.hasFallbackPos = false;
+			state.angleZ = 0.0f;
+
+			auto* player = Player();
+			auto* playerCell = player ? player->GetParentCell() : nullptr;
+			if (!player || !playerCell) {
+				return;
+			}
+
+			const bool exterior = playerCell->IsExteriorCell();
+			const auto playerPos = player->GetPosition();
+			const auto crowdCenter = ComputeCrowdCenterPoint();
+			auto* playerLoc = GetLocationFromRef(player);
+
+			RE::TESObjectREFR* bestRef = nullptr;
+			float bestScore = -1.0e30f;
+			float bestAngle = 0.0f;
+
+			auto considerRef = [&](RE::TESObjectREFR* ref, int tier) {
+				if (!ref || ref->IsDisabled()) {
+					return;
+				}
+				auto* refCell = ref->GetParentCell();
+				if (!refCell) {
+					return;
+				}
+				if (exterior) {
+					if (ref->GetWorldspace() != player->GetWorldspace()) {
+						return;
+					}
+				}
+				else if (refCell != playerCell) {
+					return;
+				}
+				auto* refLoc = GetLocationFromRef(ref);
+				if (playerLoc && refLoc && refLoc != playerLoc) {
+					return;
+				}
+				const auto refPos = ref->GetPosition();
+				const float playerDist = Distance3D(playerPos, refPos);
+				const float crowdDist = MinDistanceToLockedCrowd(refPos);
+				const float minPlayer = exterior ? 2048.0f : 256.0f;
+				const float maxPlayer = exterior ? 4096.0f : 2048.0f;
+				const float minCrowd = exterior ? 2048.0f : 512.0f;
+				if (playerDist < minPlayer || playerDist > maxPlayer) {
+					return;
+				}
+				if (crowdDist != std::numeric_limits<float>::max() && crowdDist < minCrowd) {
+					return;
+				}
+				const float ideal = exterior ? 3072.0f : 1024.0f;
+				float score = (tier == 1 ? 600.0f : (tier == 2 ? 300.0f : 0.0f));
+				if (crowdDist != std::numeric_limits<float>::max()) {
+					score += crowdDist * 2.5f;
+				}
+				score -= std::abs(playerDist - ideal);
+				score -= Distance3D(refPos, crowdCenter) * 0.15f;
+				if (score > bestScore) {
+					bestScore = score;
+					bestRef = ref;
+					bestAngle = ComputeYawFromVector(refPos.x - crowdCenter.x, refPos.y - crowdCenter.y);
+				}
+			};
+
+			if (auto* weTravel = ResolveWETravelRefType()) {
+				std::vector<RE::BGSLocation*> chain;
+				AddLocationChainSimple(chain, playerLoc);
+				for (auto* loc : chain) {
+					if (!loc) {
+						continue;
+					}
+					for (std::uint32_t i = 0; i < loc->specialRefs.size(); ++i) {
+						const auto& sref = loc->specialRefs[i];
+						if (!sref.type || sref.type->GetFormID() != weTravel->GetFormID()) {
+							continue;
+						}
+						auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(sref.refData.refID);
+						considerRef(ref, 1);
+					}
+				}
+			}
+
+			playerCell->ForEachReference([&](RE::TESObjectREFR* ref) {
+				bool heading = false;
+				if (!IsGenericMarkerRef(ref, heading)) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				considerRef(ref, heading ? 2 : 3);
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+
+			if (bestRef) {
+				state.destination = bestRef->GetHandle();
+				state.angleZ = bestAngle;
+				spdlog::info("[TFD][Defeat] left-for-dead anchor selected ref={:08X} branch={} score={:.1f}",
+					bestRef->GetFormID(),
+					NoMarkerBranchName(state.branch),
+					bestScore);
+				return;
+			}
+
+			ComputeLocalLeftForDeadFallback(state.fallbackPos, state.angleZ);
+			state.hasFallbackPos = true;
+			spdlog::info("[TFD][Defeat] left-for-dead anchor fallback=local branch={} pos=({:.1f},{:.1f},{:.1f})",
+				NoMarkerBranchName(state.branch), state.fallbackPos.x, state.fallbackPos.y, state.fallbackPos.z);
+		}
+
+		static NoMarkerFallbackBranch ResolveNoMarkerFallback(const char* reason)
+		{
+			(void)reason;
+			g_noMarkerFallback = {};
+
+			RE::Actor* preferredSpeaker = nullptr;
+			if (g_lastAggressor) {
+				auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
+				preferredSpeaker = sp.get();
+			}
+			LockCurrentBleedCrowdSnapshot(preferredSpeaker);
+
+			const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+			auto followers = ResolveFollowerCandidates(followerRadius);
+			if (followers.standing) {
+				g_noMarkerFallback.branch = NoMarkerFallbackBranch::RecoveryFollower;
+				g_noMarkerFallback.follower = followers.standing->GetHandle();
+			}
+			else if (followers.downed) {
+				g_noMarkerFallback.branch = NoMarkerFallbackBranch::LeftForDeadWithFollower;
+				g_noMarkerFallback.follower = followers.downed->GetHandle();
+				ResolveLeftForDeadDestination(g_noMarkerFallback);
+			}
+			else if (auto* potion = ResolveRecoveryPotionCandidate()) {
+				g_noMarkerFallback.branch = NoMarkerFallbackBranch::RecoveryPotion;
+				g_noMarkerFallback.potionFormId = potion->GetFormID();
+			}
+			else if (auto* rescueDest = ResolveCachedRescueDestinationForFallback()) {
+				g_noMarkerFallback.branch = NoMarkerFallbackBranch::RescueCached;
+				g_noMarkerFallback.destination = rescueDest->GetHandle();
+			}
+			else {
+				g_noMarkerFallback.branch = NoMarkerFallbackBranch::LeftForDeadSolo;
+				ResolveLeftForDeadDestination(g_noMarkerFallback);
+			}
+
+			RE::FormID followerId = 0;
+			if (g_noMarkerFallback.follower) {
+				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
+				if (auto* follower = followerSp.get()) {
+					followerId = follower->GetFormID();
+				}
+			}
+			RE::FormID destId = 0;
+			if (g_noMarkerFallback.destination) {
+				auto destSp = g_noMarkerFallback.destination.get();
+				if (auto* dest = destSp.get()) {
+					destId = dest->GetFormID();
+				}
+			}
+			spdlog::info("[TFD][Defeat] no-marker fallback resolved branch={} follower={:08X} potion={:08X} dest={:08X} crowdLocked={}",
+				NoMarkerBranchName(g_noMarkerFallback.branch),
+				followerId,
+				g_noMarkerFallback.potionFormId,
+				destId,
+				g_lockedFallbackCrowdIds.size());
+
+			return g_noMarkerFallback.branch;
+		}
+
+		static void ApplyLeftForDeadWakeState(RE::Actor* actor, bool followerStyle)
+		{
+			if (!actor) {
+				return;
+			}
+			actor->NotifyAnimationGraph("BleedoutStop");
+			actor->NotifyAnimationGraph("GetUpStart");
+			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+			const float targetHp = (std::max)(followerStyle ? 24.0f : 18.0f, hpMax * (followerStyle ? 0.28f : 0.22f));
+			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			if (hpNow < targetHp) {
+				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, targetHp - hpNow);
+			}
+			const float staminaMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kStamina));
+			const float staminaTarget = (std::max)(15.0f, staminaMax * 0.25f);
+			const float staminaNow = actor->GetActorValue(RE::ActorValue::kStamina);
+			if (staminaNow < staminaTarget) {
+				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kStamina, staminaTarget - staminaNow);
+			}
+			if (actor->IsInCombat()) {
+				actor->StopCombat();
+			}
+			actor->DrawWeaponMagicHands(false);
+		}
+
+		static void MoveFollowerNearPlayerForLeftForDead(RE::Actor* follower)
+		{
+			auto* player = Player();
+			if (!player || !follower) {
+				return;
+			}
+			const bool interior = player->GetParentCell() ? player->GetParentCell()->IsInteriorCell() : false;
+			const float offset = interior ? 128.0f : 220.0f;
+			const float yaw = player->GetAngleZ();
+			RE::NiPoint3 pos = player->GetPosition();
+			pos.x += std::cos(yaw) * offset;
+			pos.y -= std::sin(yaw) * offset;
+			if (!follower->IsDead()) {
+				follower->MoveTo(player);
+			}
+			follower->SetPosition(pos, true);
+			ApplyFallbackFacing(follower, yaw);
+			if (!follower->IsDead()) {
+				ApplyLeftForDeadWakeState(follower, true);
+				SetFollowerHold(follower);
+			}
+		}
+
+		static void ExecuteLeftForDeadWake(const char* reason)
+		{
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+			if (g_noMarkerFallback.destination) {
+				auto refSp = g_noMarkerFallback.destination.get();
+				if (auto* dest = refSp.get()) {
+					player->MoveTo(dest);
+				}
+			}
+			else if (g_noMarkerFallback.hasFallbackPos) {
+				player->SetPosition(g_noMarkerFallback.fallbackPos, true);
+			}
+			ApplyFallbackFacing(player, g_noMarkerFallback.angleZ);
+			ApplyLeftForDeadWakeState(player, false);
+			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::LeftForDeadWithFollower && g_noMarkerFallback.follower) {
+				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
+				if (auto* follower = followerSp.get()) {
+					MoveFollowerNearPlayerForLeftForDead(follower);
+				}
+			}
+			MaintainTransitionCalmWindow();
+			g_leftForDeadNeedsAggroKick = false;
+			BeginLeftForDeadCooldown(5);
+			SetGraceSeconds(5);
+			UpdatePreCombatState();
+			spdlog::info("[TFD][Transition] left-for-dead complete branch={} reason={}",
+				NoMarkerBranchName(g_noMarkerFallback.branch),
+				reason ? reason : "unknown");
+		}
 
 		static void ResolveGlobals()
 		{
@@ -985,19 +1612,45 @@ namespace TFD::DefeatMonitor
 			player->DrawWeaponMagicHands(false);
 			const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
 			TFD::AntiAggro::SweepOnce(radius, false);
-			TFD::ActorScan::Rescan(radius, false);
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto actorSP = entry.actor.get();
-				auto* actor = actorSP.get();
-				if (!actor || actor->IsDead() || actor->IsDisabled()) {
-					continue;
+
+			std::size_t applied = 0;
+			if (!g_lockedFallbackCrowdIds.empty()) {
+				for (auto id : g_lockedFallbackCrowdIds) {
+					auto* actorRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+				auto* actor = actorRef ? actorRef->As<RE::Actor>() : nullptr;
+					if (!actor || actor->IsDead() || actor->IsDisabled()) {
+						continue;
+					}
+					TFD::AggressionClamp::Apply(actor);
+					actor->StopCombat();
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
+					++applied;
 				}
-				TFD::AggressionClamp::Apply(actor);
-				actor->StopCombat();
-				actor->EvaluatePackage(true, false);
 			}
+			else {
+				TFD::ActorScan::Rescan(radius, false);
+				const auto count = TFD::ActorScan::GetCount();
+				for (int i = 0; i < count; ++i) {
+					auto entry = TFD::ActorScan::GetEntry(i);
+					auto actorSP = entry.actor.get();
+					auto* actor = actorSP.get();
+					if (!actor || actor->IsDead() || actor->IsDisabled()) {
+						continue;
+					}
+					TFD::AggressionClamp::Apply(actor);
+					actor->StopCombat();
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
+					++applied;
+				}
+			}
+
+			MaintainFollowerHold();
+			spdlog::info("[TFD][Transition] calm window maintained applied={} branch={} lockedCrowd={}",
+				applied,
+				NoMarkerBranchName(g_noMarkerFallback.branch),
+				g_lockedFallbackCrowdIds.size());
 		}
 
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID)
@@ -1048,32 +1701,37 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
-			auto* safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
-			auto* dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
+			RE::BGSLocation* safeLoc = nullptr;
+			RE::TESObjectREFR* dest = nullptr;
 
-			if ((!safeLoc || !dest)) {
-				auto* fallbackLoc = TFD::Location::GetMostRecentCachedSafeLocation();
-				if (fallbackLoc) {
-					auto* fallbackDest = ResolveBestRescueDestination(fallbackLoc);
-					if (fallbackDest) {
-						spdlog::info("[TFD][Transition] rescue fallback to recent cache reason={} currentLoc={:08X} fallbackLoc={:08X}",
-							reason ? reason : "unknown",
-							safeLoc ? safeLoc->GetFormID() : 0,
-							fallbackLoc->GetFormID());
-						safeLoc = fallbackLoc;
-						dest = fallbackDest;
+			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RescueCached && g_noMarkerFallback.destination) {
+				auto destSp = g_noMarkerFallback.destination.get();
+				dest = destSp.get();
+				safeLoc = GetLocationFromRef(dest);
+			}
+
+			if (!dest) {
+				safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
+				dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
+
+				if ((!safeLoc || !dest)) {
+					auto* fallbackLoc = TFD::Location::GetMostRecentCachedSafeLocation();
+					if (fallbackLoc) {
+						auto* fallbackDest = ResolveBestRescueDestination(fallbackLoc);
+						if (fallbackDest) {
+							spdlog::info("[TFD][Transition] rescue fallback to recent cache reason={} currentLoc={:08X} fallbackLoc={:08X}",
+								reason ? reason : "unknown",
+								safeLoc ? safeLoc->GetFormID() : 0,
+								fallbackLoc->GetFormID());
+							safeLoc = fallbackLoc;
+							dest = fallbackDest;
+						}
 					}
 				}
 			}
 
-			if (!safeLoc) {
-				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_safe_location", reason ? reason : "unknown");
-				return false;
-			}
-
 			if (!dest) {
-				spdlog::info("[TFD][Transition] rescue unavailable reason={} safeLoc={:08X} cause=no_destination",
-					reason ? reason : "unknown", safeLoc->GetFormID());
+				spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_destination", reason ? reason : "unknown");
 				return false;
 			}
 
@@ -1082,11 +1740,12 @@ namespace TFD::DefeatMonitor
 			RecoverPlayerForTransition();
 			MaintainTransitionCalmWindow();
 			g_leftForDeadNeedsAggroKick = false;
-			BeginLeftForDeadCooldown(5);
-			SetGraceSeconds(4);
+			const int grace = (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RescueCached) ? 1 : 4;
+			BeginLeftForDeadCooldown(grace);
+			SetGraceSeconds(grace);
 			UpdatePreCombatState();
-			spdlog::info("[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X}",
-				reason ? reason : "unknown", safeLoc->GetFormID(), dest->GetFormID());
+			spdlog::info("[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X} branch={}",
+				reason ? reason : "unknown", safeLoc ? safeLoc->GetFormID() : 0u, dest->GetFormID(), NoMarkerBranchName(g_noMarkerFallback.branch));
 			return true;
 		}
 
@@ -1106,13 +1765,52 @@ namespace TFD::DefeatMonitor
 
 		static void CompleteRecoverTransitionNow(const char* reason)
 		{
+			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RecoveryFollower) {
+				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
+				auto* follower = followerSp.get();
+				if (!follower || follower->IsDead() || IsActorBleedingOut(follower)) {
+					g_noMarkerFallback.branch = follower ? NoMarkerFallbackBranch::LeftForDeadWithFollower : NoMarkerFallbackBranch::LeftForDeadSolo;
+					ResolveLeftForDeadDestination(g_noMarkerFallback);
+					ExecuteLeftForDeadWake(reason ? reason : "recovery_follower_degraded_lfd");
+					return;
+				}
+				RecoverPlayerForTransition();
+				SetFollowerHold(follower);
+				MaintainTransitionCalmWindow();
+				g_leftForDeadNeedsAggroKick = false;
+				BeginLeftForDeadCooldown(3);
+				SetGraceSeconds(3);
+				UpdatePreCombatState();
+				spdlog::info("[TFD][Transition] recover complete branch={} reason={} follower={:08X}",
+					NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown", follower->GetFormID());
+				return;
+			}
+
+			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RecoveryPotion) {
+				RecoverPlayerForTransition();
+				MaintainTransitionCalmWindow();
+				g_leftForDeadNeedsAggroKick = false;
+				BeginLeftForDeadCooldown(3);
+				SetGraceSeconds(3);
+				UpdatePreCombatState();
+				spdlog::info("[TFD][Transition] recover complete branch={} reason={} potion={:08X}",
+					NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown", g_noMarkerFallback.potionFormId);
+				return;
+			}
+
+			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::LeftForDeadSolo ||
+				g_noMarkerFallback.branch == NoMarkerFallbackBranch::LeftForDeadWithFollower) {
+				ExecuteLeftForDeadWake(reason);
+				return;
+			}
+
 			RecoverPlayerForTransition();
 			MaintainTransitionCalmWindow();
-			g_leftForDeadNeedsAggroKick = true;
+			g_leftForDeadNeedsAggroKick = false;
 			BeginLeftForDeadCooldown(3);
-			SetGraceSeconds(2);
+			SetGraceSeconds(3);
 			UpdatePreCombatState();
-			spdlog::info("[TFD][Transition] recover complete reason={}", reason ? reason : "unknown");
+			spdlog::info("[TFD][Transition] recover complete branch={} reason={}", NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown");
 		}
 
 		static void BeginRecoverTransition(const char* reason)
@@ -1130,6 +1828,7 @@ namespace TFD::DefeatMonitor
 
 		static void CompleteCaptiveTransitionNow(const char* reason)
 		{
+			ClearNoMarkerFallbackState();
 			ResetBleedRuntimeState();
 			ClearBleedoutBridgeAliases(nullptr, "blackout_teleport");
 			TFD::ForceGreet::Cancel();
@@ -1189,8 +1888,12 @@ namespace TFD::DefeatMonitor
 			if (result == 102) {
 				spdlog::info("[TFD][Transition] result=rescue_blackout_ready");
 				if (!CompleteRescueTransitionNow("rescue_blackout_ready")) {
-					CompleteRecoverTransitionNow("rescue_fallback_recover");
-					SchedulePendingCinematicFadeIn(CinematicTransitionKind::Recover, "rescue_fallback_recover_fadein", 300);
+					g_noMarkerFallback.branch = NoMarkerFallbackBranch::LeftForDeadSolo;
+					g_noMarkerFallback.destination.reset();
+					g_noMarkerFallback.hasFallbackPos = false;
+					ResolveLeftForDeadDestination(g_noMarkerFallback);
+					CompleteRecoverTransitionNow("rescue_fallback_left_for_dead");
+					SchedulePendingCinematicFadeIn(CinematicTransitionKind::Recover, "rescue_fallback_left_for_dead_fadein", 300);
 				}
 				else {
 					SchedulePendingCinematicFadeIn(CinematicTransitionKind::Rescue, "rescue_fadein", 350);
@@ -1906,9 +2609,11 @@ namespace TFD::DefeatMonitor
 		static void TickLeftForDeadCooldown()
 		{
 			if (!IsLeftForDeadCooldownActive()) return;
+			MaintainFollowerHold();
 			const auto now = Now();
 			if (g_leftForDeadNextPulse.time_since_epoch().count() != 0 && now < g_leftForDeadNextPulse) return;
-			g_leftForDeadNextPulse = now + std::chrono::seconds(2);
+			g_leftForDeadNextPulse = now + std::chrono::milliseconds(900);
+			MaintainTransitionCalmWindow();
 		}
 
 		static void BeginLeftForDeadBlackout(int, const char*)
@@ -1922,6 +2627,7 @@ namespace TFD::DefeatMonitor
 		}
 
 		static void EnterNonCaptiveChoice(const char* reason);
+		static bool BeginResolvedNoMarkerFallback(const char* reason);
 
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
 		{
@@ -1930,6 +2636,7 @@ namespace TFD::DefeatMonitor
 			}
 
 			ClearBleedoutBridgeAliases(aggressor, "start_bleed_window");
+			ClearNoMarkerFallbackState();
 
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
@@ -2032,17 +2739,12 @@ namespace TFD::DefeatMonitor
 			EnterEscapeCommit("lockpick", door);
 		}
 
-		static void EnterNonCaptiveChoice(const char* reason)
+		static bool BeginResolvedNoMarkerFallback(const char* reason)
 		{
-			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "noncaptive");
 			ClearPendingCinematicFadeIn();
-			TFD::ForceGreet::Cancel();
-			TFD::FactionMask::Clear();
 			ClearEscapeContext();
 			ResetLockpickWatch();
 			g_grace.store(false, std::memory_order_release);
-			g_lastAggressor.reset();
-			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
@@ -2057,25 +2759,58 @@ namespace TFD::DefeatMonitor
 				player->DrawWeaponMagicHands(false);
 			}
 
-			const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
-			TFD::AntiAggro::SweepOnce(radius, false);
-			TFD::ActorScan::Rescan(radius, false);
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto actorSP = entry.actor.get();
-				auto* actor = actorSP.get();
-				if (!actor || actor->IsDead() || actor->IsDisabled()) {
-					continue;
-				}
-				TFD::AggressionClamp::Apply(actor);
-				actor->StopCombat();
-				actor->EvaluatePackage(true, false);
+			const auto branch = ResolveNoMarkerFallback(reason);
+			if (branch == NoMarkerFallbackBranch::None) {
+				return false;
 			}
 
+			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "noncaptive");
+			TFD::ForceGreet::Cancel();
+			SetPlayerBleedImmune(false);
+			ResetBleedRuntimeState();
+			g_lastAggressor.reset();
+			UpdatePreCombatState();
+
+			spdlog::info("[TFD][Transition] committed no-marker fallback branch={} reason={}",
+				NoMarkerBranchName(branch),
+				reason ? reason : "unknown");
+
+			if (branch == NoMarkerFallbackBranch::RescueCached) {
+				if (!BeginRescueTransition(reason ? reason : "rescue_cached")) {
+					g_noMarkerFallback.branch = NoMarkerFallbackBranch::LeftForDeadSolo;
+					g_noMarkerFallback.destination.reset();
+					g_noMarkerFallback.hasFallbackPos = false;
+					ResolveLeftForDeadDestination(g_noMarkerFallback);
+					BeginRecoverTransition("rescue_cached_fallback_left_for_dead");
+				}
+				return true;
+			}
+
+			BeginRecoverTransition(reason ? reason : NoMarkerBranchName(branch));
+			return true;
+		}
+
+		static void EnterNonCaptiveChoice(const char* reason)
+		{
+			if (BeginResolvedNoMarkerFallback(reason)) {
+				return;
+			}
+
+			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "noncaptive");
+			ClearPendingCinematicFadeIn();
+			TFD::ForceGreet::Cancel();
+			TFD::FactionMask::Clear();
+			ClearEscapeContext();
+			ResetLockpickWatch();
+			g_grace.store(false, std::memory_order_release);
+			g_lastAggressor.reset();
+			ResetBleedRuntimeState();
+			g_prevDialogueOpen = false;
+			g_prevLockpickOpen = false;
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 			SetPlayerBleedImmune(false);
 			QueueNonCaptiveChoiceRequest(reason);
-			spdlog::warn("[TFD][Transition] non-captive choice armed reason={}", reason ? reason : "unknown");
+			spdlog::warn("[TFD][Transition] fallback to legacy non-captive choice reason={}", reason ? reason : "unknown");
 		}
 
 		static void DoBlackoutTeleport()
@@ -2262,7 +2997,7 @@ namespace TFD::DefeatMonitor
 						SetGraceSeconds(4);
 					}
 					else {
-						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> no marker -> LeftForDead");
+						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> no marker -> resolve fallback");
 						g_inBleedState.store(false, std::memory_order_release);
 						g_minHp = 0.0f;
 						g_bleedSawDialogue = false;
@@ -2283,14 +3018,14 @@ namespace TFD::DefeatMonitor
 				}
 				if (remain <= 0) {
 					const bool pendingCaptive = g_bleedPendingCaptiveOutcome;
-					ResetBleedRuntimeState();
 					if (pendingCaptive && ResolveCaptiveMarkerForOutcome()) {
+						ResetBleedRuntimeState();
 						spdlog::info("[TFD][Defeat] bleed timeout -> captive blackout");
 						DoBlackoutTeleport();
 						SetGraceSeconds(4);
 					}
 					else {
-						spdlog::info("[TFD][Defeat] bleed timeout -> noncaptive fallback");
+						spdlog::info("[TFD][Defeat] bleed timeout -> resolve no-marker fallback");
 						EnterNonCaptiveChoice("bleed_timeout");
 					}
 				}
