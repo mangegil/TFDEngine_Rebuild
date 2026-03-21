@@ -108,6 +108,16 @@ namespace TFD::Pacify
         RE::Actor* actor,
         ReleaseReason reason = ReleaseReason::DialogueClosed,
         bool onlyIfStillHostile = false);
+    bool ForceDetectionAndCombatRefresh(
+        RE::Actor* actor,
+        RE::Actor* player,
+        ReleaseReason reason = ReleaseReason::Generic,
+        bool drawWeapon = true);
+    void QueueDetectionAndCombatRefresh(
+        RE::Actor* actor,
+        RE::Actor* player,
+        ReleaseReason reason = ReleaseReason::Generic,
+        bool drawWeapon = true);
     void ReleaseAll();
 
     const char* ToString(Mode mode);

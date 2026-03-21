@@ -28,6 +28,7 @@
 #include "TFDActorScan.h"
 #include "TFDAggressionClamp.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDPacify.h"
 
 namespace TFD::DefeatMonitor
 {
@@ -89,6 +90,7 @@ namespace TFD::DefeatMonitor
 		bool g_leftForDeadActive = false;
 		std::chrono::steady_clock::time_point g_leftForDeadUntil{};
 		std::chrono::steady_clock::time_point g_leftForDeadNextPulse{};
+		bool g_leftForDeadNeedsAggroKick = false;
 
 
 		RE::ActorHandle g_lastAggressor{};
@@ -217,10 +219,117 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		static RE::Actor* ResolveAggressor();
+		static RE::Actor* FindBestAggressor(float radius);
+
+		static void QueuePostRecoveryAggroKick(const char* reason)
+		{
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+
+			auto* pCell = player->GetParentCell();
+			if (!pCell) {
+				return;
+			}
+
+			const float radius = (std::max)(2200.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+			RE::Actor* primary = ResolveAggressor();
+			if (!primary) {
+				primary = FindBestAggressor(radius);
+			}
+
+			std::unordered_set<RE::FormID> queuedIds;
+			std::size_t queued = 0;
+
+			auto queueOne = [&](RE::Actor* actor, bool drawWeapon) {
+				if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					return;
+				}
+				if (actor->GetFormID() == player->GetFormID()) {
+					return;
+				}
+				if (actor->GetParentCell() != pCell) {
+					return;
+				}
+				if (!IsCaptiveSupportedAggressor(actor)) {
+					return;
+				}
+
+				const auto [_, inserted] = queuedIds.insert(actor->GetFormID());
+				if (!inserted) {
+					return;
+				}
+
+				const bool kickedNow = TFD::Pacify::ForceDetectionAndCombatRefresh(
+					actor,
+					player,
+					TFD::Pacify::ReleaseReason::DialogueClosed,
+					drawWeapon);
+				TFD::Pacify::QueueDetectionAndCombatRefresh(
+					actor,
+					player,
+					TFD::Pacify::ReleaseReason::DialogueClosed,
+					drawWeapon);
+				++queued;
+
+				spdlog::info(
+					"[TFD][Defeat] post-recovery aggro kick actor={:08X} drawWeapon={} immediate={} reason={}",
+					actor->GetFormID(),
+					drawWeapon ? 1 : 0,
+					kickedNow ? 1 : 0,
+					reason ? reason : "unknown");
+			};
+
+			if (primary) {
+				queueOne(primary, true);
+			}
+
+			TFD::ActorScan::Rescan(radius, true);
+			const auto n = TFD::ActorScan::GetCount();
+			for (int i = 0; i < n; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto sp = entry.actor.get();
+				auto* actor = sp.get();
+				if (!actor || actor == primary) {
+					continue;
+				}
+				if (entry.dist > radius) {
+					continue;
+				}
+				if (!entry.hostile && !entry.inCombat && !actor->IsInCombat() && !actor->IsHostileToActor(player)) {
+					continue;
+				}
+
+				queueOne(actor, true);
+
+				if (queued >= 8) {
+					break;
+				}
+			}
+
+			if (queued > 0) {
+				player->EvaluatePackage(false, true);
+				player->EvaluatePackage(true, true);
+				player->UpdateCombat();
+			}
+
+			spdlog::info(
+				"[TFD][Defeat] post-recovery aggro kick queued={} primary={:08X} reason={}",
+				queued,
+				primary ? primary->GetFormID() : 0u,
+				reason ? reason : "unknown");
+		}
+
 		static void FinishLeftForDeadRecovery()
 		{
 			TFD::AggressionClamp::Clear();
 			TFD::FactionMask::Clear();
+			if (g_leftForDeadNeedsAggroKick) {
+				QueuePostRecoveryAggroKick("left_for_dead_recovery_finished");
+			}
+			g_leftForDeadNeedsAggroKick = false;
 			g_leftForDeadActive = false;
 			g_leftForDeadUntil = {};
 			g_leftForDeadNextPulse = {};
@@ -249,6 +358,7 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadActive = false;
 			g_leftForDeadUntil = {};
 			g_leftForDeadNextPulse = {};
+			g_leftForDeadNeedsAggroKick = false;
 		}
 
 		static void BeginLeftForDeadCooldown(int seconds)
@@ -971,6 +1081,7 @@ namespace TFD::DefeatMonitor
 			std::this_thread::sleep_for(std::chrono::milliseconds(120));
 			RecoverPlayerForTransition();
 			MaintainTransitionCalmWindow();
+			g_leftForDeadNeedsAggroKick = false;
 			BeginLeftForDeadCooldown(5);
 			SetGraceSeconds(4);
 			UpdatePreCombatState();
@@ -997,6 +1108,7 @@ namespace TFD::DefeatMonitor
 		{
 			RecoverPlayerForTransition();
 			MaintainTransitionCalmWindow();
+			g_leftForDeadNeedsAggroKick = true;
 			BeginLeftForDeadCooldown(3);
 			SetGraceSeconds(2);
 			UpdatePreCombatState();

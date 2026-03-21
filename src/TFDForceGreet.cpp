@@ -259,13 +259,21 @@ namespace TFD::ForceGreet
 				return;
 			}
 
-			if (speaker->IsInCombat()) {
-				speaker->StopCombat();
+			const bool isTruce = (mode == Mode::InCombatTruce || mode == Mode::PreCombatTruce);
+			if (!isTruce) {
+				if (speaker->IsInCombat()) {
+					speaker->StopCombat();
+				}
+				speaker->DrawWeaponMagicHands(false);
 			}
-			speaker->DrawWeaponMagicHands(false);
+
+			speaker->AllowPCDialogue(false);
 			speaker->SetDialogueWithPlayer(false, false, nullptr);
 
-			if (mode == Mode::Bleedout || mode == Mode::InCombatTruce) {
+			if (isTruce) {
+				speaker->EvaluatePackage(false, true);
+				speaker->EvaluatePackage(true, true);
+			} else if (mode == Mode::Bleedout) {
 				speaker->EvaluatePackage(true, false);
 			}
 		}

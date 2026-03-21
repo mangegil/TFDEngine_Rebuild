@@ -678,6 +678,26 @@ namespace TFD::Pacify
             (void)entry;
         }
 
+        void PulseGlobalDetection(const char* reason)
+        {
+            auto* process = RE::ProcessLists::GetSingleton();
+            if (!process) {
+                return;
+            }
+
+            const bool before = process->runDetection;
+            process->runDetection = false;
+            process->ClearCachedFactionFightReactions();
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+
+            spdlog::info(
+                "TFDPacify: detection pulse reason={} before={} after={}",
+                reason ? reason : "<null>",
+                before ? 1 : 0,
+                process->runDetection ? 1 : 0);
+        }
+
         bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
         {
             if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
@@ -690,6 +710,10 @@ namespace TFD::Pacify
 
             if (auto* process = RE::ProcessLists::GetSingleton()) {
                 process->ClearCachedFactionFightReactions();
+            }
+
+            if (reason == ReleaseReason::DialogueClosed) {
+                PulseGlobalDetection(ToString(reason));
             }
 
             actor->SetBeenAttacked(true);
@@ -1547,6 +1571,24 @@ namespace TFD::Pacify
         g_entries.clear();
         g_sessions.clear();
         g_rehostileRequests.clear();
+    }
+
+    bool ForceDetectionAndCombatRefresh(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
+    {
+        return ForceRehostile(actor, player, reason, drawWeapon);
+    }
+
+    void QueueDetectionAndCombatRefresh(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
+    {
+        if (!actor || !player) {
+            return;
+        }
+
+        if (ForceRehostile(actor, player, reason, drawWeapon)) {
+            return;
+        }
+
+        QueueRehostileRetry(actor, player, 0, reason, PacifyNowSec(), drawWeapon);
     }
 
     const char* ToString(Mode mode)
