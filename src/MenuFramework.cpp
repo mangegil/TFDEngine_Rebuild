@@ -13,6 +13,7 @@
 #include <thread>
 #include <cmath>
 #include <cctype>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -889,46 +890,99 @@ namespace TFDMenu
 			return CaptureResult::None;
 		}
 
-		static void __stdcall RenderSettings()
+		
+		static const char* YesNo(bool v)
+		{
+			return v ? "Yes" : "No";
+		}
+
+		static bool HasPrefixNoCase(std::string_view value, std::string_view prefix)
+		{
+			if (prefix.empty() || value.size() < prefix.size()) {
+				return false;
+			}
+
+			auto lower = [](char c) {
+				return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+				};
+
+			for (std::size_t i = 0; i < prefix.size(); ++i) {
+				if (lower(value[i]) != lower(prefix[i])) {
+					return false;
+				}
+			}
+			return true;
+		}
+
+		static void RenderLocationBrief(const char* label, RE::BGSLocation* loc)
+		{
+			const auto formId = loc ? loc->GetFormID() : 0;
+			const auto editorId = loc ? TFD::Util::GetEditorId(loc) : std::string{};
+			const char* name = (loc && loc->GetName()) ? loc->GetName() : "";
+
+			ImGuiMCP::Text("%s: 0x%08X | %s | %s", label, formId, editorId.c_str(), SafeStr(name));
+		}
+
+		static void RenderCellBrief(const char* label, RE::TESObjectCELL* cell)
+		{
+			ImGuiMCP::Text(
+				"%s: 0x%08X | %s | interior=%d",
+				label,
+				cell ? cell->GetFormID() : 0,
+				cell ? TFD::Util::GetEditorId(cell).c_str() : "",
+				(cell && cell->IsInteriorCell()) ? 1 : 0);
+		}
+
+		static void RenderRefBrief(const char* label, RE::TESObjectREFR* ref)
+		{
+			auto* base = ref ? ref->GetBaseObject() : nullptr;
+			auto* cell = ref ? ref->GetParentCell() : nullptr;
+			auto* loc = ref ? TFD::Location::GetLocationFromRef(ref) : nullptr;
+			const auto refEdid = ref ? TFD::Util::GetEditorId(ref) : std::string{};
+			const auto baseEdid = base ? TFD::Util::GetEditorId(base) : std::string{};
+			const char* baseName = (base && base->GetName()) ? base->GetName() : "";
+
+			ImGuiMCP::Text(
+				"%s: 0x%08X | %s | base=%s | name=%s",
+				label,
+				ref ? ref->GetFormID() : 0,
+				refEdid.c_str(),
+				baseEdid.c_str(),
+				SafeStr(baseName));
+			RenderCellBrief("  Cell", cell);
+			RenderLocationBrief("  Loc", loc);
+		}
+
+		static void RenderCombatRulesPage()
 		{
 			ResolveGlobals();
 
-			ImGuiMCP::Text("TFDEngine");
+			ImGuiMCP::Text("Combat Rules");
 			ImGuiMCP::Separator();
 
-			if (ImGuiMCP::Checkbox("Enable defeat", &uiEnabled)) {
+			if (ImGuiMCP::Checkbox("Enable TFD", &uiEnabled)) {
 				ApplyToCore();
 			}
 
-			if (ImGuiMCP::SliderFloat("Defeat threshold (%)", &uiThreshold, 2.0f, 95.0f, "%.0f%%")) {
-				ApplyToCore();
-			}
-
-			if (ImGuiMCP::SliderInt("Bleed window (sec)", &uiBleedSeconds, 10, 30, "%d")) {
+			if (ImGuiMCP::SliderFloat("Player Health Threshold (%)", &uiThreshold, 2.0f, 95.0f, "%.0f%%")) {
 				ApplyToCore();
 			}
 
 			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Hotkey");
+			ImGuiMCP::Text("Signal Hotkey");
 
-			if (ImGuiMCP::Checkbox("Enable hotkey", &uiHotkeyEnabled)) {
-				ApplyToCore();
-			}
-			if (ImGuiMCP::Checkbox("Wave gesture", &uiHotkeyWave)) {
-				ApplyToCore();
-			}
-			if (ImGuiMCP::SliderInt("Hotkey cooldown (ms)", &uiHotkeyCooldownMs, 0, 5000, "%d")) {
+			if (ImGuiMCP::Checkbox("Enable Signal Hotkey", &uiHotkeyEnabled)) {
 				ApplyToCore();
 			}
 
-			ImGuiMCP::Text("Bound key: %s", KeyLabel(static_cast<std::uint32_t>(uiHotkeyScanCode)).c_str());
+			ImGuiMCP::Text("Current Key: %s", KeyLabel(static_cast<std::uint32_t>(uiHotkeyScanCode)).c_str());
+			ImGuiMCP::Text("Default Key: H");
 
 			if (!gCaptureHotkey) {
-				if (ImGuiMCP::Button("Rebind hotkey")) {
+				if (ImGuiMCP::Button("Rebind Signal Hotkey")) {
 					gCaptureHotkey = true;
 				}
-			}
-			else {
+			} else {
 				ImGuiMCP::Text("Press a key now... (Esc = cancel)");
 
 				std::uint32_t newCode = 0;
@@ -954,49 +1008,191 @@ namespace TFDMenu
 					break;
 				}
 			}
+		}
+
+		static void RenderDebugPage()
+		{
+			ResolveGlobals();
+
+			const bool captivePhase = IsCaptivePhase();
+			const bool escapeStart = GetGlobalValue(gCaptiveState) >= 0.5f && GetCaptivePhaseRaw() == 2u;
+			const bool escapeDone = TFD::DefeatMonitor::IsLeftForDeadRecoveryActive();
+			const char* flowName = captivePhase ? "Captive" : (escapeStart ? "Escape" : (escapeDone ? "Recovery" : "None"));
+
+			ImGuiMCP::Text("Debug");
+			ImGuiMCP::Separator();
+
+			ImGuiMCP::Text("Captive / Escape Flow");
+			ImGuiMCP::Text("Current Flow: %s", flowName);
+			ImGuiMCP::Text("Captive Phase: %s", YesNo(captivePhase));
+			ImGuiMCP::Text("Escape Start: %s", YesNo(escapeStart));
+			ImGuiMCP::Text("Escape Done / Recovery: %s", YesNo(escapeDone));
+			ImGuiMCP::Text("CaptiveState(Global): %.0f", GetGlobalValue(gCaptiveState));
+			ImGuiMCP::Text("CaptivePhase(Global): %.0f", GetGlobalValue(gCaptivePhase));
+			ImGuiMCP::Text("PreCombatState(Global): %.0f", GetGlobalValue(gPreCombatState));
 
 			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Debug");
+			ImGuiMCP::Text("Captive Marker");
+			RenderRefBrief("Location Captive Marker", TFD::Location::GetCachedCaptiveMarker());
 
-			ImGuiMCP::SliderFloat("Scan radius", &uiScanRadius, 256.0f, 12000.0f, "%.0f");
-			ImGuiMCP::SliderFloat("Sweep radius", &uiSweepRadius, 256.0f, 12000.0f, "%.0f");
-			ImGuiMCP::Checkbox("NPC only", &uiNpcOnly);
-
-			if (ImGuiMCP::Button("Apply")) {
-				ApplyToCore();
-			}
-
-			if (ImGuiMCP::Button("Rescan Marker")) {
+			if (ImGuiMCP::Button("Rescan Captive Marker")) {
 				TFD::Location::RescanCaptiveMarker();
 				TFD::Location::DumpContextToLog();
 			}
-
-			if (ImGuiMCP::Button("Teleport -> Marker")) {
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Teleport -> Captive Marker")) {
 				TFD::Location::TeleportToCaptiveMarker();
 				TFD::AntiAggro::ScheduleWaves(TFD::Settings::GetSweepRadius(), true, 6, 180);
 			}
 
-			if (ImGuiMCP::Button("Rescan Actors")) {
-				TFD::ActorScan::Rescan(TFD::Settings::GetScanRadius(), uiNpcOnly);
-			}
-
-			if (ImGuiMCP::Button("StopCombat Sweep")) {
-				TFD::AntiAggro::SweepOnce(TFD::Settings::GetSweepRadius(), true);
-			}
-
 			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Marker: 0x%08X", TFD::Location::GetCachedCaptiveMarkerFormID());
-			ImGuiMCP::Text("Actors: %d", TFD::ActorScan::GetCount());
-			ImGuiMCP::Text("Hotkey: %s", KeyLabel(TFD::Settings::GetHotkeyScanCode()).c_str());
-			ImGuiMCP::Text("InputSink: %s", inputSinkAdded.load() ? "READY" : "WAITING");
-			ImGuiMCP::Text("CaptivePhase(C++ bool): %.0f", IsCaptivePhase() ? 1.0f : 0.0f);
-			ImGuiMCP::Text("CaptivePhaseRaw(C++): %u", GetCaptivePhaseRaw());
-			ImGuiMCP::Text("CaptivePhaseName(C++): %s", GetCaptivePhaseName());
-			ImGuiMCP::Text("CaptiveFamily(C++): %.0f", IsCaptiveFamily() ? 1.0f : 0.0f);
-			ImGuiMCP::Text("CaptiveState(Global): %.0f", GetGlobalValue(gCaptiveState) >= 0.5f ? 1.0f : 0.0f);
-			ImGuiMCP::Text("PreCombatState: %.0f", IsPreCombatPhase() ? 1.0f : 0.0f);
+			ImGuiMCP::Text("Rescue Marker");
 
-			RenderLocationMonitor();
+			auto* safeLoc = TFD::Location::GetMostRecentCachedSafeLocation();
+			auto* rescueRef = TFD::Location::ResolveMostRecentCachedRescueDestination(true);
+			RenderLocationBrief("Cached Safe Location", safeLoc);
+			RenderRefBrief("Preferred Rescue Destination", rescueRef);
+
+			TFD::Location::SafeCheckpoint cp{};
+			if (safeLoc && TFD::Location::GetLastSafeCheckpointForLocation(safeLoc, cp)) {
+				RenderRefBrief("Rescue Cache Inside Marker", RE::TESForm::LookupByID<RE::TESObjectREFR>(cp.insideEntranceRefId));
+				RenderRefBrief("Rescue Cache Center Marker", RE::TESForm::LookupByID<RE::TESObjectREFR>(cp.centerMarkerRefId));
+				RenderRefBrief("Rescue Cache Entry Door", RE::TESForm::LookupByID<RE::TESObjectREFR>(cp.entryDoorRefId));
+			}
+
+			TFD::Location::ApprovedBed bed{};
+			if (safeLoc && TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
+				RenderRefBrief("Approved Rescue Bed", RE::TESForm::LookupByID<RE::TESObjectREFR>(bed.bedRefId));
+			}
+
+			if (ImGuiMCP::Button("Dump Rescue Cache To Log")) {
+				TFD::Location::DumpRescueCacheToLog();
+			}
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button("Clear Rescue Cache")) {
+				TFD::Location::ClearRescueCache();
+			}
+		}
+
+		struct QuestAliasReadLock
+		{
+			RE::BSReadWriteLock& lock;
+			explicit QuestAliasReadLock(RE::BSReadWriteLock& a_lock) : lock(a_lock) { lock.LockForRead(); }
+			~QuestAliasReadLock() { lock.UnlockForRead(); }
+		};
+
+		static void RenderQuestAliasEntry(RE::BGSBaseAlias* alias)
+		{
+			if (!alias) {
+				ImGuiMCP::BulletText("<null alias>");
+				return;
+			}
+
+			const char* aliasName = alias->aliasName.c_str();
+			const char* typeName = alias->QType().c_str();
+
+			if (auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(alias)) {
+				auto* ref = refAlias->GetReference();
+				auto* actor = refAlias->GetActorReference();
+				ImGuiMCP::BulletText(
+					"%s | %s | %s",
+					SafeStr(aliasName),
+					SafeStr(typeName),
+					ref ? "FILLED" : "EMPTY");
+				if (ref) {
+					ImGuiMCP::Indent();
+					RenderRefBrief(actor ? "Actor Ref" : "Ref", ref);
+					ImGuiMCP::Unindent();
+				}
+				return;
+			}
+
+			if (skyrim_cast<RE::BGSLocAlias*>(alias)) {
+				ImGuiMCP::BulletText("%s | %s | runtime fill monitor unavailable", SafeStr(aliasName), SafeStr(typeName));
+				return;
+			}
+
+			ImGuiMCP::BulletText("%s | %s", SafeStr(aliasName), SafeStr(typeName));
+		}
+
+		static void RenderQuestAliasMonitorPage()
+		{
+			ImGuiMCP::Text("Quest Alias Monitor");
+			ImGuiMCP::Separator();
+
+			auto* data = RE::TESDataHandler::GetSingleton();
+			if (!data) {
+				ImGuiMCP::Text("TESDataHandler not ready");
+				return;
+			}
+
+			auto& quests = data->GetFormArray<RE::TESQuest>();
+			std::vector<RE::TESQuest*> tfdQuests;
+			tfdQuests.reserve(32);
+
+			for (auto* quest : quests) {
+				if (!quest) {
+					continue;
+				}
+
+				const auto editorId = TFD::Util::GetEditorId(quest);
+				if (!HasPrefixNoCase(editorId, "TFD")) {
+					continue;
+				}
+
+				if (quest->aliases.empty()) {
+					continue;
+				}
+
+				tfdQuests.push_back(quest);
+			}
+
+			std::sort(tfdQuests.begin(), tfdQuests.end(), [](RE::TESQuest* a, RE::TESQuest* b) {
+				return TFD::Util::GetEditorId(a) < TFD::Util::GetEditorId(b);
+				});
+
+			ImGuiMCP::Text("TFD Quests With Aliases: %d", static_cast<int>(tfdQuests.size()));
+
+			for (auto* quest : tfdQuests) {
+				if (!quest) {
+					continue;
+				}
+
+				QuestAliasReadLock aliasLock(quest->aliasAccessLock);
+
+				int filledRefCount = 0;
+				for (auto* baseAlias : quest->aliases) {
+					auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+					if (refAlias && refAlias->GetReference()) {
+						++filledRefCount;
+					}
+				}
+
+				const auto editorId = TFD::Util::GetEditorId(quest);
+				const char* name = quest->GetName() ? quest->GetName() : "";
+				std::string header = editorId;
+				if (name[0]) {
+					header += " | ";
+					header += name;
+				}
+				header += " | aliases=";
+				header += std::to_string(static_cast<int>(quest->aliases.size()));
+				header += " | filled=";
+				header += std::to_string(filledRefCount);
+
+				if (ImGuiMCP::CollapsingHeader(header.c_str())) {
+					ImGuiMCP::Text(
+						"Quest: 0x%08X | running=%s | enabled=%s | active=%s",
+						quest->GetFormID(),
+						YesNo(quest->IsRunning()),
+						YesNo(quest->IsEnabled()),
+						YesNo(quest->IsActive()));
+
+					for (auto* baseAlias : quest->aliases) {
+						RenderQuestAliasEntry(baseAlias);
+					}
+				}
+			}
 		}
 
 		static void TryRegisterMenu()
@@ -1018,12 +1214,14 @@ namespace TFDMenu
 
 			SyncFromCore();
 
-			SKSEMenuFramework::SetSection("TFDEngine");
-			SKSEMenuFramework::AddSectionItem("Settings", RenderSettings);
+			SKSEMenuFramework::SetSection("TFD");
+			SKSEMenuFramework::AddSectionItem("Combat Rules", RenderCombatRulesPage);
+			SKSEMenuFramework::AddSectionItem("Debug", RenderDebugPage);
+			SKSEMenuFramework::AddSectionItem("Quest Alias Monitor", RenderQuestAliasMonitorPage);
 
 			menuRegistered = true;
 			spdlog::info("[TFD][SMF] menu registered OK");
-			RE::DebugNotification("TFDEngine: SMF menu registered");
+			RE::DebugNotification("TFD: SMF menu registered");
 		}
 
 		class InputSink : public RE::BSTEventSink<RE::InputEvent*>
