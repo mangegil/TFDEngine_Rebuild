@@ -76,7 +76,6 @@ namespace TFD::DefeatMonitor
 		}
 
 		std::atomic_bool g_inBleedState{ false };
-		std::atomic<std::uint64_t> g_bleedBridgeEpoch{ 1 };
 		float g_minHp{ 0.0f };
 		bool g_playerBleedImmuneForced = false;
 		bool g_playerWasEssential = false;
@@ -90,6 +89,8 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_bleedLastCrowdAssign{};
 
 		std::vector<RE::FormID> g_bleedCrowdAssigned{};
+		RE::FormID g_bleedTruceSessionId = 0;
+		RE::FormID g_bleedSpeakerId = 0;
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -529,113 +530,10 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
-		static bool QueueBleedBridgeClearAll(RE::TESForm* sender, const char* reason)
-		{
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				spdlog::warn("[TFD][BleedBridge] ClearAll failed: no task interface reason={}", reason ? reason : "unknown");
-				return false;
-			}
-
-			const std::uint64_t epoch = g_bleedBridgeEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-			std::uint32_t actorHandle = 0;
-			RE::FormID senderFormID = 0;
-			if (sender) {
-				senderFormID = sender->GetFormID();
-				if (auto* actor = sender->As<RE::Actor>()) {
-					actorHandle = actor->GetHandle().native_handle();
-				}
-			}
-
-			task->AddTask([epoch, actorHandle, senderFormID]() {
-				RE::TESForm* outSender = nullptr;
-				if (actorHandle != 0) {
-					auto actorSp = RE::Actor::LookupByHandle(actorHandle);
-					outSender = actorSp.get();
-					if (!outSender && senderFormID != 0) {
-						outSender = RE::TESForm::LookupByID(senderFormID);
-					}
-				}
-				else if (senderFormID != 0) {
-					outSender = RE::TESForm::LookupByID(senderFormID);
-				}
-
-				auto* src = SKSE::GetModCallbackEventSource();
-				if (!src) {
-					spdlog::warn("[TFD][BleedBridge] ClearAll dispatch skipped: no callback source sender={:08X} epoch={}", senderFormID, epoch);
-					return;
-				}
-
-				SKSE::ModCallbackEvent ev{ "TFDBleedoutClearAll", "", 0.0f, outSender };
-				src->SendEvent(&ev);
-				spdlog::info("[TFD][BleedBridge] Dispatch event=TFDBleedoutClearAll sender={:08X} resolved={:08X} epoch={}",
-					senderFormID,
-					outSender ? outSender->GetFormID() : 0u,
-					epoch);
-				});
-			return true;
-		}
-
-		static bool QueueBleedBridgeAssign(RE::Actor* actor)
-		{
-			if (!actor) {
-				return false;
-			}
-
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				spdlog::warn("[TFD][BleedBridge] Assign failed: no task interface actor={:08X}", actor->GetFormID());
-				return false;
-			}
-
-			const std::uint64_t epoch = g_bleedBridgeEpoch.load(std::memory_order_acquire);
-			const RE::FormID senderFormID = actor->GetFormID();
-			const std::uint32_t actorHandle = actor->GetHandle().native_handle();
-
-			task->AddTask([epoch, actorHandle, senderFormID]() {
-				const auto currentEpoch = g_bleedBridgeEpoch.load(std::memory_order_acquire);
-				if (epoch != currentEpoch) {
-					spdlog::info("[TFD][BleedBridge] Skip stale assign sender={:08X} queuedEpoch={} currentEpoch={}",
-						senderFormID,
-						epoch,
-						currentEpoch);
-					return;
-				}
-
-				auto actorSp = RE::Actor::LookupByHandle(actorHandle);
-				RE::TESForm* outSender = actorSp.get();
-				if (!outSender && senderFormID != 0) {
-					outSender = RE::TESForm::LookupByID(senderFormID);
-				}
-
-				if (!outSender) {
-					spdlog::info("[TFD][BleedBridge] Skip assign sender={:08X} epoch={} (sender unresolved)", senderFormID, epoch);
-					return;
-				}
-
-				auto* src = SKSE::GetModCallbackEventSource();
-				if (!src) {
-					spdlog::warn("[TFD][BleedBridge] Assign dispatch skipped: no callback source sender={:08X} epoch={}", senderFormID, epoch);
-					return;
-				}
-
-				SKSE::ModCallbackEvent ev{ "TFDBleedoutAssign", "", 0.0f, outSender };
-				src->SendEvent(&ev);
-				spdlog::info("[TFD][BleedBridge] Dispatch event=TFDBleedoutAssign sender={:08X} resolved={:08X} epoch={}",
-					senderFormID,
-					outSender ? outSender->GetFormID() : 0u,
-					epoch);
-				});
-			return true;
-		}
-
 		static void ClearBleedoutBridgeAliases(RE::TESForm* sender, const char* reason)
 		{
-			const bool queued = QueueBleedBridgeClearAll(sender, reason);
-			spdlog::info("[TFD][BleedBridge] ClearAll reason={} queued={} epoch={}",
-				reason ? reason : "unknown",
-				queued,
-				g_bleedBridgeEpoch.load(std::memory_order_acquire));
+			const bool queued = SendBridgeModEvent("TFDBleedoutClearAll", sender);
+			spdlog::info("[TFD][BleedBridge] ClearAll reason={} queued={}", reason ? reason : "unknown", queued);
 		}
 
 		static void AssignBleedoutBridgeActor(RE::Actor* actor)
@@ -644,12 +542,97 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			const auto epoch = g_bleedBridgeEpoch.load(std::memory_order_acquire);
-			const bool queued = QueueBleedBridgeAssign(actor);
-			spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={} epoch={}", actor->GetFormID(), queued, epoch);
+			const bool queued = SendBridgeModEvent("TFDBleedoutAssign", actor);
+			spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
 		}
 
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
+		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player);
+		static void ClearBleedSupportBridgeAliases(const char* reason);
+		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason);
+		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason);
+
+		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+
+			auto* actorCell = actor->GetParentCell();
+			auto* playerCell = player->GetParentCell();
+			if (!actorCell || !playerCell) {
+				return false;
+			}
+
+			const bool actorInterior = actorCell->IsInteriorCell();
+			const bool playerInterior = playerCell->IsInteriorCell();
+			if (actorInterior != playerInterior) {
+				return false;
+			}
+
+			if (playerInterior) {
+				return actorCell == playerCell;
+			}
+
+			auto* actorWs = actor->GetWorldspace();
+			auto* playerWs = player->GetWorldspace();
+			return actorWs && playerWs && actorWs == playerWs;
+		}
+
+		static void ClearBleedSupportBridgeAliases(const char* reason)
+		{
+			const bool truceQueued = SendBridgeModEvent("TFDTruceClearAll", nullptr);
+			const bool inCombatQueued = SendBridgeModEvent("TFDInCombatClearAll", nullptr);
+			spdlog::info("[TFD][BleedBridge] ClearSupport reason={} truceQueued={} inCombatQueued={}",
+				reason ? reason : "unknown",
+				truceQueued ? 1 : 0,
+				inCombatQueued ? 1 : 0);
+		}
+
+		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason)
+		{
+			ClearBleedSupportBridgeAliases(reason);
+
+			std::vector<RE::FormID> supportIds;
+			supportIds.reserve(actors.size());
+			const RE::FormID speakerId = speaker ? speaker->GetFormID() : 0;
+
+			for (auto* actor : actors) {
+				if (!actor) {
+					continue;
+				}
+				const auto actorId = actor->GetFormID();
+				if (actorId == 0 || actorId == speakerId) {
+					continue;
+				}
+				if (std::find(supportIds.begin(), supportIds.end(), actorId) != supportIds.end()) {
+					continue;
+				}
+				SendBridgeModEvent("TFDTruceAssign", actor);
+				SendBridgeModEvent("TFDInCombatAssign", actor);
+				supportIds.push_back(actorId);
+			}
+
+			g_bleedCrowdAssigned = std::move(supportIds);
+			g_bleedLastCrowdAssign = Now();
+
+			spdlog::info("[TFD][BleedBridge] AssignSupport reason={} supportSize={} speaker={:08X}",
+				reason ? reason : "unknown",
+				static_cast<unsigned int>(g_bleedCrowdAssigned.size()),
+				speakerId);
+		}
+
+		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason)
+		{
+			if (g_bleedTruceSessionId != 0) {
+				TFD::Pacify::ReleaseSession(g_bleedTruceSessionId, reason);
+				spdlog::info("[TFD][Defeat] bleed truce session released id={} reason={}",
+					g_bleedTruceSessionId,
+					TFD::Pacify::ToString(reason));
+				g_bleedTruceSessionId = 0;
+			}
+			g_bleedSpeakerId = 0;
+		}
 
 		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred, bool preserveAssigned = false)
 		{
@@ -660,10 +643,6 @@ namespace TFD::DefeatMonitor
 				return {};
 			}
 
-			auto* pCell = player->GetParentCell();
-			if (!pCell) {
-				return {};
-			}
 
 			std::unordered_set<RE::FormID> preservedIds;
 			if (preserveAssigned) {
@@ -680,7 +659,7 @@ namespace TFD::DefeatMonitor
 				if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
 				if (!actor->Is3DLoaded()) continue;
 				if (actor->GetFormID() == player->GetFormID()) continue;
-				if (actor->GetParentCell() != pCell) continue;
+				if (!IsBleedSpaceCompatible(actor, player)) continue;
 				if (!IsBleedCrowdSupportedAggressor(actor)) continue;
 				if (e.dist > scanRadius) continue;
 
@@ -758,12 +737,11 @@ namespace TFD::DefeatMonitor
 				if (!actor) {
 					continue;
 				}
-				const auto epoch = g_bleedBridgeEpoch.load(std::memory_order_acquire);
-				const bool queued = QueueBleedBridgeAssign(actor);
+				const bool queued = SendBridgeModEvent("TFDBleedoutAssign", actor);
 				if (queued) {
 					++sent;
 				}
-				spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={} epoch={}", actor->GetFormID(), queued, epoch);
+				spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
 			}
 
 			spdlog::info("[TFD][BleedBridge] Assign crowd sent={} size={} primary={:08X}",
@@ -796,6 +774,8 @@ namespace TFD::DefeatMonitor
 
 		static void ResetBleedRuntimeState()
 		{
+			ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic);
+			ClearBleedSupportBridgeAliases("reset_bleed_runtime");
 			g_inBleedState.store(false, std::memory_order_release);
 			g_minHp = 0.0f;
 			g_bleedSawDialogue = false;
@@ -1679,8 +1659,6 @@ namespace TFD::DefeatMonitor
 					MoveFollowerNearPlayerForLeftForDead(follower);
 				}
 			}
-			ClearBleedoutBridgeAliases(nullptr, "left_for_dead_escape_state");
-			g_bleedCrowdAssigned.clear();
 			MaintainTransitionCalmWindow();
 			g_leftForDeadNeedsAggroKick = false;
 			BeginLeftForDeadCooldown(5);
@@ -2637,7 +2615,7 @@ namespace TFD::DefeatMonitor
 		static RE::Actor* ResolveAggressor()
 		{
 			auto* player = Player();
-			const float maxSpeakerDist = 900.0f;
+			const float maxSpeakerDist = 1400.0f;
 			if (g_lastAggressor) {
 				auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
 				float dist = 99999.0f;
@@ -2703,8 +2681,7 @@ namespace TFD::DefeatMonitor
 			if (!IsCaptiveSupportedAggressor(actor)) {
 				return false;
 			}
-			auto* pCell = player->GetParentCell();
-			if (pCell && actor->GetParentCell() != pCell) {
+			if (!IsBleedSpaceCompatible(actor, player)) {
 				return false;
 			}
 			const auto pp = player->GetPosition();
@@ -2726,9 +2703,6 @@ namespace TFD::DefeatMonitor
 		{
 			auto* player = Player();
 			if (!player) return nullptr;
-			auto* pCell = player->GetParentCell();
-			if (!pCell) return nullptr;
-
 			float preferredDist = 99999.0f;
 			const bool preferredValid = IsReasonableBleedoutSpeaker(preferred, player, maxDist, &preferredDist);
 
@@ -2743,7 +2717,7 @@ namespace TFD::DefeatMonitor
 				if (!a || a->IsDead() || a->IsDisabled()) continue;
 				if (!a->Is3DLoaded()) continue;
 				if (a->GetFormID() == player->GetFormID()) continue;
-				if (a->GetParentCell() != pCell) continue;
+				if (!IsBleedSpaceCompatible(a, player)) continue;
 				if (!e.inCombat && !e.hostile) continue;
 				if (!IsCaptiveSupportedAggressor(a)) continue;
 				if (e.dist > maxDist) continue;
@@ -2794,7 +2768,7 @@ namespace TFD::DefeatMonitor
 			if (aggressor->IsDead() || aggressor->IsDisabled() || !aggressor->Is3DLoaded()) {
 				return false;
 			}
-			if (aggressor->GetParentCell() != player->GetParentCell()) {
+			if (!IsBleedSpaceCompatible(aggressor, player)) {
 				return false;
 			}
 
@@ -2805,12 +2779,7 @@ namespace TFD::DefeatMonitor
 			const float dz = pb.z - pa.z;
 			outDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
 
-			if (outDistance > 220.0f) {
-				return false;
-			}
-
-			bool hasLOS = false;
-			if (!aggressor->HasLineOfSight(player, hasLOS) || !hasLOS) {
+			if (outDistance > 1400.0f) {
 				return false;
 			}
 
@@ -3014,11 +2983,27 @@ namespace TFD::DefeatMonitor
 				spdlog::info("[TFD][Defeat] no local bleed speaker within {:.0f} -> hold without greet", maxSpeakerDist);
 			}
 			auto initialCrowd = CollectBleedoutCrowd(radius, aggressor, false);
-			ApplyCalmBubble(radius);
-			RefreshBleedoutBridgeCrowd(radius, aggressor, true, &initialCrowd);
+			if (aggressor) {
+				ClearBleedoutBridgeAliases(aggressor, "start_bleed_window_primary");
+				AssignBleedoutBridgeActor(aggressor);
+				AssignBleedSupportBridgeActors(initialCrowd, aggressor, "start_bleed_window_support");
+			}
+			else {
+				ClearBleedoutBridgeAliases(nullptr, "start_bleed_window_no_speaker");
+				ClearBleedSupportBridgeAliases("start_bleed_window_no_speaker");
+			}
 
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();
+				g_bleedSpeakerId = aggressor->GetFormID();
+				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true); sessionId.has_value()) {
+					g_bleedTruceSessionId = *sessionId;
+					AssignBleedSupportBridgeActors(initialCrowd, aggressor, "bleed_truce_session_begin");
+					spdlog::info("[TFD][Defeat] bleed truce session started id={} speaker={:08X}", g_bleedTruceSessionId, g_bleedSpeakerId);
+				}
+				else {
+					spdlog::warn("[TFD][Defeat] bleed truce session failed speaker={:08X}", g_bleedSpeakerId);
+				}
 
 				if (!IsCaptiveSupportedAggressor(aggressor)) {
 					g_bleedPendingCaptiveOutcome = false;
@@ -3060,7 +3045,7 @@ namespace TFD::DefeatMonitor
 						}
 
 						if (greetableNow) {
-							TFD::ForceGreet::BeginBleedout(aggressor);
+							TFD::ForceGreet::BeginInCombatTruce(aggressor);
 						}
 					}
 				}
@@ -3283,39 +3268,7 @@ namespace TFD::DefeatMonitor
 					SetPlayerBleedImmune(true);
 					ClampHealth(player, g_minHp);
 				}
-				if (g_bleedLastCalmPulse.time_since_epoch().count() == 0 || (Now() - g_bleedLastCalmPulse) >= std::chrono::milliseconds(350)) {
-					ApplyCalmBubble((std::max)(12000.0f, TFD::Settings::GetSweepRadius()));
-					g_bleedLastCalmPulse = Now();
-				}
 				const bool dOpen = IsDialogueOpen();
-				if (!dOpen) {
-					const auto nowBleed = Now();
-					if (g_bleedLastCrowdAssign.time_since_epoch().count() == 0 || (nowBleed - g_bleedLastCrowdAssign) >= std::chrono::milliseconds(900)) {
-						const float bleedRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
-						RE::Actor* preferredSpeaker = nullptr;
-						if (g_lastAggressor) {
-							auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
-							preferredSpeaker = sp.get();
-						}
-						RefreshBleedoutBridgeCrowd(bleedRadius, preferredSpeaker, false);
-
-						const bool greetActive = TFD::ForceGreet::IsActive() && TFD::ForceGreet::GetMode() == TFD::ForceGreet::Mode::Bleedout;
-						if (!greetActive) {
-							auto* speaker = FindBestBleedoutSpeaker(bleedRadius, 900.0f, preferredSpeaker);
-							if (speaker) {
-								float greetDistance = 99999.0f;
-								if (CanUseAggressorForBleedoutGreet(player, speaker, greetDistance)) {
-									g_lastAggressor = speaker->GetHandle();
-									spdlog::info("[TFD][Defeat] bleed speaker reselect {:08X} dist={:.1f}", speaker->GetFormID(), greetDistance);
-									TFD::ForceGreet::BeginBleedout(speaker);
-								}
-								else {
-									spdlog::info("[TFD][Defeat] bleed speaker still not greetable {:08X} dist={:.1f}", speaker->GetFormID(), greetDistance);
-								}
-							}
-						}
-					}
-				}
 				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 				if (dOpen) {
 					g_bleedSawDialogue = true;
@@ -3336,6 +3289,7 @@ namespace TFD::DefeatMonitor
 				}
 				if (g_bleedSawDialogue && g_prevDialogueOpen) {
 					g_prevDialogueOpen = false;
+					ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::DialogueClosed);
 					if (ResolveCaptiveMarkerForOutcome()) {
 						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> captive marker found");
 						DoBlackoutTeleport();
@@ -3362,6 +3316,7 @@ namespace TFD::DefeatMonitor
 					}
 				}
 				if (remain <= 0) {
+					ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic);
 					const bool pendingCaptive = g_bleedPendingCaptiveOutcome;
 					if (pendingCaptive && ResolveCaptiveMarkerForOutcome()) {
 						ResetBleedRuntimeState();
