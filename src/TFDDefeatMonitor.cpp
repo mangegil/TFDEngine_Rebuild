@@ -11,6 +11,7 @@
 #include <cstring>
 #include <vector>
 #include <unordered_set>
+#include <array>
 
 #include <type_traits>
 #include <RE/A/ActorValues.h>
@@ -30,11 +31,15 @@
 #include "TFDPreCombatGreet.h"
 #include "TFDPacify.h"
 #include "EditorIdCache.h"
+#include "RE/B/BGSRefAlias.h"
+#include "RE/T/TESQuest.h"
 
 namespace TFD::DefeatMonitor
 {
 	namespace
 	{
+		static void ClearBleedoutBridgeAliases(RE::TESForm* sender, const char* reason);
+		static void AssignBleedoutBridgeActor(RE::Actor* actor);
 		enum class CaptivePhaseValue : int
 		{
 			None = 0,
@@ -104,6 +109,17 @@ namespace TFD::DefeatMonitor
 		bool g_prevDialogueOpen = false;
 		bool g_prevLockpickOpen = false;
 
+		struct TeammateRegistryCache
+		{
+			RE::TESQuest* quest{ nullptr };
+			RE::TESFaction* currentFollowerFaction{ nullptr };
+			RE::TESFaction* playerFollowerFaction{ nullptr };
+			std::array<RE::BGSRefAlias*, 10> teammateAliases{};
+			bool resolved{ false };
+		};
+
+		TeammateRegistryCache g_teammateRegistry{};
+
 		enum class NoMarkerFallbackBranch : std::uint32_t
 		{
 			None = 0,
@@ -129,6 +145,7 @@ namespace TFD::DefeatMonitor
 		RE::ActorHandle g_allyHoldFollower{};
 		bool g_allyHoldActive = false;
 		std::vector<RE::FormID> g_lockedFallbackCrowdIds{};
+		std::unordered_set<RE::FormID> g_bleedFollowerDownIds{};
 
 		RE::ObjectRefHandle g_lockpickDoorCandidate{};
 		bool g_lockpickDoorWasLocked = false;
@@ -224,9 +241,14 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		static bool IsActiveFollowerActor(RE::Actor* actor);
+
 		static bool IsBleedCrowdSupportedAggressor(RE::Actor* actor)
 		{
 			if (!actor) {
+				return false;
+			}
+			if (IsActiveFollowerActor(actor)) {
 				return false;
 			}
 
@@ -251,6 +273,11 @@ namespace TFD::DefeatMonitor
 		static void ClearNoMarkerFallbackState();
 		static void MaintainFollowerHold();
 		static void MaintainTransitionCalmWindow();
+		static void SnapshotBleedFollowerDownState(float radius);
+		static void RestoreFollowerAfterTransition(RE::Actor* actor);
+		static void ResolveTeammateRegistry();
+		static bool IsRegisteredTeammateActor(RE::Actor* actor);
+		static std::vector<RE::Actor*> CollectRegisteredTeammates();
 
 		static void QueuePostRecoveryAggroKick(const char* reason)
 		{
@@ -310,7 +337,7 @@ namespace TFD::DefeatMonitor
 					drawWeapon ? 1 : 0,
 					kickedNow ? 1 : 0,
 					reason ? reason : "unknown");
-			};
+				};
 
 			if (primary) {
 				queueOne(primary, true);
@@ -354,10 +381,22 @@ namespace TFD::DefeatMonitor
 
 		static void FinishLeftForDeadRecovery()
 		{
+			RE::Actor* followerToRestore = nullptr;
+			if (g_allyHoldFollower) {
+				auto sp = RE::Actor::LookupByHandle(g_allyHoldFollower.native_handle());
+				followerToRestore = sp.get();
+			}
+			else if (g_noMarkerFallback.follower) {
+				auto sp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
+				followerToRestore = sp.get();
+			}
 			TFD::AggressionClamp::Clear();
 			TFD::FactionMask::Clear();
 			if (g_leftForDeadNeedsAggroKick) {
 				QueuePostRecoveryAggroKick("left_for_dead_recovery_finished");
+			}
+			if (followerToRestore) {
+				RestoreFollowerAfterTransition(followerToRestore);
 			}
 			g_leftForDeadNeedsAggroKick = false;
 			g_leftForDeadActive = false;
@@ -367,6 +406,7 @@ namespace TFD::DefeatMonitor
 			g_allyHoldActive = false;
 			g_lockedFallbackCrowdIds.clear();
 			g_noMarkerFallback = {};
+			g_bleedFollowerDownIds.clear();
 			spdlog::info("[TFD][Defeat] Transition recovery finished");
 		}
 
@@ -775,6 +815,7 @@ namespace TFD::DefeatMonitor
 			g_allyHoldFollower.reset();
 			g_allyHoldActive = false;
 			g_lockedFallbackCrowdIds.clear();
+			g_bleedFollowerDownIds.clear();
 		}
 
 		static bool IsActorBleedingOut(RE::Actor* actor)
@@ -786,6 +827,207 @@ namespace TFD::DefeatMonitor
 				return state->IsBleedingOut();
 			}
 			return false;
+		}
+
+		static void ResolveTeammateRegistry()
+		{
+			if (g_teammateRegistry.resolved) {
+				return;
+			}
+			g_teammateRegistry.resolved = true;
+			g_teammateRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDPlayerTeammateQuest");
+			if (!g_teammateRegistry.quest) {
+				spdlog::warn("[TFD][Defeat] teammate registry quest not found");
+				return;
+			}
+			for (auto* baseAlias : g_teammateRegistry.quest->aliases) {
+				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+				if (!refAlias) {
+					continue;
+				}
+				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName.rfind("Teammate", 0) != 0 || aliasName.size() < 10) {
+					continue;
+				}
+				try {
+					int slot = std::stoi(aliasName.substr(9));
+					if (slot >= 1 && slot <= 10) {
+						g_teammateRegistry.teammateAliases[slot - 1] = refAlias;
+					}
+				}
+				catch (...) {
+				}
+			}
+			std::size_t found = 0;
+			for (auto* a : g_teammateRegistry.teammateAliases) {
+				if (a) {
+					++found;
+				}
+			}
+			spdlog::info("[TFD][Defeat] teammate registry resolved quest={:08X} aliases={}",
+				g_teammateRegistry.quest ? g_teammateRegistry.quest->GetFormID() : 0u, found);
+		}
+
+		static bool IsRegisteredTeammateActor(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDisabled()) {
+				return false;
+			}
+			ResolveTeammateRegistry();
+			for (auto* alias : g_teammateRegistry.teammateAliases) {
+				if (!alias) {
+					continue;
+				}
+				auto* slotActor = alias->GetActorReference();
+				if (slotActor && slotActor == actor) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static std::vector<RE::Actor*> CollectRegisteredTeammates()
+		{
+			ResolveTeammateRegistry();
+			std::vector<RE::Actor*> out;
+			out.reserve(10);
+			for (auto* alias : g_teammateRegistry.teammateAliases) {
+				if (!alias) {
+					continue;
+				}
+				auto* actor = alias->GetActorReference();
+				if (!actor || actor->IsDisabled()) {
+					continue;
+				}
+				out.push_back(actor);
+			}
+			return out;
+		}
+
+		static bool HasFollowerAnchorFaction(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDisabled()) {
+				return false;
+			}
+			ResolveTeammateRegistry();
+			if (g_teammateRegistry.currentFollowerFaction && actor->IsInFaction(g_teammateRegistry.currentFollowerFaction)) {
+				return true;
+			}
+			if (g_teammateRegistry.playerFollowerFaction && actor->IsInFaction(g_teammateRegistry.playerFollowerFaction)) {
+				return true;
+			}
+			return false;
+		}
+
+		static std::vector<RE::Actor*> CollectKnownTeammates(float radius)
+		{
+			auto* player = Player();
+			std::vector<RE::Actor*> out;
+			if (!player) {
+				return out;
+			}
+
+			std::unordered_set<RE::FormID> seen;
+			const float maxRadius = radius > 0.0f ? (std::max)(radius, 5000.0f) : 5000.0f;
+
+			for (auto* actor : CollectRegisteredTeammates()) {
+				if (!actor || actor == player || actor->IsDisabled()) {
+					continue;
+				}
+				if (radius > 0.0f) {
+					auto apos = actor->GetPosition();
+					auto ppos = player->GetPosition();
+					const float dx = apos.x - ppos.x;
+					const float dy = apos.y - ppos.y;
+					const float dz = apos.z - ppos.z;
+					const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+					if (dist > maxRadius) {
+						continue;
+					}
+				}
+				seen.insert(actor->GetFormID());
+				out.push_back(actor);
+			}
+
+			TFD::ActorScan::Rescan(maxRadius, true);
+			const auto count = TFD::ActorScan::GetCount();
+			auto* pCell = player->GetParentCell();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto sp = entry.actor.get();
+				auto* actor = sp.get();
+				if (!actor || actor == player || actor->IsDisabled()) {
+					continue;
+				}
+				if (actor->GetParentCell() != pCell) {
+					continue;
+				}
+				if (entry.dist > maxRadius) {
+					continue;
+				}
+				if (!actor->IsPlayerTeammate() && !HasFollowerAnchorFaction(actor)) {
+					continue;
+				}
+				if (!seen.insert(actor->GetFormID()).second) {
+					continue;
+				}
+				out.push_back(actor);
+			}
+
+			return out;
+		}
+
+		static bool IsActiveFollowerActor(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDisabled()) {
+				return false;
+			}
+			if (IsRegisteredTeammateActor(actor)) {
+				return true;
+			}
+			if (actor->IsPlayerTeammate()) {
+				return true;
+			}
+			return HasFollowerAnchorFaction(actor);
+		}
+
+		static void SnapshotBleedFollowerDownState(float radius)
+		{
+			(void)radius;
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+			for (auto* actor : CollectKnownTeammates(radius)) {
+				if (!actor || actor == player) {
+					continue;
+				}
+				if (actor->IsDead() || IsActorBleedingOut(actor)) {
+					g_bleedFollowerDownIds.insert(actor->GetFormID());
+				}
+			}
+		}
+
+		static void RestoreFollowerAfterTransition(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDisabled()) {
+				return;
+			}
+			actor->AllowPCDialogue(true);
+			actor->SetDialogueWithPlayer(false, false, nullptr);
+			if (!actor->IsDead()) {
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+			}
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
 		}
 
 		static void ApplyFollowerHold(RE::Actor* actor)
@@ -906,32 +1148,27 @@ namespace TFD::DefeatMonitor
 				return result;
 			}
 
-			const float scanRadius = (std::max)(radius, 5000.0f);
-			TFD::ActorScan::Rescan(scanRadius, false);
-
 			float bestStandingDist = std::numeric_limits<float>::max();
 			float bestDownedDist = std::numeric_limits<float>::max();
 
-			const auto n = TFD::ActorScan::GetCount();
-			for (int i = 0; i < n; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto sp = entry.actor.get();
-				auto* actor = sp.get();
+			for (auto* actor : CollectRegisteredTeammates()) {
 				if (!actor || actor == player) {
 					continue;
 				}
-				if (!actor->IsPlayerTeammate()) {
+				const float dist = Distance3D(actor->GetPosition(), player->GetPosition());
+				if (radius > 0.0f && dist > (std::max)(radius, 5000.0f)) {
 					continue;
 				}
-				const bool downed = actor->IsDead() || IsActorBleedingOut(actor);
+				const bool wasDownedThisEvent = g_bleedFollowerDownIds.find(actor->GetFormID()) != g_bleedFollowerDownIds.end();
+				const bool downed = actor->IsDead() || IsActorBleedingOut(actor) || wasDownedThisEvent;
 				if (!downed) {
-					if (entry.dist < bestStandingDist) {
-						bestStandingDist = entry.dist;
+					if (dist < bestStandingDist) {
+						bestStandingDist = dist;
 						result.standing = actor;
 					}
 				}
-				else if (entry.dist < bestDownedDist) {
-					bestDownedDist = entry.dist;
+				else if (dist < bestDownedDist) {
+					bestDownedDist = dist;
 					result.downed = actor;
 				}
 			}
@@ -953,7 +1190,7 @@ namespace TFD::DefeatMonitor
 				}
 				auto* potion = obj.As<RE::AlchemyItem>();
 				return potion && potion->IsMedicine() && !potion->IsPoison() && !potion->IsFood();
-			}, true);
+				}, true);
 
 			for (const auto& [item, invData] : inv) {
 				const auto& [count, entry] = invData;
@@ -1160,7 +1397,7 @@ namespace TFD::DefeatMonitor
 					bestRef = ref;
 					bestAngle = ComputeYawFromVector(refPos.x - crowdCenter.x, refPos.y - crowdCenter.y);
 				}
-			};
+				};
 
 			if (auto* weTravel = ResolveWETravelRefType()) {
 				std::vector<RE::BGSLocation*> chain;
@@ -1187,7 +1424,7 @@ namespace TFD::DefeatMonitor
 				}
 				considerRef(ref, heading ? 2 : 3);
 				return RE::BSContainer::ForEachResult::kContinue;
-			});
+				});
 
 			if (bestRef) {
 				state.destination = bestRef->GetHandle();
@@ -1617,8 +1854,8 @@ namespace TFD::DefeatMonitor
 			if (!g_lockedFallbackCrowdIds.empty()) {
 				for (auto id : g_lockedFallbackCrowdIds) {
 					auto* actorRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
-				auto* actor = actorRef ? actorRef->As<RE::Actor>() : nullptr;
-					if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					auto* actor = actorRef ? actorRef->As<RE::Actor>() : nullptr;
+					if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(actor)) {
 						continue;
 					}
 					TFD::AggressionClamp::Apply(actor);
@@ -1635,7 +1872,7 @@ namespace TFD::DefeatMonitor
 					auto entry = TFD::ActorScan::GetEntry(i);
 					auto actorSP = entry.actor.get();
 					auto* actor = actorSP.get();
-					if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(actor)) {
 						continue;
 					}
 					TFD::AggressionClamp::Apply(actor);
