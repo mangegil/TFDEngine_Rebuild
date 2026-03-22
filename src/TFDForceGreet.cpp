@@ -388,7 +388,10 @@ namespace TFD::ForceGreet
 			speaker->DrawWeaponMagicHands(false);
 
 			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (player && (mode == Mode::Bleedout || mode == Mode::CaptiveMarker) && player->IsWeaponDrawn()) {
+			if (player &&
+				(mode == Mode::Bleedout || mode == Mode::CaptiveMarker ||
+				 mode == Mode::InCombatTruce || mode == Mode::PreCombatTruce) &&
+				player->IsWeaponDrawn()) {
 				player->DrawWeaponMagicHands(false);
 			}
 

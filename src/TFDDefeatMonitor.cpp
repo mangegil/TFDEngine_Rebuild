@@ -1596,13 +1596,15 @@ namespace TFD::DefeatMonitor
 			actor->NotifyAnimationGraph("BleedoutStop");
 			actor->NotifyAnimationGraph("GetUpStart");
 			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
-			const float targetHp = (std::max)(followerStyle ? 24.0f : 18.0f, hpMax * (followerStyle ? 0.28f : 0.22f));
+			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
+			const float safePct = std::clamp(threshPct + (followerStyle ? 0.14f : 0.12f), followerStyle ? 0.34f : 0.32f, 0.85f);
+			const float targetHp = (std::max)(followerStyle ? 32.0f : 45.0f, hpMax * safePct);
 			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
 			if (hpNow < targetHp) {
 				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, targetHp - hpNow);
 			}
 			const float staminaMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kStamina));
-			const float staminaTarget = (std::max)(15.0f, staminaMax * 0.25f);
+			const float staminaTarget = (std::max)(20.0f, staminaMax * (followerStyle ? 0.28f : 0.35f));
 			const float staminaNow = actor->GetActorValue(RE::ActorValue::kStamina);
 			if (staminaNow < staminaTarget) {
 				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kStamina, staminaTarget - staminaNow);
@@ -2885,11 +2887,17 @@ namespace TFD::DefeatMonitor
 			p->NotifyAnimationGraph("GetUpStart");
 			const float hpMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kHealth));
 			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
-			const float safePct = std::clamp(threshPct + 0.15f, 0.35f, 0.85f);
-			const float target = (std::max)(25.0f, hpMax * safePct);
+			const float safePct = std::clamp(threshPct + 0.17f, 0.38f, 0.85f);
+			const float target = (std::max)(45.0f, hpMax * safePct);
 			const float hpNow = p->GetActorValue(RE::ActorValue::kHealth);
 			if (hpNow < target) {
 				p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (target - hpNow));
+			}
+			const float staminaMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kStamina));
+			const float staminaTarget = (std::max)(30.0f, staminaMax * 0.40f);
+			const float staminaNow = p->GetActorValue(RE::ActorValue::kStamina);
+			if (staminaNow < staminaTarget) {
+				p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kStamina, (staminaTarget - staminaNow));
 			}
 			if (p->IsInCombat()) p->StopCombat();
 			p->DrawWeaponMagicHands(false);
@@ -2911,9 +2919,9 @@ namespace TFD::DefeatMonitor
 				}
 				};
 			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
-			const float safeHealthPct = std::clamp(threshPct + 0.10f, 0.55f, 1.00f);
-			restoreToPct(RE::ActorValue::kHealth, safeHealthPct, 40.0f);
-			restoreToPct(RE::ActorValue::kStamina, 0.95f, 35.0f);
+			const float safeHealthPct = std::clamp(threshPct + 0.12f, 0.58f, 1.00f);
+			restoreToPct(RE::ActorValue::kHealth, safeHealthPct, 45.0f);
+			restoreToPct(RE::ActorValue::kStamina, 0.98f, 40.0f);
 			restoreToPct(RE::ActorValue::kMagicka, 0.95f, 25.0f);
 			if (p->IsInCombat()) p->StopCombat();
 			p->DrawWeaponMagicHands(false);

@@ -954,11 +954,20 @@ namespace TFD::Pacify
             }
 
             if (IsPlayerArmedForPacify(player)) {
-                spdlog::info(
-                    "TFDPacify: reject session mode={} target={:08X} reason=player_armed",
-                    ToString(mode),
-                    primaryTarget->GetFormID());
-                return std::nullopt;
+                const bool allowForcedSheath = (mode == Mode::TruceInCombat || mode == Mode::TrucePreCombat);
+                if (allowForcedSheath) {
+                    player->DrawWeaponMagicHands(false);
+                    spdlog::info(
+                        "TFDPacify: forced sheath for session mode={} target={:08X} reason=player_armed",
+                        ToString(mode),
+                        primaryTarget->GetFormID());
+                } else {
+                    spdlog::info(
+                        "TFDPacify: reject session mode={} target={:08X} reason=player_armed",
+                        ToString(mode),
+                        primaryTarget->GetFormID());
+                    return std::nullopt;
+                }
             }
 
             if (Session* active = FindActiveSessionForTarget(primaryTarget->GetFormID())) {
