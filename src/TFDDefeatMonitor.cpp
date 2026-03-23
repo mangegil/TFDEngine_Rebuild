@@ -3070,6 +3070,7 @@ namespace TFD::DefeatMonitor
 			ClearBleedoutBridgeAliases(aggressor, "start_bleed_window");
 			ClearNoMarkerFallbackState();
 			ReleaseBleedNoSpeakerTameSession("start_bleed_window");
+			ClearBleedSupportBridgeAliases("start_bleed_window");
 
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
@@ -3105,7 +3106,6 @@ namespace TFD::DefeatMonitor
 			if (aggressor) {
 				ClearBleedoutBridgeAliases(aggressor, "start_bleed_window_primary");
 				AssignBleedoutBridgeActor(aggressor);
-				AssignBleedSupportBridgeActors(initialCrowd, aggressor, "start_bleed_window_support");
 			}
 			else {
 				ClearBleedoutBridgeAliases(nullptr, "start_bleed_window_no_speaker");
@@ -3117,7 +3117,6 @@ namespace TFD::DefeatMonitor
 				g_bleedSpeakerId = aggressor->GetFormID();
 				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true); sessionId.has_value()) {
 					g_bleedTruceSessionId = *sessionId;
-					AssignBleedSupportBridgeActors(initialCrowd, aggressor, "bleed_truce_session_begin");
 					spdlog::info("[TFD][Defeat] bleed truce session started id={} speaker={:08X}", g_bleedTruceSessionId, g_bleedSpeakerId);
 				}
 				else {
