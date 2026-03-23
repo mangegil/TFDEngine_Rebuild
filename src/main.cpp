@@ -20,6 +20,7 @@
 #include "TFDPreCombatGreet.h"
 #include "TFDPacify.h"
 #include "TFDPacifyHooks.h"
+#include "TFDTeammateAliasSync.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -112,6 +113,7 @@ static void InitOnceAfterLoad()
     TFD::DefeatMonitor::Install();
     TFD::DefeatMonitor::ResetGrace();
     TFD::PreCombatGreet::Install();
+    TFD::TeammateAliasSync::Install();
 
     QueueHud("TFDEngine: Init OK (after load)");
     QueueHud(BuildStamp().c_str());

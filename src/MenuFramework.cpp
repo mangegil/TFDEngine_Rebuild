@@ -26,6 +26,7 @@
 #include "TFDDefeatMonitor.h"
 #include "TFDTargetClassifier.h"
 #include "TFDInteractionRouter.h"
+#include "TFDPacify.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -709,110 +710,171 @@ namespace TFDMenu
 			TruceInCombat
 		};
 
-		static float ScoreHotkeyCandidate(
-            RE::Actor* actor,
-            RE::PlayerCharacter* player,
-            const TFD::ActorScan::Entry& entry,
-            HotkeyPickMode* outMode)
-        {
-            if (outMode) {
-                *outMode = HotkeyPickMode::None;
-            }
-
-            if (!actor || !player) {
-                return -1.0e30f;
-            }
-
-            const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-            const bool inCombat = actor->IsInCombat();
-            const bool weaponDrawn = actor->IsWeaponDrawn();
-
-            const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
-                player,
-                actor,
-                false,
-                inCombat,
-                entry.dist);
-
-            if (!classify.valid) {
-                return -1.0e30f;
-            }
-
-            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce &&
-                !inCombat &&
-                front &&
-                entry.dist <= 1150.0f) {
-                if (outMode) {
-                    *outMode = HotkeyPickMode::TrucePreCombat;
-                }
-
-                float score = 50000.0f;
-                score -= entry.dist;
-                if (weaponDrawn) {
-                    score += 900.0f;
-                }
-                if (entry.hostile) {
-                    score += 350.0f;
-                }
-                if (classify.allowDialogue) {
-                    score += 250.0f;
-                }
-                return score;
-            }
-
-            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Tame &&
-                entry.dist <= 768.0f) {
-                if (outMode) {
-                    *outMode = HotkeyPickMode::Tame;
-                }
-
-                float score = inCombat ? 32000.0f : 30000.0f;
-                score -= entry.dist;
-                if (front) {
-                    score += 300.0f;
-                }
-                if (entry.hostile) {
-                    score += 250.0f;
-                }
-                if (weaponDrawn) {
-                    score += 350.0f;
-                }
-                return score;
-            }
-
-            if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce &&
-                inCombat &&
-                entry.dist <= 1400.0f) {
-                if (outMode) {
-                    *outMode = HotkeyPickMode::TruceInCombat;
-                }
-
-                float score = 20000.0f;
-                score -= entry.dist;
-                if (front) {
-                    score += 500.0f;
-                }
-                if (classify.allowDialogue) {
-                    score += 250.0f;
-                }
-                return score;
-            }
-
-            return -1.0e30f;
-        }
-
-
-		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius, HotkeyPickMode* outMode)
+		static bool IsNonHostileActiveTameFollower(RE::Actor* actor, const TFD::ActorScan::Entry& entry)
 		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!actor) {
+				return false;
+			}
+
+			if (!TFD::Pacify::IsPacified(actor)) {
+				return false;
+			}
+
+			if (TFD::Pacify::GetMode(actor) != TFD::Pacify::Mode::Tame) {
+				return false;
+			}
+
+			const bool inCombat = actor->IsInCombat() || entry.inCombat;
+			return !entry.hostile && !inCombat;
+		}
+
+		static float ScoreTruceCandidate(
+			RE::Actor* actor,
+			RE::PlayerCharacter* player,
+			const TFD::ActorScan::Entry& entry,
+			HotkeyPickMode* outMode)
+		{
 			if (outMode) {
 				*outMode = HotkeyPickMode::None;
 			}
+
+			if (!actor || !player) {
+				return -1.0e30f;
+			}
+
+			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
+			const bool inCombat = actor->IsInCombat();
+			const bool weaponDrawn = actor->IsWeaponDrawn();
+
+			const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+				player,
+				actor,
+				false,
+				inCombat,
+				entry.dist);
+
+			if (!classify.valid ||
+				classify.intent != TFD::TargetClassifier::InteractionIntent::Truce) {
+				return -1.0e30f;
+			}
+
+			if (!inCombat &&
+				front &&
+				entry.dist <= 1150.0f) {
+				if (outMode) {
+					*outMode = HotkeyPickMode::TrucePreCombat;
+				}
+
+				float score = 50000.0f;
+				score -= entry.dist;
+				if (weaponDrawn) {
+					score += 900.0f;
+				}
+				if (entry.hostile) {
+					score += 350.0f;
+				}
+				if (classify.allowDialogue) {
+					score += 250.0f;
+				}
+				return score;
+			}
+
+			if (inCombat &&
+				entry.dist <= 1400.0f) {
+				if (outMode) {
+					*outMode = HotkeyPickMode::TruceInCombat;
+				}
+
+				float score = 20000.0f;
+				score -= entry.dist;
+				if (front) {
+					score += 500.0f;
+				}
+				if (entry.hostile) {
+					score += 150.0f;
+				}
+				if (classify.allowDialogue) {
+					score += 250.0f;
+				}
+				return score;
+			}
+
+			return -1.0e30f;
+		}
+
+		static float ScoreTameCandidate(
+			RE::Actor* actor,
+			RE::PlayerCharacter* player,
+			const TFD::ActorScan::Entry& entry,
+			HotkeyPickMode* outMode)
+		{
+			if (outMode) {
+				*outMode = HotkeyPickMode::None;
+			}
+
+			if (!actor || !player) {
+				return -1.0e30f;
+			}
+
+			if (IsNonHostileActiveTameFollower(actor, entry)) {
+				return -1.0e30f;
+			}
+
+			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
+			const bool inCombat = actor->IsInCombat() || entry.inCombat;
+			const bool weaponDrawn = actor->IsWeaponDrawn();
+
+			const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+				player,
+				actor,
+				false,
+				inCombat,
+				entry.dist);
+
+			if (!classify.valid ||
+				classify.intent != TFD::TargetClassifier::InteractionIntent::Tame) {
+				return -1.0e30f;
+			}
+
+			if (entry.dist > 768.0f) {
+				return -1.0e30f;
+			}
+
+			const bool combatRelevant = entry.hostile || inCombat;
+			if (!combatRelevant) {
+				return -1.0e30f;
+			}
+
+			if (outMode) {
+				*outMode = HotkeyPickMode::Tame;
+			}
+
+			float score = inCombat ? 32000.0f : 30000.0f;
+			score -= entry.dist;
+			if (front) {
+				score += 300.0f;
+			}
+			if (entry.hostile) {
+				score += 250.0f;
+			}
+			if (weaponDrawn) {
+				score += 350.0f;
+			}
+			return score;
+		}
+
+		static RE::Actor* PickBestHotkeyCandidateForMode(
+			RE::PlayerCharacter* player,
+			HotkeyPickMode desiredMode,
+			HotkeyPickMode* outMode)
+		{
+			if (outMode) {
+				*outMode = HotkeyPickMode::None;
+			}
+
 			if (!player) {
 				return nullptr;
 			}
-
-			TFD::ActorScan::Rescan(radius, false);
 
 			RE::Actor* best = nullptr;
 			HotkeyPickMode bestMode = HotkeyPickMode::None;
@@ -833,7 +895,14 @@ namespace TFDMenu
 				}
 
 				HotkeyPickMode mode = HotkeyPickMode::None;
-				const float score = ScoreHotkeyCandidate(actor, player, entry, &mode);
+				float score = -1.0e30f;
+
+				if (desiredMode == HotkeyPickMode::Tame) {
+					score = ScoreTameCandidate(actor, player, entry, &mode);
+				} else {
+					score = ScoreTruceCandidate(actor, player, entry, &mode);
+				}
+
 				if (score > bestScore) {
 					bestScore = score;
 					best = actor;
@@ -846,6 +915,40 @@ namespace TFDMenu
 			}
 
 			return best;
+		}
+
+		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius, HotkeyPickMode* outMode)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (outMode) {
+				*outMode = HotkeyPickMode::None;
+			}
+			if (!player) {
+				return nullptr;
+			}
+
+			TFD::ActorScan::Rescan(radius, false);
+
+			HotkeyPickMode truceMode = HotkeyPickMode::None;
+			if (auto* truceTarget = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &truceMode)) {
+				if (truceMode == HotkeyPickMode::TrucePreCombat ||
+					truceMode == HotkeyPickMode::TruceInCombat) {
+					if (outMode) {
+						*outMode = truceMode;
+					}
+					return truceTarget;
+				}
+			}
+
+			HotkeyPickMode tameMode = HotkeyPickMode::None;
+			if (auto* tameTarget = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::Tame, &tameMode)) {
+				if (outMode) {
+					*outMode = tameMode;
+				}
+				return tameTarget;
+			}
+
+			return nullptr;
 		}
 
 		enum class CaptureResult

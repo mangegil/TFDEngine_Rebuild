@@ -90,6 +90,9 @@ namespace TFD::DefeatMonitor
 
 		std::vector<RE::FormID> g_bleedCrowdAssigned{};
 		RE::FormID g_bleedTruceSessionId = 0;
+		RE::FormID g_bleedNoSpeakerTameSessionId = 0;
+		RE::FormID g_bleedNoSpeakerTamePrimaryId = 0;
+		std::chrono::steady_clock::time_point g_bleedNoSpeakerTameLastAttempt{};
 		RE::FormID g_bleedSpeakerId = 0;
 
 		std::atomic_bool g_grace{ false };
@@ -551,6 +554,8 @@ namespace TFD::DefeatMonitor
 		static void ClearBleedSupportBridgeAliases(const char* reason);
 		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason);
 		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason);
+		static void ReleaseBleedNoSpeakerTameSession(const char* reason);
+		static bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason);
 
 		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player)
 		{
@@ -632,6 +637,110 @@ namespace TFD::DefeatMonitor
 				g_bleedTruceSessionId = 0;
 			}
 			g_bleedSpeakerId = 0;
+		}
+
+		static void ReleaseBleedNoSpeakerTameSession(const char* reason)
+		{
+			if (g_bleedNoSpeakerTameSessionId != 0) {
+				TFD::Pacify::ReleaseSession(g_bleedNoSpeakerTameSessionId, TFD::Pacify::ReleaseReason::Generic);
+				spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
+					g_bleedNoSpeakerTameSessionId,
+					g_bleedNoSpeakerTamePrimaryId,
+					reason ? reason : "unknown");
+				g_bleedNoSpeakerTameSessionId = 0;
+			}
+			g_bleedNoSpeakerTamePrimaryId = 0;
+			g_bleedNoSpeakerTameLastAttempt = {};
+		}
+
+		static RE::Actor* ChooseBleedNoSpeakerTamePrimary(const std::vector<RE::Actor*>& actors)
+		{
+			auto* player = Player();
+			if (!player) {
+				return nullptr;
+			}
+
+			RE::Actor* best = nullptr;
+			float bestScore = std::numeric_limits<float>::max();
+			for (auto* actor : actors) {
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (IsCaptiveSupportedAggressor(actor)) {
+					continue;
+				}
+				const auto pp = player->GetPosition();
+				const auto ap = actor->GetPosition();
+				const float dx = ap.x - pp.x;
+				const float dy = ap.y - pp.y;
+				const float dz = ap.z - pp.z;
+				const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+				float score = dist;
+				if (actor->IsHostileToActor(player)) score -= 120.0f;
+				if (actor->IsInCombat()) score -= 80.0f;
+				if (score < bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			return best;
+		}
+
+		static bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason)
+		{
+			auto* player = Player();
+			if (!player) {
+				return false;
+			}
+
+			bool hasAny = false;
+			for (auto* actor : actors) {
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				hasAny = true;
+				if (IsCaptiveSupportedAggressor(actor)) {
+					return false;
+				}
+			}
+			if (!hasAny) {
+				return false;
+			}
+
+			auto* primary = ChooseBleedNoSpeakerTamePrimary(actors);
+			if (!primary) {
+				return false;
+			}
+
+			if (g_bleedNoSpeakerTamePrimaryId == primary->GetFormID() &&
+				TFD::Pacify::IsPacified(primary) &&
+				TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
+				return true;
+			}
+
+			if (g_bleedNoSpeakerTameSessionId != 0) {
+				ReleaseBleedNoSpeakerTameSession("restart");
+			}
+
+			player->DrawWeaponMagicHands(false);
+			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
+			if (!sessionId.has_value()) {
+				spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
+					primary->GetFormID(),
+					reason ? reason : "unknown");
+				return false;
+			}
+
+			g_bleedNoSpeakerTameSessionId = *sessionId;
+			g_bleedNoSpeakerTamePrimaryId = primary->GetFormID();
+			spdlog::info("[TFD][Defeat] bleed no-speaker tame session id={} primary={:08X} crowdSize={} reason={}",
+				g_bleedNoSpeakerTameSessionId,
+				g_bleedNoSpeakerTamePrimaryId,
+				actors.size(),
+				reason ? reason : "unknown");
+			return true;
 		}
 
 		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred, bool preserveAssigned = false)
@@ -775,6 +884,7 @@ namespace TFD::DefeatMonitor
 		static void ResetBleedRuntimeState()
 		{
 			ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic);
+			ReleaseBleedNoSpeakerTameSession("reset_bleed_runtime");
 			ClearBleedSupportBridgeAliases("reset_bleed_runtime");
 			g_inBleedState.store(false, std::memory_order_release);
 			g_minHp = 0.0f;
@@ -2959,6 +3069,7 @@ namespace TFD::DefeatMonitor
 
 			ClearBleedoutBridgeAliases(aggressor, "start_bleed_window");
 			ClearNoMarkerFallbackState();
+			ReleaseBleedNoSpeakerTameSession("start_bleed_window");
 
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
@@ -3062,7 +3173,8 @@ namespace TFD::DefeatMonitor
 				const bool hasCaptiveOutcome = ResolveCaptiveMarkerForOutcome();
 				g_bleedPendingCaptiveOutcome = hasCaptiveOutcome;
 				g_bleedPendingNonCaptiveOutcome = !hasCaptiveOutcome;
-				spdlog::info("[TFD][Defeat] no speaker -> keep bleed hold pending={}", hasCaptiveOutcome ? "captive" : "noncaptive");
+				const bool tameHeld = TryEnsureBleedNoSpeakerTameSession(initialCrowd, "start_bleed_window_no_speaker");
+				spdlog::info("[TFD][Defeat] no speaker -> keep bleed hold pending={} tameHeld={}", hasCaptiveOutcome ? "captive" : "noncaptive", tameHeld ? 1 : 0);
 			}
 
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
@@ -3295,6 +3407,19 @@ namespace TFD::DefeatMonitor
 					g_bleedLastSeconds = -1;
 					spdlog::info("[TFD][Defeat] bleed countdown resumed after dialogue");
 				}
+
+				if (g_bleedSpeakerId == 0) {
+					const auto nowBleed = Now();
+					if (g_bleedNoSpeakerTameLastAttempt.time_since_epoch().count() == 0 || (nowBleed - g_bleedNoSpeakerTameLastAttempt) >= std::chrono::milliseconds(900)) {
+						g_bleedNoSpeakerTameLastAttempt = nowBleed;
+						const float bleedRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+						auto crowd = CollectBleedoutCrowd(bleedRadius, nullptr, false);
+						const bool tameHeld = TryEnsureBleedNoSpeakerTameSession(crowd, "bleed_tick_no_speaker");
+						if (tameHeld) {
+							spdlog::info("[TFD][Defeat] bleed no-speaker tick tameHeld=1 crowdSize={}", crowd.size());
+						}
+					}
+				}
 				if (g_bleedSawDialogue && g_prevDialogueOpen) {
 					g_prevDialogueOpen = false;
 					ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::DialogueClosed);
@@ -3305,6 +3430,7 @@ namespace TFD::DefeatMonitor
 					}
 					else {
 						spdlog::info("[TFD][Defeat] bleedout dialogue closed -> no marker -> resolve fallback");
+						ReleaseBleedNoSpeakerTameSession("dialogue_closed_no_marker");
 						g_inBleedState.store(false, std::memory_order_release);
 						g_minHp = 0.0f;
 						g_bleedSawDialogue = false;
