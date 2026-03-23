@@ -86,7 +86,8 @@ namespace TFD::Pacify
         RE::Actor* player,
         RE::Actor* primaryTarget,
         double nowSec,
-        bool allowDialogue);
+        bool allowDialogue,
+        bool ignoreSpent = false);
 
     bool IsPacified(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);

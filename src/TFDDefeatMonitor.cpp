@@ -3115,7 +3115,7 @@ namespace TFD::DefeatMonitor
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();
 				g_bleedSpeakerId = aggressor->GetFormID();
-				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true); sessionId.has_value()) {
+				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true, true); sessionId.has_value()) {
 					g_bleedTruceSessionId = *sessionId;
 					spdlog::info("[TFD][Defeat] bleed truce session started id={} speaker={:08X}", g_bleedTruceSessionId, g_bleedSpeakerId);
 				}
