@@ -24,7 +24,15 @@ namespace TFD::Pacify
         PlayerArmed,
         DialogueClosed,
         TooFar,
-        TameBroken
+        TameBroken,
+        TameExpired
+    };
+
+    enum class TameDisposition : std::uint8_t
+    {
+        None = 0,
+        Calm,
+        Companion
     };
 
     struct Entry
@@ -36,10 +44,14 @@ namespace TFD::Pacify
         RE::FormID primaryTargetId{ 0 };
 
         double startTimeSec{ 0.0 };
+        double lastCalmRefreshSec{ 0.0 };
         double endTimeSec{ 0.0 };
+        double companionExpireGameDays{ 0.0 };
         double lastPacifyApplySec{ 0.0 };
         double lastPackageEvalSec{ 0.0 };
 
+        TameDisposition disposition{ TameDisposition::None };
+        bool temporaryTeammateApplied{ false };
         bool allowDialogue{ false };
         bool isPrimaryTarget{ false };
     };
@@ -54,7 +66,9 @@ namespace TFD::Pacify
         ReleaseReason pendingReleaseReason{ ReleaseReason::Generic };
 
         double startTimeSec{ 0.0 };
+        double lastCalmRefreshSec{ 0.0 };
         double endTimeSec{ 0.0 };
+        double companionExpireGameDays{ 0.0 };
         double invalidSinceSec{ 0.0 };
         double armedSinceSec{ 0.0 };
         double tooFarSinceSec{ 0.0 };
@@ -63,6 +77,8 @@ namespace TFD::Pacify
         RE::NiPoint3 lastPlayerPos{};
         bool hasPlayerSample{ false };
 
+        TameDisposition disposition{ TameDisposition::None };
+        bool temporaryTeammateApplied{ false };
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
         bool finished{ false };
@@ -75,7 +91,8 @@ namespace TFD::Pacify
         RE::Actor* player,
         RE::Actor* primaryTarget,
         double nowSec,
-        bool allowDialogue = false);
+        bool allowDialogue = false,
+        bool allowLocalSplash = false);
 
     std::optional<RE::FormID> BeginTrucePreCombatSession(
         RE::Actor* player,
@@ -92,6 +109,16 @@ namespace TFD::Pacify
     bool IsPacified(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
+    bool CanStartTame(RE::Actor* actor);
+    bool HasActiveTameSession(RE::Actor* actor);
+    bool ExtendActiveTameSession(RE::Actor* actor, double addSec, double nowSec);
+    double GetRemainingTameTime(RE::Actor* actor, double nowSec);
+    TameDisposition GetDisposition(RE::Actor* actor);
+    bool IsCompanion(RE::Actor* actor);
+    bool PromoteActiveTameToCompanion(RE::Actor* actor, double addHoursGameTime);
+    bool ExtendActiveCompanionHours(RE::Actor* actor, double addHoursGameTime);
+    bool ReleaseActiveTameActor(RE::Actor* actor, ReleaseReason reason = ReleaseReason::Generic);
+    double GetRemainingCompanionHours(RE::Actor* actor);
 
     bool CanStartTruce(RE::Actor* actor);
     bool HasSpentTruce(RE::Actor* actor);
@@ -123,4 +150,5 @@ namespace TFD::Pacify
 
     const char* ToString(Mode mode);
     const char* ToString(ReleaseReason reason);
+    const char* ToString(TameDisposition disposition);
 }

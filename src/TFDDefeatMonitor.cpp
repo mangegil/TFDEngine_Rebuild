@@ -714,18 +714,29 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
-			if (g_bleedNoSpeakerTamePrimaryId == primary->GetFormID() &&
-				TFD::Pacify::IsPacified(primary) &&
-				TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
-				return true;
-			}
-
 			if (g_bleedNoSpeakerTameSessionId != 0) {
+				auto* currentPrimary = g_bleedNoSpeakerTamePrimaryId != 0 ? RE::TESForm::LookupByID<RE::Actor>(g_bleedNoSpeakerTamePrimaryId) : nullptr;
+				if (currentPrimary &&
+					TFD::Pacify::IsPacified(currentPrimary) &&
+					TFD::Pacify::GetMode(currentPrimary) == TFD::Pacify::Mode::Tame) {
+					return true;
+				}
+
+				for (auto* actor : actors) {
+					if (!actor) {
+						continue;
+					}
+					if (TFD::Pacify::IsPacified(actor) && TFD::Pacify::GetMode(actor) == TFD::Pacify::Mode::Tame) {
+						g_bleedNoSpeakerTamePrimaryId = actor->GetFormID();
+						return true;
+					}
+				}
+
 				ReleaseBleedNoSpeakerTameSession("restart");
 			}
 
 			player->DrawWeaponMagicHands(false);
-			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
+			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false, true);
 			if (!sessionId.has_value()) {
 				spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
 					primary->GetFormID(),
@@ -3115,7 +3126,7 @@ namespace TFD::DefeatMonitor
 			if (aggressor) {
 				g_lastAggressor = aggressor->GetHandle();
 				g_bleedSpeakerId = aggressor->GetFormID();
-				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true, true); sessionId.has_value()) {
+				if (const auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, aggressor, 0.0, true); sessionId.has_value()) {
 					g_bleedTruceSessionId = *sessionId;
 					spdlog::info("[TFD][Defeat] bleed truce session started id={} speaker={:08X}", g_bleedTruceSessionId, g_bleedSpeakerId);
 				}

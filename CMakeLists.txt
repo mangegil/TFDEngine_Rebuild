@@ -45,9 +45,12 @@ add_library(TFDEngine SHARED
     src/TFDTargetClassifier.cpp
     src/TFDInteractionRouter.cpp
     src/MenuFramework.cpp
+    src/TFDTameBait.cpp
+    src/TFDFeedPopup.cpp
     src/TFDCaptiveHostility.cpp
     src/TFDCaptiveDoorController.cpp
     src/TFDTeammateAliasSync.cpp
+    src/TFDCompanionRestore.cpp
 )
 
 if(TFDEnableSmf)

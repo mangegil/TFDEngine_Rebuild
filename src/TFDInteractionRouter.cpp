@@ -169,6 +169,15 @@ namespace TFD::InteractionRouter
 
         switch (classify.intent) {
         case TFD::TargetClassifier::InteractionIntent::Tame:
+            if (!TFD::Pacify::CanStartTame(target)) {
+                spdlog::info(
+                    "[TFD][Router] reject tame target={:08X} reason=active_tame_requires_feed",
+                    target->GetFormID());
+                result.valid = false;
+                result.failReason = FailReason::TameAlreadyActive;
+                return result;
+            }
+
             result.action = Action::Tame;
             result.valid = true;
             result.failReason = FailReason::None;
@@ -312,6 +321,8 @@ namespace TFD::InteractionRouter
             return "TargetRejected";
         case FailReason::TruceUnavailable:
             return "TruceUnavailable";
+        case FailReason::TameAlreadyActive:
+            return "TameAlreadyActive";
         case FailReason::SessionBeginFailed:
             return "SessionBeginFailed";
         default:

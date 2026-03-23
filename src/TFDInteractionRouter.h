@@ -25,6 +25,7 @@ namespace TFD::InteractionRouter
         NoUsableAction,
         TargetRejected,
         TruceUnavailable,
+        TameAlreadyActive,
         SessionBeginFailed
     };
 

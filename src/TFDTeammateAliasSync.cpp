@@ -176,11 +176,18 @@ namespace TFD::TeammateAliasSync
                 if (!current) {
                     continue;
                 }
-                if (!IsValidTeammate(current) || !keepIDs.contains(current->GetFormID())) {
-                    spdlog::info("[TFD][TeammateAlias] clear alias='{}' actor={:08X}", alias->aliasName.c_str(), current->GetFormID());
+
+                if (!IsValidTeammate(current)) {
+                    spdlog::info("[TFD][TeammateAlias] clear alias='{}' actor={:08X} reason=invalid",
+                        alias->aliasName.c_str(), current->GetFormID());
                     WriteAlias(alias, nullptr);
                     continue;
                 }
+
+                // Keep already-registered valid teammates sticky even if the current scan
+                // temporarily misses them. This avoids clear/fill churn for freshly promoted
+                // creature companions whose follow state can take a moment to settle.
+                keepIDs.insert(current->GetFormID());
                 remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](RE::Actor* a) {
                     return a == current || (a && current && a->GetFormID() == current->GetFormID());
                 }), remaining.end());

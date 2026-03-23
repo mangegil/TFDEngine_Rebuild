@@ -27,6 +27,9 @@
 #include "TFDTargetClassifier.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPacify.h"
+#include "TFDTameBait.h"
+#include "TFDFeedPopup.h"
+#include "TFDCompanionRestore.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -673,6 +676,31 @@ namespace TFDMenu
 		}
 
 
+		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player)
+		{
+			if (!a || !player) {
+				return -1.0f;
+			}
+
+			const auto pa = player->GetPosition();
+			const auto pb = a->GetPosition();
+
+			const float dx = pb.x - pa.x;
+			const float dy = pb.y - pa.y;
+			const float d2 = dx * dx + dy * dy;
+			if (d2 <= 1.0f) {
+				return 1.0f;
+			}
+
+			const float len = std::sqrt(d2);
+			const float ang = player->GetAngleZ();
+			const float fx = std::sin(ang);
+			const float fy = std::cos(ang);
+			const float nx = dx / len;
+			const float ny = dy / len;
+			return nx * fx + ny * fy;
+		}
+
 		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist)
 		{
 			if (!a || !player) {
@@ -689,17 +717,7 @@ namespace TFDMenu
 				return false;
 			}
 
-			const float len = std::sqrt((std::max)(1.0f, d2));
-
-			const float ang = player->GetAngleZ();
-			const float fx = std::sin(ang);
-			const float fy = std::cos(ang);
-
-			const float nx = dx / len;
-			const float ny = dy / len;
-			const float dot = nx * fx + ny * fy;
-
-			return dot >= 0.20f;
+			return GetActorFrontDot2D(a, player) >= 0.20f;
 		}
 
 		enum class HotkeyPickMode
@@ -726,6 +744,103 @@ namespace TFDMenu
 
 			const bool inCombat = actor->IsInCombat() || entry.inCombat;
 			return !entry.hostile && !inCombat;
+		}
+
+		static bool IsShiftDown()
+		{
+			return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+			       (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+			       (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+		}
+
+		static RE::Actor* PickActiveTameTargetSameCellLoaded(float radius)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return nullptr;
+			}
+
+			TFD::ActorScan::Rescan(radius, false);
+
+			RE::Actor* best = nullptr;
+			float bestScore = -1.0e30f;
+
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				if (!actor) {
+					continue;
+				}
+				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					continue;
+				}
+				if (!TFD::Pacify::HasActiveTameSession(actor)) {
+					continue;
+				}
+				if (entry.dist > radius) {
+					continue;
+				}
+
+				const float frontDot = GetActorFrontDot2D(actor, player);
+				float score = 20000.0f - entry.dist;
+				if (frontDot >= 0.20f) {
+					score += 4000.0f + (frontDot * 2000.0f);
+				} else {
+					score += frontDot * 500.0f;
+				}
+				if (actor->IsInCombat() || entry.inCombat) {
+					score += 50.0f;
+				}
+
+				if (score > bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			if (!best) {
+				const auto restored = TFD::CompanionRestore::RestoreNow();
+				if (restored > 0) {
+					TFD::ActorScan::Rescan(radius, false);
+
+					const auto retryCount = TFD::ActorScan::GetCount();
+					for (int i = 0; i < retryCount; ++i) {
+						auto entry = TFD::ActorScan::GetEntry(i);
+						auto* actor = TFD::ActorScan::GetActor(i);
+						if (!actor) {
+							continue;
+						}
+						if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+							continue;
+						}
+						if (!TFD::Pacify::HasActiveTameSession(actor)) {
+							continue;
+						}
+						if (entry.dist > radius) {
+							continue;
+						}
+
+						const float frontDot = GetActorFrontDot2D(actor, player);
+						float score = 20000.0f - entry.dist;
+						if (frontDot >= 0.20f) {
+							score += 4000.0f + (frontDot * 2000.0f);
+						} else {
+							score += frontDot * 500.0f;
+						}
+						if (actor->IsInCombat() || entry.inCombat) {
+							score += 50.0f;
+						}
+
+						if (score > bestScore) {
+							bestScore = score;
+							best = actor;
+						}
+					}
+				}
+			}
+
+			return best;
 		}
 
 		static float ScoreTruceCandidate(
@@ -1321,14 +1436,29 @@ namespace TFDMenu
 			SKSEMenuFramework::AddSectionItem("Combat Rules", RenderCombatRulesPage);
 			SKSEMenuFramework::AddSectionItem("Debug", RenderDebugPage);
 			SKSEMenuFramework::AddSectionItem("Quest Alias Monitor", RenderQuestAliasMonitorPage);
+			TFD::FeedPopup::Init();
 
 			menuRegistered = true;
 			spdlog::info("[TFD][SMF] menu registered OK");
 			RE::DebugNotification("TFD: SMF menu registered");
 		}
 
+
+		constexpr std::uint32_t kScanCodeEscape = 0x01;
+		constexpr std::uint32_t kScanCodeEnter = 0x1C;
+		constexpr std::uint32_t kScanCodeNumpadEnter = 0x9C;
+		constexpr std::uint32_t kScanCodeUp = 0xC8;
+		constexpr std::uint32_t kScanCodeDown = 0xD0;
+
+		constexpr double kPopupNavDebounce = 0.25;
+		constexpr double kPopupConfirmDebounce = 0.20;
+
 		class InputSink : public RE::BSTEventSink<RE::InputEvent*>
 		{
+		private:
+			Clock::time_point nextPopupNav{};
+			Clock::time_point nextPopupConfirm{};
+
 		public:
 			RE::BSEventNotifyControl ProcessEvent(RE::InputEvent* const* evns, RE::BSTEventSource<RE::InputEvent*>*) override
 			{
@@ -1348,11 +1478,50 @@ namespace TFDMenu
 						continue;
 					}
 
+					const auto code = static_cast<std::uint32_t>(btn->GetIDCode());
+
+					if (TFD::FeedPopup::IsOpen()) {
+						const auto nowPopup = Clock::now();
+						switch (code) {
+						case kScanCodeUp:
+							if (nowPopup >= nextPopupNav && TFD::FeedPopup::PrevSelection()) {
+								nextPopupNav = nowPopup + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kPopupNavDebounce));
+								return RE::BSEventNotifyControl::kStop;
+							}
+							return RE::BSEventNotifyControl::kStop;
+						case kScanCodeDown:
+							if (nowPopup >= nextPopupNav && TFD::FeedPopup::NextSelection()) {
+								nextPopupNav = nowPopup + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kPopupNavDebounce));
+								return RE::BSEventNotifyControl::kStop;
+							}
+							return RE::BSEventNotifyControl::kStop;
+						case kScanCodeEnter:
+						case kScanCodeNumpadEnter:
+							if (nowPopup >= nextPopupConfirm && TFD::FeedPopup::ConfirmSelection()) {
+								nextPopupConfirm = nowPopup + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kPopupConfirmDebounce));
+								return RE::BSEventNotifyControl::kStop;
+							}
+							return RE::BSEventNotifyControl::kStop;
+						case kScanCodeEscape:
+							if (nowPopup >= nextPopupConfirm && TFD::FeedPopup::CancelSelection()) {
+								nextPopupConfirm = nowPopup + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kPopupConfirmDebounce));
+								return RE::BSEventNotifyControl::kStop;
+							}
+							return RE::BSEventNotifyControl::kStop;
+						default:
+							break;
+						}
+
+						if (code == TFD::Settings::GetHotkeyScanCode()) {
+							RE::DebugNotification("TFD: Feed selection pending.");
+							return RE::BSEventNotifyControl::kStop;
+						}
+					}
+
 					if (!TFD::Settings::GetHotkeyEnabled()) {
 						continue;
 					}
 
-					const auto code = static_cast<std::uint32_t>(btn->GetIDCode());
 					if (code != TFD::Settings::GetHotkeyScanCode()) {
 						continue;
 					}
@@ -1383,6 +1552,13 @@ namespace TFDMenu
 
 					ResolveGlobals();
 
+					if (TFD::FeedPopup::IsOpen()) {
+						RE::DebugNotification("TFD: Feed selection pending.");
+						continue;
+					}
+
+					const bool shiftDown = IsShiftDown();
+
 					if (TFD::Settings::GetHotkeyWave()) {
 						player->NotifyAnimationGraph("IdleWave");
 					}
@@ -1404,6 +1580,19 @@ namespace TFDMenu
 						continue;
 					}
 
+					if (shiftDown) {
+						auto* tameTarget = PickActiveTameTargetSameCellLoaded(1400.0f);
+						if (!tameTarget) {
+							RE::DebugNotification("TFD: No Active Tame Target");
+							continue;
+						}
+
+						if (!TFD::FeedPopup::Open(tameTarget)) {
+							RE::DebugNotification("TFD: No Available Tame Commands");
+						}
+						continue;
+					}
+
 					// Precombat / InCombat / Tame
 					HotkeyPickMode pickMode = HotkeyPickMode::None;
 					auto* target = PickPreCombatTargetSameCellLoaded(3500.0f, &pickMode);
@@ -1419,7 +1608,11 @@ namespace TFDMenu
 						NowSec());
 
 					if (!exec.executed) {
-						RE::DebugNotification("TFD: Interaction Failed");
+						if (exec.failReason == TFD::InteractionRouter::FailReason::TameAlreadyActive) {
+							RE::DebugNotification("TFD: Already Tamed. Use Shift+H to Feed");
+						} else {
+							RE::DebugNotification("TFD: Interaction Failed");
+						}
 						continue;
 					}
 
@@ -1513,6 +1706,7 @@ namespace TFDMenu
 
 			if (m->type == SKSE::MessagingInterface::kPreLoadGame) {
 				ResolveGlobals();
+				TFD::FeedPopup::Close();
 				TFD::PreCombatGreet::OnPreLoadGame();
 				TFD::DefeatMonitor::SetLoadTransition(true);
 				spdlog::info("[TFD][Menu] PreLoadGame -> prepare only");
@@ -1521,6 +1715,7 @@ namespace TFDMenu
 			if (m->type == SKSE::MessagingInterface::kPostLoadGame ||
 				m->type == SKSE::MessagingInterface::kNewGame) {
 				ResolveGlobals();
+				TFD::FeedPopup::Close();
 				TFD::PreCombatGreet::OnPostLoadGame();
 				spdlog::info("[TFD][Menu] PostLoad/NewGame -> bridge refresh only");
 			}
