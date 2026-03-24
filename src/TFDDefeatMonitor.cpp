@@ -40,6 +40,7 @@ namespace TFD::DefeatMonitor
 	{
 		static void ClearBleedoutBridgeAliases(RE::TESForm* sender, const char* reason);
 		static void AssignBleedoutBridgeActor(RE::Actor* actor);
+		static float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b);
 		enum class CaptivePhaseValue : int
 		{
 			None = 0,
@@ -551,6 +552,22 @@ namespace TFD::DefeatMonitor
 
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player);
+
+		static void SendPlayerSaviorAssign(RE::Actor* actor)
+		{
+			if (!actor) {
+				return;
+			}
+			const bool queued = SendBridgeModEvent("TFDPlayerSaviorAssign", actor);
+			spdlog::info("[TFD][SaviorBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
+		}
+
+		static void ClearPlayerSavior(RE::TESForm* sender = nullptr, const char* reason = nullptr)
+		{
+			const bool queued = SendBridgeModEvent("TFDPlayerSaviorClear", sender);
+			spdlog::info("[TFD][SaviorBridge] Clear queued={} reason={}", queued, reason ? reason : "unknown");
+		}
+
 		static void ClearBleedSupportBridgeAliases(const char* reason);
 		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason);
 		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason);
@@ -714,29 +731,18 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
+			if (g_bleedNoSpeakerTamePrimaryId == primary->GetFormID() &&
+				TFD::Pacify::IsPacified(primary) &&
+				TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
+				return true;
+			}
+
 			if (g_bleedNoSpeakerTameSessionId != 0) {
-				auto* currentPrimary = g_bleedNoSpeakerTamePrimaryId != 0 ? RE::TESForm::LookupByID<RE::Actor>(g_bleedNoSpeakerTamePrimaryId) : nullptr;
-				if (currentPrimary &&
-					TFD::Pacify::IsPacified(currentPrimary) &&
-					TFD::Pacify::GetMode(currentPrimary) == TFD::Pacify::Mode::Tame) {
-					return true;
-				}
-
-				for (auto* actor : actors) {
-					if (!actor) {
-						continue;
-					}
-					if (TFD::Pacify::IsPacified(actor) && TFD::Pacify::GetMode(actor) == TFD::Pacify::Mode::Tame) {
-						g_bleedNoSpeakerTamePrimaryId = actor->GetFormID();
-						return true;
-					}
-				}
-
 				ReleaseBleedNoSpeakerTameSession("restart");
 			}
 
 			player->DrawWeaponMagicHands(false);
-			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false, true);
+			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
 			if (!sessionId.has_value()) {
 				spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
 					primary->GetFormID(),
@@ -1023,6 +1029,7 @@ namespace TFD::DefeatMonitor
 			g_allyHoldActive = false;
 			g_lockedFallbackCrowdIds.clear();
 			g_bleedFollowerDownIds.clear();
+			ClearPlayerSavior(nullptr, "clear_no_marker_fallback");
 		}
 
 		static bool IsActorBleedingOut(RE::Actor* actor)
@@ -1196,6 +1203,52 @@ namespace TFD::DefeatMonitor
 				return true;
 			}
 			return HasFollowerAnchorFaction(actor);
+		}
+
+		static bool IsHumanoidSaviorCandidate(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+			if (!IsActiveFollowerActor(actor)) {
+				return false;
+			}
+			if (IsActorBleedingOut(actor)) {
+				return false;
+			}
+			if (!ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return false;
+			}
+			return true;
+		}
+
+		static RE::Actor* ResolveBestHumanoidSavior(float radius)
+		{
+			auto* player = Player();
+			if (!player) {
+				return nullptr;
+			}
+
+			RE::Actor* best = nullptr;
+			float bestDist = std::numeric_limits<float>::max();
+
+			for (auto* actor : CollectRegisteredTeammates()) {
+				if (!IsHumanoidSaviorCandidate(actor) || actor == player) {
+					continue;
+				}
+
+				const float dist = Distance3D(actor->GetPosition(), player->GetPosition());
+				if (radius > 0.0f && dist > (std::max)(radius, 5000.0f)) {
+					continue;
+				}
+
+				if (dist < bestDist) {
+					bestDist = dist;
+					best = actor;
+				}
+			}
+
+			return best;
 		}
 
 		static void SnapshotBleedFollowerDownState(float radius)
@@ -1662,8 +1715,20 @@ namespace TFD::DefeatMonitor
 			LockCurrentBleedCrowdSnapshot(preferredSpeaker);
 
 			const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+			auto* savior = ResolveBestHumanoidSavior(followerRadius);
 			auto followers = ResolveFollowerCandidates(followerRadius);
-			if (followers.standing) {
+			if (savior) {
+				if (auto* rescueDest = ResolveCachedRescueDestinationForFallback()) {
+					g_noMarkerFallback.branch = NoMarkerFallbackBranch::RescueCached;
+					g_noMarkerFallback.follower = savior->GetHandle();
+					g_noMarkerFallback.destination = rescueDest->GetHandle();
+				}
+				else {
+					g_noMarkerFallback.branch = NoMarkerFallbackBranch::RecoveryFollower;
+					g_noMarkerFallback.follower = savior->GetHandle();
+				}
+			}
+			else if (followers.standing) {
 				g_noMarkerFallback.branch = NoMarkerFallbackBranch::RecoveryFollower;
 				g_noMarkerFallback.follower = followers.standing->GetHandle();
 			}
@@ -2190,6 +2255,16 @@ namespace TFD::DefeatMonitor
 			BeginLeftForDeadCooldown(grace);
 			SetGraceSeconds(grace);
 			UpdatePreCombatState();
+			if (g_noMarkerFallback.follower) {
+				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
+				if (auto* follower = followerSp.get()) {
+					SendPlayerSaviorAssign(follower);
+					follower->EvaluatePackage(false, true);
+					follower->EvaluatePackage(true, true);
+					spdlog::info("[TFD][Transition] rescue savior assigned {:08X}", follower->GetFormID());
+				}
+			}
+
 			spdlog::info("[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X} branch={}",
 				reason ? reason : "unknown", safeLoc ? safeLoc->GetFormID() : 0u, dest->GetFormID(), NoMarkerBranchName(g_noMarkerFallback.branch));
 			return true;
@@ -2211,6 +2286,7 @@ namespace TFD::DefeatMonitor
 
 		static void CompleteRecoverTransitionNow(const char* reason)
 		{
+			ClearPlayerSavior(nullptr, "recover_transition");
 			if (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RecoveryFollower) {
 				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
 				auto* follower = followerSp.get();
