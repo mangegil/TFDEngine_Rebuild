@@ -11,6 +11,8 @@
 #include <cstring>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
+#include <tuple>
 #include <array>
 
 #include <type_traits>
@@ -127,6 +129,25 @@ namespace TFD::DefeatMonitor
 		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		RE::ActorHandle g_bleedBattlePreferredEnemy{};
 		BleedBattleObserverState g_bleedBattleObserver{};
+
+		enum class BleedLockKind : std::uint8_t
+		{
+			Player = 0,
+			Ally = 1,
+			Other = 2
+		};
+
+		struct BleedLockEntry
+		{
+			RE::ActorHandle handle{};
+			BleedLockKind kind{ BleedLockKind::Other };
+			float thresholdPct{ 0.0f };
+			float minHp{ 0.0f };
+			std::chrono::steady_clock::time_point lastPulse{};
+		};
+
+		std::unordered_map<RE::FormID, BleedLockEntry> g_bleedLocks{};
+		std::chrono::steady_clock::time_point g_bleedLockLastScan{};
 
 		bool g_captiveState = false;
 		CaptivePhaseValue g_captivePhase = CaptivePhaseValue::None;
@@ -941,8 +962,11 @@ namespace TFD::DefeatMonitor
 			g_bleedLastCrowdAssign = Now();
 		}
 
+		static void ReleasePlayerBleedLock(const char* reason, bool playGetUp);
+
 		static void ResetBleedRuntimeState()
 		{
+			ReleasePlayerBleedLock("reset_bleed_runtime", false);
 			ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic);
 			ReleaseBleedNoSpeakerTameSession("reset_bleed_runtime");
 			ClearBleedSupportBridgeAliases("reset_bleed_runtime");
@@ -3400,6 +3424,250 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+		static float ResolveBleedLockThresholdPct(RE::Actor* actor)
+		{
+			if (!actor) {
+				return 0.0f;
+			}
+			if (actor == Player()) {
+				return TFD::Settings::GetDefeatThresholdPct();
+			}
+			if (IsActiveFollowerActor(actor)) {
+				return TFD::Settings::GetAllyDownedThresholdPct();
+			}
+			return TFD::Settings::GetEnemyDownedThresholdPct();
+		}
+
+		static BleedLockKind ResolveBleedLockKind(RE::Actor* actor)
+		{
+			if (!actor) {
+				return BleedLockKind::Other;
+			}
+			if (actor == Player()) {
+				return BleedLockKind::Player;
+			}
+			if (IsActiveFollowerActor(actor)) {
+				return BleedLockKind::Ally;
+			}
+			return BleedLockKind::Other;
+		}
+
+		static bool ShouldEnterBleedLock(RE::Actor* actor, float thresholdPct)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+			return GetActorHealthPct(actor) <= std::clamp(thresholdPct, 2.0f, 95.0f);
+		}
+
+		static void EnterBleedLock(RE::Actor* actor, BleedLockKind kind, float thresholdPct, const char* reason)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return;
+			}
+
+			const auto formID = actor->GetFormID();
+			auto& entry = g_bleedLocks[formID];
+			const bool wasNew = !entry.handle;
+			entry.handle = actor->GetHandle();
+			entry.kind = kind;
+			entry.thresholdPct = std::clamp(thresholdPct, 2.0f, 95.0f);
+			if (kind == BleedLockKind::Player) {
+				const float maxHp = actor->GetPermanentActorValue(RE::ActorValue::kHealth);
+				entry.minHp = (std::max)(1.0f, maxHp * 0.02f);
+				g_minHp = (std::max)(g_minHp, entry.minHp);
+				SetPlayerBleedImmune(true);
+				ClampHealth(actor, entry.minHp);
+			}
+
+			if (!actor->IsDead()) {
+				if (kind != BleedLockKind::Player) {
+					if (actor->IsInCombat()) {
+						actor->StopCombat();
+					}
+					if (auto* process = RE::ProcessLists::GetSingleton()) {
+						process->StopCombatAndAlarmOnActor(actor, false);
+					}
+					if (actor->IsWeaponDrawn()) {
+						actor->DrawWeaponMagicHands(false);
+					}
+				}
+				actor->NotifyAnimationGraph("BleedoutStart");
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+				entry.lastPulse = Now();
+			}
+
+			if (wasNew) {
+				spdlog::info("[TFD][Defeat] bleed lock enter actor={:08X} kind={} threshold={:.1f} reason={}",
+					formID,
+					static_cast<int>(kind),
+					entry.thresholdPct,
+					reason ? reason : "unknown");
+			}
+		}
+
+		static void ReleaseBleedLock(RE::Actor* actor, const char* reason, bool playGetUp)
+		{
+			if (!actor) {
+				return;
+			}
+			const auto formID = actor->GetFormID();
+			auto it = g_bleedLocks.find(formID);
+			if (it == g_bleedLocks.end()) {
+				return;
+			}
+			const auto kind = it->second.kind;
+			g_bleedLocks.erase(it);
+			if (kind == BleedLockKind::Player) {
+				g_minHp = 0.0f;
+				SetPlayerBleedImmune(false);
+			}
+			if (playGetUp && actor && !actor->IsDead() && !actor->IsDisabled()) {
+				actor->NotifyAnimationGraph("BleedoutStop");
+				actor->NotifyAnimationGraph("GetUpStart");
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+			}
+			spdlog::info("[TFD][Defeat] bleed lock release actor={:08X} reason={} getUp={}",
+				formID,
+				reason ? reason : "unknown",
+				playGetUp ? 1 : 0);
+		}
+
+		static void ReleasePlayerBleedLock(const char* reason, bool playGetUp)
+		{
+			ReleaseBleedLock(Player(), reason, playGetUp);
+		}
+
+		static void ClearAllBleedLocks(const char* reason)
+		{
+			for (auto& [formID, entry] : g_bleedLocks) {
+				auto sp = entry.handle.get();
+				auto* actor = sp.get();
+				if (entry.kind == BleedLockKind::Player) {
+					g_minHp = 0.0f;
+					SetPlayerBleedImmune(false);
+				}
+				if (actor && !actor->IsDead() && !actor->IsDisabled()) {
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
+				}
+				spdlog::info("[TFD][Defeat] bleed lock clear actor={:08X} reason={}", formID, reason ? reason : "unknown");
+			}
+			g_bleedLocks.clear();
+			g_bleedLockLastScan = {};
+		}
+
+		static void ScanBleedLockCandidates()
+		{
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+
+			const float playerThreshold = ResolveBleedLockThresholdPct(player);
+			if (ShouldEnterBleedLock(player, playerThreshold)) {
+				EnterBleedLock(player, BleedLockKind::Player, playerThreshold, "threshold_scan_player");
+			}
+
+			const float radius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
+			for (auto* actor : CollectKnownTeammates(radius)) {
+				const float threshold = ResolveBleedLockThresholdPct(actor);
+				if (ShouldEnterBleedLock(actor, threshold)) {
+					EnterBleedLock(actor, ResolveBleedLockKind(actor), threshold, "threshold_scan_follower");
+				}
+			}
+
+			TFD::ActorScan::Rescan(radius, false);
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto e = TFD::ActorScan::GetEntry(i);
+				auto sp = e.actor.get();
+				auto* actor = sp.get();
+				if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
+					continue;
+				}
+				if (IsActiveFollowerActor(actor)) {
+					continue;
+				}
+				const float threshold = ResolveBleedLockThresholdPct(actor);
+				if (ShouldEnterBleedLock(actor, threshold)) {
+					EnterBleedLock(actor, ResolveBleedLockKind(actor), threshold, "threshold_scan_other");
+				}
+			}
+		}
+
+		static void TickBleedLocks()
+		{
+			auto* player = Player();
+			const auto now = Now();
+			if (g_bleedLockLastScan.time_since_epoch().count() == 0 || (now - g_bleedLockLastScan) >= std::chrono::milliseconds(250)) {
+				g_bleedLockLastScan = now;
+				ScanBleedLockCandidates();
+			}
+
+			std::vector<std::tuple<RE::FormID, RE::Actor*, const char*, bool>> releases;
+			for (auto& [formID, entry] : g_bleedLocks) {
+				auto sp = entry.handle.get();
+				auto* actor = sp.get();
+				if (!actor || actor->IsDisabled()) {
+					releases.emplace_back(formID, actor, "invalid", false);
+					continue;
+				}
+
+				if (actor->IsDead() || actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f) {
+					releases.emplace_back(formID, actor, "dead", false);
+					continue;
+				}
+
+				if (entry.kind == BleedLockKind::Player) {
+					if (entry.minHp > 0.0f) {
+						SetPlayerBleedImmune(true);
+						ClampHealth(actor, entry.minHp);
+					}
+				}
+				else {
+					if (GetActorHealthPct(actor) > (entry.thresholdPct + 8.0f)) {
+						releases.emplace_back(formID, actor, "recovered", true);
+						continue;
+					}
+					if (actor->IsInCombat()) {
+						actor->StopCombat();
+					}
+					if (auto* process = RE::ProcessLists::GetSingleton()) {
+						process->StopCombatAndAlarmOnActor(actor, false);
+					}
+					if (actor->IsWeaponDrawn()) {
+						actor->DrawWeaponMagicHands(false);
+					}
+				}
+
+				const bool pulseDue = entry.lastPulse.time_since_epoch().count() == 0 || (now - entry.lastPulse) >= std::chrono::milliseconds(250);
+				if (!IsActorBleedingOut(actor) || pulseDue) {
+					actor->NotifyAnimationGraph("BleedoutStart");
+					entry.lastPulse = now;
+				}
+			}
+
+			for (auto& [formID, actor, reason, playGetUp] : releases) {
+				if (actor) {
+					ReleaseBleedLock(actor, reason, playGetUp);
+				}
+				else {
+					auto it = g_bleedLocks.find(formID);
+					if (it != g_bleedLocks.end()) {
+						if (it->second.kind == BleedLockKind::Player) {
+							g_minHp = 0.0f;
+							SetPlayerBleedImmune(false);
+						}
+						spdlog::info("[TFD][Defeat] bleed lock release actor={:08X} reason={} getUp=0", formID, reason ? reason : "unknown");
+						g_bleedLocks.erase(it);
+					}
+				}
+			}
+		}
+
 		static void SetGraceSeconds(int seconds)
 		{
 			g_grace.store(true, std::memory_order_release);
@@ -3724,6 +3992,7 @@ namespace TFD::DefeatMonitor
 		{
 			auto* p = Player();
 			if (!p) return;
+			ReleasePlayerBleedLock("recover_after_teleport", false);
 			p->NotifyAnimationGraph("BleedoutStop");
 			p->NotifyAnimationGraph("GetUpStart");
 			const float hpMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kHealth));
@@ -3749,6 +4018,7 @@ namespace TFD::DefeatMonitor
 		{
 			auto* p = Player();
 			if (!p) return;
+			ReleasePlayerBleedLock("recover_for_transition", false);
 			p->NotifyAnimationGraph("BleedoutStop");
 			p->NotifyAnimationGraph("GetUpStart");
 			auto restoreToPct = [&](RE::ActorValue av, float pct, float minValue) {
@@ -3940,6 +4210,7 @@ namespace TFD::DefeatMonitor
 
 			auto* player = Player();
 			if (player) {
+				ReleasePlayerBleedLock("resolved_no_marker_fallback", false);
 				player->NotifyAnimationGraph("BleedoutStop");
 				player->NotifyAnimationGraph("GetUpStart");
 				if (player->IsInCombat()) {
@@ -4217,6 +4488,7 @@ namespace TFD::DefeatMonitor
 			const float pct = (hpNow / hpMax) * 100.0f;
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
 			if (pct <= thresh) {
+				EnterBleedLock(player, BleedLockKind::Player, thresh, "player_threshold");
 				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 				auto* aggressor = ResolveAggressor();
 				if (!aggressor) {
@@ -4274,6 +4546,7 @@ namespace TFD::DefeatMonitor
 		ClearEscapeContext();
 		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
+		ClearAllBleedLocks("install");
 		ClearBleedoutBridgeAliases(nullptr, "install");
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
@@ -4294,6 +4567,7 @@ namespace TFD::DefeatMonitor
 		g_queuedCaptivePhase = CaptivePhaseValue::None;
 		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
+		ClearAllBleedLocks("shutdown");
 		ClearBleedoutBridgeAliases(nullptr, "shutdown");
 		g_loadTransition.store(false, std::memory_order_release);
 		ResetLockpickWatch();
@@ -4368,6 +4642,7 @@ namespace TFD::DefeatMonitor
 		g_grace.store(false, std::memory_order_release);
 		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
+		ClearAllBleedLocks("reset_for_load");
 		ClearBleedoutBridgeAliases(nullptr, "reset_for_load");
 		g_lastAggressor = RE::ActorHandle{};
 		SetCaptiveRuntimeOnly(false, CaptivePhaseValue::None);
@@ -4386,6 +4661,7 @@ namespace TFD::DefeatMonitor
 		g_loadTransition.store(active, std::memory_order_release);
 		if (active) {
 			SetPlayerBleedImmune(false);
+			ClearAllBleedLocks("set_load_transition");
 			ClearBleedoutBridgeAliases(nullptr, "set_load_transition");
 			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
@@ -4435,7 +4711,8 @@ namespace TFD::DefeatMonitor
 
 	bool IsPlayerBleedHoldTargetBlocked()
 	{
-		return false;
+		return g_inBleedState.load(std::memory_order_acquire) &&
+			(g_bleedBattleObservePending || g_bleedBattleObserveActive);
 	}
 
 }
