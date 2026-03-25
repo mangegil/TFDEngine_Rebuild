@@ -7,6 +7,7 @@
 #include <atomic>
 
 #include "TFDPacify.h"
+#include "TFDDefeatMonitor.h"
 
 #ifdef SKYRIM_SUPPORT_AE
 #define TFD_RELID(SE, AE) REL::ID(AE)
@@ -42,6 +43,29 @@ namespace TFD::PacifyHooks
             }
 
         private:
+            static void ClearBlockedPlayerTarget(RE::Character* actor)
+            {
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!actor || !player || actor == player) {
+                    return;
+                }
+
+                if (!TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                    return;
+                }
+
+                auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                auto* target = targetSp.get();
+                if (target != player) {
+                    return;
+                }
+
+                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->ClearCachedFactionFightReactions();
+                }
+            }
+
             static void UpdateCombat(RE::Character* actor)
             {
                 if (actor && TFD::Pacify::IsPacified(actor)) {
@@ -60,7 +84,9 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
+                ClearBlockedPlayerTarget(actor);
                 _UpdateCombat(actor);
+                ClearBlockedPlayerTarget(actor);
             }
 
             static std::uint8_t* DoDetect(
@@ -77,6 +103,12 @@ namespace TFD::PacifyHooks
             {
                 if ((target && TFD::Pacify::IsPacified(target)) ||
                     (viewer && TFD::Pacify::IsPacified(viewer))) {
+                    detectVal = -1000;
+                    return nullptr;
+                }
+
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (player && viewer && target == player && viewer != player && TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
                     detectVal = -1000;
                     return nullptr;
                 }

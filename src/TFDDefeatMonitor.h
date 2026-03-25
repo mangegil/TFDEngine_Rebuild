@@ -25,4 +25,5 @@ namespace TFD::DefeatMonitor
 	const char* GetCaptivePhaseName();
 	bool IsCaptiveFamily();
 	bool IsLeftForDeadRecoveryActive();
+	bool IsPlayerBleedHoldTargetBlocked();
 }

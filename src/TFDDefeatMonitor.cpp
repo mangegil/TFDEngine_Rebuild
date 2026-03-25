@@ -136,11 +136,9 @@ namespace TFD::DefeatMonitor
 		struct TeammateRegistryCache
 		{
 			RE::TESQuest* quest{ nullptr };
-			RE::TESQuest* creatureQuest{ nullptr };
 			RE::TESFaction* currentFollowerFaction{ nullptr };
 			RE::TESFaction* playerFollowerFaction{ nullptr };
 			std::array<RE::BGSRefAlias*, 10> teammateAliases{};
-			std::array<RE::BGSRefAlias*, 6> creatureAliases{};
 			bool resolved{ false };
 		};
 
@@ -320,11 +318,8 @@ namespace TFD::DefeatMonitor
 		static void RestoreFollowerAfterTransition(RE::Actor* actor);
 		static void ResolveTeammateRegistry();
 		static bool IsRegisteredTeammateActor(RE::Actor* actor);
-		static bool IsRegisteredCreatureTeammateActor(RE::Actor* actor);
 		static std::vector<RE::Actor*> CollectRegisteredTeammates();
-		static std::vector<RE::Actor*> CollectRegisteredCreatureTeammates();
 		static bool IsActorBleedingOut(RE::Actor* actor);
-		static bool IsCombatReadyBleedAlly(RE::Actor* actor);
 		static std::vector<RE::Actor*> CollectKnownTeammates(float radius);
 		static RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
 		static void ClearPendingCinematicFadeIn();
@@ -1101,6 +1096,40 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		static float GetActorHealthPct(RE::Actor* actor)
+		{
+			if (!actor) {
+				return 0.0f;
+			}
+			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+			const float hpNow = (std::max)(0.0f, actor->GetActorValue(RE::ActorValue::kHealth));
+			return (hpNow / hpMax) * 100.0f;
+		}
+
+		static bool IsActorDownByThreshold(RE::Actor* actor, float thresholdPct)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead() || IsActorBleedingOut(actor)) {
+				return true;
+			}
+			return GetActorHealthPct(actor) <= std::clamp(thresholdPct, 2.0f, 95.0f);
+		}
+
+		static bool IsStandingAllyThresholdActor(RE::Actor* actor)
+		{
+			if (!actor || actor == Player()) {
+				return false;
+			}
+			return !IsActorDownByThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
+		}
+
+		static bool IsStandingEnemyThresholdActor(RE::Actor* actor)
+		{
+			if (!actor || actor == Player()) {
+				return false;
+			}
+			return !IsActorDownByThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct());
+		}
+
 		static void ResolveTeammateRegistry()
 		{
 			if (g_teammateRegistry.resolved) {
@@ -1108,58 +1137,36 @@ namespace TFD::DefeatMonitor
 			}
 			g_teammateRegistry.resolved = true;
 			g_teammateRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDPlayerTeammateQuest");
-			g_teammateRegistry.creatureQuest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDCreatureTeammateQuest");
-			g_teammateRegistry.currentFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("CurrentFollowerFaction");
-			g_teammateRegistry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
-
 			if (!g_teammateRegistry.quest) {
 				spdlog::warn("[TFD][Defeat] teammate registry quest not found");
+				return;
 			}
-			if (!g_teammateRegistry.creatureQuest) {
-				spdlog::warn("[TFD][Defeat] creature teammate registry quest not found");
+			for (auto* baseAlias : g_teammateRegistry.quest->aliases) {
+				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+				if (!refAlias) {
+					continue;
+				}
+				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName.rfind("Teammate", 0) != 0 || aliasName.size() < 10) {
+					continue;
+				}
+				try {
+					int slot = std::stoi(aliasName.substr(9));
+					if (slot >= 1 && slot <= 10) {
+						g_teammateRegistry.teammateAliases[slot - 1] = refAlias;
+					}
+				}
+				catch (...) {
+				}
 			}
-
-			auto resolveAliases = [](RE::TESQuest* quest, auto& outAliases) {
-				if (!quest) {
-					return std::size_t{ 0 };
+			std::size_t found = 0;
+			for (auto* a : g_teammateRegistry.teammateAliases) {
+				if (a) {
+					++found;
 				}
-				for (auto* baseAlias : quest->aliases) {
-					auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
-					if (!refAlias) {
-						continue;
-					}
-					const auto aliasName = std::string(refAlias->aliasName.c_str());
-					if (aliasName.rfind("Teammate", 0) != 0 || aliasName.size() < 10) {
-						continue;
-					}
-					try {
-						const int slot = std::stoi(aliasName.substr(9));
-						if (slot >= 1 && slot <= static_cast<int>(outAliases.size())) {
-							outAliases[slot - 1] = refAlias;
-						}
-					}
-					catch (...) {
-					}
-				}
-				std::size_t found = 0;
-				for (auto* alias : outAliases) {
-					if (alias) {
-						++found;
-					}
-				}
-				return found;
-				};
-
-			const auto humanoidFound = resolveAliases(g_teammateRegistry.quest, g_teammateRegistry.teammateAliases);
-			const auto creatureFound = resolveAliases(g_teammateRegistry.creatureQuest, g_teammateRegistry.creatureAliases);
-
-			spdlog::info("[TFD][Defeat] teammate registry resolved quest={:08X} aliases={} creatureQuest={:08X} creatureAliases={} followerFaction={:08X} playerFollowerFaction={:08X}",
-				g_teammateRegistry.quest ? g_teammateRegistry.quest->GetFormID() : 0u,
-				humanoidFound,
-				g_teammateRegistry.creatureQuest ? g_teammateRegistry.creatureQuest->GetFormID() : 0u,
-				creatureFound,
-				g_teammateRegistry.currentFollowerFaction ? g_teammateRegistry.currentFollowerFaction->GetFormID() : 0u,
-				g_teammateRegistry.playerFollowerFaction ? g_teammateRegistry.playerFollowerFaction->GetFormID() : 0u);
+			}
+			spdlog::info("[TFD][Defeat] teammate registry resolved quest={:08X} aliases={}",
+				g_teammateRegistry.quest ? g_teammateRegistry.quest->GetFormID() : 0u, found);
 		}
 
 		static bool IsRegisteredTeammateActor(RE::Actor* actor)
@@ -1169,24 +1176,6 @@ namespace TFD::DefeatMonitor
 			}
 			ResolveTeammateRegistry();
 			for (auto* alias : g_teammateRegistry.teammateAliases) {
-				if (!alias) {
-					continue;
-				}
-				auto* slotActor = alias->GetActorReference();
-				if (slotActor && slotActor == actor) {
-					return true;
-				}
-			}
-			return false;
-		}
-
-		static bool IsRegisteredCreatureTeammateActor(RE::Actor* actor)
-		{
-			if (!actor || actor->IsDisabled()) {
-				return false;
-			}
-			ResolveTeammateRegistry();
-			for (auto* alias : g_teammateRegistry.creatureAliases) {
 				if (!alias) {
 					continue;
 				}
@@ -1216,24 +1205,6 @@ namespace TFD::DefeatMonitor
 			return out;
 		}
 
-		static std::vector<RE::Actor*> CollectRegisteredCreatureTeammates()
-		{
-			ResolveTeammateRegistry();
-			std::vector<RE::Actor*> out;
-			out.reserve(g_teammateRegistry.creatureAliases.size());
-			for (auto* alias : g_teammateRegistry.creatureAliases) {
-				if (!alias) {
-					continue;
-				}
-				auto* actor = alias->GetActorReference();
-				if (!actor || actor->IsDisabled()) {
-					continue;
-				}
-				out.push_back(actor);
-			}
-			return out;
-		}
-
 		static bool HasFollowerAnchorFaction(RE::Actor* actor)
 		{
 			if (!actor || actor->IsDisabled()) {
@@ -1249,19 +1220,6 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
-		static bool IsCombatReadyBleedAlly(RE::Actor* actor)
-		{
-			if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead() || IsActorBleedingOut(actor)) {
-				return false;
-			}
-
-			const float maxHp = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
-			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
-			const float pct = (hpNow / maxHp) * 100.0f;
-			const float thresh = TFD::Settings::GetDefeatThresholdPct();
-			return pct > (thresh + 0.5f);
-		}
-
 		static std::vector<RE::Actor*> CollectKnownTeammates(float radius)
 		{
 			auto* player = Player();
@@ -1273,27 +1231,23 @@ namespace TFD::DefeatMonitor
 			std::unordered_set<RE::FormID> seen;
 			const float maxRadius = radius > 0.0f ? (std::max)(radius, 5000.0f) : 5000.0f;
 
-			auto addIfNearby = [&](RE::Actor* actor) {
+			for (auto* actor : CollectRegisteredTeammates()) {
 				if (!actor || actor == player || actor->IsDisabled()) {
-					return;
+					continue;
 				}
 				if (radius > 0.0f) {
-					const float dist = Distance3D(actor->GetPosition(), player->GetPosition());
+					auto apos = actor->GetPosition();
+					auto ppos = player->GetPosition();
+					const float dx = apos.x - ppos.x;
+					const float dy = apos.y - ppos.y;
+					const float dz = apos.z - ppos.z;
+					const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 					if (dist > maxRadius) {
-						return;
+						continue;
 					}
 				}
-				if (!seen.insert(actor->GetFormID()).second) {
-					return;
-				}
+				seen.insert(actor->GetFormID());
 				out.push_back(actor);
-				};
-
-			for (auto* actor : CollectRegisteredTeammates()) {
-				addIfNearby(actor);
-			}
-			for (auto* actor : CollectRegisteredCreatureTeammates()) {
-				addIfNearby(actor);
 			}
 
 			TFD::ActorScan::Rescan(maxRadius, true);
@@ -1312,10 +1266,7 @@ namespace TFD::DefeatMonitor
 				if (entry.dist > maxRadius) {
 					continue;
 				}
-				if (!actor->IsPlayerTeammate() &&
-					!HasFollowerAnchorFaction(actor) &&
-					!IsRegisteredCreatureTeammateActor(actor) &&
-					!TFD::Pacify::IsCompanion(actor)) {
+				if (!actor->IsPlayerTeammate() && !HasFollowerAnchorFaction(actor)) {
 					continue;
 				}
 				if (!seen.insert(actor->GetFormID()).second) {
@@ -1332,13 +1283,10 @@ namespace TFD::DefeatMonitor
 			if (!actor || actor->IsDisabled()) {
 				return false;
 			}
-			if (IsRegisteredTeammateActor(actor) || IsRegisteredCreatureTeammateActor(actor)) {
+			if (IsRegisteredTeammateActor(actor)) {
 				return true;
 			}
 			if (actor->IsPlayerTeammate()) {
-				return true;
-			}
-			if (TFD::Pacify::IsCompanion(actor)) {
 				return true;
 			}
 			return HasFollowerAnchorFaction(actor);
@@ -1355,13 +1303,10 @@ namespace TFD::DefeatMonitor
 
 		static bool IsHumanoidSaviorCandidate(RE::Actor* actor)
 		{
-			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+			if (!actor || !IsStandingAllyThresholdActor(actor)) {
 				return false;
 			}
 			if (!IsActiveFollowerActor(actor)) {
-				return false;
-			}
-			if (IsActorBleedingOut(actor)) {
 				return false;
 			}
 			if (!ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
@@ -1410,7 +1355,7 @@ namespace TFD::DefeatMonitor
 				if (!actor || actor == player) {
 					continue;
 				}
-				if (actor->IsDead() || IsActorBleedingOut(actor)) {
+				if (IsActorDownByThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct())) {
 					g_bleedFollowerDownIds.insert(actor->GetFormID());
 				}
 			}
@@ -1568,7 +1513,7 @@ namespace TFD::DefeatMonitor
 					continue;
 				}
 				const bool wasDownedThisEvent = g_bleedFollowerDownIds.find(actor->GetFormID()) != g_bleedFollowerDownIds.end();
-				const bool downed = actor->IsDead() || IsActorBleedingOut(actor) || wasDownedThisEvent;
+				const bool downed = wasDownedThisEvent || IsActorDownByThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
 				if (!downed) {
 					if (dist < bestStandingDist) {
 						bestStandingDist = dist;
@@ -1588,7 +1533,7 @@ namespace TFD::DefeatMonitor
 		{
 			std::vector<RE::Actor*> out;
 			for (auto* actor : CollectKnownTeammates(radius)) {
-				if (!IsCombatReadyBleedAlly(actor)) {
+				if (!IsStandingAllyThresholdActor(actor)) {
 					continue;
 				}
 				out.push_back(actor);
@@ -1613,7 +1558,7 @@ namespace TFD::DefeatMonitor
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto sp = e.actor.get();
 				auto* actor = sp.get();
-				if (!actor || actor == player || actor->IsDisabled() || actor->IsDead() || IsActorBleedingOut(actor)) {
+				if (!IsStandingEnemyThresholdActor(actor)) {
 					continue;
 				}
 				if (!actor->Is3DLoaded()) {
@@ -1657,7 +1602,7 @@ namespace TFD::DefeatMonitor
 
 		static bool IsObserverEnemy(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies, bool hostileHint, bool inCombatHint)
 		{
-			if (!player || !IsStandingObserverActor(actor) || actor == player) {
+			if (!player || !IsStandingEnemyThresholdActor(actor) || actor == player) {
 				return false;
 			}
 			if (IsObserverAlly(actor)) {
@@ -1671,7 +1616,7 @@ namespace TFD::DefeatMonitor
 
 			bool hostileToSide = actor->IsHostileToActor(player);
 			for (auto* ally : allies) {
-				if (!ally || !IsStandingObserverActor(ally)) {
+				if (!IsStandingAllyThresholdActor(ally)) {
 					continue;
 				}
 				if (target == ally) {
@@ -1691,7 +1636,7 @@ namespace TFD::DefeatMonitor
 		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers)
 		{
 			for (auto* actor : followers) {
-				if (!IsStandingObserverActor(actor)) {
+				if (!IsStandingAllyThresholdActor(actor)) {
 					continue;
 				}
 				if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
@@ -1768,17 +1713,9 @@ namespace TFD::DefeatMonitor
 		static std::vector<RE::Actor*> CollectBleedStandingFollowersFromSnapshot()
 		{
 			std::vector<RE::Actor*> out;
-			auto* player = Player();
-			if (!player) {
-				return out;
-			}
-			auto* pCell = player->GetParentCell();
 			for (auto id : g_bleedBattleObserver.allyIds) {
 				auto* actor = RE::TESForm::LookupByID<RE::Actor>(id);
-				if (!actor || !actor->Is3DLoaded() || !IsCombatReadyBleedAlly(actor)) {
-					continue;
-				}
-				if (pCell && actor->GetParentCell() != pCell) {
+				if (!IsStandingAllyThresholdActor(actor)) {
 					continue;
 				}
 				out.push_back(actor);
@@ -1789,17 +1726,9 @@ namespace TFD::DefeatMonitor
 		static std::vector<RE::Actor*> CollectBleedStandingEnemiesFromSnapshot()
 		{
 			std::vector<RE::Actor*> out;
-			auto* player = Player();
-			if (!player) {
-				return out;
-			}
-			auto* pCell = player->GetParentCell();
 			for (auto id : g_bleedBattleObserver.enemyIds) {
 				auto* actor = RE::TESForm::LookupByID<RE::Actor>(id);
-				if (!actor || !IsStandingObserverActor(actor) || !actor->Is3DLoaded()) {
-					continue;
-				}
-				if (pCell && actor->GetParentCell() != pCell) {
+				if (!IsStandingEnemyThresholdActor(actor)) {
 					continue;
 				}
 				out.push_back(actor);
@@ -1818,15 +1747,7 @@ namespace TFD::DefeatMonitor
 			const auto srcPos = source->GetPosition();
 
 			for (auto* actor : candidates) {
-				if (!actor || actor == source) {
-					continue;
-				}
-				if (IsObserverAlly(actor)) {
-					if (!IsCombatReadyBleedAlly(actor)) {
-						continue;
-					}
-				}
-				else if (!IsStandingObserverActor(actor)) {
+				if (!actor || !IsStandingObserverActor(actor) || actor == source) {
 					continue;
 				}
 
@@ -1846,65 +1767,36 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			auto* process = RE::ProcessLists::GetSingleton();
-
 			for (auto* enemy : enemies) {
-				if (!enemy || !IsStandingObserverActor(enemy)) {
+				if (!IsStandingEnemyThresholdActor(enemy)) {
 					continue;
 				}
 
 				auto* currentTarget = ResolveCurrentCombatTarget(enemy);
-				auto* desiredTarget = PickClosestObservedTarget(enemy, followers);
-				if (!desiredTarget) {
-					continue;
-				}
-
-				const bool currentTargetValidAlly = currentTarget && IsObserverAlly(currentTarget) && IsCombatReadyBleedAlly(currentTarget);
-				const bool hardBreakFromPlayer = currentTarget == player;
-				const bool badCurrentTarget =
-					hardBreakFromPlayer ||
-					currentTarget == nullptr ||
-					!IsStandingObserverActor(currentTarget) ||
-					!currentTargetValidAlly;
-
-				if (badCurrentTarget) {
-					if (hardBreakFromPlayer) {
-						if (process) {
-							process->StopCombatAndAlarmOnActor(enemy, false);
-						}
-						enemy->StopCombat();
-					}
-					enemy->GetActorRuntimeData().currentCombatTarget = desiredTarget->GetHandle();
-					enemy->UpdateCombat();
-					enemy->EvaluatePackage(false, true);
-					spdlog::info("[TFD][Defeat] bleed redirect enemy={:08X} from={:08X} to={:08X}",
-						enemy->GetFormID(),
-						currentTarget ? currentTarget->GetFormID() : 0u,
-						desiredTarget->GetFormID());
-				}
-			}
-
-			for (auto* follower : followers) {
-				if (!follower || !IsCombatReadyBleedAlly(follower)) {
-					continue;
-				}
-
-				auto* currentTarget = ResolveCurrentCombatTarget(follower);
-				auto* desiredTarget = PickClosestObservedTarget(follower, enemies);
-				if (!desiredTarget) {
-					continue;
-				}
-
-				const bool badCurrentTarget =
-					currentTarget == nullptr ||
-					!IsStandingObserverActor(currentTarget) ||
+				const bool currentTargetValidAlly =
+					currentTarget &&
+					currentTarget != player &&
+					IsStandingAllyThresholdActor(currentTarget) &&
 					IsObserverAlly(currentTarget);
-
-				if (badCurrentTarget) {
-					follower->GetActorRuntimeData().currentCombatTarget = desiredTarget->GetHandle();
-					follower->UpdateCombat();
-					follower->EvaluatePackage(false, true);
+				if (currentTargetValidAlly) {
+					continue;
 				}
+
+				auto* desiredTarget = PickClosestObservedTarget(enemy, followers);
+				if (!desiredTarget || desiredTarget == player) {
+					continue;
+				}
+				if (currentTarget == desiredTarget) {
+					continue;
+				}
+
+				enemy->GetActorRuntimeData().currentCombatTarget = desiredTarget->GetHandle();
+				enemy->UpdateCombat();
+				enemy->EvaluatePackage(true, false);
+				spdlog::info("[TFD][Defeat] bleed redirect enemy={:08X} from={:08X} to={:08X}",
+					enemy->GetFormID(),
+					currentTarget ? currentTarget->GetFormID() : 0u,
+					desiredTarget->GetFormID());
 			}
 		}
 
@@ -1982,15 +1874,16 @@ namespace TFD::DefeatMonitor
 				preferredEnemy = nullptr;
 			}
 			auto enemies = CollectCurrentObservedEnemies(player, radius, preferredEnemy, followers);
-
-			spdlog::info("[TFD][Defeat] bleed observe pending scan followers={} enemies={} preferred={:08X}",
+			spdlog::info("[TFD][Defeat] bleed observe pending scan followers={} enemies={} allyThresh={:.1f} enemyThresh={:.1f} preferred={:08X}",
 				followers.size(),
 				enemies.size(),
+				TFD::Settings::GetAllyDownedThresholdPct(),
+				TFD::Settings::GetEnemyDownedThresholdPct(),
 				preferredEnemy ? preferredEnemy->GetFormID() : 0u);
 
 			const auto now = Now();
 			if (g_bleedBattleObservePendingLastRedirect.time_since_epoch().count() == 0 ||
-				(now - g_bleedBattleObservePendingLastRedirect) >= std::chrono::milliseconds(300)) {
+				(now - g_bleedBattleObservePendingLastRedirect) >= std::chrono::milliseconds(350)) {
 				g_bleedBattleObservePendingLastRedirect = now;
 				RedirectBleedObserverAggro(player, followers, enemies);
 			}
@@ -2144,13 +2037,14 @@ namespace TFD::DefeatMonitor
 
 			auto followers = CollectBleedStandingFollowersFromSnapshot();
 			auto enemies = CollectBleedStandingEnemiesFromSnapshot();
-
-			spdlog::info("[TFD][Defeat] bleed observe active scan followers={} enemies={}",
+			spdlog::info("[TFD][Defeat] bleed observe active scan followers={} enemies={} allyThresh={:.1f} enemyThresh={:.1f}",
 				followers.size(),
-				enemies.size());
+				enemies.size(),
+				TFD::Settings::GetAllyDownedThresholdPct(),
+				TFD::Settings::GetEnemyDownedThresholdPct());
 
 			const auto now = Now();
-			if (g_bleedBattleObserveLastRedirect.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastRedirect) >= std::chrono::milliseconds(300)) {
+			if (g_bleedBattleObserveLastRedirect.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastRedirect) >= std::chrono::milliseconds(350)) {
 				g_bleedBattleObserveLastRedirect = now;
 				RedirectBleedObserverAggro(player, followers, enemies);
 			}
@@ -3621,7 +3515,7 @@ namespace TFD::DefeatMonitor
 			if (!actor || !player) {
 				return false;
 			}
-			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			if (!IsStandingEnemyThresholdActor(actor) || !actor->Is3DLoaded()) {
 				return false;
 			}
 			if (actor->GetFormID() == player->GetFormID()) {
@@ -3663,7 +3557,7 @@ namespace TFD::DefeatMonitor
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto sp = e.actor.get();
 				auto* a = sp.get();
-				if (!a || a->IsDead() || a->IsDisabled()) continue;
+				if (!IsStandingEnemyThresholdActor(a)) continue;
 				if (!a->Is3DLoaded()) continue;
 				if (a->GetFormID() == player->GetFormID()) continue;
 				if (!IsBleedSpaceCompatible(a, player)) continue;
@@ -3714,7 +3608,7 @@ namespace TFD::DefeatMonitor
 			if (!player || !aggressor) {
 				return false;
 			}
-			if (aggressor->IsDead() || aggressor->IsDisabled() || !aggressor->Is3DLoaded()) {
+			if (!IsStandingEnemyThresholdActor(aggressor) || !aggressor->Is3DLoaded()) {
 				return false;
 			}
 			if (!IsBleedSpaceCompatible(aggressor, player)) {
@@ -4538,4 +4432,10 @@ namespace TFD::DefeatMonitor
 	{
 		return g_captiveState || g_captivePhase != CaptivePhaseValue::None;
 	}
+
+	bool IsPlayerBleedHoldTargetBlocked()
+	{
+		return false;
+	}
+
 }
