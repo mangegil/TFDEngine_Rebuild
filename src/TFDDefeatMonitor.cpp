@@ -143,11 +143,14 @@ namespace TFD::DefeatMonitor
 			BleedLockKind kind{ BleedLockKind::Other };
 			float thresholdPct{ 0.0f };
 			float minHp{ 0.0f };
+			float protectedHealth{ 0.0f };
+			float lastHealthSample{ 0.0f };
 			float savedHealRate{ 0.0f };
 			float savedHealRateMult{ 100.0f };
 			float savedCombatHealRateMult{ 1.0f };
 			bool regenOverridden{ false };
 			std::chrono::steady_clock::time_point lastPulse{};
+			std::chrono::steady_clock::time_point lastDamageLog{};
 		};
 
 		std::unordered_map<RE::FormID, BleedLockEntry> g_bleedLocks{};
@@ -328,6 +331,7 @@ namespace TFD::DefeatMonitor
 		static bool IsStandingObserverActor(RE::Actor* actor);
 		static bool IsObserverAlly(RE::Actor* actor);
 		static bool IsObserverEnemy(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies, bool hostileHint, bool inCombatHint);
+		static bool IsValidBleedBattleEnemyRosterActor(RE::Actor* actor, RE::Actor* player);
 		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers);
 		static bool BuildBleedBattleObserveSnapshot(RE::Actor* player, float radius, RE::Actor* preferredEnemy);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowersFromSnapshot();
@@ -1674,6 +1678,83 @@ namespace TFD::DefeatMonitor
 			return false;
 		}
 
+		static float ComputeBleedBattleEnemyScanRadius(RE::Actor* player, const std::vector<RE::Actor*>& allies, float baseRadius)
+		{
+			float scanRadius = (std::max)(2400.0f, baseRadius);
+			if (!player) {
+				return scanRadius;
+			}
+
+			for (auto* ally : allies) {
+				if (!IsStandingAllyThresholdActor(ally)) {
+					continue;
+				}
+				const float dist = Distance3D(player->GetPosition(), ally->GetPosition());
+				scanRadius = (std::max)(scanRadius, dist + 1600.0f);
+			}
+
+			return (std::min)(scanRadius, 9000.0f);
+		}
+
+		static float MinDistanceToObserverSide(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies)
+		{
+			if (!actor || !player) {
+				return std::numeric_limits<float>::max();
+			}
+
+			float best = Distance3D(actor->GetPosition(), player->GetPosition());
+			for (auto* ally : allies) {
+				if (!IsStandingAllyThresholdActor(ally)) {
+					continue;
+				}
+				best = (std::min)(best, Distance3D(actor->GetPosition(), ally->GetPosition()));
+			}
+			return best;
+		}
+
+		static bool IsLikelyObservedEnemySeed(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies, float seedRadius, bool hostileHint, bool inCombatHint)
+		{
+			if (!IsValidBleedBattleEnemyRosterActor(actor, player)) {
+				return false;
+			}
+			if (!IsBleedCrowdSupportedAggressor(actor)) {
+				return false;
+			}
+
+			if (IsObserverEnemy(actor, player, allies, hostileHint, inCombatHint)) {
+				return true;
+			}
+
+			auto* target = ResolveCurrentCombatTarget(actor);
+			if (target == player) {
+				return true;
+			}
+
+			bool targetsSide = false;
+			bool hostileToSide = actor->IsHostileToActor(player);
+			for (auto* ally : allies) {
+				if (!IsStandingAllyThresholdActor(ally)) {
+					continue;
+				}
+				if (target == ally) {
+					targetsSide = true;
+				}
+				if (actor->IsHostileToActor(ally)) {
+					hostileToSide = true;
+				}
+			}
+
+			if (targetsSide || hostileToSide) {
+				return true;
+			}
+
+			if (!hostileHint && !inCombatHint && !actor->IsInCombat()) {
+				return false;
+			}
+
+			return MinDistanceToObserverSide(actor, player, allies) <= seedRadius;
+		}
+
 		static std::vector<RE::Actor*> CollectCurrentObservedEnemies(RE::Actor* player, float radius, RE::Actor* preferredEnemy, const std::vector<RE::Actor*>& allies)
 		{
 			std::vector<RE::Actor*> out;
@@ -1685,7 +1766,9 @@ namespace TFD::DefeatMonitor
 				return out;
 			}
 
-			TFD::ActorScan::Rescan(radius, false);
+			const float scanRadius = ComputeBleedBattleEnemyScanRadius(player, allies, radius);
+			const float seedRadius = (std::max)(1800.0f, scanRadius * 0.55f);
+			TFD::ActorScan::Rescan(scanRadius, false);
 			const auto count = TFD::ActorScan::GetCount();
 			for (int i = 0; i < count; ++i) {
 				auto e = TFD::ActorScan::GetEntry(i);
@@ -1694,16 +1777,22 @@ namespace TFD::DefeatMonitor
 				if (!actor || actor->GetParentCell() != pCell || !actor->Is3DLoaded()) {
 					continue;
 				}
-				if (IsObserverEnemy(actor, player, allies, e.hostile, e.inCombat)) {
+				if (IsLikelyObservedEnemySeed(actor, player, allies, seedRadius, e.hostile, e.inCombat)) {
 					out.push_back(actor);
 				}
 			}
 
-			if (preferredEnemy && IsObserverEnemy(preferredEnemy, player, allies, true, preferredEnemy->IsInCombat())) {
+			if (preferredEnemy && IsLikelyObservedEnemySeed(preferredEnemy, player, allies, seedRadius, true, preferredEnemy->IsInCombat())) {
 				const auto id = preferredEnemy->GetFormID();
 				auto it = std::find_if(out.begin(), out.end(), [id](RE::Actor* a) { return a && a->GetFormID() == id; });
 				if (it == out.end()) {
 					out.push_back(preferredEnemy);
+				}
+			}
+			else if (out.empty()) {
+				auto* fallbackEnemy = FindBestAggressor(scanRadius);
+				if (fallbackEnemy && IsLikelyObservedEnemySeed(fallbackEnemy, player, allies, seedRadius, true, fallbackEnemy->IsInCombat())) {
+					out.push_back(fallbackEnemy);
 				}
 			}
 
@@ -1933,7 +2022,11 @@ namespace TFD::DefeatMonitor
 
 			const float immediateRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
 			auto immediateFollowers = CollectBleedStandingFollowers(immediateRadius);
+			const float immediateEnemyScanRadius = ComputeBleedBattleEnemyScanRadius(player, immediateFollowers, immediateRadius);
 			auto* immediatePreferredEnemy = ResolveAggressor();
+			if (!immediatePreferredEnemy) {
+				immediatePreferredEnemy = FindBestAggressor(immediateEnemyScanRadius);
+			}
 			if (immediatePreferredEnemy && IsObserverAlly(immediatePreferredEnemy)) {
 				immediatePreferredEnemy = nullptr;
 			}
@@ -1971,7 +2064,11 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
+			const float enemyScanRadius = ComputeBleedBattleEnemyScanRadius(player, followers, radius);
 			auto* preferredEnemy = ResolveAggressor();
+			if (!preferredEnemy) {
+				preferredEnemy = FindBestAggressor(enemyScanRadius);
+			}
 			if (preferredEnemy && IsObserverAlly(preferredEnemy)) {
 				preferredEnemy = nullptr;
 			}
@@ -3505,6 +3602,42 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+		static void EnforcePlayerBleedInvulnerability(RE::Actor* actor, BleedLockEntry& entry)
+		{
+			if (!actor) {
+				return;
+			}
+
+			SetPlayerBleedImmune(true);
+
+			const float protectedHp = (std::max)(entry.protectedHealth, entry.minHp);
+			if (entry.minHp > 0.0f) {
+				ClampHealth(actor, entry.minHp);
+			}
+
+			float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			if (hpNow + 0.001f < protectedHp) {
+				const float delta = protectedHp - hpNow;
+				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, delta);
+				const auto now = Now();
+				if (entry.lastDamageLog.time_since_epoch().count() == 0 || (now - entry.lastDamageLog) >= std::chrono::milliseconds(250)) {
+					spdlog::info("[TFD][Defeat] player bleed invuln ignored damage actor={:08X} from={:.2f} restore={:.2f} target={:.2f}",
+						actor->GetFormID(),
+						hpNow,
+						delta,
+						protectedHp);
+					entry.lastDamageLog = now;
+				}
+				hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			}
+
+			if (hpNow > entry.protectedHealth + 0.001f) {
+				entry.protectedHealth = hpNow;
+			}
+
+			entry.lastHealthSample = hpNow;
+		}
+
 		static void ApplyBleedRegenOverride(RE::Actor* actor, BleedLockEntry& entry)
 		{
 			auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
@@ -3594,6 +3727,8 @@ namespace TFD::DefeatMonitor
 				g_minHp = (std::max)(g_minHp, entry.minHp);
 				SetPlayerBleedImmune(true);
 				ClampHealth(actor, entry.minHp);
+				entry.protectedHealth = (std::max)(entry.minHp, actor->GetActorValue(RE::ActorValue::kHealth));
+				entry.lastHealthSample = entry.protectedHealth;
 			}
 
 			ApplyBleedRegenOverride(actor, entry);
@@ -3737,7 +3872,7 @@ namespace TFD::DefeatMonitor
 					continue;
 				}
 
-				if (actor->IsDead() || actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f) {
+				if (entry.kind != BleedLockKind::Player && (actor->IsDead() || actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f)) {
 					releases.emplace_back(formID, actor, "dead", false);
 					continue;
 				}
@@ -3745,9 +3880,10 @@ namespace TFD::DefeatMonitor
 				ApplyBleedRegenOverride(actor, entry);
 
 				if (entry.kind == BleedLockKind::Player) {
-					if (entry.minHp > 0.0f) {
-						SetPlayerBleedImmune(true);
-						ClampHealth(actor, entry.minHp);
+					EnforcePlayerBleedInvulnerability(actor, entry);
+					if (actor->IsDead()) {
+						releases.emplace_back(formID, actor, "dead", false);
+						continue;
 					}
 				}
 				else {
@@ -4507,6 +4643,7 @@ namespace TFD::DefeatMonitor
 				SyncPreCombatGlobal(false);
 				return;
 			}
+			TickBleedLocks();
 			UpdatePreCombatState();
 			if (IsLeftForDeadCooldownActive()) {
 				TickLeftForDeadCooldown();
