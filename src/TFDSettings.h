@@ -13,6 +13,12 @@ namespace TFD::Settings
 	float GetDefeatThresholdPct();
 	void  SetDefeatThresholdPct(float a_pct);
 
+	float GetAllyDownedThresholdPct();
+	void  SetAllyDownedThresholdPct(float a_pct);
+
+	float GetEnemyDownedThresholdPct();
+	void  SetEnemyDownedThresholdPct(float a_pct);
+
 	int   GetBleedWindowSeconds();
 	void  SetBleedWindowSeconds(int a_seconds);
 

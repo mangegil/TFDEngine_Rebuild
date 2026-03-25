@@ -1,4 +1,5 @@
 #include "TFDInteractionRouter.h"
+#include "TFDTameBait.h"
 
 #include <spdlog/spdlog.h>
 
@@ -178,6 +179,15 @@ namespace TFD::InteractionRouter
                 return result;
             }
 
+            if (TFD::TameBait::CollectValidBaits(player, target).empty()) {
+                spdlog::info(
+                    "[TFD][Router] reject tame target={:08X} reason=no_valid_bait",
+                    target->GetFormID());
+                result.valid = false;
+                result.failReason = FailReason::NoValidBait;
+                return result;
+            }
+
             result.action = Action::Tame;
             result.valid = true;
             result.failReason = FailReason::None;
@@ -236,7 +246,8 @@ namespace TFD::InteractionRouter
                 player,
                 target,
                 nowSec,
-                resolved.shouldOpenDialogue);
+                resolved.shouldOpenDialogue,
+                true);
             break;
 
         case Action::TrucePreCombat:
@@ -323,6 +334,8 @@ namespace TFD::InteractionRouter
             return "TruceUnavailable";
         case FailReason::TameAlreadyActive:
             return "TameAlreadyActive";
+        case FailReason::NoValidBait:
+            return "NoValidBait";
         case FailReason::SessionBeginFailed:
             return "SessionBeginFailed";
         default:

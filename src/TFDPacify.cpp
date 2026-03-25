@@ -3,6 +3,7 @@
 #include "TFDActorScan.h"
 #include "TFDSettings.h"
 #include "TFDTargetClassifier.h"
+#include "TFDTameBait.h"
 
 #include <algorithm>
 #include <chrono>
@@ -174,6 +175,7 @@ namespace TFD::Pacify
 
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
+        bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
         bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon);
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon);
         void ProcessRehostileRetries(double nowSec);
@@ -465,12 +467,58 @@ namespace TFD::Pacify
 
         constexpr float kLocalHostileSplashRadiusMin = 1000.0f;
         constexpr float kLocalHostileSplashRadiusMax = 1800.0f;
+        constexpr std::size_t kTamePackMaxMembers = 6;
 
         float GetLocalHostileSplashRadius()
         {
             const float settingsRadius = TFD::Settings::GetSweepRadius();
             return std::clamp(settingsRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
         }
+
+        RE::TESRace* GetActorRace(RE::Actor* actor)
+        {
+            if (!actor) {
+                return nullptr;
+            }
+
+            auto* base = actor->GetActorBase();
+            return base ? base->GetRace() : nullptr;
+        }
+
+        bool IsSameTamePackSpecies(RE::Actor* actor, RE::Actor* primaryTarget)
+        {
+            auto* actorRace = GetActorRace(actor);
+            auto* primaryRace = GetActorRace(primaryTarget);
+            if (!actorRace || !primaryRace) {
+                return false;
+            }
+
+            return actorRace->GetFormID() == primaryRace->GetFormID();
+        }
+
+        bool SharesPrimaryCombatAnchor(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!actor || !player || !primaryTarget) {
+                return false;
+            }
+
+            auto* primaryCombatTarget = ResolveCurrentCombatTarget(primaryTarget);
+            if (!primaryCombatTarget) {
+                return true;
+            }
+
+            auto* actorCombatTarget = ResolveCurrentCombatTarget(actor);
+            if (!actorCombatTarget) {
+                return true;
+            }
+
+            const auto playerId = player->GetFormID();
+            const auto primaryAnchorId = primaryCombatTarget->GetFormID();
+            const auto actorAnchorId = actorCombatTarget->GetFormID();
+
+            return actorAnchorId == primaryAnchorId || actorAnchorId == playerId;
+        }
+
 
         bool IsEligibleLocalSplashActor(
             RE::Actor* actor,
@@ -516,6 +564,71 @@ namespace TFD::Pacify
             const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
             const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
             return distToPrimary <= radius || distToPlayer <= radius;
+        }
+
+        std::vector<RE::FormID> BuildTamePackMemberIds(
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            float splashRadius,
+            bool& outRejected)
+        {
+            outRejected = false;
+
+            std::vector<RE::FormID> result{};
+            if (!player || !primaryTarget) {
+                return result;
+            }
+
+            const auto primaryId = primaryTarget->GetFormID();
+            result.push_back(primaryId);
+
+            const float scanRadius = splashRadius + 256.0f;
+            TFD::ActorScan::Rescan(scanRadius, false);
+
+            const auto count = TFD::ActorScan::GetCount();
+            for (int i = 0; i < count; ++i) {
+                auto scanEntry = TFD::ActorScan::GetEntry(i);
+                auto* actor = TFD::ActorScan::GetActor(i);
+                if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, splashRadius)) {
+                    continue;
+                }
+                if (!IsSameTamePackSpecies(actor, primaryTarget)) {
+                    continue;
+                }
+                if (!SharesPrimaryCombatAnchor(actor, player, primaryTarget)) {
+                    continue;
+                }
+
+                const auto actorId = actor->GetFormID();
+                if (actorId == 0 || actorId == primaryId) {
+                    continue;
+                }
+                if (IsActorBoundToDifferentActiveTameSession(actorId, 0)) {
+                    outRejected = true;
+                    spdlog::info(
+                        "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=actor_bound_to_other_tame_session",
+                        primaryId,
+                        actorId);
+                    return {};
+                }
+
+                result.push_back(actorId);
+            }
+
+            std::sort(result.begin(), result.end());
+            result.erase(std::unique(result.begin(), result.end()), result.end());
+
+            if (result.size() > kTamePackMaxMembers) {
+                outRejected = true;
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} reason=pack_too_large size={} max={}",
+                    primaryId,
+                    static_cast<unsigned int>(result.size()),
+                    static_cast<unsigned int>(kTamePackMaxMembers));
+                return {};
+            }
+
+            return result;
         }
 
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
@@ -1303,6 +1416,26 @@ namespace TFD::Pacify
                 ReleaseSession(activeSessionId, ReleaseReason::Generic);
             }
 
+            std::vector<RE::FormID> curatedTameIds;
+            bool tamePackRejected = false;
+            if (mode == Mode::Tame && allowLocalSplash) {
+                curatedTameIds = BuildTamePackMemberIds(player, primaryTarget, GetLocalHostileSplashRadius(), tamePackRejected);
+                if (tamePackRejected || curatedTameIds.empty()) {
+                    return std::nullopt;
+                }
+
+                for (auto actorId : curatedTameIds) {
+                    auto* actor = ResolveActor(actorId);
+                    if (!IsActorStillValid(actor) || !actor->Is3DLoaded()) {
+                        spdlog::info(
+                            "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_not_ready",
+                            primaryTarget->GetFormID(),
+                            actorId);
+                        return std::nullopt;
+                    }
+                }
+            }
+
             const RE::FormID playerId = player->GetFormID();
             const RE::FormID targetId = primaryTarget->GetFormID();
 
@@ -1453,21 +1586,28 @@ namespace TFD::Pacify
             }
 
             if (mode == Mode::Tame && allowLocalSplash) {
-                const float splashRadius = GetLocalHostileSplashRadius();
-                const float scanRadius = splashRadius + 256.0f;
-                TFD::ActorScan::Rescan(scanRadius, false);
-                const auto count = TFD::ActorScan::GetCount();
-                for (int i = 0; i < count; ++i) {
-                    auto scanEntry = TFD::ActorScan::GetEntry(i);
-                    auto* actor = TFD::ActorScan::GetActor(i);
-                    if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, splashRadius)) {
+                for (auto actorId : curatedTameIds) {
+                    if (actorId == 0 || actorId == targetId) {
                         continue;
                     }
 
-                    const RE::FormID actorId = actor->GetFormID();
-                    if (IsActorBoundToDifferentActiveTameSession(actorId, sessionId)) {
-                        continue;
+                    auto* actor = ResolveActor(actorId);
+                    if (!IsActorStillValid(actor) || !actor->Is3DLoaded()) {
+                        for (auto it = g_entries.begin(); it != g_entries.end();) {
+                            if (it->second.sessionId == sessionId) {
+                                it = g_entries.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                        spdlog::info(
+                            "TFDPacify: reject tame pack session={} target={:08X} actor={:08X} reason=pack_member_lost_before_apply",
+                            sessionId,
+                            targetId,
+                            actorId);
+                        return std::nullopt;
                     }
+
                     const bool existedInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
@@ -1482,7 +1622,19 @@ namespace TFD::Pacify
                         endTimeSec,
                         allowDialogue,
                         false)) {
-                        continue;
+                        for (auto it = g_entries.begin(); it != g_entries.end();) {
+                            if (it->second.sessionId == sessionId) {
+                                it = g_entries.erase(it);
+                            } else {
+                                ++it;
+                            }
+                        }
+                        spdlog::info(
+                            "TFDPacify: reject tame pack session={} target={:08X} actor={:08X} reason=pack_add_failed",
+                            sessionId,
+                            targetId,
+                            actorId);
+                        return std::nullopt;
                     }
 
                     if (!existedInSession) {
@@ -1635,16 +1787,103 @@ namespace TFD::Pacify
             return std::nullopt;
         }
 
-        return BeginSessionCommon(
-            player,
-            primaryTarget,
-            Mode::Tame,
-            nowSec,
-            kTameDurationSec,
-            allowDialogue,
-            false,
-            allowLocalSplash,
-            0.0f);
+        if (!allowLocalSplash) {
+            return BeginSessionCommon(
+                player,
+                primaryTarget,
+                Mode::Tame,
+                nowSec,
+                kTameDurationSec,
+                allowDialogue,
+                false,
+                false,
+                0.0f);
+        }
+
+        bool tamePackRejected = false;
+        auto tamePackIds = BuildTamePackMemberIds(player, primaryTarget, GetLocalHostileSplashRadius(), tamePackRejected);
+        if (tamePackRejected || tamePackIds.empty()) {
+            return std::nullopt;
+        }
+
+        for (auto actorId : tamePackIds) {
+            auto* actor = ResolveActor(actorId);
+            if (!IsActorStillValid(actor) || !actor->Is3DLoaded()) {
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_not_ready_before_batch",
+                    primaryTarget ? primaryTarget->GetFormID() : 0,
+                    actorId);
+                return std::nullopt;
+            }
+
+            if (!CanStartTame(actor)) {
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=actor_already_has_active_tame",
+                    primaryTarget ? primaryTarget->GetFormID() : 0,
+                    actorId);
+                return std::nullopt;
+            }
+
+            if (TFD::TameBait::CollectValidBaits(player, actor).empty()) {
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=no_valid_bait_for_pack_member",
+                    primaryTarget ? primaryTarget->GetFormID() : 0,
+                    actorId);
+                return std::nullopt;
+            }
+        }
+
+        std::vector<RE::FormID> createdSessionIds;
+        createdSessionIds.reserve(tamePackIds.size());
+
+        std::optional<RE::FormID> primarySessionId;
+        for (auto actorId : tamePackIds) {
+            auto* actor = ResolveActor(actorId);
+            if (!actor) {
+                for (auto createdId : createdSessionIds) {
+                    ReleaseSession(createdId, ReleaseReason::Generic);
+                }
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_lost_during_batch",
+                    primaryTarget ? primaryTarget->GetFormID() : 0,
+                    actorId);
+                return std::nullopt;
+            }
+
+            auto sessionId = BeginSessionCommon(
+                player,
+                actor,
+                Mode::Tame,
+                nowSec,
+                kTameDurationSec,
+                allowDialogue,
+                false,
+                false,
+                0.0f);
+            if (!sessionId.has_value()) {
+                for (auto createdId : createdSessionIds) {
+                    ReleaseSession(createdId, ReleaseReason::Generic);
+                }
+                spdlog::info(
+                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=batch_session_begin_failed",
+                    primaryTarget ? primaryTarget->GetFormID() : 0,
+                    actorId);
+                return std::nullopt;
+            }
+
+            createdSessionIds.push_back(*sessionId);
+            if (actorId == primaryTarget->GetFormID()) {
+                primarySessionId = *sessionId;
+            }
+        }
+
+        spdlog::info(
+            "TFDPacify: tame pack batch success primary={:08X} members={} primarySession={} separateSessions=1",
+            primaryTarget ? primaryTarget->GetFormID() : 0,
+            static_cast<unsigned int>(tamePackIds.size()),
+            primarySessionId.value_or(0));
+
+        return primarySessionId;
     }
 
     std::optional<RE::FormID> BeginTrucePreCombatSession(
@@ -1712,7 +1951,12 @@ namespace TFD::Pacify
             return false;
         }
 
-        return g_entries.find(actor->GetFormID()) != g_entries.end();
+        auto it = g_entries.find(actor->GetFormID());
+        if (it == g_entries.end()) {
+            return false;
+        }
+
+        return it->second.disposition != TameDisposition::Companion;
     }
 
     Mode GetMode(RE::Actor* actor)
@@ -1938,6 +2182,17 @@ namespace TFD::Pacify
         session.hasPlayerSample = false;
 
         SyncSessionDisposition(session);
+
+        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->ClearCachedFactionFightReactions();
+            }
+
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+            actor->UpdateCombat();
+            player->UpdateCombat();
+        }
 
         spdlog::info(
             "TFDPacify: promote companion session={} target={:08X} addHours={:.2f} expireGameDays={:.4f}",

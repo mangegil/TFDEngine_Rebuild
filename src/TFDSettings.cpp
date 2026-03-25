@@ -28,6 +28,8 @@ namespace TFD::Settings
 	{
 		std::atomic_bool   g_enabled{ true };
 		std::atomic<float> g_defeatThresholdPct{ 30.0f };
+		std::atomic<float> g_allyDownedThresholdPct{ 20.0f };
+		std::atomic<float> g_enemyDownedThresholdPct{ 10.0f };
 		std::atomic<int>   g_bleedWindowSeconds{ 30 };
 		std::atomic<float> g_scanRadius{ 2500.0f };
 		std::atomic<float> g_sweepRadius{ 2500.0f };
@@ -176,6 +178,8 @@ namespace TFD::Settings
 			std::string s;
 			s += "enabled=" + std::to_string(GetEnabled() ? 1 : 0) + "\n";
 			s += "defeatThresholdPct=" + std::to_string(GetDefeatThresholdPct()) + "\n";
+			s += "allyDownedThresholdPct=" + std::to_string(GetAllyDownedThresholdPct()) + "\n";
+			s += "enemyDownedThresholdPct=" + std::to_string(GetEnemyDownedThresholdPct()) + "\n";
 			s += "bleedWindowSeconds=" + std::to_string(GetBleedWindowSeconds()) + "\n";
 			s += "scanRadius=" + std::to_string(GetScanRadius()) + "\n";
 			s += "sweepRadius=" + std::to_string(GetSweepRadius()) + "\n";
@@ -230,6 +234,8 @@ namespace TFD::Settings
 
 			g_enabled.store(getBool("enabled", g_enabled.load()));
 			g_defeatThresholdPct.store(ClampPct(getFloat("defeatThresholdPct", g_defeatThresholdPct.load())));
+			g_allyDownedThresholdPct.store(ClampPct(getFloat("allyDownedThresholdPct", g_allyDownedThresholdPct.load())));
+			g_enemyDownedThresholdPct.store(ClampPct(getFloat("enemyDownedThresholdPct", g_enemyDownedThresholdPct.load())));
 			g_bleedWindowSeconds.store(ClampBleed(getInt("bleedWindowSeconds", g_bleedWindowSeconds.load())));
 			g_scanRadius.store(ClampRadius(getFloat("scanRadius", g_scanRadius.load())));
 			g_sweepRadius.store(ClampRadius(getFloat("sweepRadius", g_sweepRadius.load())));
@@ -309,6 +315,20 @@ namespace TFD::Settings
 	void SetDefeatThresholdPct(float a_pct)
 	{
 		g_defeatThresholdPct.store(ClampPct(a_pct));
+		MarkDirty();
+	}
+
+	float GetAllyDownedThresholdPct() { return g_allyDownedThresholdPct.load(); }
+	void SetAllyDownedThresholdPct(float a_pct)
+	{
+		g_allyDownedThresholdPct.store(ClampPct(a_pct));
+		MarkDirty();
+	}
+
+	float GetEnemyDownedThresholdPct() { return g_enemyDownedThresholdPct.load(); }
+	void SetEnemyDownedThresholdPct(float a_pct)
+	{
+		g_enemyDownedThresholdPct.store(ClampPct(a_pct));
 		MarkDirty();
 	}
 

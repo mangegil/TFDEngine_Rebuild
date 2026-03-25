@@ -120,9 +120,11 @@ namespace TFD::DefeatMonitor
 		bool g_bleedBattleObservePending = false;
 		std::chrono::steady_clock::time_point g_bleedBattleObservePendingUntil{};
 		std::chrono::steady_clock::time_point g_bleedBattleObservePendingLastRedirect{};
+		int g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 		bool g_bleedBattleObserveActive = false;
 		std::chrono::steady_clock::time_point g_bleedBattleObserveSince{};
 		std::chrono::steady_clock::time_point g_bleedBattleObserveLastRedirect{};
+		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		RE::ActorHandle g_bleedBattlePreferredEnemy{};
 		BleedBattleObserverState g_bleedBattleObserver{};
 
@@ -301,6 +303,7 @@ namespace TFD::DefeatMonitor
 		static bool IsStandingObserverActor(RE::Actor* actor);
 		static bool IsObserverAlly(RE::Actor* actor);
 		static bool IsObserverEnemy(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies, bool hostileHint, bool inCombatHint);
+		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers);
 		static bool BuildBleedBattleObserveSnapshot(RE::Actor* player, float radius, RE::Actor* preferredEnemy);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowersFromSnapshot();
 		static std::vector<RE::Actor*> CollectBleedStandingEnemiesFromSnapshot();
@@ -955,9 +958,14 @@ namespace TFD::DefeatMonitor
 			g_bleedCrowdAssigned.clear();
 			g_bleedStart = Now();
 			g_bleedLastSeconds = -1;
+			g_bleedBattleObservePending = false;
+			g_bleedBattleObservePendingUntil = {};
+			g_bleedBattleObservePendingLastRedirect = {};
+			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObserveActive = false;
 			g_bleedBattleObserveSince = {};
 			g_bleedBattleObserveLastRedirect = {};
+			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy.reset();
 			g_bleedBattleObserver = {};
 		}
@@ -1594,6 +1602,19 @@ namespace TFD::DefeatMonitor
 			return hostileToSide || hostileHint || inCombatHint || actor->IsInCombat();
 		}
 
+		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers)
+		{
+			for (auto* actor : followers) {
+				if (!IsStandingObserverActor(actor)) {
+					continue;
+				}
+				if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+					return true;
+				}
+			}
+			return false;
+		}
+
 		static std::vector<RE::Actor*> CollectCurrentObservedEnemies(RE::Actor* player, float radius, RE::Actor* preferredEnemy, const std::vector<RE::Actor*>& allies)
 		{
 			std::vector<RE::Actor*> out;
@@ -1813,9 +1834,14 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObservePending = true;
 			g_bleedBattleObservePendingUntil = Now() + std::chrono::milliseconds(1800);
 			g_bleedBattleObservePendingLastRedirect = {};
+			g_bleedBattleObservePending = false;
+			g_bleedBattleObservePendingUntil = {};
+			g_bleedBattleObservePendingLastRedirect = {};
+			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObserveActive = false;
 			g_bleedBattleObserveSince = {};
 			g_bleedBattleObserveLastRedirect = {};
+			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy = {};
 			g_bleedBattleObserver = {};
 
@@ -1850,7 +1876,7 @@ namespace TFD::DefeatMonitor
 			auto followers = CollectBleedStandingFollowers(radius);
 			if (followers.empty()) {
 				g_bleedBattleObservePending = false;
-				spdlog::info("[TFD][Defeat] bleed observe pending ended: no standing followers");
+				EnterObservedLeftForDead("battle_observe_pending_no_followers");
 				return;
 			}
 
@@ -1862,7 +1888,7 @@ namespace TFD::DefeatMonitor
 
 			const auto now = Now();
 			if (g_bleedBattleObservePendingLastRedirect.time_since_epoch().count() == 0 ||
-				(now - g_bleedBattleObservePendingLastRedirect) >= std::chrono::milliseconds(250)) {
+				(now - g_bleedBattleObservePendingLastRedirect) >= std::chrono::milliseconds(120)) {
 				g_bleedBattleObservePendingLastRedirect = now;
 				RedirectBleedObserverAggro(player, followers, enemies);
 			}
@@ -1876,18 +1902,24 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			if (followers.empty()) {
-				g_bleedBattleObservePending = false;
-				return;
-			}
-
 			if (enemies.empty()) {
+				++g_bleedBattleObservePendingEmptyEnemyTicks;
+				if (g_bleedBattleObservePendingEmptyEnemyTicks < 8) {
+					g_bleedBattleObservePendingUntil = now + std::chrono::milliseconds(500);
+					return;
+				}
+
 				g_bleedBattleObservePending = false;
-				EnterObservedBattleWin();
+				if (HasStandingHumanoidFollowers(followers)) {
+					EnterObservedBattleWin();
+				}
+				else {
+					EnterObservedLeftForDead("battle_observe_creature_only_victory");
+				}
 				return;
 			}
 
-			// keep waiting while both sides are still standing even if snapshot is unstable
+			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObservePendingUntil = now + std::chrono::milliseconds(750);
 		}
 
@@ -1921,9 +1953,11 @@ namespace TFD::DefeatMonitor
 			g_bleedLastCrowdAssign = {};
 			g_bleedCrowdAssigned.clear();
 			g_bleedBattleObservePending = false;
+			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObserveActive = true;
 			g_bleedBattleObserveSince = Now();
 			g_bleedBattleObserveLastRedirect = {};
+			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy = preferredEnemy ? preferredEnemy->GetHandle() : RE::ActorHandle{};
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
@@ -2010,14 +2044,29 @@ namespace TFD::DefeatMonitor
 			auto enemies = CollectBleedStandingEnemiesFromSnapshot();
 
 			const auto now = Now();
-			if (g_bleedBattleObserveLastRedirect.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastRedirect) >= std::chrono::milliseconds(450)) {
+			if (g_bleedBattleObserveLastRedirect.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastRedirect) >= std::chrono::milliseconds(120)) {
 				g_bleedBattleObserveLastRedirect = now;
 				RedirectBleedObserverAggro(player, followers, enemies);
 			}
 
+			if (followers.empty()) {
+				EnterObservedLeftForDead("battle_observe_loss");
+				return;
+			}
+
 			if (enemies.empty()) {
+				++g_bleedBattleObserveActiveEmptyEnemyTicks;
+				if (g_bleedBattleObserveActiveEmptyEnemyTicks < 8) {
+					return;
+				}
+
 				if (g_bleedBattleObserver.hadValidObservedEnemy && !followers.empty()) {
-					EnterObservedBattleWin();
+					if (HasStandingHumanoidFollowers(followers)) {
+						EnterObservedBattleWin();
+					}
+					else {
+						EnterObservedLeftForDead("battle_observe_creature_only_victory");
+					}
 				}
 				else {
 					EnterObservedLeftForDead("battle_observe_no_survivor");
@@ -2025,10 +2074,7 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			if (followers.empty()) {
-				EnterObservedLeftForDead("battle_observe_loss");
-				return;
-			}
+			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		}
 
 		static RE::AlchemyItem* ResolveRecoveryPotionCandidate()
@@ -3768,9 +3814,14 @@ namespace TFD::DefeatMonitor
 			g_bleedLastCalmPulse = {};
 			g_bleedLastCrowdAssign = {};
 			g_bleedCrowdAssigned.clear();
+			g_bleedBattleObservePending = false;
+			g_bleedBattleObservePendingUntil = {};
+			g_bleedBattleObservePendingLastRedirect = {};
+			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObserveActive = false;
 			g_bleedBattleObserveSince = {};
 			g_bleedBattleObserveLastRedirect = {};
+			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy.reset();
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);

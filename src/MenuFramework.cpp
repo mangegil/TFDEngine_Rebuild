@@ -68,6 +68,8 @@ namespace TFDMenu
 
 		static bool  uiEnabled = true;
 		static float uiThreshold = 30.0f;
+		static float uiAllyThreshold = 20.0f;
+		static float uiEnemyThreshold = 10.0f;
 		static int   uiBleedSeconds = 10;
 		static float uiScanRadius = 2500.0f;
 		static float uiSweepRadius = 2500.0f;
@@ -564,6 +566,8 @@ namespace TFDMenu
 		{
 			uiEnabled = TFD::Settings::GetEnabled();
 			uiThreshold = TFD::Settings::GetDefeatThresholdPct();
+			uiAllyThreshold = TFD::Settings::GetAllyDownedThresholdPct();
+			uiEnemyThreshold = TFD::Settings::GetEnemyDownedThresholdPct();
 			uiBleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 			uiScanRadius = TFD::Settings::GetScanRadius();
 			uiSweepRadius = TFD::Settings::GetSweepRadius();
@@ -578,6 +582,8 @@ namespace TFDMenu
 		{
 			TFD::Settings::SetEnabled(uiEnabled);
 			TFD::Settings::SetDefeatThresholdPct(uiThreshold);
+			TFD::Settings::SetAllyDownedThresholdPct(uiAllyThreshold);
+			TFD::Settings::SetEnemyDownedThresholdPct(uiEnemyThreshold);
 			TFD::Settings::SetBleedWindowSeconds(uiBleedSeconds);
 			TFD::Settings::SetScanRadius(uiScanRadius);
 			TFD::Settings::SetSweepRadius(uiSweepRadius);
@@ -753,12 +759,45 @@ namespace TFDMenu
 			       (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
 		}
 
-		static RE::Actor* PickActiveTameTargetSameCellLoaded(float radius)
+		static RE::Actor* PickExactActiveTameTargetSameCellLoaded(float radius)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			if (!player) {
 				return nullptr;
 			}
+
+			auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
+				if (!actor) {
+					return -1.0e30f;
+				}
+				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					return -1.0e30f;
+				}
+				if (!TFD::Pacify::HasActiveTameSession(actor)) {
+					return -1.0e30f;
+				}
+				if (entry.dist > radius) {
+					return -1.0e30f;
+				}
+
+				const float frontDot = GetActorFrontDot2D(actor, player);
+				if (frontDot < 0.80f) {
+					return -1.0e30f;
+				}
+
+				float score = (frontDot * 100000.0f) - entry.dist;
+				if (frontDot >= 0.98f) {
+					score += 6000.0f;
+				} else if (frontDot >= 0.94f) {
+					score += 3500.0f;
+				} else if (frontDot >= 0.90f) {
+					score += 1500.0f;
+				}
+				if (actor->IsInCombat() || entry.inCombat) {
+					score += 50.0f;
+				}
+				return score;
+			};
 
 			TFD::ActorScan::Rescan(radius, false);
 
@@ -769,30 +808,7 @@ namespace TFDMenu
 			for (int i = 0; i < count; ++i) {
 				auto entry = TFD::ActorScan::GetEntry(i);
 				auto* actor = TFD::ActorScan::GetActor(i);
-				if (!actor) {
-					continue;
-				}
-				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-					continue;
-				}
-				if (!TFD::Pacify::HasActiveTameSession(actor)) {
-					continue;
-				}
-				if (entry.dist > radius) {
-					continue;
-				}
-
-				const float frontDot = GetActorFrontDot2D(actor, player);
-				float score = 20000.0f - entry.dist;
-				if (frontDot >= 0.20f) {
-					score += 4000.0f + (frontDot * 2000.0f);
-				} else {
-					score += frontDot * 500.0f;
-				}
-				if (actor->IsInCombat() || entry.inCombat) {
-					score += 50.0f;
-				}
-
+				const float score = scoreActor(actor, entry);
 				if (score > bestScore) {
 					bestScore = score;
 					best = actor;
@@ -808,30 +824,7 @@ namespace TFDMenu
 					for (int i = 0; i < retryCount; ++i) {
 						auto entry = TFD::ActorScan::GetEntry(i);
 						auto* actor = TFD::ActorScan::GetActor(i);
-						if (!actor) {
-							continue;
-						}
-						if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-							continue;
-						}
-						if (!TFD::Pacify::HasActiveTameSession(actor)) {
-							continue;
-						}
-						if (entry.dist > radius) {
-							continue;
-						}
-
-						const float frontDot = GetActorFrontDot2D(actor, player);
-						float score = 20000.0f - entry.dist;
-						if (frontDot >= 0.20f) {
-							score += 4000.0f + (frontDot * 2000.0f);
-						} else {
-							score += frontDot * 500.0f;
-						}
-						if (actor->IsInCombat() || entry.inCombat) {
-							score += 50.0f;
-						}
-
+						const float score = scoreActor(actor, entry);
 						if (score > bestScore) {
 							bestScore = score;
 							best = actor;
@@ -1183,6 +1176,14 @@ namespace TFDMenu
 			}
 
 			if (ImGuiMCP::SliderFloat("Player Health Threshold (%)", &uiThreshold, 2.0f, 95.0f, "%.0f%%")) {
+				ApplyToCore();
+			}
+
+			if (ImGuiMCP::SliderFloat("Ally Downed Threshold (%)", &uiAllyThreshold, 2.0f, 95.0f, "%.0f%%")) {
+				ApplyToCore();
+			}
+
+			if (ImGuiMCP::SliderFloat("Enemy Downed Threshold (%)", &uiEnemyThreshold, 2.0f, 95.0f, "%.0f%%")) {
 				ApplyToCore();
 			}
 
@@ -1581,9 +1582,9 @@ namespace TFDMenu
 					}
 
 					if (shiftDown) {
-						auto* tameTarget = PickActiveTameTargetSameCellLoaded(1400.0f);
+						auto* tameTarget = PickExactActiveTameTargetSameCellLoaded(1400.0f);
 						if (!tameTarget) {
-							RE::DebugNotification("TFD: No Active Tame Target");
+							RE::DebugNotification("TFD: No Exact Tame Target");
 							continue;
 						}
 
@@ -1610,6 +1611,11 @@ namespace TFDMenu
 					if (!exec.executed) {
 						if (exec.failReason == TFD::InteractionRouter::FailReason::TameAlreadyActive) {
 							RE::DebugNotification("TFD: Already Tamed. Use Shift+H to Feed");
+						} else if (exec.failReason == TFD::InteractionRouter::FailReason::NoValidBait) {
+							RE::DebugNotification("TFD: No Valid Bait");
+						} else if (exec.action == TFD::InteractionRouter::Action::Tame &&
+							   exec.failReason == TFD::InteractionRouter::FailReason::SessionBeginFailed) {
+							RE::DebugNotification("TFD: Pack Tame Failed");
 						} else {
 							RE::DebugNotification("TFD: Interaction Failed");
 						}
