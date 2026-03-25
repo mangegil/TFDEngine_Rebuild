@@ -2,6 +2,11 @@
 
 #include <cstdint>
 
+namespace RE
+{
+	class Actor;
+}
+
 namespace TFD::DefeatMonitor
 {
 	void Install();
@@ -26,4 +31,10 @@ namespace TFD::DefeatMonitor
 	bool IsCaptiveFamily();
 	bool IsLeftForDeadRecoveryActive();
 	bool IsPlayerBleedHoldTargetBlocked();
+
+	bool IsDefeatedEnemyKnocked(RE::Actor* actor);
+	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor);
+	bool IsCreatureDefeatedEnemy(RE::Actor* actor);
+	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor);
+	bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec);
 }

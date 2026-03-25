@@ -148,7 +148,15 @@ namespace TFD::DefeatMonitor
 			float savedHealRate{ 0.0f };
 			float savedHealRateMult{ 100.0f };
 			float savedCombatHealRateMult{ 1.0f };
+			float savedAggression{ 1.0f };
 			bool regenOverridden{ false };
+			bool aggressionOverridden{ false };
+			bool defeatedManaged{ false };
+			bool defeatedFactionApplied{ false };
+			bool defeatedAutoDeathIssued{ false };
+			bool defeatedFatalDamageApplied{ false };
+			int defeatedAliasSlot{ -1 };
+			std::chrono::steady_clock::time_point defeatedDeadline{};
 			std::chrono::steady_clock::time_point lastPulse{};
 			std::chrono::steady_clock::time_point lastDamageLog{};
 		};
@@ -171,6 +179,19 @@ namespace TFD::DefeatMonitor
 		};
 
 		TeammateRegistryCache g_teammateRegistry{};
+
+		struct DefeatedEnemyRegistryCache
+		{
+			RE::TESQuest* quest{ nullptr };
+			RE::TESFaction* faction{ nullptr };
+			std::array<RE::BGSRefAlias*, 10> enemyAliases{};
+			bool resolved{ false };
+		};
+
+		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
+		static constexpr double kDefeatedEnemyKnockSeconds = 30.0;
+		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
+		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
 
 		enum class NoMarkerFallbackBranch : std::uint32_t
 		{
@@ -325,6 +346,13 @@ namespace TFD::DefeatMonitor
 		static void ClearNoMarkerFallbackState();
 		static void MaintainFollowerHold();
 		static void MaintainTransitionCalmWindow();
+		static void ResolveDefeatedEnemyRegistry();
+		static bool IsDefeatedEnemyCandidate(RE::Actor* actor);
+		static bool IsDefeatedEnemyKnockedInternal(RE::Actor* actor);
+		static bool IsDialogueCapableDefeatedEnemyInternal(RE::Actor* actor);
+		static bool IsCreatureDefeatedEnemyInternal(RE::Actor* actor);
+		static double GetDefeatedEnemyRemainingSecondsInternal(RE::Actor* actor);
+		static void ClearAllDefeatedEnemyAliases(const char* reason);
 		static void SnapshotBleedFollowerDownState(float radius);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowers(float radius);
 		static std::vector<RE::Actor*> CollectBleedStandingEnemies(float radius);
@@ -343,6 +371,8 @@ namespace TFD::DefeatMonitor
 		static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy);
 		static void TickBleedBattleObserve();
 		static void EnterObservedBattleWin();
+		static void RecoverVictoryTeammates();
+		static void ReleaseBleedLock(RE::Actor* actor, const char* reason, bool playGetUp);
 		static void EnterObservedLeftForDead(const char* reason);
 		static void RestoreFollowerAfterTransition(RE::Actor* actor);
 		static void ResolveTeammateRegistry();
@@ -1237,6 +1267,311 @@ namespace TFD::DefeatMonitor
 			return out;
 		}
 
+
+		static void ResolveDefeatedEnemyRegistry()
+		{
+			if (g_defeatedEnemyRegistry.resolved) {
+				return;
+			}
+			g_defeatedEnemyRegistry.resolved = true;
+			g_defeatedEnemyRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDDefeatedEnemyQuest");
+			g_defeatedEnemyRegistry.faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDDefeatedFaction");
+			if (!g_defeatedEnemyRegistry.quest) {
+				spdlog::warn("[TFD][Defeat] defeated enemy registry quest not found");
+				return;
+			}
+
+			for (auto* baseAlias : g_defeatedEnemyRegistry.quest->aliases) {
+				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+				if (!refAlias) {
+					continue;
+				}
+				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName.rfind("Enemy", 0) != 0 || aliasName.size() < 6) {
+					continue;
+				}
+				try {
+					int slot = std::stoi(aliasName.substr(5));
+					if (slot >= 1 && slot <= static_cast<int>(g_defeatedEnemyRegistry.enemyAliases.size())) {
+						g_defeatedEnemyRegistry.enemyAliases[slot - 1] = refAlias;
+					}
+				}
+				catch (...) {
+				}
+			}
+
+			std::size_t found = 0;
+			for (auto* a : g_defeatedEnemyRegistry.enemyAliases) {
+				if (a) {
+					++found;
+				}
+			}
+			spdlog::info("[TFD][Defeat] defeated enemy registry resolved quest={:08X} faction={:08X} aliases={}",
+				g_defeatedEnemyRegistry.quest ? g_defeatedEnemyRegistry.quest->GetFormID() : 0u,
+				g_defeatedEnemyRegistry.faction ? g_defeatedEnemyRegistry.faction->GetFormID() : 0u,
+				found);
+		}
+
+		static void WriteDefeatedEnemyAlias(RE::BGSRefAlias* alias, RE::Actor* actor)
+		{
+			ResolveDefeatedEnemyRegistry();
+			if (!g_defeatedEnemyRegistry.quest || !alias) {
+				return;
+			}
+
+			RE::ObjectRefHandle handle{};
+			if (actor) {
+				handle = actor->CreateRefHandle();
+			}
+
+			RE::BSWriteLockGuard lock(g_defeatedEnemyRegistry.quest->aliasAccessLock);
+			auto it = g_defeatedEnemyRegistry.quest->refAliasMap.find(alias->aliasID);
+			if (actor) {
+				if (it != g_defeatedEnemyRegistry.quest->refAliasMap.end()) {
+					it->second = handle;
+				}
+				else {
+					g_defeatedEnemyRegistry.quest->refAliasMap.insert({ alias->aliasID, handle });
+				}
+			}
+			else {
+				if (it != g_defeatedEnemyRegistry.quest->refAliasMap.end()) {
+					g_defeatedEnemyRegistry.quest->refAliasMap.erase(it);
+				}
+			}
+		}
+
+		static int FindDefeatedEnemyAliasSlot(RE::Actor* actor)
+		{
+			if (!actor) {
+				return -1;
+			}
+			ResolveDefeatedEnemyRegistry();
+			for (std::size_t i = 0; i < g_defeatedEnemyRegistry.enemyAliases.size(); ++i) {
+				auto* alias = g_defeatedEnemyRegistry.enemyAliases[i];
+				if (!alias) {
+					continue;
+				}
+				auto* current = alias->GetActorReference();
+				if (current && current->GetFormID() == actor->GetFormID()) {
+					return static_cast<int>(i);
+				}
+			}
+			return -1;
+		}
+
+		static void SyncDefeatedEnemyAlias(RE::Actor* actor, BleedLockEntry& entry)
+		{
+			if (!actor) {
+				return;
+			}
+			ResolveDefeatedEnemyRegistry();
+			if (g_defeatedEnemyRegistry.faction) {
+				actor->AddToFaction(g_defeatedEnemyRegistry.faction, 0);
+				entry.defeatedFactionApplied = true;
+			}
+
+			int slot = FindDefeatedEnemyAliasSlot(actor);
+			if (slot >= 0) {
+				entry.defeatedAliasSlot = slot;
+				return;
+			}
+
+			for (std::size_t i = 0; i < g_defeatedEnemyRegistry.enemyAliases.size(); ++i) {
+				auto* alias = g_defeatedEnemyRegistry.enemyAliases[i];
+				if (!alias) {
+					continue;
+				}
+				auto* current = alias->GetActorReference();
+				if (current && current != actor) {
+					continue;
+				}
+				WriteDefeatedEnemyAlias(alias, actor);
+				entry.defeatedAliasSlot = static_cast<int>(i);
+				spdlog::info("[TFD][Defeat] defeated enemy alias fill alias='{}' actor={:08X}",
+					alias->aliasName.c_str(), actor->GetFormID());
+				return;
+			}
+		}
+
+		static void ClearDefeatedEnemyMirrorState(RE::Actor* actor, BleedLockEntry& entry, const char* reason)
+		{
+			ResolveDefeatedEnemyRegistry();
+			if (entry.defeatedAliasSlot >= 0 && entry.defeatedAliasSlot < static_cast<int>(g_defeatedEnemyRegistry.enemyAliases.size())) {
+				if (auto* alias = g_defeatedEnemyRegistry.enemyAliases[entry.defeatedAliasSlot]) {
+					auto* current = alias->GetActorReference();
+					if (!actor || !current || current->GetFormID() == actor->GetFormID()) {
+						WriteDefeatedEnemyAlias(alias, nullptr);
+						spdlog::info("[TFD][Defeat] defeated enemy alias clear alias='{}' actor={:08X} reason={}",
+							alias->aliasName.c_str(), actor ? actor->GetFormID() : 0u, reason ? reason : "unknown");
+					}
+				}
+			}
+			entry.defeatedAliasSlot = -1;
+
+			if (entry.defeatedFactionApplied && actor && g_defeatedEnemyRegistry.faction) {
+				actor->RemoveFromFaction(g_defeatedEnemyRegistry.faction);
+			}
+			entry.defeatedFactionApplied = false;
+			entry.defeatedManaged = false;
+			entry.defeatedAutoDeathIssued = false;
+			entry.defeatedFatalDamageApplied = false;
+			entry.defeatedDeadline = {};
+		}
+
+		static void ClearAllDefeatedEnemyAliases(const char* reason)
+		{
+			ResolveDefeatedEnemyRegistry();
+			for (auto* alias : g_defeatedEnemyRegistry.enemyAliases) {
+				if (!alias) {
+					continue;
+				}
+				auto* current = alias->GetActorReference();
+				if (!current) {
+					continue;
+				}
+				WriteDefeatedEnemyAlias(alias, nullptr);
+				spdlog::info("[TFD][Defeat] defeated enemy alias clear alias='{}' actor={:08X} reason={}",
+					alias->aliasName.c_str(), current->GetFormID(), reason ? reason : "unknown");
+			}
+		}
+
+		static bool IsDefeatedReentrySuppressed(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto it = g_defeatedReentrySuppress.find(actor->GetFormID());
+			if (it == g_defeatedReentrySuppress.end()) {
+				return false;
+			}
+			if (Now() >= it->second) {
+				g_defeatedReentrySuppress.erase(it);
+				return false;
+			}
+			return true;
+		}
+
+		static void SuppressDefeatedReentry(RE::Actor* actor, double seconds, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+			const auto secs = (std::max)(0.5, seconds);
+			g_defeatedReentrySuppress[actor->GetFormID()] = Now() + std::chrono::milliseconds(static_cast<int>(secs * 1000.0));
+			spdlog::info("[TFD][Defeat] defeated reentry suppress actor={:08X} seconds={:.1f} reason={}",
+				actor->GetFormID(),
+				secs,
+				reason ? reason : "unknown");
+		}
+
+		static bool IsDefeatedEnemyCandidate(RE::Actor* actor)
+		{
+			auto* player = Player();
+			if (!actor || !player || actor == player || actor->IsDead() || actor->IsDisabled()) {
+				return false;
+			}
+			if (IsDefeatedReentrySuppressed(actor)) {
+				return false;
+			}
+			if (actor->IsPlayerTeammate() || IsActiveFollowerActor(actor)) {
+				return false;
+			}
+			if (TFD::Pacify::IsCompanion(actor) || TFD::Pacify::HasActiveTameSession(actor)) {
+				return false;
+			}
+			if (!IsBleedCrowdSupportedAggressor(actor)) {
+				return false;
+			}
+			if (actor->IsHostileToActor(player)) {
+				return true;
+			}
+			auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+			if (auto* current = targetSp.get()) {
+				if (current == player || IsActiveFollowerActor(current)) {
+					return true;
+				}
+			}
+			if (g_bleedBattleObserver.enemyIds.find(actor->GetFormID()) != g_bleedBattleObserver.enemyIds.end()) {
+				return true;
+			}
+			if (g_lastAggressor) {
+				auto sp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
+				if (sp.get() == actor) {
+					return true;
+				}
+			}
+			return actor->IsInCombat();
+		}
+
+		static bool IsDefeatedEnemyKnockedInternal(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto it = g_bleedLocks.find(actor->GetFormID());
+			if (it == g_bleedLocks.end()) {
+				return false;
+			}
+			return it->second.kind == BleedLockKind::Other && it->second.defeatedManaged;
+		}
+
+		static bool IsDialogueCapableDefeatedEnemyInternal(RE::Actor* actor)
+		{
+			return IsDefeatedEnemyKnockedInternal(actor) && actor && IsCaptiveSupportedAggressor(actor);
+		}
+
+		static bool IsCreatureDefeatedEnemyInternal(RE::Actor* actor)
+		{
+			if (!IsDefeatedEnemyKnockedInternal(actor) || !actor) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return false;
+			}
+			return ActorHasKeywordByEditorID(actor, "ActorTypeCreature") || ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") || ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") || ActorHasKeywordByEditorID(actor, "ActorTypeUndead");
+		}
+
+		static double GetDefeatedEnemyRemainingSecondsInternal(RE::Actor* actor)
+		{
+			if (!actor) {
+				return 0.0;
+			}
+			auto it = g_bleedLocks.find(actor->GetFormID());
+			if (it == g_bleedLocks.end() || !it->second.defeatedManaged) {
+				return 0.0;
+			}
+			const auto now = Now();
+			if (it->second.defeatedDeadline <= now) {
+				return 0.0;
+			}
+			return std::chrono::duration<double>(it->second.defeatedDeadline - now).count();
+		}
+
+		static void ApplyDefeatedEnemyPassiveOverride(RE::Actor* actor, BleedLockEntry& entry)
+		{
+			auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+			if (!avo) {
+				return;
+			}
+			if (!entry.aggressionOverridden) {
+				entry.savedAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+				entry.aggressionOverridden = true;
+			}
+			avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+		}
+
+		static void RestoreDefeatedEnemyPassiveOverride(RE::Actor* actor, BleedLockEntry& entry)
+		{
+			if (!entry.aggressionOverridden) {
+				return;
+			}
+			auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+			if (avo) {
+				avo->SetActorValue(RE::ActorValue::kAggression, entry.savedAggression);
+			}
+			entry.aggressionOverridden = false;
+		}
 		static bool HasFollowerAnchorFaction(RE::Actor* actor)
 		{
 			if (!actor || actor->IsDisabled()) {
@@ -2186,6 +2521,7 @@ namespace TFD::DefeatMonitor
 			g_lastAggressor.reset();
 			g_bleedBattleObservePending = false;
 			g_bleedBattleObservePending = false;
+			RecoverVictoryTeammates();
 			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
@@ -3673,6 +4009,76 @@ namespace TFD::DefeatMonitor
 			avo->SetActorValue(RE::ActorValue::kCombatHealthRegenMultiply, entry.savedCombatHealRateMult);
 		}
 
+		static void RestoreActorHealthToSafePct(RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			const float thresh = std::clamp(thresholdPct / 100.0f, 0.05f, 0.95f);
+			const float safePct = std::clamp(thresh + bonusPct, minSafePct, maxSafePct);
+			const float target = (std::max)(minAbsHp, hpMax * safePct);
+			if (hpNow + 0.001f < target) {
+				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (target - hpNow));
+				spdlog::info("[TFD][Defeat] recover actor hp actor={:08X} reason={} from={:.2f} to={:.2f} threshPct={:.1f}",
+					actor->GetFormID(),
+					reason ? reason : "unknown",
+					hpNow,
+					target,
+					thresholdPct);
+			}
+		}
+
+		static void RecoverVictoryTeammates()
+		{
+			const float allyThresholdPct = TFD::Settings::GetAllyDownedThresholdPct();
+			std::vector<RE::Actor*> lockedAllies;
+			lockedAllies.reserve(g_bleedLocks.size());
+			for (auto& [formID, entry] : g_bleedLocks) {
+				if (entry.kind != BleedLockKind::Ally) {
+					continue;
+				}
+				auto sp = entry.handle.get();
+				auto* actor = sp.get();
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				lockedAllies.push_back(actor);
+			}
+
+			for (auto* actor : lockedAllies) {
+				RestoreActorHealthToSafePct(actor, allyThresholdPct, 0.18f, 0.48f, 0.88f, 35.0f, "battle_victory_teammate");
+				ReleaseBleedLock(actor, "battle_observe_victory_teammate", true);
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				actor->DrawWeaponMagicHands(false);
+			}
+
+			for (auto* actor : CollectRegisteredTeammates()) {
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (g_bleedLocks.find(actor->GetFormID()) != g_bleedLocks.end()) {
+					continue;
+				}
+				if (!IsActorBleedingOut(actor)) {
+					continue;
+				}
+				RestoreActorHealthToSafePct(actor, allyThresholdPct, 0.18f, 0.48f, 0.88f, 35.0f, "battle_victory_teammate_graph_only");
+				actor->NotifyAnimationGraph("BleedoutStop");
+				actor->NotifyAnimationGraph("GetUpStart");
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				actor->DrawWeaponMagicHands(false);
+				spdlog::info("[TFD][Defeat] recover teammate graph-only actor={:08X} reason=battle_observe_victory", actor->GetFormID());
+			}
+		}
+
 		static float ResolveBleedLockThresholdPct(RE::Actor* actor)
 		{
 			if (!actor) {
@@ -3718,6 +4124,7 @@ namespace TFD::DefeatMonitor
 			const auto formID = actor->GetFormID();
 			auto& entry = g_bleedLocks[formID];
 			const bool wasNew = !entry.handle;
+			const bool wasDefeatedManaged = entry.defeatedManaged;
 			entry.handle = actor->GetHandle();
 			entry.kind = kind;
 			entry.thresholdPct = std::clamp(thresholdPct, 2.0f, 95.0f);
@@ -3732,6 +4139,20 @@ namespace TFD::DefeatMonitor
 			}
 
 			ApplyBleedRegenOverride(actor, entry);
+			if (kind == BleedLockKind::Other && IsDefeatedEnemyCandidate(actor)) {
+				entry.defeatedManaged = true;
+				if (!wasDefeatedManaged) {
+					entry.defeatedDeadline = Now() + std::chrono::milliseconds(static_cast<int>(kDefeatedEnemyKnockSeconds * 1000.0));
+					entry.defeatedAutoDeathIssued = false;
+					entry.defeatedFatalDamageApplied = false;
+				}
+				ApplyDefeatedEnemyPassiveOverride(actor, entry);
+				SyncDefeatedEnemyAlias(actor, entry);
+			}
+
+			if (!wasNew) {
+				return;
+			}
 
 			if (!actor->IsDead()) {
 				if (kind != BleedLockKind::Player) {
@@ -3774,6 +4195,13 @@ namespace TFD::DefeatMonitor
 			const auto kind = entry.kind;
 			g_bleedLocks.erase(it);
 			RestoreBleedRegenOverride(actor, entry);
+			if (entry.defeatedManaged) {
+				if (actor && reason && std::strstr(reason, "recruit")) {
+					SuppressDefeatedReentry(actor, kDefeatedReentrySuppressSeconds, reason);
+				}
+				ClearDefeatedEnemyMirrorState(actor, entry, reason);
+				RestoreDefeatedEnemyPassiveOverride(actor, entry);
+			}
 			if (kind == BleedLockKind::Player) {
 				g_minHp = 0.0f;
 				SetPlayerBleedImmune(false);
@@ -3801,6 +4229,10 @@ namespace TFD::DefeatMonitor
 				auto sp = entry.handle.get();
 				auto* actor = sp.get();
 				RestoreBleedRegenOverride(actor, entry);
+				if (entry.defeatedManaged) {
+					ClearDefeatedEnemyMirrorState(actor, entry, reason);
+					RestoreDefeatedEnemyPassiveOverride(actor, entry);
+				}
 				if (entry.kind == BleedLockKind::Player) {
 					g_minHp = 0.0f;
 					SetPlayerBleedImmune(false);
@@ -3813,6 +4245,7 @@ namespace TFD::DefeatMonitor
 			}
 			g_bleedLocks.clear();
 			g_bleedLockLastScan = {};
+			ClearAllDefeatedEnemyAliases(reason);
 		}
 
 		static void ScanBleedLockCandidates()
@@ -3886,7 +4319,7 @@ namespace TFD::DefeatMonitor
 						continue;
 					}
 				}
-				else {
+				else if (entry.kind == BleedLockKind::Ally) {
 					if (GetActorHealthPct(actor) > (entry.thresholdPct + 8.0f)) {
 						releases.emplace_back(formID, actor, "recovered", true);
 						continue;
@@ -3901,9 +4334,78 @@ namespace TFD::DefeatMonitor
 						actor->DrawWeaponMagicHands(false);
 					}
 				}
+				else {
+					if (!entry.defeatedManaged && GetActorHealthPct(actor) > (entry.thresholdPct + 8.0f)) {
+						releases.emplace_back(formID, actor, "recovered", true);
+						continue;
+					}
+					if (entry.defeatedManaged) {
+						ApplyDefeatedEnemyPassiveOverride(actor, entry);
+						SyncDefeatedEnemyAlias(actor, entry);
+					}
+					if (actor->IsInCombat()) {
+						actor->StopCombat();
+					}
+					if (auto* process = RE::ProcessLists::GetSingleton()) {
+						process->StopCombatAndAlarmOnActor(actor, false);
+					}
+					if (actor->IsWeaponDrawn()) {
+						actor->DrawWeaponMagicHands(false);
+					}
+					if (entry.defeatedManaged && !IsDialogueOpen() && entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
+						if (!entry.defeatedAutoDeathIssued) {
+							if (actor->IsEssential() || actor->IsProtected()) {
+								spdlog::warn("[TFD][Defeat] defeated enemy auto-death skipped actor={:08X} reason=protected_or_essential", actor->GetFormID());
+								releases.emplace_back(formID, actor, "timeout_skip_kill", true);
+								continue;
+							}
+							entry.defeatedAutoDeathIssued = true;
+							entry.defeatedFatalDamageApplied = false;
+							entry.defeatedDeadline = now + std::chrono::milliseconds(450);
+							entry.lastPulse = now;
+							actor->NotifyAnimationGraph("BleedoutStop");
+							actor->EvaluatePackage(false, true);
+							actor->EvaluatePackage(true, true);
+							spdlog::info("[TFD][Defeat] defeated enemy auto-death queued actor={:08X}", actor->GetFormID());
+							continue;
+						}
 
+						if (!entry.defeatedFatalDamageApplied) {
+							if (actor->IsDead()) {
+								spdlog::info("[TFD][Defeat] defeated enemy auto-death confirmed actor={:08X}", actor->GetFormID());
+								releases.emplace_back(formID, actor, "timeout_dead", false);
+								continue;
+							}
+							const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+							const float fatalDamage = (std::max)(25.0f, hpNow + 5000.0f);
+							actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, -fatalDamage);
+							entry.defeatedFatalDamageApplied = true;
+							entry.defeatedDeadline = now + std::chrono::milliseconds(1500);
+							spdlog::info("[TFD][Defeat] defeated enemy auto-death damage actor={:08X} hpBefore={:.2f} damage={:.2f}",
+								actor->GetFormID(),
+								hpNow,
+								fatalDamage);
+							continue;
+						}
+
+						if (actor->IsDead()) {
+							spdlog::info("[TFD][Defeat] defeated enemy auto-death confirmed actor={:08X}", actor->GetFormID());
+							releases.emplace_back(formID, actor, "timeout_dead", false);
+							continue;
+						}
+
+						if ((now - entry.defeatedDeadline) >= std::chrono::milliseconds(1500)) {
+							spdlog::warn("[TFD][Defeat] defeated enemy auto-death fallback kill actor={:08X}", actor->GetFormID());
+							actor->KillImmediate();
+							releases.emplace_back(formID, actor, "timeout_dead_fallback", false);
+							continue;
+						}
+					}
+				}
+
+				const bool suppressBleedPulse = entry.defeatedManaged && entry.defeatedAutoDeathIssued;
 				const bool pulseDue = entry.lastPulse.time_since_epoch().count() == 0 || (now - entry.lastPulse) >= std::chrono::milliseconds(250);
-				if (!IsActorBleedingOut(actor) || pulseDue) {
+				if (!suppressBleedPulse && (!IsActorBleedingOut(actor) || pulseDue)) {
 					actor->NotifyAnimationGraph("BleedoutStart");
 					entry.lastPulse = now;
 				}
@@ -4970,6 +5472,59 @@ namespace TFD::DefeatMonitor
 	{
 		return g_inBleedState.load(std::memory_order_acquire) &&
 			(g_bleedBattleObservePending || g_bleedBattleObserveActive);
+	}
+
+
+	bool IsDefeatedEnemyKnocked(RE::Actor* actor)
+	{
+		return IsDefeatedEnemyKnockedInternal(actor);
+	}
+
+	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor)
+	{
+		return IsDialogueCapableDefeatedEnemyInternal(actor);
+	}
+
+	bool IsCreatureDefeatedEnemy(RE::Actor* actor)
+	{
+		return IsCreatureDefeatedEnemyInternal(actor);
+	}
+
+	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor)
+	{
+		return GetDefeatedEnemyRemainingSecondsInternal(actor);
+	}
+
+	bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec)
+	{
+		auto* player = Player();
+		if (!player || !actor || !IsCreatureDefeatedEnemyInternal(actor)) {
+			return false;
+		}
+		if (GetDefeatedEnemyRemainingSecondsInternal(actor) <= 0.0) {
+			return false;
+		}
+		// Defeated creature recruit is a direct single-target conversion, not a normal local-splash tame.
+		// Bypass pack bait validation here so Shift+H on a knocked creature does not fail on tame-bait checks.
+		auto session = TFD::Pacify::BeginTameSession(player, actor, nowSec, false, false);
+		if (!session.has_value()) {
+			spdlog::warn("[TFD][Defeat] defeated creature recruit failed actor={:08X} reason=begin_tame_failed", actor->GetFormID());
+			return false;
+		}
+		if (!TFD::Pacify::PromoteActiveTameToCompanion(actor, 24.0)) {
+			TFD::Pacify::ReleaseActiveTameActor(actor, TFD::Pacify::ReleaseReason::Generic);
+			spdlog::warn("[TFD][Defeat] defeated creature recruit failed actor={:08X} reason=promote_failed", actor->GetFormID());
+			return false;
+		}
+		SuppressDefeatedReentry(actor, kDefeatedReentrySuppressSeconds, "defeated_creature_recruit");
+		ReleaseBleedLock(actor, "defeated_creature_recruit", true);
+		RestoreActorHealthToSafePct(actor, TFD::Settings::GetEnemyDownedThresholdPct(), 0.12f, 0.58f, 0.92f, 45.0f, "defeated_creature_recruit");
+		if (actor->IsInCombat()) {
+			actor->StopCombat();
+		}
+		actor->DrawWeaponMagicHands(false);
+		spdlog::info("[TFD][Defeat] defeated creature recruit actor={:08X}", actor->GetFormID());
+		return true;
 	}
 
 }

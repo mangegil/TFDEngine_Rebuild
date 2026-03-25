@@ -836,7 +836,67 @@ namespace TFDMenu
 			return best;
 		}
 
-		static float ScoreTruceCandidate(
+		
+		static RE::Actor* PickExactDefeatedCreatureTargetSameCellLoaded(float radius)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return nullptr;
+			}
+
+			auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
+				if (!actor) {
+					return -1.0e30f;
+				}
+				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					return -1.0e30f;
+				}
+				if (!TFD::DefeatMonitor::IsCreatureDefeatedEnemy(actor)) {
+					return -1.0e30f;
+				}
+				if (TFD::DefeatMonitor::GetDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
+					return -1.0e30f;
+				}
+				if (entry.dist > radius) {
+					return -1.0e30f;
+				}
+
+				const float frontDot = GetActorFrontDot2D(actor, player);
+				if (frontDot < 0.80f) {
+					return -1.0e30f;
+				}
+
+				float score = (frontDot * 100000.0f) - entry.dist;
+				if (frontDot >= 0.98f) {
+					score += 6000.0f;
+				} else if (frontDot >= 0.94f) {
+					score += 3500.0f;
+				} else if (frontDot >= 0.90f) {
+					score += 1500.0f;
+				}
+				return score;
+			};
+
+			TFD::ActorScan::Rescan(radius, false);
+
+			RE::Actor* best = nullptr;
+			float bestScore = -1.0e30f;
+
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				const float score = scoreActor(actor, entry);
+				if (score > bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			return best;
+		}
+
+static float ScoreTruceCandidate(
 			RE::Actor* actor,
 			RE::PlayerCharacter* player,
 			const TFD::ActorScan::Entry& entry,
@@ -847,6 +907,9 @@ namespace TFDMenu
 			}
 
 			if (!actor || !player) {
+				return -1.0e30f;
+			}
+			if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
 				return -1.0e30f;
 			}
 
@@ -921,6 +984,9 @@ namespace TFDMenu
 			}
 
 			if (!actor || !player) {
+				return -1.0e30f;
+			}
+			if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
 				return -1.0e30f;
 			}
 
@@ -1582,6 +1648,15 @@ namespace TFDMenu
 					}
 
 					if (shiftDown) {
+						if (auto* defeatedCreature = PickExactDefeatedCreatureTargetSameCellLoaded(1400.0f)) {
+							if (TFD::DefeatMonitor::RecruitDefeatedCreatureAsTeammate(defeatedCreature, NowSec())) {
+								RE::DebugNotification("TFD: Defeated Creature Recruited");
+							} else {
+								RE::DebugNotification("TFD: Defeated Recruit Failed");
+							}
+							continue;
+						}
+
 						auto* tameTarget = PickExactActiveTameTargetSameCellLoaded(1400.0f);
 						if (!tameTarget) {
 							RE::DebugNotification("TFD: No Exact Tame Target");
