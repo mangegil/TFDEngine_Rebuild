@@ -43,7 +43,7 @@ namespace TFD::PacifyHooks
             }
 
         private:
-            static void ClearBlockedPlayerTarget(RE::Character* actor)
+            static void RedirectBlockedPlayerTarget(RE::Character* actor)
             {
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (!actor || !player || actor == player) {
@@ -60,10 +60,24 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                auto* redirectTarget = TFD::DefeatMonitor::ResolveBleedRedirectTarget(actor);
+                if (!redirectTarget || redirectTarget == player) {
+                    return;
+                }
+
+                actor->GetActorRuntimeData().currentCombatTarget = redirectTarget->GetHandle();
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     process->ClearCachedFactionFightReactions();
                 }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+            }
+
+            static void RedirectBleedFollowerTarget(RE::Character* actor)
+            {
+                (void)actor;
+                // Intentionally disabled: follower combat should continue naturally once combat has started.
+                // Player bleedout must not retarget or wake follower AI here.
             }
 
             static void UpdateCombat(RE::Character* actor)
@@ -84,9 +98,9 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                ClearBlockedPlayerTarget(actor);
+                RedirectBlockedPlayerTarget(actor);
                 _UpdateCombat(actor);
-                ClearBlockedPlayerTarget(actor);
+                RedirectBlockedPlayerTarget(actor);
             }
 
             static std::uint8_t* DoDetect(
@@ -108,9 +122,12 @@ namespace TFD::PacifyHooks
                 }
 
                 auto* player = RE::PlayerCharacter::GetSingleton();
-                if (player && viewer && target == player && viewer != player && TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
-                    detectVal = -1000;
-                    return nullptr;
+                if (player && viewer && target == player && viewer != player) {
+                    auto* redirectTarget = TFD::DefeatMonitor::ResolveBleedRedirectTarget(viewer);
+                    if (redirectTarget && redirectTarget != player) {
+                        detectVal = -1000;
+                        return nullptr;
+                    }
                 }
 
                 return _DoDetect(viewer, target, detectVal, unk04, unk05, unk06, pos, unk08, unk09, unk10);

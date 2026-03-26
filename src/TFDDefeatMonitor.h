@@ -32,6 +32,10 @@ namespace TFD::DefeatMonitor
 	bool IsCaptiveFamily();
 	bool IsLeftForDeadRecoveryActive();
 	bool IsPlayerBleedHoldTargetBlocked();
+	bool IsThresholdDownedActor(RE::Actor* actor);
+	bool IsThresholdCombatTargetValid(RE::Actor* actor);
+		RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
+	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);
 
 	bool IsDefeatedEnemyKnocked(RE::Actor* actor);
 	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor);
