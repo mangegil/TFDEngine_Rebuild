@@ -24,6 +24,7 @@ namespace TFD::DefeatMonitor
 
 	void ResetForLoad();
 	void SetLoadTransition(bool active);
+	void SetPendingDefeatedDialogueTarget(RE::Actor* actor);
 
 	bool IsCaptivePhase();
 	std::uint32_t GetCaptivePhaseRaw();
@@ -36,5 +37,6 @@ namespace TFD::DefeatMonitor
 	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor);
 	bool IsCreatureDefeatedEnemy(RE::Actor* actor);
 	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor);
+	bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor);
 	bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec);
 }

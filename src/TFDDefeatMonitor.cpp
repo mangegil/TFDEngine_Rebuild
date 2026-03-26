@@ -192,6 +192,11 @@ namespace TFD::DefeatMonitor
 		static constexpr double kDefeatedEnemyKnockSeconds = 30.0;
 		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
+		RE::ObjectRefHandle g_pendingDefeatedDialogueTarget{};
+		std::chrono::steady_clock::time_point g_pendingDefeatedDialogueExpiry{};
+		constexpr double kPendingDefeatedDialogueTargetSeconds = 20.0;
+		constexpr const char* kDefeatedHumanoidRecruitEvent = "TFDDefeatedHumanoidRecruit";
+		constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
 
 		enum class NoMarkerFallbackBranch : std::uint32_t
 		{
@@ -352,6 +357,43 @@ namespace TFD::DefeatMonitor
 		static bool IsDialogueCapableDefeatedEnemyInternal(RE::Actor* actor);
 		static bool IsCreatureDefeatedEnemyInternal(RE::Actor* actor);
 		static double GetDefeatedEnemyRemainingSecondsInternal(RE::Actor* actor);
+		static void SetPendingDefeatedDialogueTargetInternal(RE::Actor* actor);
+		static RE::Actor* ResolvePendingDefeatedDialogueTargetInternal();
+		static void ClearPendingDefeatedDialogueTargetInternal();
+
+		static void SetPendingDefeatedDialogueTargetInternal(RE::Actor* actor)
+		{
+			g_pendingDefeatedDialogueTarget = {};
+			g_pendingDefeatedDialogueExpiry = {};
+			if (!actor) {
+				return;
+			}
+			g_pendingDefeatedDialogueTarget = actor->GetHandle();
+			g_pendingDefeatedDialogueExpiry = std::chrono::steady_clock::now() + std::chrono::milliseconds(static_cast<long long>(kPendingDefeatedDialogueTargetSeconds * 1000.0));
+		}
+
+		static RE::Actor* ResolvePendingDefeatedDialogueTargetInternal()
+		{
+			if (!g_pendingDefeatedDialogueTarget || std::chrono::steady_clock::now() >= g_pendingDefeatedDialogueExpiry) {
+				g_pendingDefeatedDialogueTarget = {};
+				g_pendingDefeatedDialogueExpiry = {};
+				return nullptr;
+			}
+			auto actor = g_pendingDefeatedDialogueTarget.get().get();
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				g_pendingDefeatedDialogueTarget = {};
+				g_pendingDefeatedDialogueExpiry = {};
+				return nullptr;
+			}
+			return actor->As<RE::Actor>();
+		}
+
+		static void ClearPendingDefeatedDialogueTargetInternal()
+		{
+			g_pendingDefeatedDialogueTarget = {};
+			g_pendingDefeatedDialogueExpiry = {};
+		}
+
 		static void ClearAllDefeatedEnemyAliases(const char* reason);
 		static void SnapshotBleedFollowerDownState(float radius);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowers(float radius);
@@ -2525,6 +2567,7 @@ namespace TFD::DefeatMonitor
 			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
 			g_prevLockpickOpen = false;
+			ClearPendingDefeatedDialogueTargetInternal();
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 			SetPlayerBleedImmune(false);
 			QueueNonCaptiveChoiceRequest("battle_observe_win");
@@ -5282,6 +5325,31 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+		class DefeatedRecruitEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
+			{
+				if (!ev) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				std::string_view name(ev->eventName);
+				if (name.empty() || name != kDefeatedHumanoidRecruitEvent) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				auto* actor = ResolvePendingDefeatedDialogueTargetInternal();
+				if (!actor) {
+					spdlog::warn("[TFD][Defeat] defeated humanoid recruit event ignored reason=no_pending_target");
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const bool ok = RecruitDefeatedHumanoidAsTeammate(actor);
+				spdlog::info("[TFD][Defeat] defeated humanoid recruit event actor={:08X} ok={}", actor->GetFormID(), ok ? 1 : 0);
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		DefeatedRecruitEventSink g_defeatedRecruitEventSink{};
+
 		static void WorkerLoop()
 		{
 			while (g_running.load(std::memory_order_acquire)) {
@@ -5310,6 +5378,10 @@ namespace TFD::DefeatMonitor
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
 		TFD::ForceGreet::Install();
+		if (auto* src = SKSE::GetModCallbackEventSource()) {
+			src->AddEventSink(&g_defeatedRecruitEventSink);
+		}
+		ClearPendingDefeatedDialogueTargetInternal();
 		g_worker = std::thread([]() { WorkerLoop(); });
 		TFD::DefeatMonitor::ApplyQueuedProgressState();
 		spdlog::info("[TFD][Defeat] monitor installed");
@@ -5332,6 +5404,10 @@ namespace TFD::DefeatMonitor
 		ResetLockpickWatch();
 		ClearEscapeContext();
 		ClearLeftForDeadCooldown();
+		if (auto* src = SKSE::GetModCallbackEventSource()) {
+			src->RemoveEventSink(&g_defeatedRecruitEventSink);
+		}
+		ClearPendingDefeatedDialogueTargetInternal();
 		spdlog::info("[TFD][Defeat] monitor shutdown");
 	}
 
@@ -5475,6 +5551,30 @@ namespace TFD::DefeatMonitor
 	}
 
 
+	static bool RecruitDefeatedHumanoidAsTeammateBridgeImpl(RE::Actor* actor)
+	{
+		if (!actor || !IsDialogueCapableDefeatedEnemyInternal(actor)) {
+			return false;
+		}
+		if (GetDefeatedEnemyRemainingSecondsInternal(actor) <= 0.0) {
+			return false;
+		}
+		if (!SendBridgeModEvent(kHumanoidTeammateAssignEvent, actor)) {
+			spdlog::warn("[TFD][Defeat] defeated humanoid recruit failed actor={:08X} reason=bridge_assign_failed", actor->GetFormID());
+			return false;
+		}
+		SuppressDefeatedReentry(actor, kDefeatedReentrySuppressSeconds, "defeated_humanoid_recruit");
+		ReleaseBleedLock(actor, "defeated_humanoid_recruit", true);
+		RestoreActorHealthToSafePct(actor, TFD::Settings::GetEnemyDownedThresholdPct(), 0.12f, 0.58f, 0.92f, 45.0f, "defeated_humanoid_recruit");
+		if (actor->IsInCombat()) {
+			actor->StopCombat();
+		}
+		actor->DrawWeaponMagicHands(false);
+		ClearPendingDefeatedDialogueTargetInternal();
+		spdlog::info("[TFD][Defeat] defeated humanoid recruit actor={:08X}", actor->GetFormID());
+		return true;
+	}
+
 	bool IsDefeatedEnemyKnocked(RE::Actor* actor)
 	{
 		return IsDefeatedEnemyKnockedInternal(actor);
@@ -5493,6 +5593,16 @@ namespace TFD::DefeatMonitor
 	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor)
 	{
 		return GetDefeatedEnemyRemainingSecondsInternal(actor);
+	}
+
+	void SetPendingDefeatedDialogueTarget(RE::Actor* actor)
+	{
+		SetPendingDefeatedDialogueTargetInternal(actor);
+	}
+
+	bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor)
+	{
+		return RecruitDefeatedHumanoidAsTeammateBridgeImpl(actor);
 	}
 
 	bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec)

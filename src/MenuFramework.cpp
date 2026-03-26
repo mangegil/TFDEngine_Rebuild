@@ -48,6 +48,11 @@
 
 #include "SKSEMenuFramework.h"
 
+namespace TFD::DefeatMonitor
+{
+	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor);
+}
+
 namespace TFDMenu
 {
 	namespace
@@ -757,6 +762,59 @@ namespace TFDMenu
 			return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
 			       (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
 			       (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+		}
+
+		static RE::Actor* PickExactDialogueDefeatedTargetSameCellLoaded(float radius)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return nullptr;
+			}
+
+			TFD::ActorScan::Rescan(radius, false);
+
+			RE::Actor* best = nullptr;
+			float bestScore = -1.0e30f;
+
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				if (!actor) {
+					continue;
+				}
+				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					continue;
+				}
+				if (entry.dist > radius) {
+					continue;
+				}
+				if (actor->GetParentCell() != player->GetParentCell()) {
+					continue;
+				}
+				if (!TFD::DefeatMonitor::IsDialogueCapableDefeatedEnemy(actor)) {
+					continue;
+				}
+
+				const float frontDot = GetActorFrontDot2D(actor, player);
+				if (frontDot < 0.75f) {
+					continue;
+				}
+
+				float score = (frontDot * 100000.0f) - entry.dist;
+				if (frontDot >= 0.96f) {
+					score += 4000.0f;
+				} else if (frontDot >= 0.90f) {
+					score += 2000.0f;
+				}
+
+				if (score > bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			return best;
 		}
 
 		static RE::Actor* PickExactActiveTameTargetSameCellLoaded(float radius)
@@ -1511,6 +1569,7 @@ static float ScoreTruceCandidate(
 		}
 
 
+		constexpr std::uint32_t kScanCodeActivate = 0x12;
 		constexpr std::uint32_t kScanCodeEscape = 0x01;
 		constexpr std::uint32_t kScanCodeEnter = 0x1C;
 		constexpr std::uint32_t kScanCodeNumpadEnter = 0x9C;
@@ -1546,6 +1605,28 @@ static float ScoreTruceCandidate(
 					}
 
 					const auto code = static_cast<std::uint32_t>(btn->GetIDCode());
+
+					if (code == kScanCodeActivate) {
+						auto* ui = RE::UI::GetSingleton();
+						if (!TFD::FeedPopup::IsOpen() &&
+							(!ui || (!ui->IsMenuOpen(RE::MainMenu::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::Console::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
+							         !ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
+							auto* player = RE::PlayerCharacter::GetSingleton();
+							if (player && !TFD::DefeatMonitor::IsCaptivePhase()) {
+								if (auto* defeatedTalkTarget = PickExactDialogueDefeatedTargetSameCellLoaded(220.0f)) {
+									spdlog::info("[TFD][Menu] activate intercepted for defeated dialogue target={:08X}", defeatedTalkTarget->GetFormID());
+									TFD::ForceGreet::BeginInCombatTruce(defeatedTalkTarget);
+									RE::DebugNotification("TFD: Defeated Dialogue");
+									return RE::BSEventNotifyControl::kStop;
+								}
+							}
+						}
+					}
 
 					if (TFD::FeedPopup::IsOpen()) {
 						const auto nowPopup = Clock::now();
