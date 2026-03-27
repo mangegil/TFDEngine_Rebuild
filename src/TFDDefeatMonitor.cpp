@@ -118,12 +118,8 @@ namespace TFD::DefeatMonitor
 		struct BleedBattleObserverState
 		{
 			bool hadValidObservedEnemy = false;
-			bool engagementCommitted = false;
-			std::chrono::steady_clock::time_point lastEngage{};
 			std::unordered_set<RE::FormID> allyIds{};
 			std::unordered_set<RE::FormID> enemyIds{};
-			std::unordered_map<RE::FormID, RE::FormID> enemyToAlly{};
-			std::unordered_map<RE::FormID, RE::FormID> allyToEnemy{};
 		};
 
 		bool g_bleedBattleObservePending = false;
@@ -133,8 +129,6 @@ namespace TFD::DefeatMonitor
 		bool g_bleedBattleObserveActive = false;
 		std::chrono::steady_clock::time_point g_bleedBattleObserveSince{};
 		std::chrono::steady_clock::time_point g_bleedBattleObserveLastRedirect{};
-		std::chrono::steady_clock::time_point g_bleedBattleObserveQuietUntil{};
-		std::chrono::steady_clock::time_point g_bleedBattleObserveLastScanLog{};
 		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		RE::ActorHandle g_bleedBattlePreferredEnemy{};
 		BleedBattleObserverState g_bleedBattleObserver{};
@@ -276,15 +270,25 @@ namespace TFD::DefeatMonitor
 
 		static void SetPlayerBleedImmune(bool enable)
 		{
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+
+			auto& boolFlags = player->GetActorRuntimeData().boolFlags;
 			if (enable) {
-				if (g_playerBleedImmuneForced) {
-					return;
+				if (!g_playerBleedImmuneForced) {
+					g_playerWasEssential = boolFlags.all(RE::Actor::BOOL_FLAGS::kEssential);
+					g_playerWasInvulnerable = boolFlags.all(RE::Actor::BOOL_FLAGS::kProtected);
+					g_playerBleedImmuneForced = true;
+					spdlog::info("[TFD][Defeat] player bleed hard-invuln enabled essentialWas={} protectedWas={}",
+						g_playerWasEssential ? 1 : 0,
+						g_playerWasInvulnerable ? 1 : 0);
 				}
 
-				g_playerBleedImmuneForced = true;
-				g_playerWasEssential = false;
-				g_playerWasInvulnerable = false;
-				spdlog::info("[TFD][Defeat] player bleed soft-guard enabled");
+				boolFlags.set(RE::Actor::BOOL_FLAGS::kEssential);
+				boolFlags.set(RE::Actor::BOOL_FLAGS::kProtected);
+				boolFlags.set(RE::Actor::BOOL_FLAGS::kCanSpeakToEssentialDown);
 				return;
 			}
 
@@ -292,10 +296,17 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
+			if (!g_playerWasEssential) {
+				boolFlags.reset(RE::Actor::BOOL_FLAGS::kEssential);
+			}
+			if (!g_playerWasInvulnerable) {
+				boolFlags.reset(RE::Actor::BOOL_FLAGS::kProtected);
+			}
+			boolFlags.reset(RE::Actor::BOOL_FLAGS::kCanSpeakToEssentialDown);
 			g_playerBleedImmuneForced = false;
 			g_playerWasEssential = false;
 			g_playerWasInvulnerable = false;
-			spdlog::info("[TFD][Defeat] player bleed soft-guard released");
+			spdlog::info("[TFD][Defeat] player bleed hard-invuln released");
 		}
 
 		static RE::BGSKeyword* LookupKeyword(const char* editorID)
@@ -503,22 +514,27 @@ namespace TFD::DefeatMonitor
 		static bool BuildBleedBattleObserveSnapshot(RE::Actor* player, float radius, RE::Actor* preferredEnemy);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowersFromSnapshot();
 		static std::vector<RE::Actor*> CollectBleedStandingEnemiesFromSnapshot();
-		static RE::Actor* PickClosestObservedTarget(RE::Actor* source, const std::vector<RE::Actor*>& candidates);
-		static void ForceObservedCombatCommit(RE::Actor* actor, RE::Actor* target, bool drawWeapon);
-		static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies);
-		static void MaintainBleedObserverFollowerAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies);
-		static std::vector<RE::Actor*> CollectCurrentObservedEnemies(RE::Actor* player, float radius, RE::Actor* preferredEnemy, const std::vector<RE::Actor*>& allies);
+		static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
+		{
+			(void)player;
+			(void)followers;
+			(void)enemies;
+			return;
+		}
+
+		static void MaintainBleedObserverFollowerAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
+		{
+			(void)player;
+			(void)followers;
+			(void)enemies;
+			return;
+		}
+
 		static bool StartBleedBattleObservePending(RE::Actor* player);
 		static void TickBleedBattleObservePending();
 		static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy);
 		static void TickBleedBattleObserve();
 		static RE::Actor* ResolveBleedRedirectTargetInternal(RE::Actor* actor);
-		static RE::Actor* ResolveBleedFollowerAggroTargetInternal(RE::Actor* actor);
-		static bool IsDefeatCombatOverrideParticipantInternal(RE::Actor* actor);
-		static void ClearObservedCombatLocks();
-		static bool IsObservedCombatQuietWindowActive(const std::chrono::steady_clock::time_point& now);
-		static void RebuildObservedCombatLocks(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies, const char* reason);
-		static void MaintainObservedCombatLocks(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies);
 		static void EnterObservedBattleWin();
 		static void RecoverVictoryTeammates();
 		static void ReleaseBleedLock(RE::Actor* actor, const char* reason, bool playGetUp);
@@ -1176,12 +1192,9 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObserveActive = false;
 			g_bleedBattleObserveSince = {};
 			g_bleedBattleObserveLastRedirect = {};
-			g_bleedBattleObserveQuietUntil = {};
-			g_bleedBattleObserveLastScanLog = {};
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy.reset();
 			g_bleedBattleObserver = {};
-			ClearObservedCombatLocks();
 			ClearLastEnemyTargetingPlayerInternal();
 		}
 
@@ -2419,260 +2432,6 @@ namespace TFD::DefeatMonitor
 			return out;
 		}
 
-		static bool IsDefeatCombatOverrideParticipantInternal(RE::Actor* actor)
-		{
-			if (!actor || !IsPlayerBleedHoldTargetBlocked()) {
-				return false;
-			}
-			const auto id = actor->GetFormID();
-			return g_bleedBattleObserver.allyIds.find(id) != g_bleedBattleObserver.allyIds.end() ||
-				g_bleedBattleObserver.enemyIds.find(id) != g_bleedBattleObserver.enemyIds.end();
-		}
-
-		static void ClearObservedCombatLocks()
-		{
-			g_bleedBattleObserver.enemyToAlly.clear();
-			g_bleedBattleObserver.allyToEnemy.clear();
-			g_bleedBattleObserver.engagementCommitted = false;
-			g_bleedBattleObserver.lastEngage = {};
-		}
-
-		static bool IsObservedCombatQuietWindowActive(const std::chrono::steady_clock::time_point& now)
-		{
-			return g_bleedBattleObserveQuietUntil.time_since_epoch().count() != 0 && now < g_bleedBattleObserveQuietUntil;
-		}
-
-		static RE::Actor* ResolveLockedAllyForEnemy(RE::Actor* enemy)
-		{
-			if (!enemy) {
-				return nullptr;
-			}
-			auto it = g_bleedBattleObserver.enemyToAlly.find(enemy->GetFormID());
-			if (it == g_bleedBattleObserver.enemyToAlly.end()) {
-				return nullptr;
-			}
-			auto* ally = RE::TESForm::LookupByID<RE::Actor>(it->second);
-			return IsStandingAllyThresholdActor(ally) ? ally : nullptr;
-		}
-
-		static RE::Actor* ResolveLockedEnemyForAlly(RE::Actor* ally)
-		{
-			if (!ally) {
-				return nullptr;
-			}
-			auto it = g_bleedBattleObserver.allyToEnemy.find(ally->GetFormID());
-			if (it == g_bleedBattleObserver.allyToEnemy.end()) {
-				return nullptr;
-			}
-			auto* enemy = RE::TESForm::LookupByID<RE::Actor>(it->second);
-			return IsStandingEnemyThresholdActor(enemy) && !IsObserverAlly(enemy) ? enemy : nullptr;
-		}
-
-		static void RebuildObservedCombatLocks(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies, const char* reason)
-		{
-			ClearObservedCombatLocks();
-			if (!player || followers.empty() || enemies.empty()) {
-				return;
-			}
-
-			auto now = Now();
-			std::unordered_set<RE::FormID> reservedAllies{};
-			std::unordered_set<RE::FormID> reservedEnemies{};
-
-			auto lockPair = [&](RE::Actor* enemy, RE::Actor* ally) {
-				if (!enemy || !ally) {
-					return false;
-				}
-				if (!IsStandingEnemyThresholdActor(enemy) || IsObserverAlly(enemy) || !IsStandingAllyThresholdActor(ally) || ally == player) {
-					return false;
-				}
-				g_bleedBattleObserver.enemyToAlly[enemy->GetFormID()] = ally->GetFormID();
-				g_bleedBattleObserver.allyToEnemy[ally->GetFormID()] = enemy->GetFormID();
-				reservedEnemies.insert(enemy->GetFormID());
-				reservedAllies.insert(ally->GetFormID());
-				return true;
-			};
-
-			RE::Actor* primaryEnemy = nullptr;
-			if (g_bleedBattlePreferredEnemy) {
-				auto preferredSp = RE::Actor::LookupByHandle(g_bleedBattlePreferredEnemy.native_handle());
-				if (auto* preferred = preferredSp.get(); preferred && IsStandingEnemyThresholdActor(preferred) && !IsObserverAlly(preferred)) {
-					primaryEnemy = preferred;
-				}
-			}
-			if (!primaryEnemy) {
-				for (auto* enemy : enemies) {
-					if (enemy && IsStandingEnemyThresholdActor(enemy) && !IsObserverAlly(enemy)) {
-						primaryEnemy = enemy;
-						break;
-					}
-				}
-			}
-
-			if (primaryEnemy) {
-				auto* primaryAlly = PickClosestObservedTarget(primaryEnemy, followers);
-				lockPair(primaryEnemy, primaryAlly);
-
-				RE::Actor* backupAlly = nullptr;
-				float bestBackupDist = std::numeric_limits<float>::max();
-				const auto enemyPos = primaryEnemy->GetPosition();
-				for (auto* ally : followers) {
-					if (!ally || !IsStandingAllyThresholdActor(ally) || ally == primaryAlly) {
-						continue;
-					}
-					const float dist = Distance3D(enemyPos, ally->GetPosition());
-					if (dist < bestBackupDist) {
-						bestBackupDist = dist;
-						backupAlly = ally;
-					}
-				}
-				if (backupAlly) {
-					g_bleedBattleObserver.allyToEnemy[backupAlly->GetFormID()] = primaryEnemy->GetFormID();
-					reservedAllies.insert(backupAlly->GetFormID());
-				}
-			}
-
-			for (auto* enemy : enemies) {
-				if (!enemy || reservedEnemies.find(enemy->GetFormID()) != reservedEnemies.end()) {
-					continue;
-				}
-				if (!IsStandingEnemyThresholdActor(enemy) || IsObserverAlly(enemy)) {
-					continue;
-				}
-				RE::Actor* ally = nullptr;
-				float bestDist = std::numeric_limits<float>::max();
-				const auto enemyPos = enemy->GetPosition();
-				for (auto* candidate : followers) {
-					if (!candidate || !IsStandingAllyThresholdActor(candidate) || reservedAllies.find(candidate->GetFormID()) != reservedAllies.end()) {
-						continue;
-					}
-					const float dist = Distance3D(enemyPos, candidate->GetPosition());
-					if (dist < bestDist) {
-						bestDist = dist;
-						ally = candidate;
-					}
-				}
-				lockPair(enemy, ally);
-			}
-
-			for (const auto& [enemyId, allyId] : g_bleedBattleObserver.enemyToAlly) {
-				auto* enemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				auto* ally = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				if (!IsStandingEnemyThresholdActor(enemy) || !IsStandingAllyThresholdActor(ally)) {
-					continue;
-				}
-				ForceObservedCombatCommit(enemy, ally, false);
-				ForceObservedCombatCommit(ally, enemy, true);
-			}
-			for (const auto& [allyId, enemyId] : g_bleedBattleObserver.allyToEnemy) {
-				if (g_bleedBattleObserver.enemyToAlly.find(enemyId) != g_bleedBattleObserver.enemyToAlly.end() &&
-					g_bleedBattleObserver.enemyToAlly[enemyId] == allyId) {
-					continue;
-				}
-				auto* ally = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				auto* enemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				if (!IsStandingAllyThresholdActor(ally) || !IsStandingEnemyThresholdActor(enemy) || IsObserverAlly(enemy)) {
-					continue;
-				}
-				ForceObservedCombatCommit(ally, enemy, true);
-			}
-
-			g_bleedBattleObserver.engagementCommitted = !g_bleedBattleObserver.enemyToAlly.empty() || !g_bleedBattleObserver.allyToEnemy.empty();
-			g_bleedBattleObserver.lastEngage = now;
-			spdlog::info("[TFD][Defeat] observed combat rebuild reason={} enemyLocks={} allyLocks={} quietMs={}",
-				reason ? reason : "unknown",
-				g_bleedBattleObserver.enemyToAlly.size(),
-				g_bleedBattleObserver.allyToEnemy.size(),
-				IsObservedCombatQuietWindowActive(now) ? 1 : 0);
-		}
-
-		static void MaintainObservedCombatLocks(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
-		{
-			if (!player) {
-				return;
-			}
-			if (followers.empty() || enemies.empty()) {
-				ClearObservedCombatLocks();
-				return;
-			}
-
-			const auto now = Now();
-			if (IsObservedCombatQuietWindowActive(now)) {
-				return;
-			}
-
-			bool needsRebuild = !g_bleedBattleObserver.engagementCommitted ||
-				(g_bleedBattleObserver.enemyToAlly.empty() && g_bleedBattleObserver.allyToEnemy.empty());
-			bool needsBurst = false;
-
-			for (const auto& [enemyId, allyId] : g_bleedBattleObserver.enemyToAlly) {
-				auto* enemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				auto* lockedAlly = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				if (!IsStandingEnemyThresholdActor(enemy) || !IsStandingAllyThresholdActor(lockedAlly) || IsObserverAlly(enemy)) {
-					needsRebuild = true;
-					continue;
-				}
-				auto* current = ResolveCurrentCombatTarget(enemy);
-				if (!current || current == Player() || !IsThresholdCombatTargetValid(current)) {
-					needsBurst = true;
-				}
-			}
-
-			for (const auto& [allyId, enemyId] : g_bleedBattleObserver.allyToEnemy) {
-				auto* ally = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				auto* lockedEnemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				if (!IsStandingAllyThresholdActor(ally) || !IsStandingEnemyThresholdActor(lockedEnemy) || IsObserverAlly(lockedEnemy)) {
-					needsRebuild = true;
-					continue;
-				}
-				auto* current = ResolveCurrentCombatTarget(ally);
-				if (!current || current == Player() || !IsThresholdCombatTargetValid(current)) {
-					needsBurst = true;
-				}
-			}
-
-			const bool canIntervene = g_bleedBattleObserver.lastEngage.time_since_epoch().count() == 0 ||
-				(now - g_bleedBattleObserver.lastEngage) >= std::chrono::milliseconds(1400);
-
-			if (needsRebuild && canIntervene) {
-				RebuildObservedCombatLocks(player, followers, enemies, "maintain_invalid_lock");
-				g_bleedBattleObserveQuietUntil = Now() + std::chrono::milliseconds(1500);
-				return;
-			}
-
-			if (!needsBurst || !canIntervene) {
-				return;
-			}
-
-			for (const auto& [enemyId, allyId] : g_bleedBattleObserver.enemyToAlly) {
-				auto* enemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				auto* ally = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				if (!IsStandingEnemyThresholdActor(enemy) || !IsStandingAllyThresholdActor(ally) || IsObserverAlly(enemy)) {
-					continue;
-				}
-				auto* current = ResolveCurrentCombatTarget(enemy);
-				if (!current || current == Player() || !IsThresholdCombatTargetValid(current)) {
-					ForceObservedCombatCommit(enemy, ally, false);
-				}
-			}
-			for (const auto& [allyId, enemyId] : g_bleedBattleObserver.allyToEnemy) {
-				auto* ally = RE::TESForm::LookupByID<RE::Actor>(allyId);
-				auto* enemy = RE::TESForm::LookupByID<RE::Actor>(enemyId);
-				if (!IsStandingAllyThresholdActor(ally) || !IsStandingEnemyThresholdActor(enemy) || IsObserverAlly(enemy)) {
-					continue;
-				}
-				auto* current = ResolveCurrentCombatTarget(ally);
-				if (!current || current == Player() || !IsThresholdCombatTargetValid(current)) {
-					ForceObservedCombatCommit(ally, enemy, true);
-				}
-			}
-			g_bleedBattleObserver.lastEngage = now;
-			g_bleedBattleObserveQuietUntil = now + std::chrono::milliseconds(1200);
-			spdlog::info("[TFD][Defeat] observed combat burst commit enemyLocks={} allyLocks={}",
-				g_bleedBattleObserver.enemyToAlly.size(),
-				g_bleedBattleObserver.allyToEnemy.size());
-		}
-
 		static RE::Actor* PickClosestObservedTarget(RE::Actor* source, const std::vector<RE::Actor*>& candidates)
 		{
 			if (!source || candidates.empty()) {
@@ -2882,90 +2641,6 @@ namespace TFD::DefeatMonitor
 			target->UpdateCombat();
 		}
 
-		static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
-		{
-			(void)followers;
-			if (!player || enemies.empty()) {
-				return;
-			}
-
-			for (auto* enemy : enemies) {
-				if (!IsStandingEnemyThresholdActor(enemy)) {
-					continue;
-				}
-
-				auto* currentTarget = ResolveCurrentCombatTarget(enemy);
-				const bool needsReplacement = !currentTarget || currentTarget == player || !IsThresholdCombatTargetValid(currentTarget);
-				if (!needsReplacement) {
-					continue;
-				}
-
-				auto* replacement = ResolveBleedRedirectTargetInternal(enemy);
-				if (replacement && replacement != enemy && replacement != currentTarget && IsThresholdCombatTargetValid(replacement)) {
-					ForceObservedCombatCommit(enemy, replacement, false);
-					spdlog::info("[TFD][Defeat] bleed redirect enemy={:08X} from={:08X} to={:08X} engage=1",
-						enemy->GetFormID(),
-						currentTarget ? currentTarget->GetFormID() : 0u,
-						replacement->GetFormID());
-					continue;
-				}
-
-				if (currentTarget && !IsThresholdCombatTargetValid(currentTarget)) {
-					if (IsPlayerBleedHoldTargetBlocked()) {
-						spdlog::info("[TFD][Defeat] bleed preserve invalid enemy target actor={:08X} target={:08X} reason=await redirect",
-							enemy->GetFormID(),
-							currentTarget ? currentTarget->GetFormID() : 0u);
-						continue;
-					}
-					enemy->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
-					if (auto* process = RE::ProcessLists::GetSingleton()) {
-						process->ClearCachedFactionFightReactions();
-					}
-					enemy->EvaluatePackage(false, true);
-					enemy->EvaluatePackage(true, true);
-					spdlog::info("[TFD][Defeat] bleed clear invalid enemy target actor={:08X} target={:08X}",
-						enemy->GetFormID(),
-						currentTarget ? currentTarget->GetFormID() : 0u);
-				}
-			}
-		}
-
-		static void MaintainBleedObserverFollowerAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
-		{
-			(void)player;
-			(void)enemies;
-			if (followers.empty()) {
-				return;
-			}
-
-			for (auto* follower : followers) {
-				if (!follower || !IsStandingAllyThresholdActor(follower)) {
-					continue;
-				}
-				if (!IsActiveFollowerActor(follower) && !TFD::Pacify::IsCompanion(follower)) {
-					continue;
-				}
-
-				auto* currentTarget = ResolveCurrentCombatTarget(follower);
-				auto* desiredTarget = ResolveBleedFollowerAggroTargetInternal(follower);
-				const bool currentInvalid = !currentTarget || !IsThresholdCombatTargetValid(currentTarget) || currentTarget == Player();
-				const bool currentNotEnemy = currentTarget && (IsObserverAlly(currentTarget) || !IsStandingEnemyThresholdActor(currentTarget));
-				const bool needsReplacement = desiredTarget && (currentInvalid || currentNotEnemy || currentTarget != desiredTarget);
-				if (!needsReplacement) {
-					continue;
-				}
-				if (desiredTarget == follower || desiredTarget == currentTarget || !IsThresholdCombatTargetValid(desiredTarget)) {
-					continue;
-				}
-
-				ForceObservedCombatCommit(follower, desiredTarget, true);
-				spdlog::info("[TFD][Defeat] bleed follower retaliate ally={:08X} target={:08X} old={:08X}",
-					follower->GetFormID(),
-					desiredTarget->GetFormID(),
-					currentTarget ? currentTarget->GetFormID() : 0u);
-			}
-		}
-
 		static bool StartBleedBattleObservePending(RE::Actor* player)
 		{
 			if (!player) {
@@ -3002,8 +2677,6 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObserveActive = false;
 			g_bleedBattleObserveSince = {};
 			g_bleedBattleObserveLastRedirect = {};
-			g_bleedBattleObserveQuietUntil = {};
-			g_bleedBattleObserveLastScanLog = {};
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy = {};
 			g_bleedBattleObserver = {};
@@ -3037,9 +2710,8 @@ namespace TFD::DefeatMonitor
 				immediateResolvedEnemies.size(),
 				immediatePreferredEnemy ? immediatePreferredEnemy->GetFormID() : 0u);
 			if (!immediateFollowers.empty() && !immediateResolvedEnemies.empty()) {
-				g_bleedBattleObservePending = false;
-				spdlog::info("[TFD][Defeat] bleed observe pending escalated immediately -> active");
-				return StartBleedBattleObserve(player, immediatePreferredEnemy);
+				spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=vanilla_ai_passthrough");
+				g_bleedBattleObservePendingLastRedirect = Now();
 			}
 
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
@@ -3094,13 +2766,10 @@ namespace TFD::DefeatMonitor
 				preferredEnemy ? preferredEnemy->GetFormID() : 0u);
 
 			const auto now = Now();
+
 			if (!rosterEnemies.empty()) {
-				g_bleedBattleObservePending = false;
 				g_bleedBattleObservePendingEmptyEnemyTicks = 0;
-				spdlog::info("[TFD][Defeat] bleed observe pending escalated -> active followers={} enemies={}",
-					followers.size(),
-					rosterEnemies.size());
-				StartBleedBattleObserve(player, preferredEnemy);
+				g_bleedBattleObservePendingUntil = now + std::chrono::milliseconds(750);
 				return;
 			}
 
@@ -3161,11 +2830,8 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObservePending = false;
 			g_bleedBattleObservePendingEmptyEnemyTicks = 0;
 			g_bleedBattleObserveActive = true;
-			auto activeNow = Now();
-			g_bleedBattleObserveSince = activeNow;
-			g_bleedBattleObserveLastRedirect = activeNow;
-			g_bleedBattleObserveQuietUntil = activeNow + std::chrono::milliseconds(1500);
-			g_bleedBattleObserveLastScanLog = {};
+			g_bleedBattleObserveSince = Now();
+			g_bleedBattleObserveLastRedirect = {};
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy = preferredEnemy ? preferredEnemy->GetHandle() : RE::ActorHandle{};
 
@@ -3174,10 +2840,6 @@ namespace TFD::DefeatMonitor
 			SetPlayerBleedImmune(true);
 			ClampHealth(player, g_minHp);
 			player->NotifyAnimationGraph("BleedoutStart");
-
-			auto activeFollowers = CollectBleedStandingFollowersFromSnapshot();
-			auto activeEnemies = CollectBleedStandingEnemiesFromSnapshot();
-			RebuildObservedCombatLocks(player, activeFollowers, activeEnemies, "start_active");
 
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 			char msg[96]{};
@@ -3257,22 +2919,14 @@ namespace TFD::DefeatMonitor
 
 			auto followers = CollectBleedStandingFollowersFromSnapshot();
 			auto enemies = CollectBleedStandingEnemiesFromSnapshot();
-			const auto now = Now();
-			if (g_bleedBattleObserveLastScanLog.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastScanLog) >= std::chrono::milliseconds(1000)) {
-				g_bleedBattleObserveLastScanLog = now;
-				spdlog::info("[TFD][Defeat] bleed observe active scan followers={} enemies={} quiet={} allyThresh={:.1f} enemyThresh={:.1f}",
-					followers.size(),
-					enemies.size(),
-					IsObservedCombatQuietWindowActive(now) ? 1 : 0,
-					TFD::Settings::GetAllyDownedThresholdPct(),
-					TFD::Settings::GetEnemyDownedThresholdPct());
-			}
+			spdlog::info("[TFD][Defeat] bleed observe active scan followers={} enemies={} allyThresh={:.1f} enemyThresh={:.1f}",
+				followers.size(),
+				enemies.size(),
+				TFD::Settings::GetAllyDownedThresholdPct(),
+				TFD::Settings::GetEnemyDownedThresholdPct());
 
-			if (!IsObservedCombatQuietWindowActive(now) &&
-				(g_bleedBattleObserveLastRedirect.time_since_epoch().count() == 0 || (now - g_bleedBattleObserveLastRedirect) >= std::chrono::milliseconds(1000))) {
-				g_bleedBattleObserveLastRedirect = now;
-				MaintainObservedCombatLocks(player, followers, enemies);
-			}
+			const auto now = Now();
+			(void)now;
 
 			if (followers.empty()) {
 				EnterObservedLeftForDead("battle_observe_loss");
@@ -4648,10 +4302,9 @@ namespace TFD::DefeatMonitor
 
 			SetPlayerBleedImmune(true);
 
-			const float protectedHp = (std::max)(entry.protectedHealth, entry.minHp);
-			if (entry.minHp > 0.0f) {
-				ClampHealth(actor, entry.minHp);
-			}
+			const float hardFloorHp = (std::max)(1.0f, entry.minHp);
+			const float protectedHp = (std::max)(entry.protectedHealth, hardFloorHp);
+			ClampHealth(actor, hardFloorHp);
 
 			float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
 			if (hpNow + 0.001f < protectedHp) {
@@ -6308,11 +5961,6 @@ namespace TFD::DefeatMonitor
 	bool IsObservedCombatCommitInProgress()
 	{
 		return g_observedCombatCommitDepth > 0;
-	}
-
-	bool IsDefeatCombatOverrideParticipant(RE::Actor* actor)
-	{
-		return IsDefeatCombatOverrideParticipantInternal(actor);
 	}
 
 	bool IsThresholdDownedActor(RE::Actor* actor)

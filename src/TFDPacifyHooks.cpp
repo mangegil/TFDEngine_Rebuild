@@ -59,6 +59,7 @@ namespace TFD::PacifyHooks
                 if (!actor) {
                     return;
                 }
+
                 if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
                     return;
                 }
@@ -144,17 +145,12 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
-                    _UpdateCombat(actor);
-                    return;
-                }
-
                 if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
                     _UpdateCombat(actor);
                     return;
                 }
 
-                if (TFD::DefeatMonitor::IsDefeatCombatOverrideParticipant(actor)) {
+                if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
                     _UpdateCombat(actor);
                     return;
                 }
@@ -185,6 +181,10 @@ namespace TFD::PacifyHooks
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (viewer && target && player && target == player) {
                     TFD::DefeatMonitor::NoteEnemyTargetingPlayer(viewer);
+                }
+
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                    return _DoDetect(viewer, target, detectVal, unk04, unk05, unk06, pos, unk08, unk09, unk10);
                 }
 
                 if (target && !TFD::DefeatMonitor::IsThresholdCombatTargetValid(target)) {
