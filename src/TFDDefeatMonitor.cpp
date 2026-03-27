@@ -132,7 +132,22 @@ namespace TFD::DefeatMonitor
 		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		RE::ActorHandle g_bleedBattlePreferredEnemy{};
 		BleedBattleObserverState g_bleedBattleObserver{};
-		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_bleedFollowerRetaliateCooldown{};
+		thread_local std::uint32_t g_observedCombatCommitDepth = 0;
+
+		struct ObservedCombatCommitScope
+		{
+			ObservedCombatCommitScope()
+			{
+				++g_observedCombatCommitDepth;
+			}
+
+			~ObservedCombatCommitScope()
+			{
+				if (g_observedCombatCommitDepth > 0) {
+					--g_observedCombatCommitDepth;
+				}
+			}
+		};
 
 		enum class BleedLockKind : std::uint8_t
 		{
@@ -1150,7 +1165,6 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy.reset();
 			g_bleedBattleObserver = {};
-			g_bleedFollowerRetaliateCooldown.clear();
 			ClearLastEnemyTargetingPlayerInternal();
 		}
 
@@ -2562,20 +2576,39 @@ namespace TFD::DefeatMonitor
 
 		static void ForceObservedCombatCommit(RE::Actor* actor, RE::Actor* target, bool drawWeapon)
 		{
-			(void)drawWeapon;
 			if (!actor || !target) {
 				return;
 			}
 
+			ObservedCombatCommitScope commitScope{};
+			auto* player = Player();
 			actor->GetActorRuntimeData().currentCombatTarget = target->GetHandle();
 			if (!actor->IsAIEnabled()) {
 				actor->EnableAI(true);
+			}
+			if (drawWeapon && !actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(true);
+			}
+			actor->SetBeenAttacked(true);
+			target->SetBeenAttacked(true);
+			actor->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
+			target->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+			if (player) {
+				player->SetBeenAttacked(true);
+				actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+				player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+				player->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
+				target->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
 			}
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				process->ClearCachedFactionFightReactions();
 			}
 			actor->EvaluatePackage(false, true);
 			actor->EvaluatePackage(true, true);
+			target->EvaluatePackage(false, true);
+			target->EvaluatePackage(true, true);
+			actor->UpdateCombat();
+			target->UpdateCombat();
 		}
 
 		static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
@@ -2607,6 +2640,12 @@ namespace TFD::DefeatMonitor
 				}
 
 				if (currentTarget && !IsThresholdCombatTargetValid(currentTarget)) {
+					if (IsPlayerBleedHoldTargetBlocked()) {
+						spdlog::info("[TFD][Defeat] bleed preserve invalid enemy target actor={:08X} target={:08X} reason=await redirect",
+							enemy->GetFormID(),
+							currentTarget ? currentTarget->GetFormID() : 0u);
+						continue;
+					}
 					enemy->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
 					if (auto* process = RE::ProcessLists::GetSingleton()) {
 						process->ClearCachedFactionFightReactions();
@@ -2628,7 +2667,6 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			const auto now = Now();
 			for (auto* follower : followers) {
 				if (!follower || !IsStandingAllyThresholdActor(follower)) {
 					continue;
@@ -2649,13 +2687,7 @@ namespace TFD::DefeatMonitor
 					continue;
 				}
 
-				auto& nextAttempt = g_bleedFollowerRetaliateCooldown[follower->GetFormID()];
-				if (nextAttempt.time_since_epoch().count() != 0 && now < nextAttempt) {
-					continue;
-				}
-				nextAttempt = now + std::chrono::milliseconds(1000);
-
-				ForceObservedCombatCommit(follower, desiredTarget, false);
+				ForceObservedCombatCommit(follower, desiredTarget, true);
 				spdlog::info("[TFD][Defeat] bleed follower retaliate ally={:08X} target={:08X} old={:08X}",
 					follower->GetFormID(),
 					desiredTarget->GetFormID(),
@@ -2669,11 +2701,17 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=begin");
 			ClearBleedoutBridgeAliases(nullptr, "start_bleed_observe_pending");
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_clear_bridge");
 			ClearNoMarkerFallbackState();
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_clear_nomarker");
 			ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic);
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_release_truce");
 			ReleaseBleedNoSpeakerTameSession("start_bleed_observe_pending");
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_release_tame");
 			ClearBleedSupportBridgeAliases("start_bleed_observe_pending");
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_clear_support");
 
 			g_inBleedState.store(true, std::memory_order_release);
 			g_bleedSawDialogue = false;
@@ -2696,7 +2734,6 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy = {};
 			g_bleedBattleObserver = {};
-			g_bleedFollowerRetaliateCooldown.clear();
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
 			g_minHp = (std::max)(1.0f, maxHp * 0.02f);
@@ -2721,6 +2758,19 @@ namespace TFD::DefeatMonitor
 			UpdateBleedBattleObserverRoster(player, immediateFollowers, immediateEnemies, immediatePreferredEnemy);
 			auto immediateRosterEnemies = CollectBleedStandingEnemiesFromSnapshot();
 			auto immediateResolvedEnemies = immediateRosterEnemies.empty() ? immediateEnemies : immediateRosterEnemies;
+			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_snapshot followers={} enemies={} rosterEnemies={} preferred={:08X}",
+				immediateFollowers.size(),
+				immediateEnemies.size(),
+				immediateResolvedEnemies.size(),
+				immediatePreferredEnemy ? immediatePreferredEnemy->GetFormID() : 0u);
+			if (!immediateFollowers.empty() && !immediateResolvedEnemies.empty()) {
+				spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=before_immediate_redirect");
+				RedirectBleedObserverAggro(player, immediateFollowers, immediateResolvedEnemies);
+				spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_immediate_redirect");
+				MaintainBleedObserverFollowerAggro(player, immediateFollowers, immediateResolvedEnemies);
+				spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_immediate_followers");
+				g_bleedBattleObservePendingLastRedirect = Now();
+			}
 
 			const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
 			char msg[96]{};
@@ -5323,7 +5373,6 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObserveLastRedirect = {};
 			g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
 			g_bleedBattlePreferredEnemy.reset();
-			g_bleedFollowerRetaliateCooldown.clear();
 
 			const float maxHp = player->GetPermanentActorValue(RE::ActorValue::kHealth);
 			const float minHp = (std::max)(1.0f, maxHp * 0.02f);
@@ -5976,6 +6025,11 @@ namespace TFD::DefeatMonitor
 	{
 		return g_inBleedState.load(std::memory_order_acquire) &&
 			(g_bleedBattleObservePending || g_bleedBattleObserveActive);
+	}
+
+	bool IsObservedCombatCommitInProgress()
+	{
+		return g_observedCombatCommitDepth > 0;
 	}
 
 	bool IsThresholdDownedActor(RE::Actor* actor)

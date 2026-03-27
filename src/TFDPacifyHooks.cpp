@@ -70,22 +70,44 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                auto* replacement = TFD::DefeatMonitor::ResolveBleedRedirectTarget(actor);
+                RE::Actor* replacement = nullptr;
+                if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+                    replacement = TFD::DefeatMonitor::ResolveBleedFollowerAggroTarget(actor);
+                }
+                if (!replacement) {
+                    replacement = TFD::DefeatMonitor::ResolveBleedRedirectTarget(actor);
+                }
                 if (replacement && replacement != actor && replacement != target && !IsInvalidCombatTarget(replacement)) {
                     actor->GetActorRuntimeData().currentCombatTarget = replacement->GetHandle();
                     if (!actor->IsAIEnabled()) {
                         actor->EnableAI(true);
                     }
+                    if ((actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) && !actor->IsWeaponDrawn()) {
+                        actor->DrawWeaponMagicHands(true);
+                    }
+                    actor->SetBeenAttacked(true);
+                    replacement->SetBeenAttacked(true);
+                    actor->RequestDetectionLevel(replacement, RE::DETECTION_PRIORITY::kCritical);
+                    replacement->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         process->ClearCachedFactionFightReactions();
                     }
                     actor->EvaluatePackage(false, true);
                     actor->EvaluatePackage(true, true);
+                    replacement->EvaluatePackage(false, true);
+                    replacement->EvaluatePackage(true, true);
 
                     spdlog::info("[TFD][PacifyHooks] swapped invalid combat target actor={:08X} old={:08X} new={:08X}",
                         actor->GetFormID(),
                         target ? target->GetFormID() : 0u,
                         replacement->GetFormID());
+                    return;
+                }
+
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                    spdlog::info("[TFD][PacifyHooks] preserved invalid combat target actor={:08X} target={:08X} reason=bleed observe wait redirect",
+                        actor->GetFormID(),
+                        target ? target->GetFormID() : 0u);
                     return;
                 }
 
@@ -119,44 +141,14 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                const bool protectTeammate = actor &&
-                    TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() &&
-                    (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor));
-
-                if (!protectTeammate) {
-                    ClearInvalidCombatTarget(actor);
+                if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
                     _UpdateCombat(actor);
-                    ClearInvalidCombatTarget(actor);
                     return;
                 }
 
+                ClearInvalidCombatTarget(actor);
                 _UpdateCombat(actor);
-
-                auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
-                auto* target = targetSp.get();
-                if (target && !IsInvalidCombatTarget(target)) {
-                    return;
-                }
-
-                auto* replacement = TFD::DefeatMonitor::ResolveBleedFollowerAggroTarget(actor);
-                if (!replacement || replacement == actor || replacement == target || IsInvalidCombatTarget(replacement)) {
-                    return;
-                }
-
-                actor->GetActorRuntimeData().currentCombatTarget = replacement->GetHandle();
-                if (!actor->IsAIEnabled()) {
-                    actor->EnableAI(true);
-                }
-                if (auto* process = RE::ProcessLists::GetSingleton()) {
-                    process->ClearCachedFactionFightReactions();
-                }
-                actor->EvaluatePackage(false, true);
-                actor->EvaluatePackage(true, true);
-
-                spdlog::info("[TFD][PacifyHooks] preserved teammate combat target actor={:08X} old={:08X} new={:08X}",
-                    actor->GetFormID(),
-                    target ? target->GetFormID() : 0u,
-                    replacement->GetFormID());
+                ClearInvalidCombatTarget(actor);
             }
 
             static std::uint8_t* DoDetect(
