@@ -34,7 +34,8 @@ namespace TFD::DefeatMonitor
 	bool IsPlayerBleedHoldTargetBlocked();
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
-		RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
+	void NoteEnemyTargetingPlayer(RE::Actor* actor);
+	RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
 	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);
 
 	bool IsDefeatedEnemyKnocked(RE::Actor* actor);

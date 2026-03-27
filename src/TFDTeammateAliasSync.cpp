@@ -28,6 +28,9 @@ namespace TFD::TeammateAliasSync
             bool resolved{ false };
             RE::TESQuest* quest{ nullptr };
             std::array<RE::BGSRefAlias*, 10> teammateAliases{};
+            RE::TESFaction* teammateFaction{ nullptr };
+            RE::TESFaction* currentFollowerFaction{ nullptr };
+            RE::TESFaction* playerFollowerFaction{ nullptr };
         };
 
         RegistryCache g_registry{};
@@ -72,19 +75,72 @@ namespace TFD::TeammateAliasSync
                 }
             }
 
+            g_registry.teammateFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTeammateFaction");
+            g_registry.currentFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("CurrentFollowerFaction");
+            g_registry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
+            if (!g_registry.teammateFaction) {
+                spdlog::warn("[TFD][TeammateAlias] faction TFDTeammateFaction not found");
+            }
+
             std::size_t found = 0;
             for (auto* alias : g_registry.teammateAliases) {
                 if (alias) {
                     ++found;
                 }
             }
-            spdlog::info("[TFD][TeammateAlias] registry resolved quest={:08X} aliases={}",
-                g_registry.quest ? g_registry.quest->GetFormID() : 0u, found);
+            spdlog::info("[TFD][TeammateAlias] registry resolved quest={:08X} aliases={} faction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X}",
+                g_registry.quest ? g_registry.quest->GetFormID() : 0u,
+                found,
+                g_registry.teammateFaction ? g_registry.teammateFaction->GetFormID() : 0u,
+                g_registry.currentFollowerFaction ? g_registry.currentFollowerFaction->GetFormID() : 0u,
+                g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u);
         }
 
         static bool IsValidTeammate(RE::Actor* actor)
         {
-            return actor && actor != Player() && !actor->IsDisabled() && !actor->IsDead() && actor->IsPlayerTeammate();
+            ResolveRegistry();
+            if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead()) {
+                return false;
+            }
+            if (actor->IsPlayerTeammate()) {
+                return true;
+            }
+            if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
+                return true;
+            }
+            if (g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction)) {
+                return true;
+            }
+            if (g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction)) {
+                return true;
+            }
+            return false;
+        }
+
+        static void SyncTeammateFaction(RE::Actor* actor, bool shouldHaveFaction)
+        {
+            if (!actor || !g_registry.teammateFaction) {
+                return;
+            }
+
+            const bool hasFaction = actor->IsInFaction(g_registry.teammateFaction);
+            if (shouldHaveFaction) {
+                if (!hasFaction) {
+                    actor->AddToFaction(g_registry.teammateFaction, 0);
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
+                    spdlog::info("[TFD][TeammateAlias] add faction actor={:08X} faction={:08X}",
+                        actor->GetFormID(),
+                        g_registry.teammateFaction->GetFormID());
+                }
+            } else if (hasFaction) {
+                actor->RemoveFromFaction(g_registry.teammateFaction);
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                spdlog::info("[TFD][TeammateAlias] remove faction actor={:08X} faction={:08X}",
+                    actor->GetFormID(),
+                    g_registry.teammateFaction->GetFormID());
+            }
         }
 
         static void WriteAlias(RE::BGSRefAlias* alias, RE::Actor* actor)
@@ -120,7 +176,7 @@ namespace TFD::TeammateAliasSync
             }
 
             const float useRadius = (std::max)(radius, 6000.0f);
-            TFD::ActorScan::Rescan(useRadius, true);
+            TFD::ActorScan::Rescan(useRadius, false);
             const auto count = TFD::ActorScan::GetCount();
             std::unordered_set<RE::FormID> seen;
             out.reserve(8);
@@ -180,9 +236,12 @@ namespace TFD::TeammateAliasSync
                 if (!IsValidTeammate(current)) {
                     spdlog::info("[TFD][TeammateAlias] clear alias='{}' actor={:08X} reason=invalid",
                         alias->aliasName.c_str(), current->GetFormID());
+                    SyncTeammateFaction(current, false);
                     WriteAlias(alias, nullptr);
                     continue;
                 }
+
+                SyncTeammateFaction(current, true);
 
                 // Keep already-registered valid teammates sticky even if the current scan
                 // temporarily misses them. This avoids clear/fill churn for freshly promoted
@@ -204,6 +263,7 @@ namespace TFD::TeammateAliasSync
                 auto* actor = remaining.front();
                 remaining.erase(remaining.begin());
                 WriteAlias(alias, actor);
+                SyncTeammateFaction(actor, true);
                 spdlog::info("[TFD][TeammateAlias] fill alias='{}' actor={:08X} name='{}'",
                     alias->aliasName.c_str(), actor ? actor->GetFormID() : 0u,
                     actor && actor->GetName() ? actor->GetName() : "");
