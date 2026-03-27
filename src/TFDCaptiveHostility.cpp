@@ -9,6 +9,7 @@
 #include "TFDSettings.h"
 #include "TFDFactionMask.h"
 #include "TFDActorScan.h"
+#include "TFDDefeatMonitor.h"
 
 namespace TFD::CaptiveHostility
 {
@@ -160,6 +161,11 @@ namespace TFD::CaptiveHostility
 
         // kalau mod dimatiin: pastiin clean
         if (!TFD::Settings::GetEnabled()) {
+            RestoreAll();
+            return;
+        }
+
+        if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
             RestoreAll();
             return;
         }

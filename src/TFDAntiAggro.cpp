@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDActorScan.h"
+#include "TFDDefeatMonitor.h"
 
 namespace TFD::AntiAggro
 {
@@ -19,6 +20,10 @@ namespace TFD::AntiAggro
 
 	void SweepOnce(float radius, bool npcOnly)
 	{
+		if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+			return;
+		}
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) {
 			return;

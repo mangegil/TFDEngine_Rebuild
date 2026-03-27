@@ -33,6 +33,7 @@ namespace TFD::DefeatMonitor
 	bool IsLeftForDeadRecoveryActive();
 	bool IsPlayerBleedHoldTargetBlocked();
 	bool IsObservedCombatCommitInProgress();
+bool IsDefeatCombatOverrideParticipant(RE::Actor* actor);
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
 	void NoteEnemyTargetingPlayer(RE::Actor* actor);

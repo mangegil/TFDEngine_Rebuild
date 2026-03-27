@@ -59,6 +59,9 @@ namespace TFD::PacifyHooks
                 if (!actor) {
                     return;
                 }
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                    return;
+                }
 
                 auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
                 auto* target = targetSp.get();
@@ -142,6 +145,16 @@ namespace TFD::PacifyHooks
                 }
 
                 if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
+                    _UpdateCombat(actor);
+                    return;
+                }
+
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                    _UpdateCombat(actor);
+                    return;
+                }
+
+                if (TFD::DefeatMonitor::IsDefeatCombatOverrideParticipant(actor)) {
                     _UpdateCombat(actor);
                     return;
                 }
