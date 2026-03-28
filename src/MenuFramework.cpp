@@ -88,6 +88,13 @@ namespace TFDMenu
 		static bool gCaptureHotkey = false;
 		static Clock::time_point nextHotkey{};
 
+		static std::vector<TFD::Pacify::ActiveTameSnapshot> gCreatureTeammateMenuRows{};
+		static double gCreatureTeammateMenuRefreshRealSec = 0.0;
+		static double gCreatureTeammateMenuRefreshGameDays = 0.0;
+		static double gCreatureTeammateMenuLastRenderSec = -1000.0;
+		static RE::FormID gCreatureTeammateFeedSessionId = 0;
+		static RE::FormID gCreatureTeammateReleaseConfirmSessionId = 0;
+
 		static RE::TESGlobal* gCaptiveState = nullptr;
 		static RE::TESGlobal* gCaptivePhase = nullptr;
 		static RE::TESGlobal* gPreCombatState = nullptr;
@@ -130,6 +137,87 @@ namespace TFDMenu
 		static const char* SafeStr(const char* s)
 		{
 			return (s && s[0]) ? s : "";
+		}
+
+		static double CurrentGameDays()
+		{
+			auto* calendar = RE::Calendar::GetSingleton();
+			return calendar ? static_cast<double>(calendar->rawDaysPassed) : 0.0;
+		}
+
+		static void RefreshCreatureTeammateMenuRows(bool resetInlineState)
+		{
+			const double now = NowSec();
+			TFD::Pacify::Update(now);
+			gCreatureTeammateMenuRows = TFD::Pacify::GetActiveTameSnapshots(now);
+			gCreatureTeammateMenuRefreshRealSec = now;
+			gCreatureTeammateMenuRefreshGameDays = CurrentGameDays();
+			if (resetInlineState) {
+				gCreatureTeammateFeedSessionId = 0;
+				gCreatureTeammateReleaseConfirmSessionId = 0;
+				return;
+			}
+
+			auto keepSession = [](RE::FormID sessionId) {
+				return sessionId != 0 && std::any_of(
+					gCreatureTeammateMenuRows.begin(),
+					gCreatureTeammateMenuRows.end(),
+					[&](const TFD::Pacify::ActiveTameSnapshot& snap) { return snap.sessionId == sessionId; });
+			};
+			if (!keepSession(gCreatureTeammateFeedSessionId)) {
+				gCreatureTeammateFeedSessionId = 0;
+			}
+			if (!keepSession(gCreatureTeammateReleaseConfirmSessionId)) {
+				gCreatureTeammateReleaseConfirmSessionId = 0;
+			}
+		}
+
+		static double GetDisplayRemainingTameSec(const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			const double elapsed = NowSec() - gCreatureTeammateMenuRefreshRealSec;
+			return (std::max)(0.0, snap.remainingTameSec - elapsed);
+		}
+
+		static double GetDisplayRemainingCompanionHours(const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			const double elapsedHours = (CurrentGameDays() - gCreatureTeammateMenuRefreshGameDays) * 24.0;
+			return (std::max)(0.0, snap.remainingCompanionHours - elapsedHours);
+		}
+
+		static std::string FormatCountdownClock(double totalSeconds)
+		{
+			const auto secs = static_cast<int>(std::floor((std::max)(0.0, totalSeconds) + 0.5));
+			const int hours = secs / 3600;
+			const int mins = (secs % 3600) / 60;
+			const int rem = secs % 60;
+			char buffer[64];
+			if (hours > 0) {
+				std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", hours, mins, rem);
+			} else {
+				std::snprintf(buffer, sizeof(buffer), "%02d:%02d", mins, rem);
+			}
+			return buffer;
+		}
+
+		static std::string FormatCreatureTimer(const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
+				return FormatCountdownClock(GetDisplayRemainingCompanionHours(snap) * 3600.0);
+			}
+
+			return FormatCountdownClock(GetDisplayRemainingTameSec(snap));
+		}
+
+		static const char* CreatureStateLabel(const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			switch (snap.disposition) {
+			case TFD::Pacify::TameDisposition::Companion:
+				return "Teammate";
+			case TFD::Pacify::TameDisposition::Calm:
+				return "Tame";
+			default:
+				return "Unknown";
+			}
 		}
 
 		static RE::BGSLocation* GetCellLocation(RE::TESObjectREFR* ref)
@@ -1288,6 +1376,89 @@ static float ScoreTruceCandidate(
 			RenderLocationBrief("  Loc", loc);
 		}
 
+		static void RenderInlineFeedChoices(RE::Actor* actor, const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			if (!actor) {
+				ImGuiMCP::Text("Feed unavailable: creature not loaded.");
+				return;
+			}
+
+			const bool downed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+			if (downed) {
+				ImGuiMCP::Text("This creature is downed. Feeding will revive and heal it.");
+			}
+
+			auto renderFeedGroup = [&](const char* title, TFD::Pacify::FeedAction action) {
+				auto options = TFD::Pacify::GetActiveTameFeedOptions(actor, action);
+				ImGuiMCP::Text("%s", title);
+				if (options.empty()) {
+					ImGuiMCP::Text("  No valid bait.");
+					return;
+				}
+				for (const auto& opt : options) {
+					char buttonLabel[256];
+					std::snprintf(buttonLabel, sizeof(buttonLabel), "%s##feed_%08X_%u_%08X", opt.label.c_str(), snap.actorId, snap.sessionId, opt.itemId);
+					if (ImGuiMCP::Button(buttonLabel)) {
+						if (TFD::Pacify::ApplyActiveTameFeed(actor, opt.itemId, action)) {
+							if (action == TFD::Pacify::FeedAction::Teammate) {
+								RE::DebugNotification("TFD: Teammate fed.");
+							} else {
+								RE::DebugNotification("TFD: Calm feed applied.");
+							}
+							gCreatureTeammateFeedSessionId = 0;
+							RefreshCreatureTeammateMenuRows(false);
+						} else {
+							RE::DebugNotification("TFD: Feed failed.");
+						}
+					}
+				}
+			};
+
+			ImGuiMCP::Indent();
+			if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
+				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
+			} else {
+				renderFeedGroup("Calm Feed", TFD::Pacify::FeedAction::Calm);
+				ImGuiMCP::Separator();
+				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
+			}
+			if (ImGuiMCP::Button((std::string("Close Feed##") + std::to_string(snap.sessionId)).c_str())) {
+				gCreatureTeammateFeedSessionId = 0;
+			}
+			ImGuiMCP::Unindent();
+		}
+
+		static void RenderInlineReleaseConfirm(RE::Actor* actor, const TFD::Pacify::ActiveTameSnapshot& snap)
+		{
+			ImGuiMCP::Indent();
+			ImGuiMCP::Text("Release this creature?");
+			char confirmLabel[64];
+			char cancelLabel[64];
+			std::snprintf(confirmLabel, sizeof(confirmLabel), "Confirm Release##%u", snap.sessionId);
+			std::snprintf(cancelLabel, sizeof(cancelLabel), "Cancel##%u", snap.sessionId);
+			if (ImGuiMCP::Button(confirmLabel)) {
+				bool released = false;
+				if (actor) {
+					released = TFD::Pacify::ReleaseActiveTameActor(actor, TFD::Pacify::ReleaseReason::Generic);
+				} else {
+					TFD::Pacify::ReleaseSession(snap.sessionId, TFD::Pacify::ReleaseReason::Generic);
+					released = true;
+				}
+				if (released) {
+					RE::DebugNotification("TFD: Creature released.");
+					gCreatureTeammateReleaseConfirmSessionId = 0;
+					RefreshCreatureTeammateMenuRows(false);
+				} else {
+					RE::DebugNotification("TFD: Release failed.");
+				}
+			}
+			ImGuiMCP::SameLine();
+			if (ImGuiMCP::Button(cancelLabel)) {
+				gCreatureTeammateReleaseConfirmSessionId = 0;
+			}
+			ImGuiMCP::Unindent();
+		}
+
 		static void RenderCombatRulesPage()
 		{
 			ResolveGlobals();
@@ -1349,6 +1520,62 @@ static float ScoreTruceCandidate(
 				case CaptureResult::None:
 				default:
 					break;
+				}
+			}
+
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("Creature Teammates");
+
+			const double nowMenu = NowSec();
+			const bool creaturePanelJustOpened = (nowMenu - gCreatureTeammateMenuLastRenderSec) > 0.75;
+			gCreatureTeammateMenuLastRenderSec = nowMenu;
+			if (creaturePanelJustOpened) {
+				RefreshCreatureTeammateMenuRows(true);
+			}
+
+			if (gCreatureTeammateMenuRows.empty()) {
+				ImGuiMCP::Text("No active creature tame or teammate sessions.");
+			} else {
+				for (const auto& snap : gCreatureTeammateMenuRows) {
+					RE::Actor* actor = snap.loaded ? RE::TESForm::LookupByID<RE::Actor>(snap.actorId) : nullptr;
+					const bool actorDowned = actor && TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+					ImGuiMCP::Separator();
+					ImGuiMCP::Text("%s", snap.actorName.c_str());
+					if (actorDowned) {
+						ImGuiMCP::Text("State: Downed %s", CreatureStateLabel(snap));
+					} else {
+						ImGuiMCP::Text("State: %s", CreatureStateLabel(snap));
+					}
+					ImGuiMCP::Text("Remaining: %s", FormatCreatureTimer(snap).c_str());
+					ImGuiMCP::Text("Actor: 0x%08X | Session: %u%s", snap.actorId, snap.sessionId, snap.loaded ? "" : " | not loaded");
+					char feedLabel[64];
+					char releaseLabel[64];
+					const char* feedText = gCreatureTeammateFeedSessionId == snap.sessionId ? "Hide Feed" : (actorDowned ? "Feed / Revive" : "Feed");
+					std::snprintf(feedLabel, sizeof(feedLabel), "%s##%u", feedText, snap.sessionId);
+					std::snprintf(releaseLabel, sizeof(releaseLabel), "%s##%u", gCreatureTeammateReleaseConfirmSessionId == snap.sessionId ? "Cancel Release" : "Release", snap.sessionId);
+
+					ImGuiMCP::BeginDisabled(actor == nullptr);
+					if (ImGuiMCP::Button(feedLabel)) {
+						gCreatureTeammateFeedSessionId = (gCreatureTeammateFeedSessionId == snap.sessionId) ? 0 : snap.sessionId;
+						gCreatureTeammateReleaseConfirmSessionId = 0;
+					}
+					ImGuiMCP::EndDisabled();
+					ImGuiMCP::SameLine();
+					if (ImGuiMCP::Button(releaseLabel)) {
+						if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
+							gCreatureTeammateReleaseConfirmSessionId = 0;
+						} else {
+							gCreatureTeammateReleaseConfirmSessionId = snap.sessionId;
+							gCreatureTeammateFeedSessionId = 0;
+						}
+					}
+
+					if (gCreatureTeammateFeedSessionId == snap.sessionId) {
+						RenderInlineFeedChoices(actor, snap);
+					}
+					if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
+						RenderInlineReleaseConfirm(actor, snap);
+					}
 				}
 			}
 		}

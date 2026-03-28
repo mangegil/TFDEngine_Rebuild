@@ -4,6 +4,8 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace TFD::Pacify
 {
@@ -84,6 +86,35 @@ namespace TFD::Pacify
         bool finished{ false };
     };
 
+    struct ActiveTameSnapshot
+    {
+        RE::FormID actorId{ 0 };
+        RE::FormID sessionId{ 0 };
+        Mode mode{ Mode::None };
+        TameDisposition disposition{ TameDisposition::None };
+        double remainingTameSec{ 0.0 };
+        double remainingCompanionHours{ 0.0 };
+        bool loaded{ false };
+        std::string actorName{};
+    };
+
+    enum class FeedAction : std::uint8_t
+    {
+        Calm = 0,
+        Teammate
+    };
+
+    struct FeedOptionSnapshot
+    {
+        RE::FormID itemId{ 0 };
+        std::string label{};
+        std::string itemName{};
+        std::int32_t count{ 0 };
+        std::int32_t cost{ 0 };
+        double calmExtendSec{ 0.0 };
+        FeedAction action{ FeedAction::Calm };
+    };
+
     void Reset();
     void Update(double nowSec);
 
@@ -111,6 +142,9 @@ namespace TFD::Pacify
     bool CanOpenDialogue(RE::Actor* actor);
     bool CanStartTame(RE::Actor* actor);
     bool HasActiveTameSession(RE::Actor* actor);
+    std::vector<ActiveTameSnapshot> GetActiveTameSnapshots(double nowSec = 0.0);
+    std::vector<FeedOptionSnapshot> GetActiveTameFeedOptions(RE::Actor* actor, FeedAction action);
+    bool ApplyActiveTameFeed(RE::Actor* actor, RE::FormID itemId, FeedAction action);
     bool ExtendActiveTameSession(RE::Actor* actor, double addSec, double nowSec);
     double GetRemainingTameTime(RE::Actor* actor, double nowSec);
     TameDisposition GetDisposition(RE::Actor* actor);

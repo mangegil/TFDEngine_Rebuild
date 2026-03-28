@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cmath>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -99,6 +100,9 @@ namespace TFD::Pacify
         constexpr double kCompanionInitialHours = 3.0;
         constexpr double kCompanionExtendHours = 3.0;
         constexpr double kCompanionMaxHours = 9.0;
+        constexpr double kCompanionFeedHours = 3.0;
+        constexpr std::int32_t kCalmFeedCost = 1;
+        constexpr std::int32_t kCompanionFeedCost = 2;
 
         void SendModEvent(const char* eventName, RE::Actor* sender)
         {
@@ -2048,6 +2052,168 @@ namespace TFD::Pacify
         }
 
         return sessionIt->second.primaryMode == Mode::Tame;
+    }
+
+    std::vector<ActiveTameSnapshot> GetActiveTameSnapshots(double nowSec)
+    {
+        if (nowSec <= 0.0) {
+            nowSec = PacifyNowSec();
+        }
+
+        std::vector<ActiveTameSnapshot> result{};
+        result.reserve(g_sessions.size());
+
+        for (const auto& [sessionId, session] : g_sessions) {
+            if (session.finished || session.primaryMode != Mode::Tame || session.primaryTargetId == 0) {
+                continue;
+            }
+
+            ActiveTameSnapshot snap{};
+            snap.actorId = session.primaryTargetId;
+            snap.sessionId = sessionId;
+            snap.mode = session.primaryMode;
+            snap.disposition = session.disposition;
+            snap.remainingTameSec = session.disposition == TameDisposition::Companion || session.endTimeSec <= 0.0 ?
+                0.0 :
+                (std::max)(0.0, session.endTimeSec - nowSec);
+
+            if (session.disposition == TameDisposition::Companion && session.companionExpireGameDays > 0.0) {
+                const double remainingDays = session.companionExpireGameDays - CurrentGameDays();
+                snap.remainingCompanionHours = (std::max)(0.0, remainingDays * 24.0);
+            }
+
+            if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(snap.actorId)) {
+                snap.loaded = true;
+                if (const char* name = actor->GetName(); name && name[0]) {
+                    snap.actorName = name;
+                }
+            }
+
+            if (snap.actorName.empty()) {
+                char fallback[64];
+                std::snprintf(fallback, sizeof(fallback), "Creature 0x%08X", snap.actorId);
+                snap.actorName = fallback;
+            }
+
+            result.push_back(std::move(snap));
+        }
+
+        std::sort(result.begin(), result.end(), [](const ActiveTameSnapshot& a, const ActiveTameSnapshot& b) {
+            if (a.disposition != b.disposition) {
+                return static_cast<std::uint8_t>(a.disposition) > static_cast<std::uint8_t>(b.disposition);
+            }
+            if (a.actorName != b.actorName) {
+                return a.actorName < b.actorName;
+            }
+            return a.actorId < b.actorId;
+        });
+
+        return result;
+    }
+
+    std::vector<FeedOptionSnapshot> GetActiveTameFeedOptions(RE::Actor* actor, FeedAction action)
+    {
+        std::vector<FeedOptionSnapshot> result{};
+        if (!actor || !HasActiveTameSession(actor)) {
+            return result;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return result;
+        }
+
+        const bool downed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+        const auto options = TFD::TameBait::CollectValidBaits(player, actor);
+        const std::int32_t cost = action == FeedAction::Teammate ? kCompanionFeedCost : kCalmFeedCost;
+        result.reserve(options.size());
+
+        for (const auto& opt : options) {
+            if (!opt.item || opt.count < cost) {
+                continue;
+            }
+
+            FeedOptionSnapshot bait{};
+            bait.itemId = opt.item->GetFormID();
+            bait.itemName = opt.name;
+            bait.count = opt.count;
+            bait.cost = cost;
+            bait.calmExtendSec = opt.extendSec;
+            bait.action = action;
+
+            char buffer[224];
+            if (action == FeedAction::Teammate) {
+                if (downed) {
+                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
+                } else {
+                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
+                }
+            } else {
+                if (downed) {
+                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
+                } else {
+                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
+                }
+            }
+            bait.label = buffer;
+            result.push_back(std::move(bait));
+        }
+
+        return result;
+    }
+
+    bool ApplyActiveTameFeed(RE::Actor* actor, RE::FormID itemId, FeedAction action)
+    {
+        if (!actor || itemId == 0 || !HasActiveTameSession(actor)) {
+            return false;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return false;
+        }
+
+        const bool reviveAfterFeed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+        const auto options = GetActiveTameFeedOptions(actor, action);
+        const auto it = std::find_if(options.begin(), options.end(), [&](const FeedOptionSnapshot& opt) {
+            return opt.itemId == itemId;
+        });
+        if (it == options.end()) {
+            return false;
+        }
+
+        auto* item = RE::TESForm::LookupByID<RE::TESBoundObject>(itemId);
+        if (!item) {
+            return false;
+        }
+
+        bool ok = false;
+        if (action == FeedAction::Teammate) {
+            if (IsCompanion(actor)) {
+                ok = ExtendActiveCompanionHours(actor, kCompanionFeedHours);
+            } else {
+                ok = PromoteActiveTameToCompanion(actor, kCompanionFeedHours);
+            }
+        } else {
+            ok = ExtendActiveTameSession(actor, it->calmExtendSec, 0.0);
+        }
+
+        if (!ok) {
+            return false;
+        }
+
+        if (!TFD::TameBait::ConsumeBait(player, item, it->cost)) {
+            return false;
+        }
+
+        if (reviveAfterFeed) {
+            const float reviveHealPct = action == FeedAction::Teammate ? 60.0f : 45.0f;
+            if (!TFD::DefeatMonitor::ReviveDownedAlly(actor, reviveHealPct)) {
+                spdlog::warn("TFDPacify: feed revive failed actor={:08X} action={}", actor->GetFormID(), action == FeedAction::Teammate ? "teammate" : "calm");
+            }
+        }
+
+        return true;
     }
 
     bool ExtendActiveTameSession(RE::Actor* actor, double addSec, double nowSec)

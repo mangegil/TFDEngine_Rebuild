@@ -83,6 +83,8 @@ namespace TFD::DefeatMonitor
 		bool g_playerBleedImmuneForced = false;
 		bool g_playerWasEssential = false;
 		bool g_playerWasInvulnerable = false;
+		bool g_playerWasNoBleedoutRecovery = false;
+		bool g_playerWasBaseInvulnerable = false;
 
 		std::chrono::steady_clock::time_point g_bleedStart{};
 		int g_bleedLastSeconds = -1;
@@ -276,19 +278,30 @@ namespace TFD::DefeatMonitor
 			}
 
 			auto& boolFlags = player->GetActorRuntimeData().boolFlags;
+			auto* actorBase = player->GetActorBase();
+			auto* baseData = actorBase ? static_cast<RE::TESActorBaseData*>(actorBase) : nullptr;
 			if (enable) {
 				if (!g_playerBleedImmuneForced) {
 					g_playerWasEssential = boolFlags.all(RE::Actor::BOOL_FLAGS::kEssential);
 					g_playerWasInvulnerable = boolFlags.all(RE::Actor::BOOL_FLAGS::kProtected);
+					g_playerWasNoBleedoutRecovery = boolFlags.all(RE::Actor::BOOL_FLAGS::kNoBleedoutRecovery);
+					g_playerWasBaseInvulnerable = baseData && baseData->actorData.actorBaseFlags.all(RE::ACTOR_BASE_DATA::Flag::kInvulnerable);
 					g_playerBleedImmuneForced = true;
-					spdlog::info("[TFD][Defeat] player bleed hard-invuln enabled essentialWas={} protectedWas={}",
+					spdlog::info("[TFD][Defeat] player bleed hard-invuln enabled essentialWas={} protectedWas={} noBleedoutWas={} baseInvulnWas={}",
 						g_playerWasEssential ? 1 : 0,
-						g_playerWasInvulnerable ? 1 : 0);
+						g_playerWasInvulnerable ? 1 : 0,
+						g_playerWasNoBleedoutRecovery ? 1 : 0,
+						g_playerWasBaseInvulnerable ? 1 : 0);
 				}
 
 				boolFlags.set(RE::Actor::BOOL_FLAGS::kEssential);
 				boolFlags.set(RE::Actor::BOOL_FLAGS::kProtected);
 				boolFlags.set(RE::Actor::BOOL_FLAGS::kCanSpeakToEssentialDown);
+				boolFlags.set(RE::Actor::BOOL_FLAGS::kNoBleedoutRecovery);
+				boolFlags.reset(RE::Actor::BOOL_FLAGS::kIsInKillMove);
+				if (baseData) {
+					baseData->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kInvulnerable);
+				}
 				return;
 			}
 
@@ -302,10 +315,19 @@ namespace TFD::DefeatMonitor
 			if (!g_playerWasInvulnerable) {
 				boolFlags.reset(RE::Actor::BOOL_FLAGS::kProtected);
 			}
+			if (!g_playerWasNoBleedoutRecovery) {
+				boolFlags.reset(RE::Actor::BOOL_FLAGS::kNoBleedoutRecovery);
+			}
 			boolFlags.reset(RE::Actor::BOOL_FLAGS::kCanSpeakToEssentialDown);
+			boolFlags.reset(RE::Actor::BOOL_FLAGS::kIsInKillMove);
+			if (baseData && !g_playerWasBaseInvulnerable) {
+				baseData->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kInvulnerable);
+			}
 			g_playerBleedImmuneForced = false;
 			g_playerWasEssential = false;
 			g_playerWasInvulnerable = false;
+			g_playerWasNoBleedoutRecovery = false;
+			g_playerWasBaseInvulnerable = false;
 			spdlog::info("[TFD][Defeat] player bleed hard-invuln released");
 		}
 
@@ -4294,25 +4316,71 @@ namespace TFD::DefeatMonitor
 			return hpMax * std::clamp(pct / 100.0f, 0.0f, 1.0f);
 		}
 
-		static void EnforcePlayerBleedInvulnerability(RE::Actor* actor, BleedLockEntry& entry)
+		static void ForcePlayerBleedAlive(RE::Actor* actor, BleedLockEntry& entry, const char* reason)
 		{
 			if (!actor) {
 				return;
 			}
 
 			SetPlayerBleedImmune(true);
+			auto& boolFlags = actor->GetActorRuntimeData().boolFlags;
+			const bool wasDead = actor->IsDead(false);
+			const bool wasKillMove = boolFlags.all(RE::Actor::BOOL_FLAGS::kIsInKillMove);
+
+			if (wasDead) {
+				actor->Resurrect(false, true);
+			}
+
+			boolFlags.set(RE::Actor::BOOL_FLAGS::kEssential);
+			boolFlags.set(RE::Actor::BOOL_FLAGS::kProtected);
+			boolFlags.set(RE::Actor::BOOL_FLAGS::kCanSpeakToEssentialDown);
+			boolFlags.set(RE::Actor::BOOL_FLAGS::kNoBleedoutRecovery);
+			boolFlags.reset(RE::Actor::BOOL_FLAGS::kIsInKillMove);
+
+			const float hardFloorHp = (std::max)(1.0f, entry.minHp);
+			ClampHealth(actor, hardFloorHp);
+			float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			if (hpNow + 0.001f < hardFloorHp) {
+				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, hardFloorHp - hpNow);
+				hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+			}
+			entry.protectedHealth = (std::max)(entry.protectedHealth, hpNow);
+			entry.lastHealthSample = hpNow;
+
+			actor->NotifyAnimationGraph("BleedoutStart");
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+
+			spdlog::warn("[TFD][Defeat] player bleed anti-death reassert actor={:08X} reason={} resurrected={} killmove={}",
+				actor->GetFormID(),
+				reason ? reason : "unknown",
+				wasDead ? 1 : 0,
+				wasKillMove ? 1 : 0);
+		}
+
+		static void EnforcePlayerBleedInvulnerability(RE::Actor* actor, BleedLockEntry& entry)
+		{
+			if (!actor) {
+				return;
+			}
+
+			if (actor->IsDead(false) || actor->GetActorRuntimeData().boolFlags.all(RE::Actor::BOOL_FLAGS::kIsInKillMove)) {
+				ForcePlayerBleedAlive(actor, entry, actor->IsDead(false) ? "dead_state" : "killmove_state");
+			}
+
+			SetPlayerBleedImmune(true);
 
 			const float hardFloorHp = (std::max)(1.0f, entry.minHp);
 			const float protectedHp = (std::max)(entry.protectedHealth, hardFloorHp);
-			ClampHealth(actor, hardFloorHp);
+			ClampHealth(actor, protectedHp);
 
 			float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
 			if (hpNow + 0.001f < protectedHp) {
 				const float delta = protectedHp - hpNow;
 				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, delta);
 				const auto now = Now();
-				if (entry.lastDamageLog.time_since_epoch().count() == 0 || (now - entry.lastDamageLog) >= std::chrono::milliseconds(250)) {
-					spdlog::info("[TFD][Defeat] player bleed invuln ignored damage actor={:08X} from={:.2f} restore={:.2f} target={:.2f}",
+				if (entry.lastDamageLog.time_since_epoch().count() == 0 || (now - entry.lastDamageLog) >= std::chrono::milliseconds(150)) {
+					spdlog::info("[TFD][Defeat] player bleed zeroed health damage actor={:08X} from={:.2f} restore={:.2f} target={:.2f}",
 						actor->GetFormID(),
 						hpNow,
 						delta,
@@ -4475,8 +4543,10 @@ namespace TFD::DefeatMonitor
 				g_minHp = (std::max)(g_minHp, entry.minHp);
 				SetPlayerBleedImmune(true);
 				ClampHealth(actor, entry.minHp);
-				entry.protectedHealth = (std::max)(entry.minHp, actor->GetActorValue(RE::ActorValue::kHealth));
+				const float zeroDamageAnchor = (std::max)(entry.minHp, ResolveActorHealthForPct(actor, (std::max)(entry.thresholdPct, 5.0f)));
+				entry.protectedHealth = (std::max)(zeroDamageAnchor, actor->GetActorValue(RE::ActorValue::kHealth));
 				entry.lastHealthSample = entry.protectedHealth;
+				ClampHealth(actor, entry.protectedHealth);
 			}
 
 			ApplyBleedRegenOverride(actor, entry);
@@ -4655,41 +4725,28 @@ namespace TFD::DefeatMonitor
 
 				if (entry.kind == BleedLockKind::Player) {
 					EnforcePlayerBleedInvulnerability(actor, entry);
-					if (actor->IsDead()) {
-						releases.emplace_back(formID, actor, "dead", false);
+					if (actor->IsDead(false)) {
+						ForcePlayerBleedAlive(actor, entry, "tick_dead_state");
 						continue;
 					}
 				}
 				else if (entry.kind == BleedLockKind::Ally) {
-					const float releasePct = entry.thresholdPct + 8.0f;
 					const float holdCeilingHp = (std::max)(1.0f, ResolveActorHealthForPct(actor, (std::max)(2.0f, entry.thresholdPct - 0.5f)));
-					const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
 					const float hpBeforeClamp = actor->GetActorValue(RE::ActorValue::kHealth);
-					const float hpPctBeforeClamp = GetActorHealthPct(actor);
-					const float healGain = hpBeforeClamp - entry.lastHealthSample;
-					const float manualHealFloor = (std::max)(10.0f, hpMax * 0.10f);
 
-					if (healGain > 0.5f) {
-						entry.healAccumulator += healGain;
-						entry.lastHealGain = now;
-					}
-					else if (entry.lastHealGain.time_since_epoch().count() != 0 && (now - entry.lastHealGain) >= std::chrono::milliseconds(1200)) {
-						entry.healAccumulator = 0.0f;
-					}
-
-					const bool healedAboveRelease = hpPctBeforeClamp > releasePct;
-					const bool meaningfulManualHeal = entry.healAccumulator >= manualHealFloor;
-					const bool allowManualRecover = !actor->IsInCombat() && healedAboveRelease && meaningfulManualHeal;
-
-					if (!allowManualRecover) {
-						ClampHealthCeiling(actor, holdCeilingHp);
-					}
+					ClampHealthCeiling(actor, holdCeilingHp);
 
 					const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
-					if (allowManualRecover) {
-						releases.emplace_back(formID, actor, "manual_heal_recovered", true);
-						continue;
+					if (hpNow > holdCeilingHp + 0.001f) {
+						spdlog::info("[TFD][Defeat] ally bleed clamp actor={:08X} from={:.2f} to={:.2f} thresholdPct={:.1f}",
+							actor->GetFormID(),
+							hpBeforeClamp,
+							holdCeilingHp,
+							entry.thresholdPct);
 					}
+
+					entry.healAccumulator = 0.0f;
+					entry.lastHealGain = {};
 
 					if (actor->IsInCombat()) {
 						actor->StopCombat();
@@ -4700,6 +4757,8 @@ namespace TFD::DefeatMonitor
 					if (actor->IsWeaponDrawn()) {
 						actor->DrawWeaponMagicHands(false);
 					}
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
 
 					entry.lastHealthSample = hpNow;
 				}
@@ -4773,19 +4832,23 @@ namespace TFD::DefeatMonitor
 				}
 
 				const bool suppressBleedPulse = entry.defeatedManaged && entry.defeatedAutoDeathIssued;
-				const auto pulseInterval = entry.kind == BleedLockKind::Ally ? std::chrono::milliseconds(1000) : std::chrono::milliseconds(250);
+				const auto pulseInterval = entry.kind == BleedLockKind::Ally ? std::chrono::milliseconds(250) : std::chrono::milliseconds(250);
 				const bool pulseDue = entry.lastPulse.time_since_epoch().count() == 0 || (now - entry.lastPulse) >= pulseInterval;
 				const bool shouldPulse = [&]() {
 					if (suppressBleedPulse) {
 						return false;
 					}
 					if (entry.kind == BleedLockKind::Ally) {
-						return !IsActorBleedingOut(actor) && pulseDue;
+						return pulseDue;
 					}
 					return !IsActorBleedingOut(actor) || pulseDue;
 				}();
 				if (shouldPulse) {
 					actor->NotifyAnimationGraph("BleedoutStart");
+					if (entry.kind == BleedLockKind::Ally) {
+						actor->EvaluatePackage(false, true);
+						actor->EvaluatePackage(true, true);
+					}
 					entry.lastPulse = now;
 				}
 			}
@@ -5976,6 +6039,54 @@ namespace TFD::DefeatMonitor
 			return IsActorDownByThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
 		}
 		return IsActorDownByThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct());
+	}
+
+	bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct)
+	{
+		if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead()) {
+			return false;
+		}
+
+		const bool managedAlly = IsActiveFollowerActor(actor) || TFD::Pacify::IsCompanion(actor) || TFD::Pacify::HasActiveTameSession(actor);
+		if (!managedAlly) {
+			return false;
+		}
+
+		auto it = g_bleedLocks.find(actor->GetFormID());
+		const bool hadAllyLock = it != g_bleedLocks.end() && it->second.kind == BleedLockKind::Ally;
+		const bool downed = hadAllyLock || IsActorBleedingOut(actor) || IsActorDownByThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
+
+		const float desiredPct = std::clamp(targetHealthPct, 20.0f, 95.0f);
+		const float desiredRatio = desiredPct / 100.0f;
+		const float thresholdPct = TFD::Settings::GetAllyDownedThresholdPct();
+		const float thresholdRatio = std::clamp(thresholdPct / 100.0f, 0.05f, 0.95f);
+		const float bonusPct = (std::max)(0.0f, desiredRatio - thresholdRatio);
+
+		if (hadAllyLock) {
+			ReleaseBleedLock(actor, "ally_feed_revive", true);
+		} else if (downed) {
+			actor->NotifyAnimationGraph("BleedoutStop");
+			actor->NotifyAnimationGraph("GetUpStart");
+		}
+
+		RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, desiredRatio, desiredRatio, 35.0f, downed ? "ally_feed_revive" : "ally_feed_heal");
+
+		if (auto* process = RE::ProcessLists::GetSingleton()) {
+			process->ClearCachedFactionFightReactions();
+		}
+		actor->EvaluatePackage(false, true);
+		actor->EvaluatePackage(true, true);
+		actor->UpdateCombat();
+		if (auto* player = Player()) {
+			player->UpdateCombat();
+		}
+
+		spdlog::info("[TFD][Defeat] ally feed revive actor={:08X} downed={} healPct={:.1f} allyLock={}",
+			actor->GetFormID(),
+			downed ? 1 : 0,
+			desiredPct,
+			hadAllyLock ? 1 : 0);
+		return true;
 	}
 
 	bool IsThresholdCombatTargetValid(RE::Actor* actor)
