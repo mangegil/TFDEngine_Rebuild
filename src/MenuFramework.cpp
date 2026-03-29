@@ -163,7 +163,7 @@ namespace TFDMenu
 					gCreatureTeammateMenuRows.begin(),
 					gCreatureTeammateMenuRows.end(),
 					[&](const TFD::Pacify::ActiveTameSnapshot& snap) { return snap.sessionId == sessionId; });
-			};
+				};
 			if (!keepSession(gCreatureTeammateFeedSessionId)) {
 				gCreatureTeammateFeedSessionId = 0;
 			}
@@ -193,7 +193,8 @@ namespace TFDMenu
 			char buffer[64];
 			if (hours > 0) {
 				std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", hours, mins, rem);
-			} else {
+			}
+			else {
 				std::snprintf(buffer, sizeof(buffer), "%02d:%02d", mins, rem);
 			}
 			return buffer;
@@ -848,8 +849,8 @@ namespace TFDMenu
 		static bool IsShiftDown()
 		{
 			return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-			       (GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-			       (GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
+				(GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+				(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
 		}
 
 		static RE::Actor* PickExactDialogueDefeatedTargetSameCellLoaded(float radius)
@@ -892,7 +893,8 @@ namespace TFDMenu
 				float score = (frontDot * 100000.0f) - entry.dist;
 				if (frontDot >= 0.96f) {
 					score += 4000.0f;
-				} else if (frontDot >= 0.90f) {
+				}
+				else if (frontDot >= 0.90f) {
 					score += 2000.0f;
 				}
 
@@ -934,16 +936,18 @@ namespace TFDMenu
 				float score = (frontDot * 100000.0f) - entry.dist;
 				if (frontDot >= 0.98f) {
 					score += 6000.0f;
-				} else if (frontDot >= 0.94f) {
+				}
+				else if (frontDot >= 0.94f) {
 					score += 3500.0f;
-				} else if (frontDot >= 0.90f) {
+				}
+				else if (frontDot >= 0.90f) {
 					score += 1500.0f;
 				}
 				if (actor->IsInCombat() || entry.inCombat) {
 					score += 50.0f;
 				}
 				return score;
-			};
+				};
 
 			TFD::ActorScan::Rescan(radius, false);
 
@@ -982,7 +986,7 @@ namespace TFDMenu
 			return best;
 		}
 
-		
+
 		static RE::Actor* PickExactDefeatedCreatureTargetSameCellLoaded(float radius)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1015,13 +1019,15 @@ namespace TFDMenu
 				float score = (frontDot * 100000.0f) - entry.dist;
 				if (frontDot >= 0.98f) {
 					score += 6000.0f;
-				} else if (frontDot >= 0.94f) {
+				}
+				else if (frontDot >= 0.94f) {
 					score += 3500.0f;
-				} else if (frontDot >= 0.90f) {
+				}
+				else if (frontDot >= 0.90f) {
 					score += 1500.0f;
 				}
 				return score;
-			};
+				};
 
 			TFD::ActorScan::Rescan(radius, false);
 
@@ -1042,7 +1048,7 @@ namespace TFDMenu
 			return best;
 		}
 
-static float ScoreTruceCandidate(
+		static float ScoreTruceCandidate(
 			RE::Actor* actor,
 			RE::PlayerCharacter* player,
 			const TFD::ActorScan::Entry& entry,
@@ -1219,7 +1225,8 @@ static float ScoreTruceCandidate(
 
 				if (desiredMode == HotkeyPickMode::Tame) {
 					score = ScoreTameCandidate(actor, player, entry, &mode);
-				} else {
+				}
+				else {
 					score = ScoreTruceCandidate(actor, player, entry, &mode);
 				}
 
@@ -1313,7 +1320,7 @@ static float ScoreTruceCandidate(
 			return CaptureResult::None;
 		}
 
-		
+
 		static const char* YesNo(bool v)
 		{
 			return v ? "Yes" : "No";
@@ -1402,22 +1409,25 @@ static float ScoreTruceCandidate(
 						if (TFD::Pacify::ApplyActiveTameFeed(actor, opt.itemId, action)) {
 							if (action == TFD::Pacify::FeedAction::Teammate) {
 								RE::DebugNotification("TFD: Teammate fed.");
-							} else {
+							}
+							else {
 								RE::DebugNotification("TFD: Calm feed applied.");
 							}
 							gCreatureTeammateFeedSessionId = 0;
 							RefreshCreatureTeammateMenuRows(false);
-						} else {
+						}
+						else {
 							RE::DebugNotification("TFD: Feed failed.");
 						}
 					}
 				}
-			};
+				};
 
 			ImGuiMCP::Indent();
 			if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
 				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
-			} else {
+			}
+			else {
 				renderFeedGroup("Calm Feed", TFD::Pacify::FeedAction::Calm);
 				ImGuiMCP::Separator();
 				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
@@ -1440,7 +1450,8 @@ static float ScoreTruceCandidate(
 				bool released = false;
 				if (actor) {
 					released = TFD::Pacify::ReleaseActiveTameActor(actor, TFD::Pacify::ReleaseReason::Generic);
-				} else {
+				}
+				else {
 					TFD::Pacify::ReleaseSession(snap.sessionId, TFD::Pacify::ReleaseReason::Generic);
 					released = true;
 				}
@@ -1448,7 +1459,8 @@ static float ScoreTruceCandidate(
 					RE::DebugNotification("TFD: Creature released.");
 					gCreatureTeammateReleaseConfirmSessionId = 0;
 					RefreshCreatureTeammateMenuRows(false);
-				} else {
+				}
+				else {
 					RE::DebugNotification("TFD: Release failed.");
 				}
 			}
@@ -1496,7 +1508,8 @@ static float ScoreTruceCandidate(
 				if (ImGuiMCP::Button("Rebind Signal Hotkey")) {
 					gCaptureHotkey = true;
 				}
-			} else {
+			}
+			else {
 				ImGuiMCP::Text("Press a key now... (Esc = cancel)");
 
 				std::uint32_t newCode = 0;
@@ -1535,7 +1548,8 @@ static float ScoreTruceCandidate(
 
 			if (gCreatureTeammateMenuRows.empty()) {
 				ImGuiMCP::Text("No active creature tame or teammate sessions.");
-			} else {
+			}
+			else {
 				for (const auto& snap : gCreatureTeammateMenuRows) {
 					RE::Actor* actor = snap.loaded ? RE::TESForm::LookupByID<RE::Actor>(snap.actorId) : nullptr;
 					const bool actorDowned = actor && TFD::DefeatMonitor::IsThresholdDownedActor(actor);
@@ -1543,7 +1557,8 @@ static float ScoreTruceCandidate(
 					ImGuiMCP::Text("%s", snap.actorName.c_str());
 					if (actorDowned) {
 						ImGuiMCP::Text("State: Downed %s", CreatureStateLabel(snap));
-					} else {
+					}
+					else {
 						ImGuiMCP::Text("State: %s", CreatureStateLabel(snap));
 					}
 					ImGuiMCP::Text("Remaining: %s", FormatCreatureTimer(snap).c_str());
@@ -1564,7 +1579,8 @@ static float ScoreTruceCandidate(
 					if (ImGuiMCP::Button(releaseLabel)) {
 						if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
 							gCreatureTeammateReleaseConfirmSessionId = 0;
-						} else {
+						}
+						else {
 							gCreatureTeammateReleaseConfirmSessionId = snap.sessionId;
 							gCreatureTeammateFeedSessionId = 0;
 						}
@@ -1837,17 +1853,16 @@ static float ScoreTruceCandidate(
 						auto* ui = RE::UI::GetSingleton();
 						if (!TFD::FeedPopup::IsOpen() &&
 							(!ui || (!ui->IsMenuOpen(RE::MainMenu::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::Console::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
-							         !ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
+								!ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::Console::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
 							if (player && !TFD::DefeatMonitor::IsCaptivePhase()) {
 								if (auto* defeatedTalkTarget = PickExactDialogueDefeatedTargetSameCellLoaded(220.0f)) {
 									spdlog::info("[TFD][Menu] activate intercepted for defeated dialogue target={:08X}", defeatedTalkTarget->GetFormID());
-									TFD::ForceGreet::BeginInCombatTruce(defeatedTalkTarget);
 									RE::DebugNotification("TFD: Defeated Dialogue");
 									return RE::BSEventNotifyControl::kStop;
 								}
@@ -1949,7 +1964,6 @@ static float ScoreTruceCandidate(
 						ApplyCellHotkeyCalmBubble(player, captor, 12000.0f);
 						SendBridgeEvent("TFDCaptiveClearAll");
 						SendBridgeAssignActor("TFDCaptiveAssign", captor);
-						TFD::ForceGreet::BeginCaptiveMarker(captor);
 
 						RE::DebugNotification("TFD: Calling Captor");
 						continue;
@@ -1959,7 +1973,8 @@ static float ScoreTruceCandidate(
 						if (auto* defeatedCreature = PickExactDefeatedCreatureTargetSameCellLoaded(1400.0f)) {
 							if (TFD::DefeatMonitor::RecruitDefeatedCreatureAsTeammate(defeatedCreature, NowSec())) {
 								RE::DebugNotification("TFD: Defeated Creature Recruited");
-							} else {
+							}
+							else {
 								RE::DebugNotification("TFD: Defeated Recruit Failed");
 							}
 							continue;
@@ -1984,44 +1999,58 @@ static float ScoreTruceCandidate(
 						RE::DebugNotification("TFD: No Valid Target");
 						continue;
 					}
+					if (pickMode == HotkeyPickMode::Tame) {
+						const auto exec = TFD::InteractionRouter::HandleHotkeyPress(
+							player,
+							target,
+							false,
+							NowSec());
 
-					const auto exec = TFD::InteractionRouter::HandleHotkeyPress(
-						player,
-						target,
-						false,
-						NowSec());
+						if (!exec.executed) {
+							if (exec.failReason == TFD::InteractionRouter::FailReason::TameAlreadyActive) {
+								RE::DebugNotification("TFD: Already Tamed. Use Shift+H to Feed");
+							}
+							else if (exec.failReason == TFD::InteractionRouter::FailReason::NoValidBait) {
+								RE::DebugNotification("TFD: No Valid Bait");
+							}
+							else if (exec.action == TFD::InteractionRouter::Action::Tame &&
+								exec.failReason == TFD::InteractionRouter::FailReason::SessionBeginFailed) {
+								RE::DebugNotification("TFD: Pack Tame Failed");
+							}
+							else {
+								RE::DebugNotification("TFD: Interaction Failed");
+							}
+							continue;
+						}
 
-					if (!exec.executed) {
-						if (exec.failReason == TFD::InteractionRouter::FailReason::TameAlreadyActive) {
-							RE::DebugNotification("TFD: Already Tamed. Use Shift+H to Feed");
-						} else if (exec.failReason == TFD::InteractionRouter::FailReason::NoValidBait) {
-							RE::DebugNotification("TFD: No Valid Bait");
-						} else if (exec.action == TFD::InteractionRouter::Action::Tame &&
-							   exec.failReason == TFD::InteractionRouter::FailReason::SessionBeginFailed) {
-							RE::DebugNotification("TFD: Pack Tame Failed");
-						} else {
-							RE::DebugNotification("TFD: Interaction Failed");
+						switch (exec.action) {
+						case TFD::InteractionRouter::Action::Tame:
+							RE::DebugNotification("TFD: Tame");
+							break;
+						case TFD::InteractionRouter::Action::None:
+						default:
+							RE::DebugNotification("TFD: Tame Started");
+							break;
 						}
 						continue;
 					}
 
-					if (exec.dialogueRequested) {
-						if (exec.action == TFD::InteractionRouter::Action::TrucePreCombat) {
-							TFD::ForceGreet::BeginPreCombatTruce(target);
-						} else if (exec.action == TFD::InteractionRouter::Action::TruceInCombat) {
-							TFD::ForceGreet::BeginInCombatTruce(target);
-						}
+					TFD::InteractionRouter::Action truceAction = TFD::InteractionRouter::Action::None;
+					const bool truceStarted = TFD::PreCombatGreet::BeginForActor(target, &truceAction);
+					if (!truceStarted) {
+						RE::DebugNotification("TFD: Truce Failed");
+						continue;
 					}
 
-					switch (exec.action) {
+					switch (truceAction) {
 					case TFD::InteractionRouter::Action::TrucePreCombat:
 						RE::DebugNotification("TFD: PreCombat Truce");
 						break;
-					case TFD::InteractionRouter::Action::Tame:
-						RE::DebugNotification("TFD: Tame");
-						break;
 					case TFD::InteractionRouter::Action::TruceInCombat:
 						RE::DebugNotification("TFD: InCombat Truce");
+						break;
+					case TFD::InteractionRouter::Action::Tame:
+						RE::DebugNotification("TFD: Tame");
 						break;
 					case TFD::InteractionRouter::Action::None:
 					default:
@@ -2122,7 +2151,6 @@ static float ScoreTruceCandidate(
 
 		spdlog::info("[TFD][Menu] Init()");
 
-		TFD::ForceGreet::Install();
 		TFD::PreCombatGreet::Install();
 
 		TryRegisterMenu();

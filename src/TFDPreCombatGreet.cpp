@@ -1,6 +1,7 @@
 
 #include "TFDPreCombatGreet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -8,6 +9,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <string_view>
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -15,7 +17,6 @@
 
 #include "TFDDefeatMonitor.h"
 #include "TFDFactionMask.h"
-#include "TFDForceGreet.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPacify.h"
 
@@ -30,6 +31,13 @@ namespace TFD::PreCombatGreet
 		constexpr double kCooldownAfterFailSec = 5.0;
 		constexpr double kCooldownAfterPlayerAttackSec = 1.0;
 		constexpr double kRecentActorHoldSec = 12.0;
+		constexpr double kPleasureStartHoldSec = 20.0;
+		constexpr double kPleasureSceneHoldSec = 900.0;
+
+		constexpr const char* kPleasureStartPendingEvent = "TFDPreCombatPleasureStartPending";
+		constexpr const char* kPleasureStartedEvent = "TFDPreCombatPleasureStarted";
+		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
+		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
 
 		struct Pending
 		{
@@ -40,7 +48,8 @@ namespace TFD::PreCombatGreet
 			bool dialogueRequested{ false };
 			bool dialogSeen{ false };
 			bool assignSent{ false };
-			bool forceGreetStarted{ false };
+			bool pleasureHandoff{ false };
+			bool pleasureSceneActive{ false };
 			double nextDebugLogSec{ 0.0 };
 		};
 
@@ -237,6 +246,95 @@ namespace TFD::PreCombatGreet
 			return true;
 		}
 
+		bool IsPleasureDialogueHandoffAction(TFD::InteractionRouter::Action action)
+		{
+			return action == TFD::InteractionRouter::Action::TrucePreCombat;
+		}
+
+		Pending* FindPendingLocked(RE::Actor* actor)
+		{
+			if (!actor) {
+				return nullptr;
+			}
+
+			auto it = gPending.find(GetHandleId(actor));
+			if (it == gPending.end()) {
+				return nullptr;
+			}
+
+			return std::addressof(it->second);
+		}
+
+		void ArmPleasureHandoffLocked(RE::Actor* actor)
+		{
+			auto* pending = FindPendingLocked(actor);
+			if (!pending) {
+				return;
+			}
+
+			if (!pending->dialogueRequested || !IsPleasureDialogueHandoffAction(pending->action)) {
+				return;
+			}
+
+			pending->pleasureHandoff = true;
+			pending->pleasureSceneActive = false;
+			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureStartHoldSec);
+
+			CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_start_pending");
+			spdlog::info(
+				"[TFD][PreCombatGreet] pleasure handoff armed actor={:08X} session={} action={}",
+				actor->GetFormID(),
+				pending->pacifySessionId,
+				TFD::InteractionRouter::ToString(pending->action));
+		}
+
+		void MarkPleasureStartedLocked(RE::Actor* actor)
+		{
+			auto* pending = FindPendingLocked(actor);
+			if (!pending) {
+				return;
+			}
+
+			if (!pending->dialogueRequested || !IsPleasureDialogueHandoffAction(pending->action)) {
+				return;
+			}
+
+			pending->pleasureHandoff = true;
+			pending->pleasureSceneActive = true;
+			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureSceneHoldSec);
+
+			CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_scene_started");
+			spdlog::info(
+				"[TFD][PreCombatGreet] pleasure scene started actor={:08X} session={} action={}",
+				actor->GetFormID(),
+				pending->pacifySessionId,
+				TFD::InteractionRouter::ToString(pending->action));
+		}
+
+		RE::Actor* ResolvePleasureEventActor(const SKSE::ModCallbackEvent* ev)
+		{
+			if (!ev) {
+				return nullptr;
+			}
+
+			if (auto* actor = ev->sender ? ev->sender->As<RE::Actor>() : nullptr) {
+				return actor;
+			}
+
+			const auto* rawArg = ev->strArg.c_str();
+			if (!rawArg || rawArg[0] == '\0') {
+				return nullptr;
+			}
+
+			try {
+				const auto actorId = static_cast<RE::FormID>(std::stoul(rawArg, nullptr, 10));
+				return RE::TESForm::LookupByID<RE::Actor>(actorId);
+			}
+			catch (...) {
+				return nullptr;
+			}
+		}
+
 		void LogInCombatDialogueState(const char* tag, RE::Actor* actor, bool dialogueOpen)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -271,10 +369,6 @@ namespace TFD::PreCombatGreet
 			const char* reason,
 			TFD::Pacify::ReleaseReason pacifyReason)
 		{
-			if (pending.forceGreetStarted && pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-				TFD::ForceGreet::Cancel();
-				pending.forceGreetStarted = false;
-			}
 
 			if (pending.pacifySessionId != 0) {
 				TFD::Pacify::ReleaseSession(pending.pacifySessionId, pacifyReason);
@@ -391,6 +485,70 @@ namespace TFD::PreCombatGreet
 
 		HitSink gHitSink{};
 
+		class PleasureEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
+			{
+				if (!ev) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				const auto* rawName = ev->eventName.c_str();
+				const std::string_view name = rawName ? std::string_view(rawName) : std::string_view{};
+				if (name.empty()) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* actor = ResolvePleasureEventActor(ev);
+				if (!actor) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (name == kPleasureStartPendingEvent) {
+					std::scoped_lock lk(gLock);
+					ArmPleasureHandoffLocked(actor);
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (name == kPleasureStartedEvent) {
+					std::scoped_lock lk(gLock);
+					MarkPleasureStartedLocked(actor);
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (name == kPleasureFailedEvent || name == kPleasureEndedEvent) {
+					std::scoped_lock lk(gLock);
+
+					auto it = gPending.find(GetHandleId(actor));
+					if (it == gPending.end()) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
+
+					auto& pending = it->second;
+					if (!pending.dialogueRequested || !IsPleasureDialogueHandoffAction(pending.action)) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
+
+					if (name == kPleasureFailedEvent) {
+						CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_failed");
+						CleanupOne(actor, pending, kCooldownAfterFailSec, "pleasure_failed", TFD::Pacify::ReleaseReason::DialogueClosed);
+					}
+					else {
+						CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_ended");
+						CleanupOne(actor, pending, kCooldownAfterDoneSec, "pleasure_ended", TFD::Pacify::ReleaseReason::Generic);
+					}
+
+					gPending.erase(it);
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		PleasureEventSink gPleasureEventSink{};
+
 		void TickUI()
 		{
 			struct Guard
@@ -453,18 +611,6 @@ namespace TFD::PreCombatGreet
 					continue;
 				}
 
-				if (pending.action == TFD::InteractionRouter::Action::TruceInCombat &&
-					pending.dialogueRequested && !pending.forceGreetStarted && !dialogueOpen) {
-					auto* player = RE::PlayerCharacter::GetSingleton();
-					const bool sameCell = player && actor->GetParentCell() && player->GetParentCell() && actor->GetParentCell() == player->GetParentCell();
-					const float dist = player ? actor->GetPosition().GetDistance(player->GetPosition()) : 99999.0f;
-					if (sameCell && dist <= 220.0f && !TFD::ForceGreet::IsActive() && TFD::Pacify::CanOpenDialogue(actor)) {
-						LogInCombatDialogueState("forcegreet_begin", actor, dialogueOpen);
-						TFD::ForceGreet::BeginInCombatTruce(actor);
-						pending.forceGreetStarted = true;
-					}
-				}
-
 				if (pending.dialogueRequested) {
 					if (dialogueOpen) {
 						pending.dialogSeen = true;
@@ -473,6 +619,12 @@ namespace TFD::PreCombatGreet
 					}
 
 					if (pending.dialogSeen) {
+						if (pending.pleasureHandoff && IsPleasureDialogueHandoffAction(pending.action)) {
+							CacheRecentActor(actor, kRecentActorHoldSec, pending.pleasureSceneActive ? "pleasure_scene_active" : "pleasure_handoff_wait");
+							++it;
+							continue;
+						}
+
 						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
 							LogInCombatDialogueState("dialogue_closed", actor, dialogueOpen);
 						}
@@ -536,6 +688,9 @@ namespace TFD::PreCombatGreet
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
 			scripts->AddEventSink(&gHitSink);
 		}
+		if (auto* src = SKSE::GetModCallbackEventSource()) {
+			src->AddEventSink(&gPleasureEventSink);
+		}
 
 		gSuspended.store(false, std::memory_order_release);
 		gRunning.store(true, std::memory_order_release);
@@ -552,6 +707,9 @@ namespace TFD::PreCombatGreet
 
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
 			scripts->RemoveEventSink(&gHitSink);
+		}
+		if (auto* src = SKSE::GetModCallbackEventSource()) {
+			src->RemoveEventSink(&gPleasureEventSink);
 		}
 
 		gRunning.store(false, std::memory_order_release);
@@ -656,7 +814,8 @@ namespace TFD::PreCombatGreet
 		pending.dialogueRequested = result.dialogueRequested;
 		pending.dialogSeen = false;
 		pending.assignSent = false;
-		pending.forceGreetStarted = false;
+		pending.pleasureHandoff = false;
+		pending.pleasureSceneActive = false;
 		pending.nextDebugLogSec = now;
 
 		if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {

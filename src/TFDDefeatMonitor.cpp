@@ -27,7 +27,6 @@
 #include "TFDCaptiveDoorController.h"
 #include "TFDAntiAggro.h"
 #include "TFDFactionMask.h"
-#include "TFDForceGreet.h"
 #include "TFDActorScan.h"
 #include "TFDAggressionClamp.h"
 #include "TFDPreCombatGreet.h"
@@ -2878,7 +2877,6 @@ namespace TFD::DefeatMonitor
 		{
 			ClearBleedoutBridgeAliases(nullptr, "battle_observe_win");
 			ClearPendingCinematicFadeIn();
-			TFD::ForceGreet::Cancel();
 			TFD::FactionMask::Clear();
 			ClearEscapeContext();
 			ResetLockpickWatch();
@@ -2913,7 +2911,6 @@ namespace TFD::DefeatMonitor
 
 			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "battle_observe_loss");
 			ClearPendingCinematicFadeIn();
-			TFD::ForceGreet::Cancel();
 			TFD::FactionMask::Clear();
 			ClearEscapeContext();
 			ResetLockpickWatch();
@@ -3893,7 +3890,6 @@ namespace TFD::DefeatMonitor
 			ClearNoMarkerFallbackState();
 			ResetBleedRuntimeState();
 			ClearBleedoutBridgeAliases(nullptr, "blackout_teleport");
-			TFD::ForceGreet::Cancel();
 			g_lastAggressor.reset();
 			AdvanceGameHoursSoft(1.0f);
 			if (!TeleportPlayerToCachedMarkerNow()) {
@@ -4181,7 +4177,6 @@ namespace TFD::DefeatMonitor
 		static void EnterEscapeCommit(const char* reason, RE::TESObjectREFR* door)
 		{
 			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) return;
-			TFD::ForceGreet::Cancel();
 			TFD::FactionMask::Clear();
 			TFD::AggressionClamp::Clear();
 			g_grace.store(false, std::memory_order_release);
@@ -5447,7 +5442,6 @@ namespace TFD::DefeatMonitor
 						}
 
 						if (greetableNow) {
-							TFD::ForceGreet::BeginInCombatTruce(aggressor);
 						}
 					}
 				}
@@ -5493,7 +5487,6 @@ namespace TFD::DefeatMonitor
 			}
 
 			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "noncaptive");
-			TFD::ForceGreet::Cancel();
 			SetPlayerBleedImmune(false);
 			ResetBleedRuntimeState();
 			if (player && !player->IsDead() && !player->IsDisabled()) {
@@ -5529,7 +5522,6 @@ namespace TFD::DefeatMonitor
 
 			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "noncaptive");
 			ClearPendingCinematicFadeIn();
-			TFD::ForceGreet::Cancel();
 			TFD::FactionMask::Clear();
 			ClearEscapeContext();
 			ResetLockpickWatch();
@@ -5548,7 +5540,6 @@ namespace TFD::DefeatMonitor
 		{
 			ResetBleedRuntimeState();
 			ClearBleedoutBridgeAliases(nullptr, "blackout_teleport");
-			TFD::ForceGreet::Cancel();
 			g_lastAggressor.reset();
 			RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
 			if (!ResolveCaptiveMarkerForOutcome()) {
@@ -5629,7 +5620,6 @@ namespace TFD::DefeatMonitor
 				UpdatePreCombatState();
 				return;
 			}
-			TFD::ForceGreet::Tick();
 			NormalizeInvalidCaptivePair();
 			if (g_captiveState && g_captivePhase == CaptivePhaseValue::Captive) {
 				const bool dialogOpen = IsDialogueOpen();
@@ -5847,7 +5837,6 @@ namespace TFD::DefeatMonitor
 		ClearBleedoutBridgeAliases(nullptr, "install");
 		TFD::FactionMask::Initialize();
 		TFD::Location::Initialize();
-		TFD::ForceGreet::Install();
 		if (auto* src = SKSE::GetModCallbackEventSource()) {
 			src->AddEventSink(&g_defeatedRecruitEventSink);
 		}
@@ -5957,7 +5946,6 @@ namespace TFD::DefeatMonitor
 		ClearEscapeContext();
 		TFD::FactionMask::Clear();
 		TFD::AggressionClamp::Clear();
-		TFD::ForceGreet::Cancel();
 		ClearLeftForDeadCooldown();
 		spdlog::info("[TFD][Defeat] ResetForLoad -> runtime only");
 	}
@@ -5969,7 +5957,6 @@ namespace TFD::DefeatMonitor
 			SetPlayerBleedImmune(false);
 			ClearAllBleedLocks("set_load_transition");
 			ClearBleedoutBridgeAliases(nullptr, "set_load_transition");
-			TFD::ForceGreet::Cancel();
 			ResetLockpickWatch();
 			spdlog::info("[TFD][Defeat] SetLoadTransition(true)");
 		}

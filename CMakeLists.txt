@@ -36,7 +36,6 @@ add_library(TFDEngine SHARED
     src/TFDAntiAggro.cpp
     src/TFDDefeatMonitor.cpp
     src/TFDFactionMask.cpp
-    src/TFDForceGreet.cpp
     src/TFDAggressionClamp.cpp
     src/TFDPreCombat.cpp
     src/TFDPreCombatGreet.cpp
