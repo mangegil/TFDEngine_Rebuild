@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 
 namespace RE
@@ -35,13 +36,27 @@ namespace TFD::Location
 		std::uint32_t useSerial{ 0 };
 	};
 
+	struct CaptiveStorageDebugSnapshot
+	{
+		std::array<std::uint32_t, 3> bossActorFormIDs{};
+		std::array<std::uint32_t, 3> bossContainerFormIDs{};
+		std::array<std::uint32_t, 3> containerFormIDs{};
+		std::uint32_t finalTargetFormID{ 0 };
+		std::uint32_t finalTargetKind{ 0 };
+		bool hasMarker{ false };
+	};
+
 	void Initialize();
 
 	bool RescanCaptiveMarker();
 	bool RescanCaptiveMarkerWithAggressor(RE::Actor* aggressor, bool preferInterior);
+	bool RefreshCaptiveMarkerSilent(RE::Actor* aggressor, bool preferInterior);
 
 	RE::TESObjectREFR* GetCachedCaptiveMarker();
 	std::uint32_t GetCachedCaptiveMarkerFormID();
+	RE::TESObjectREFR* ResolveNearestCaptiveStorageTarget(RE::Actor* preferredActor = nullptr);
+	std::uint32_t ResolveNearestCaptiveStorageTargetFormID(RE::Actor* preferredActor = nullptr);
+	bool GetLastCaptiveStorageDebugSnapshot(CaptiveStorageDebugSnapshot& out);
 
 	void DumpContextToLog();
 	bool TeleportToCaptiveMarker();

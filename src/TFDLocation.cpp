@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <RE/Skyrim.h>
+#include <RE/E/ExtraLock.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
@@ -718,6 +719,459 @@ namespace TFD::Location
 			return best;
 		}
 
+
+		static bool DoRescanInternal(RE::Actor* aggressor, bool preferInterior);
+
+		static constexpr float kCaptiveStorageScanRadius = 12000.0f;
+
+		enum class CaptiveStorageKind
+		{
+			BossContainer = 0,
+			BossActor = 1,
+			Container = 2,
+			FallbackActor = 3
+		};
+
+		struct CaptiveStorageCandidate
+		{
+			RE::TESObjectREFR* ref{ nullptr };
+			CaptiveStorageKind kind{ CaptiveStorageKind::Container };
+			double distSq{ 0.0 };
+		};
+
+		TFD::Location::CaptiveStorageDebugSnapshot g_lastCaptiveStorageDebugSnapshot{};
+
+		static void ClearCaptiveStorageDebugSnapshot(bool hasMarker)
+		{
+			g_lastCaptiveStorageDebugSnapshot = {};
+			g_lastCaptiveStorageDebugSnapshot.hasMarker = hasMarker;
+		}
+
+		static std::uint32_t CaptiveStorageKindCode(CaptiveStorageKind kind)
+		{
+			switch (kind) {
+			case CaptiveStorageKind::BossContainer:
+				return 1;
+			case CaptiveStorageKind::BossActor:
+				return 2;
+			case CaptiveStorageKind::Container:
+				return 3;
+			case CaptiveStorageKind::FallbackActor:
+				return 4;
+			default:
+				return 0;
+			}
+		}
+
+		static double DistSq(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
+		{
+			if (!a || !b) {
+				return std::numeric_limits<double>::max();
+			}
+
+			const auto ap = a->GetPosition();
+			const auto bp = b->GetPosition();
+			const double dx = static_cast<double>(ap.x - bp.x);
+			const double dy = static_cast<double>(ap.y - bp.y);
+			const double dz = static_cast<double>(ap.z - bp.z);
+			return dx * dx + dy * dy + dz * dz;
+		}
+
+		static bool IsRefInSameCell(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
+		{
+			if (!a || !b) {
+				return false;
+			}
+			auto* acell = a->GetParentCell();
+			auto* bcell = b->GetParentCell();
+			return acell && bcell && acell == bcell;
+		}
+
+		static int CaptiveStorageTiePriority(CaptiveStorageKind kind)
+		{
+			switch (kind) {
+			case CaptiveStorageKind::BossContainer:
+				return 0;
+			case CaptiveStorageKind::BossActor:
+				return 1;
+			case CaptiveStorageKind::Container:
+				return 2;
+			case CaptiveStorageKind::FallbackActor:
+				return 3;
+			default:
+				return 99;
+			}
+		}
+
+		static const char* EvaluateBossStorageRejectReason(RE::TESObjectREFR* marker, RE::TESObjectREFR* ref)
+		{
+			if (!marker) {
+				return "marker_none";
+			}
+			if (!ref) {
+				return "ref_none";
+			}
+			if (ref == marker) {
+				return "same_as_marker";
+			}
+			if (ref->IsDisabled()) {
+				return "disabled";
+			}
+			if (!IsRefInSameCell(marker, ref)) {
+				return "different_cell";
+			}
+			const auto maxDistSq = static_cast<double>(kCaptiveStorageScanRadius) * static_cast<double>(kCaptiveStorageScanRadius);
+			if (DistSq(marker, ref) > maxDistSq) {
+				return "out_of_radius";
+			}
+			return nullptr;
+		}
+
+		static void LogCaptiveStorageReject(CaptiveStorageKind kind, RE::TESObjectREFR* marker, RE::TESObjectREFR* ref, const char* reason)
+		{
+			if (!reason) {
+				return;
+			}
+
+			spdlog::info(
+				"[TFD][Location] captive storage reject kind={} marker={:08X} ref={:08X} base={:08X} markerCell={:08X} refCell={:08X} reason={}",
+				CaptiveStorageKindCode(kind),
+				marker ? marker->GetFormID() : 0u,
+				ref ? ref->GetFormID() : 0u,
+				(ref && ref->GetBaseObject()) ? ref->GetBaseObject()->GetFormID() : 0u,
+				(marker && marker->GetParentCell()) ? marker->GetParentCell()->GetFormID() : 0u,
+				(ref && ref->GetParentCell()) ? ref->GetParentCell()->GetFormID() : 0u,
+				reason);
+		}
+
+		static bool IsValidBossStorageRef(RE::TESObjectREFR* marker, RE::TESObjectREFR* ref)
+		{
+			return EvaluateBossStorageRejectReason(marker, ref) == nullptr;
+		}
+
+		static bool IsRefKeyOnlyLocked(RE::TESObjectREFR* ref)
+		{
+			if (!ref) {
+				return false;
+			}
+
+			auto* lock = ref->GetLock();
+			if (!lock || !lock->IsLocked() || !lock->key) {
+				return false;
+			}
+
+			// Only reject true key-only locks. Many normal containers can be opened
+			// either with a matching key or with lockpicking, and those should stay valid.
+			// In practice, the unpickable / key-required case resolves to lock level 255.
+			const auto lockLevel = static_cast<std::int32_t>(ref->GetLockLevel());
+			return lockLevel >= 255;
+		}
+
+		static const char* EvaluateContainerStorageRejectReason(RE::TESObjectREFR* marker, RE::TESObjectREFR* ref)
+		{
+			if (const auto* bossReason = EvaluateBossStorageRejectReason(marker, ref)) {
+				return bossReason;
+			}
+
+			auto* base = ref ? ref->GetBaseObject() : nullptr;
+			if (!base) {
+				return "base_none";
+			}
+
+			if (!base->As<RE::TESObjectCONT>()) {
+				return "not_container";
+			}
+
+			if (IsRefKeyOnlyLocked(ref)) {
+				return "requires_key";
+			}
+
+			return nullptr;
+		}
+
+		static bool IsValidContainerStorageRef(RE::TESObjectREFR* marker, RE::TESObjectREFR* ref)
+		{
+			return EvaluateContainerStorageRejectReason(marker, ref) == nullptr;
+		}
+
+		static bool IsValidFallbackActor(RE::TESObjectREFR* marker, RE::Actor* actor)
+		{
+			if (!marker || !actor) {
+				return false;
+			}
+			if (actor == Player()) {
+				return false;
+			}
+			if (actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+			if (actor->IsPlayerTeammate()) {
+				return false;
+			}
+			if (!IsRefInSameCell(marker, actor)) {
+				return false;
+			}
+			return DistSq(marker, actor) <= static_cast<double>(kCaptiveStorageScanRadius) * static_cast<double>(kCaptiveStorageScanRadius);
+		}
+
+		static void PushBestStorageCandidate(
+			std::vector<CaptiveStorageCandidate>& list,
+			RE::TESObjectREFR* marker,
+			RE::TESObjectREFR* ref,
+			CaptiveStorageKind kind)
+		{
+			if (!marker || !ref) {
+				return;
+			}
+
+			const char* rejectReason = nullptr;
+			const bool valid = [&]() {
+				switch (kind) {
+				case CaptiveStorageKind::Container:
+					rejectReason = EvaluateContainerStorageRejectReason(marker, ref);
+					break;
+				case CaptiveStorageKind::BossContainer:
+				case CaptiveStorageKind::BossActor:
+				case CaptiveStorageKind::FallbackActor:
+				default:
+					rejectReason = EvaluateBossStorageRejectReason(marker, ref);
+					break;
+				}
+				return rejectReason == nullptr;
+				}();
+
+			if (!valid) {
+				LogCaptiveStorageReject(kind, marker, ref, rejectReason);
+				return;
+			}
+
+			const auto id = ref->GetFormID();
+			for (const auto& it : list) {
+				if (it.ref && it.ref->GetFormID() == id) {
+					return;
+				}
+			}
+
+			list.push_back(CaptiveStorageCandidate{ ref, kind, DistSq(marker, ref) });
+		}
+
+		static RE::TESObjectREFR* PickBestStorageCandidate(const std::vector<CaptiveStorageCandidate>& list)
+		{
+			const CaptiveStorageCandidate* best = nullptr;
+
+			for (const auto& it : list) {
+				if (!it.ref) {
+					continue;
+				}
+
+				if (!best ||
+					it.distSq < best->distSq ||
+					(it.distSq == best->distSq && CaptiveStorageTiePriority(it.kind) < CaptiveStorageTiePriority(best->kind)) ||
+					(it.distSq == best->distSq && CaptiveStorageTiePriority(it.kind) == CaptiveStorageTiePriority(best->kind) && it.ref->GetFormID() < best->ref->GetFormID())) {
+					best = &it;
+				}
+			}
+
+			return best ? best->ref : nullptr;
+		}
+
+		static void SortCaptiveStorageCandidates(std::vector<CaptiveStorageCandidate>& list)
+		{
+			std::sort(list.begin(), list.end(), [](const CaptiveStorageCandidate& a, const CaptiveStorageCandidate& b) {
+				if (!a.ref && !b.ref) {
+					return false;
+				}
+				if (!a.ref) {
+					return false;
+				}
+				if (!b.ref) {
+					return true;
+				}
+				if (a.distSq != b.distSq) {
+					return a.distSq < b.distSq;
+				}
+				if (CaptiveStorageTiePriority(a.kind) != CaptiveStorageTiePriority(b.kind)) {
+					return CaptiveStorageTiePriority(a.kind) < CaptiveStorageTiePriority(b.kind);
+				}
+				return a.ref->GetFormID() < b.ref->GetFormID();
+				});
+		}
+
+		static void StoreCaptiveStorageDebugSnapshot(
+			RE::TESObjectREFR* marker,
+			std::vector<CaptiveStorageCandidate> bossActors,
+			std::vector<CaptiveStorageCandidate> bossContainers,
+			std::vector<CaptiveStorageCandidate> containers,
+			RE::TESObjectREFR* finalTarget,
+			CaptiveStorageKind finalKind)
+		{
+			ClearCaptiveStorageDebugSnapshot(marker != nullptr);
+			SortCaptiveStorageCandidates(bossActors);
+			SortCaptiveStorageCandidates(bossContainers);
+			SortCaptiveStorageCandidates(containers);
+
+			for (std::size_t i = 0; i < g_lastCaptiveStorageDebugSnapshot.bossActorFormIDs.size() && i < bossActors.size(); ++i) {
+				g_lastCaptiveStorageDebugSnapshot.bossActorFormIDs[i] = bossActors[i].ref ? bossActors[i].ref->GetFormID() : 0u;
+			}
+			for (std::size_t i = 0; i < g_lastCaptiveStorageDebugSnapshot.bossContainerFormIDs.size() && i < bossContainers.size(); ++i) {
+				g_lastCaptiveStorageDebugSnapshot.bossContainerFormIDs[i] = bossContainers[i].ref ? bossContainers[i].ref->GetFormID() : 0u;
+			}
+			for (std::size_t i = 0; i < g_lastCaptiveStorageDebugSnapshot.containerFormIDs.size() && i < containers.size(); ++i) {
+				g_lastCaptiveStorageDebugSnapshot.containerFormIDs[i] = containers[i].ref ? containers[i].ref->GetFormID() : 0u;
+			}
+
+			g_lastCaptiveStorageDebugSnapshot.finalTargetFormID = finalTarget ? finalTarget->GetFormID() : 0u;
+			g_lastCaptiveStorageDebugSnapshot.finalTargetKind = finalTarget ? CaptiveStorageKindCode(finalKind) : 0u;
+		}
+
+		static RE::TESObjectREFR* ResolveNearestFallbackActor(RE::TESObjectREFR* marker, RE::Actor* preferredActor)
+		{
+			if (!marker) {
+				return nullptr;
+			}
+
+			RE::TESObjectREFR* best = nullptr;
+			double bestDistSq = std::numeric_limits<double>::max();
+
+			if (IsValidFallbackActor(marker, preferredActor)) {
+				best = preferredActor;
+				bestDistSq = DistSq(marker, preferredActor);
+			}
+
+			auto* cell = marker->GetParentCell();
+			if (!cell) {
+				return best;
+			}
+
+			const auto origin = marker->GetPosition();
+			cell->ForEachReferenceInRange(origin, kCaptiveStorageScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+				auto* actor = candidate ? candidate->As<RE::Actor>() : nullptr;
+				if (!IsValidFallbackActor(marker, actor)) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				const double distSq = DistSq(marker, actor);
+				if (!best || distSq < bestDistSq || (distSq == bestDistSq && actor->GetFormID() < best->GetFormID())) {
+					best = actor;
+					bestDistSq = distSq;
+				}
+
+				return RE::BSContainer::ForEachResult::kContinue;
+				});
+
+			return best;
+		}
+
+		static RE::TESObjectREFR* ResolveNearestCaptiveStorageInternal(RE::Actor* preferredActor)
+		{
+			EnsureRefTypes();
+			(void)preferredActor;
+
+			auto* marker = GetCachedCaptiveMarker();
+			if (!marker) {
+				DoRescanInternal(preferredActor, IsPlayerInterior());
+				marker = GetCachedCaptiveMarker();
+			}
+			if (!marker) {
+				ClearCaptiveStorageDebugSnapshot(false);
+				spdlog::info("[TFD][Location] captive storage resolve miss reason=no_marker");
+				return nullptr;
+			}
+
+			auto* markerLoc = GetLocationFromRef(marker);
+			std::vector<RE::BGSLocation*> locs;
+			AddLocationChain(locs, markerLoc);
+
+			std::vector<CaptiveStorageCandidate> storageCandidates;
+			std::vector<CaptiveStorageCandidate> bossActorCandidates;
+			std::vector<CaptiveStorageCandidate> bossContainerCandidates;
+			std::vector<CaptiveStorageCandidate> containerCandidates;
+			storageCandidates.reserve(24);
+			bossActorCandidates.reserve(8);
+			bossContainerCandidates.reserve(8);
+			containerCandidates.reserve(16);
+
+			for (auto* loc : locs) {
+				if (!loc) {
+					continue;
+				}
+
+				for (std::uint32_t i = 0; i < loc->specialRefs.size(); ++i) {
+					const auto& sref = loc->specialRefs[i];
+					auto* type = sref.type;
+					if (!type) {
+						continue;
+					}
+
+					auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(sref.refData.refID);
+					if (!ref) {
+						continue;
+					}
+
+					if (SameRefType(type, g_bossContainerType)) {
+						PushBestStorageCandidate(storageCandidates, marker, ref, CaptiveStorageKind::BossContainer);
+						PushBestStorageCandidate(bossContainerCandidates, marker, ref, CaptiveStorageKind::BossContainer);
+					}
+					else if (SameRefType(type, g_bossType)) {
+						PushBestStorageCandidate(bossActorCandidates, marker, ref, CaptiveStorageKind::BossActor);
+					}
+				}
+			}
+
+			auto* cell = marker->GetParentCell();
+			if (cell) {
+				const auto origin = marker->GetPosition();
+				cell->ForEachReferenceInRange(origin, kCaptiveStorageScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+					auto* base = candidate ? candidate->GetBaseObject() : nullptr;
+					if (base && base->As<RE::TESObjectCONT>()) {
+						PushBestStorageCandidate(storageCandidates, marker, candidate, CaptiveStorageKind::Container);
+						PushBestStorageCandidate(containerCandidates, marker, candidate, CaptiveStorageKind::Container);
+					}
+					return RE::BSContainer::ForEachResult::kContinue;
+					});
+			}
+
+			spdlog::info(
+				"[TFD][Location] captive storage candidate summary marker={:08X} all={} bossActors={} bossContainers={} containers={}",
+				marker->GetFormID(),
+				storageCandidates.size(),
+				bossActorCandidates.size(),
+				bossContainerCandidates.size(),
+				containerCandidates.size());
+
+			if (auto* storage = PickBestStorageCandidate(storageCandidates)) {
+				CaptiveStorageKind finalKind = CaptiveStorageKind::Container;
+				for (const auto& it : storageCandidates) {
+					if (it.ref && it.ref->GetFormID() == storage->GetFormID()) {
+						finalKind = it.kind;
+						break;
+					}
+				}
+
+				StoreCaptiveStorageDebugSnapshot(marker, bossActorCandidates, bossContainerCandidates, containerCandidates, storage, finalKind);
+				const auto dist = std::sqrt(DistSq(marker, storage));
+				spdlog::info(
+					"[TFD][Location] captive storage resolved marker={:08X} storage={:08X} kind={} dist={:.1f} cell={:08X}",
+					marker->GetFormID(),
+					storage->GetFormID(),
+					CaptiveStorageKindCode(finalKind),
+					dist,
+					storage->GetParentCell() ? storage->GetParentCell()->GetFormID() : 0);
+				return storage;
+			}
+
+			StoreCaptiveStorageDebugSnapshot(marker, bossActorCandidates, bossContainerCandidates, containerCandidates, nullptr, CaptiveStorageKind::Container);
+			spdlog::info(
+				"[TFD][Location] captive storage resolve miss marker={:08X} sameCellOnly=1 radius={:.1f} containerOnly=1 bossActors={} bossContainers={} containers={} -> keep player inventory",
+				marker->GetFormID(),
+				kCaptiveStorageScanRadius,
+				bossActorCandidates.size(),
+				bossContainerCandidates.size(),
+				containerCandidates.size());
+			return nullptr;
+		}
+
+
 		static bool DoRescanInternal(RE::Actor* aggressor, bool preferInterior)
 		{
 			EnsureRefTypes();
@@ -1397,6 +1851,11 @@ namespace TFD::Location
 		return ok;
 	}
 
+	bool RefreshCaptiveMarkerSilent(RE::Actor* aggressor, bool preferInterior)
+	{
+		return DoRescanInternal(aggressor, preferInterior);
+	}
+
 	RE::TESObjectREFR* GetCachedCaptiveMarker()
 	{
 		auto ni = g_cachedMarker.get();
@@ -1407,6 +1866,24 @@ namespace TFD::Location
 	{
 		auto* m = GetCachedCaptiveMarker();
 		return m ? m->GetFormID() : 0;
+	}
+
+
+	RE::TESObjectREFR* ResolveNearestCaptiveStorageTarget(RE::Actor* preferredActor)
+	{
+		return ResolveNearestCaptiveStorageInternal(preferredActor);
+	}
+
+	std::uint32_t ResolveNearestCaptiveStorageTargetFormID(RE::Actor* preferredActor)
+	{
+		auto* ref = ResolveNearestCaptiveStorageInternal(preferredActor);
+		return ref ? ref->GetFormID() : 0;
+	}
+
+	bool GetLastCaptiveStorageDebugSnapshot(CaptiveStorageDebugSnapshot& out)
+	{
+		out = g_lastCaptiveStorageDebugSnapshot;
+		return out.hasMarker;
 	}
 
 	void DumpContextToLog()

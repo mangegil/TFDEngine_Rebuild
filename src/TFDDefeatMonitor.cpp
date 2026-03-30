@@ -15,9 +15,9 @@
 #include <tuple>
 #include <array>
 
+#include <RE/Skyrim.h>
 #include <type_traits>
 #include <RE/A/ActorValues.h>
-#include <RE/Skyrim.h>
 #include <RE/L/LockpickingMenu.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
@@ -190,6 +190,7 @@ namespace TFD::DefeatMonitor
 		CaptivePhaseValue g_captivePhase = CaptivePhaseValue::None;
 		bool g_prevDialogueOpen = false;
 		bool g_prevLockpickOpen = false;
+		bool g_captiveConfiscationApplied = false;
 
 		struct TeammateRegistryCache
 		{
@@ -211,6 +212,19 @@ namespace TFD::DefeatMonitor
 		};
 
 		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
+
+		struct CaptiveQuestRegistryCache
+		{
+			RE::TESQuest* quest{ nullptr };
+			RE::BGSRefAlias* playerCaptiveAlias{ nullptr };
+			std::array<RE::BGSRefAlias*, 3> bossCaptorAliases{};
+			std::array<RE::BGSRefAlias*, 3> bossContainerAliases{};
+			std::array<RE::BGSRefAlias*, 3> containerAliases{};
+			RE::BGSRefAlias* lootTargetAlias{ nullptr };
+			bool resolved{ false };
+		};
+
+		CaptiveQuestRegistryCache g_captiveQuestRegistry{};
 		static constexpr double kDefeatedEnemyKnockSeconds = 30.0;
 		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
@@ -1302,6 +1316,9 @@ namespace TFD::DefeatMonitor
 		static void CompleteCaptiveTransitionNow(const char* reason);
 		static bool CompleteRescueTransitionNow(const char* reason);
 		static void CompleteRecoverTransitionNow(const char* reason);
+		static bool TransferPlayerInventoryToCaptiveStorage(RE::TESObjectREFR* target, const char* reason);
+		static bool ProcessCaptiveConfiscation(const char* reason);
+		static void SyncCaptiveStorageDebugAliases(const char* reason);
 		static void EnterNonCaptiveChoice(const char* reason);
 		static bool BeginResolvedNoMarkerFallback(const char* reason);
 		static void RecoverPlayerAfterTeleport();
@@ -1513,6 +1530,203 @@ namespace TFD::DefeatMonitor
 				g_defeatedEnemyRegistry.quest ? g_defeatedEnemyRegistry.quest->GetFormID() : 0u,
 				g_defeatedEnemyRegistry.faction ? g_defeatedEnemyRegistry.faction->GetFormID() : 0u,
 				found);
+		}
+
+		static void ResolveCaptiveQuestRegistry()
+		{
+			if (g_captiveQuestRegistry.resolved) {
+				return;
+			}
+			g_captiveQuestRegistry.resolved = true;
+			g_captiveQuestRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDCaptiveQuest");
+			if (!g_captiveQuestRegistry.quest) {
+				spdlog::warn("[TFD][Captive] captive quest not found");
+				return;
+			}
+
+			for (auto* baseAlias : g_captiveQuestRegistry.quest->aliases) {
+				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+				if (!refAlias) {
+					continue;
+				}
+				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName == "PlayerCaptive") {
+					g_captiveQuestRegistry.playerCaptiveAlias = refAlias;
+					continue;
+				}
+				if (aliasName == "LootTarget") {
+					g_captiveQuestRegistry.lootTargetAlias = refAlias;
+					continue;
+				}
+				if (aliasName.rfind("BossCaptor", 0) == 0 && aliasName.size() >= 11) {
+					try {
+						int slot = std::stoi(aliasName.substr(10));
+						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossCaptorAliases.size())) {
+							g_captiveQuestRegistry.bossCaptorAliases[slot - 1] = refAlias;
+						}
+					}
+					catch (...) {}
+					continue;
+				}
+				if (aliasName.rfind("BossContainer", 0) == 0 && aliasName.size() >= 14) {
+					try {
+						int slot = std::stoi(aliasName.substr(13));
+						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossContainerAliases.size())) {
+							g_captiveQuestRegistry.bossContainerAliases[slot - 1] = refAlias;
+						}
+					}
+					catch (...) {}
+					continue;
+				}
+				if (aliasName.rfind("Container", 0) == 0 && aliasName.size() >= 10) {
+					try {
+						int slot = std::stoi(aliasName.substr(9));
+						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.containerAliases.size())) {
+							g_captiveQuestRegistry.containerAliases[slot - 1] = refAlias;
+						}
+					}
+					catch (...) {}
+					continue;
+				}
+			}
+
+			std::size_t bossCaptorCount = 0;
+			std::size_t bossContainerCount = 0;
+			std::size_t containerCount = 0;
+			for (auto* alias : g_captiveQuestRegistry.bossCaptorAliases) {
+				if (alias) {
+					++bossCaptorCount;
+				}
+			}
+			for (auto* alias : g_captiveQuestRegistry.bossContainerAliases) {
+				if (alias) {
+					++bossContainerCount;
+				}
+			}
+			for (auto* alias : g_captiveQuestRegistry.containerAliases) {
+				if (alias) {
+					++containerCount;
+				}
+			}
+
+			spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
+				g_captiveQuestRegistry.quest ? g_captiveQuestRegistry.quest->GetFormID() : 0u,
+				g_captiveQuestRegistry.playerCaptiveAlias ? g_captiveQuestRegistry.playerCaptiveAlias->aliasID : static_cast<std::uint32_t>(0),
+				bossCaptorCount,
+				bossContainerCount,
+				containerCount,
+				g_captiveQuestRegistry.lootTargetAlias ? 1 : 0);
+		}
+
+		static void WriteCaptiveQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
+		{
+			ResolveCaptiveQuestRegistry();
+			if (!g_captiveQuestRegistry.quest || !alias) {
+				return;
+			}
+
+			RE::ObjectRefHandle handle{};
+			if (ref) {
+				handle = ref->CreateRefHandle();
+			}
+
+			RE::BSWriteLockGuard lock(g_captiveQuestRegistry.quest->aliasAccessLock);
+			auto it = g_captiveQuestRegistry.quest->refAliasMap.find(alias->aliasID);
+			if (ref) {
+				if (it != g_captiveQuestRegistry.quest->refAliasMap.end()) {
+					it->second = handle;
+				}
+				else {
+					g_captiveQuestRegistry.quest->refAliasMap.insert({ alias->aliasID, handle });
+				}
+			}
+			else {
+				if (it != g_captiveQuestRegistry.quest->refAliasMap.end()) {
+					g_captiveQuestRegistry.quest->refAliasMap.erase(it);
+				}
+			}
+		}
+
+		static void WritePlayerCaptiveAlias(RE::Actor* actor)
+		{
+			ResolveCaptiveQuestRegistry();
+			WriteCaptiveQuestAlias(g_captiveQuestRegistry.playerCaptiveAlias, actor);
+		}
+
+		static void SyncPlayerCaptiveAlias(RE::Actor* actor, const char* reason)
+		{
+			ResolveCaptiveQuestRegistry();
+			if (!g_captiveQuestRegistry.quest || !g_captiveQuestRegistry.playerCaptiveAlias) {
+				spdlog::warn("[TFD][Captive] player captive alias unavailable reason={}", reason ? reason : "unknown");
+				return;
+			}
+
+			WritePlayerCaptiveAlias(actor);
+			spdlog::info("[TFD][Captive] PlayerCaptive alias {} actor={:08X} reason={}",
+				actor ? "assigned" : "cleared",
+				actor ? actor->GetFormID() : 0u,
+				reason ? reason : "unknown");
+		}
+
+		static void SyncCaptiveStorageDebugAliases(const char* reason)
+		{
+			ResolveCaptiveQuestRegistry();
+			if (!g_captiveQuestRegistry.quest) {
+				return;
+			}
+
+			TFD::Location::CaptiveStorageDebugSnapshot snapshot{};
+			const bool hasSnapshot = TFD::Location::GetLastCaptiveStorageDebugSnapshot(snapshot);
+
+			auto assignByFormID = [&](RE::BGSRefAlias* alias, std::uint32_t formID) {
+				RE::TESObjectREFR* ref = nullptr;
+				if (formID != 0) {
+					ref = LookupRefByFormID(formID);
+				}
+				WriteCaptiveQuestAlias(alias, ref);
+				};
+
+			for (std::size_t i = 0; i < g_captiveQuestRegistry.bossCaptorAliases.size(); ++i) {
+				assignByFormID(g_captiveQuestRegistry.bossCaptorAliases[i], hasSnapshot ? snapshot.bossActorFormIDs[i] : 0u);
+			}
+			for (std::size_t i = 0; i < g_captiveQuestRegistry.bossContainerAliases.size(); ++i) {
+				assignByFormID(g_captiveQuestRegistry.bossContainerAliases[i], hasSnapshot ? snapshot.bossContainerFormIDs[i] : 0u);
+			}
+			for (std::size_t i = 0; i < g_captiveQuestRegistry.containerAliases.size(); ++i) {
+				assignByFormID(g_captiveQuestRegistry.containerAliases[i], hasSnapshot ? snapshot.containerFormIDs[i] : 0u);
+			}
+			assignByFormID(g_captiveQuestRegistry.lootTargetAlias, hasSnapshot ? snapshot.finalTargetFormID : 0u);
+
+			spdlog::info("[TFD][Captive] debug aliases synced reason={} hasSnapshot={} boss1={:08X} bossContainer1={:08X} container1={:08X} lootTarget={:08X} targetKind={}",
+				reason ? reason : "unknown",
+				hasSnapshot ? 1 : 0,
+				hasSnapshot ? snapshot.bossActorFormIDs[0] : 0u,
+				hasSnapshot ? snapshot.bossContainerFormIDs[0] : 0u,
+				hasSnapshot ? snapshot.containerFormIDs[0] : 0u,
+				hasSnapshot ? snapshot.finalTargetFormID : 0u,
+				hasSnapshot ? snapshot.finalTargetKind : 0u);
+		}
+
+		static void ClearCaptiveStorageDebugAliases(const char* reason)
+		{
+			ResolveCaptiveQuestRegistry();
+			if (!g_captiveQuestRegistry.quest) {
+				return;
+			}
+
+			for (auto* alias : g_captiveQuestRegistry.bossCaptorAliases) {
+				WriteCaptiveQuestAlias(alias, nullptr);
+			}
+			for (auto* alias : g_captiveQuestRegistry.bossContainerAliases) {
+				WriteCaptiveQuestAlias(alias, nullptr);
+			}
+			for (auto* alias : g_captiveQuestRegistry.containerAliases) {
+				WriteCaptiveQuestAlias(alias, nullptr);
+			}
+			WriteCaptiveQuestAlias(g_captiveQuestRegistry.lootTargetAlias, nullptr);
+
+			spdlog::info("[TFD][Captive] debug aliases cleared reason={}",
+				reason ? reason : "unknown");
 		}
 
 		static void WriteDefeatedEnemyAlias(RE::BGSRefAlias* alias, RE::Actor* actor)
@@ -2600,7 +2814,8 @@ namespace TFD::DefeatMonitor
 				float score = Distance3D(actorPos, enemy->GetPosition());
 				if (targetsActor) {
 					score -= 3000.0f;
-				} else if (enemyTarget && IsActiveFollowerActor(enemyTarget)) {
+				}
+				else if (enemyTarget && IsActiveFollowerActor(enemyTarget)) {
 					score -= 1200.0f;
 				}
 				if (hostileToActor) {
@@ -3885,6 +4100,142 @@ namespace TFD::DefeatMonitor
 			HideBlackoutFader();
 		}
 
+		static RE::TESBoundObject* ResolveLockpickItem()
+		{
+			static RE::TESBoundObject* cached = nullptr;
+			static bool resolved = false;
+			if (!resolved) {
+				resolved = true;
+				cached = RE::TESForm::LookupByEditorID<RE::TESBoundObject>("Lockpick");
+				if (!cached) {
+					spdlog::warn("[TFD][Captive] Lockpick form not found by EditorID");
+				}
+			}
+			return cached;
+		}
+
+		static std::int32_t GetReferenceItemCount(RE::TESObjectREFR* ref, RE::TESBoundObject* item)
+		{
+			if (!ref || !item) {
+				return 0;
+			}
+
+			const auto inv = ref->GetInventory([item](RE::TESBoundObject& obj) {
+				return &obj == item;
+				}, true);
+
+			auto it = inv.find(item);
+			if (it == inv.end()) {
+				return 0;
+			}
+
+			return (std::max)(0, it->second.first);
+		}
+
+		static void EnsureCaptiveStarterLockpicks(std::int32_t targetCount, const char* reason)
+		{
+			auto* player = Player();
+			auto* lockpick = ResolveLockpickItem();
+			if (!player || !lockpick || targetCount <= 0) {
+				return;
+			}
+
+			const auto currentCount = GetReferenceItemCount(player, lockpick);
+			if (currentCount >= targetCount) {
+				spdlog::info("[TFD][Captive] starter lockpick skipped current={} target={} reason={}",
+					currentCount,
+					targetCount,
+					reason ? reason : "unknown");
+				return;
+			}
+
+			const auto addCount = targetCount - currentCount;
+			player->AddObjectToContainer(lockpick, nullptr, addCount, nullptr);
+			spdlog::info("[TFD][Captive] starter lockpick granted add={} finalTarget={} reason={}",
+				addCount,
+				targetCount,
+				reason ? reason : "unknown");
+		}
+
+		static bool TransferPlayerInventoryToCaptiveStorage(RE::TESObjectREFR* target, const char* reason)
+		{
+			auto* player = Player();
+			if (!player || !target || target == player) {
+				spdlog::info("[TFD][Captive] confiscation skipped player={:08X} target={:08X} reason={}",
+					player ? player->GetFormID() : 0u,
+					target ? target->GetFormID() : 0u,
+					reason ? reason : "unknown");
+				return false;
+			}
+
+			auto* changes = player->GetInventoryChanges();
+			if (!changes) {
+				spdlog::info("[TFD][Captive] confiscation skipped no_inventory_changes target={:08X} reason={}",
+					target->GetFormID(),
+					reason ? reason : "unknown");
+				return false;
+			}
+
+			const auto inv = player->GetInventory([](RE::TESBoundObject&) {
+				return true;
+				}, true);
+
+			std::int32_t totalStacks = 0;
+			std::int32_t totalUnits = 0;
+			for (const auto& [item, invData] : inv) {
+				const auto& [count, entry] = invData;
+				if (!item || count <= 0 || !entry) {
+					continue;
+				}
+
+				++totalStacks;
+				totalUnits += count;
+			}
+
+			if (totalUnits <= 0) {
+				spdlog::info("[TFD][Captive] confiscation skipped empty_inventory target={:08X} reason={}",
+					target->GetFormID(),
+					reason ? reason : "unknown");
+				return false;
+			}
+
+			changes->RemoveAllItems(
+				player,
+				target,
+				false,
+				false,
+				false);
+
+			spdlog::info(
+				"[TFD][Captive] confiscation moved_all target={:08X} stacks={} units={} keepOwnership=0 arg6=0 reason={}",
+				target->GetFormID(),
+				totalStacks,
+				totalUnits,
+				reason ? reason : "unknown");
+			return true;
+		}
+
+		static bool ProcessCaptiveConfiscation(const char* reason)
+		{
+			if (g_captiveConfiscationApplied) {
+				spdlog::info("[TFD][Captive] confiscation already applied reason={}", reason ? reason : "unknown");
+				SyncCaptiveStorageDebugAliases(reason ? reason : "confiscation_already_applied");
+				return false;
+			}
+
+			auto* storage = TFD::Location::ResolveNearestCaptiveStorageTarget(nullptr);
+			SyncCaptiveStorageDebugAliases(reason ? reason : "confiscation_scan");
+			if (!storage) {
+				g_captiveConfiscationApplied = true;
+				spdlog::info("[TFD][Captive] no storage target found; skipping confiscation reason={}", reason ? reason : "unknown");
+				return false;
+			}
+
+			TransferPlayerInventoryToCaptiveStorage(storage, reason);
+			g_captiveConfiscationApplied = true;
+			return true;
+		}
+
 		static void CompleteCaptiveTransitionNow(const char* reason)
 		{
 			ClearNoMarkerFallbackState();
@@ -3908,7 +4259,14 @@ namespace TFD::DefeatMonitor
 				g_captiveDoor.SealToInitial(true);
 			}
 			ApplyCalmBubble((std::max)(2000.0f, TFD::Settings::GetSweepRadius()));
-			spdlog::info("[TFD][Captive] entered captivePhase reason={}", reason ? reason : "unknown");
+			const bool starterKitAllowed = ProcessCaptiveConfiscation(reason);
+			SyncPlayerCaptiveAlias(Player(), reason ? reason : "captive_enter");
+			if (starterKitAllowed) {
+				EnsureCaptiveStarterLockpicks(3, reason ? reason : "captive_enter");
+			}
+			spdlog::info("[TFD][Captive] entered captivePhase reason={} starterKitAllowed={}",
+				reason ? reason : "unknown",
+				starterKitAllowed ? 1 : 0);
 		}
 
 		static void PollTransitionResult()
@@ -3994,6 +4352,13 @@ namespace TFD::DefeatMonitor
 		{
 			g_captiveState = stateActive;
 			g_captivePhase = phase;
+			if (!stateActive) {
+				SyncPlayerCaptiveAlias(nullptr, "captive_exit");
+				ClearCaptiveStorageDebugAliases("captive_exit");
+			}
+			if (!stateActive || phase != CaptivePhaseValue::Captive) {
+				g_captiveConfiscationApplied = false;
+			}
 		}
 
 		static void SetCaptiveRuntime(bool stateActive, CaptivePhaseValue phase)
@@ -4837,7 +5202,7 @@ namespace TFD::DefeatMonitor
 						return pulseDue;
 					}
 					return !IsActorBleedingOut(actor) || pulseDue;
-				}();
+					}();
 				if (shouldPulse) {
 					actor->NotifyAnimationGraph("BleedoutStart");
 					if (entry.kind == BleedLockKind::Ally) {
@@ -6051,7 +6416,8 @@ namespace TFD::DefeatMonitor
 
 		if (hadAllyLock) {
 			ReleaseBleedLock(actor, "ally_feed_revive", true);
-		} else if (downed) {
+		}
+		else if (downed) {
 			actor->NotifyAnimationGraph("BleedoutStop");
 			actor->NotifyAnimationGraph("GetUpStart");
 		}

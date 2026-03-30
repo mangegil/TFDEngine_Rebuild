@@ -700,7 +700,10 @@ namespace TFDMenu
 				return nullptr;
 			}
 
-			TFD::ActorScan::Rescan(radius, true);
+			// Captive hotkey should still find a captor even when the actor is far away
+			// inside the same loaded cell. Do not keep the old 3500 hard limit.
+			const float searchRadius = (std::max)(radius, 12000.0f);
+			TFD::ActorScan::Rescan(searchRadius, true);
 
 			RE::Actor* best = nullptr;
 			float bestDist = 1.0e30f;
@@ -1955,7 +1958,7 @@ namespace TFDMenu
 
 					// Captive
 					if (IsCaptivePhase()) {
-						auto* captor = PickCaptorSameCellLoaded(3500.0f);
+						auto* captor = PickCaptorSameCellLoaded(12000.0f);
 						if (!captor) {
 							RE::DebugNotification("TFD: No Response");
 							continue;
