@@ -10,4 +10,5 @@ namespace TFD::FactionMask
 	bool ApplyFromAggressor(RE::Actor* aggressor);
 	void Clear();
 	bool IsActive();
+	bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs);
 }

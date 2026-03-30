@@ -51,6 +51,19 @@ namespace TFD::DefeatMonitor
 			Scene = 4
 		};
 
+		constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
+		constexpr const char* kBleedoutOutcomePleasureEvent = "TFDBleedoutOutcomePleasure";
+		constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
+		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
+		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
+
+		enum class BleedDialogueOutcome : std::uint8_t
+		{
+			None = 0,
+			PayRelease = 1,
+			Pleasure = 2
+		};
+
 		std::atomic_bool g_installed{ false };
 		std::atomic_bool g_running{ false };
 		std::atomic_bool g_loadTransition{ false };
@@ -115,6 +128,7 @@ namespace TFD::DefeatMonitor
 		bool g_bleedSawDialogue = false;
 		bool g_bleedPendingCaptiveOutcome = false;
 		bool g_bleedPendingNonCaptiveOutcome = false;
+		BleedDialogueOutcome g_bleedDialogueOutcome = BleedDialogueOutcome::None;
 
 		struct BleedBattleObserverState
 		{
@@ -1221,6 +1235,7 @@ namespace TFD::DefeatMonitor
 			g_bleedSawDialogue = false;
 			g_bleedPendingCaptiveOutcome = false;
 			g_bleedPendingNonCaptiveOutcome = false;
+			g_bleedDialogueOutcome = BleedDialogueOutcome::None;
 			g_bleedPaused = false;
 			g_bleedPauseStarted = {};
 			g_bleedLastCalmPulse = {};
@@ -1306,6 +1321,10 @@ namespace TFD::DefeatMonitor
 		static bool BeginRescueTransition(const char* reason);
 		static void BeginRecoverTransition(const char* reason);
 		static void DoBlackoutTeleport();
+		static void CompleteBleedPayRelease(const char* reason);
+		static void CompleteBleedPleasureHandoff(const char* reason);
+		static void SetBleedDialogueOutcome(BleedDialogueOutcome outcome, const char* reason);
+		static void ClearBleedDialogueOutcome(const char* reason);
 
 		enum class CinematicTransitionKind
 		{
@@ -5428,6 +5447,122 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+
+		static const char* BleedDialogueOutcomeName(BleedDialogueOutcome outcome)
+		{
+			switch (outcome) {
+			case BleedDialogueOutcome::PayRelease:
+				return "pay_release";
+			case BleedDialogueOutcome::Pleasure:
+				return "pleasure";
+			default:
+				return "none";
+			}
+		}
+
+		static void SetBleedDialogueOutcome(BleedDialogueOutcome outcome, const char* reason)
+		{
+			g_bleedDialogueOutcome = outcome;
+			spdlog::info("[TFD][Defeat] bleed dialogue outcome set={} reason={}",
+				BleedDialogueOutcomeName(outcome),
+				reason ? reason : "unknown");
+		}
+
+		static void ClearBleedDialogueOutcome(const char* reason)
+		{
+			if (g_bleedDialogueOutcome != BleedDialogueOutcome::None) {
+				spdlog::info("[TFD][Defeat] bleed dialogue outcome cleared={} reason={}",
+					BleedDialogueOutcomeName(g_bleedDialogueOutcome),
+					reason ? reason : "unknown");
+			}
+			g_bleedDialogueOutcome = BleedDialogueOutcome::None;
+		}
+
+		static void PreparePlayerForBleedoutPleasureScene(const char* reason)
+		{
+			auto* p = Player();
+			if (!p || p->IsDead() || p->IsDisabled()) {
+				return;
+			}
+
+			ReleasePlayerBleedLock(reason ? reason : "bleed_pleasure_prepare", true);
+			p->NotifyAnimationGraph("BleedoutStop");
+			p->NotifyAnimationGraph("GetUpStart");
+
+			const float hpMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kHealth));
+			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
+			const float safeHealthPct = std::clamp(threshPct + 0.08f, 0.22f, 0.95f);
+			const float healthTarget = (std::max)(35.0f, hpMax * safeHealthPct);
+			const float hpNow = p->GetActorValue(RE::ActorValue::kHealth);
+			if (hpNow < healthTarget) {
+				p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (healthTarget - hpNow));
+			}
+
+			const float staminaMax = (std::max)(1.0f, p->GetPermanentActorValue(RE::ActorValue::kStamina));
+			const float staminaTarget = (std::max)(30.0f, staminaMax * 0.45f);
+			const float staminaNow = p->GetActorValue(RE::ActorValue::kStamina);
+			if (staminaNow < staminaTarget) {
+				p->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kStamina, (staminaTarget - staminaNow));
+			}
+
+			if (p->IsInCombat()) {
+				p->StopCombat();
+			}
+			if (p->IsWeaponDrawn()) {
+				p->DrawWeaponMagicHands(false);
+			}
+			p->EvaluatePackage(false, true);
+			p->EvaluatePackage(true, true);
+			spdlog::info("[TFD][Defeat] player prepared for bleed pleasure scene reason={} hpTarget={:.2f} hpNow={:.2f}",
+				reason ? reason : "unknown",
+				healthTarget,
+				p->GetActorValue(RE::ActorValue::kHealth));
+		}
+
+		static void CompleteBleedPayRelease(const char* reason)
+		{
+			ClearPendingCinematicFadeIn();
+			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "bleed_pay_release");
+			TFD::FactionMask::Clear();
+			ClearEscapeContext();
+			ResetLockpickWatch();
+			g_grace.store(false, std::memory_order_release);
+			g_lastAggressor.reset();
+			ResetBleedRuntimeState();
+			g_prevDialogueOpen = false;
+			g_prevLockpickOpen = false;
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
+			SetPlayerBleedImmune(false);
+			RecoverPlayerForTransition();
+			ApplyCalmBubble((std::max)(2200.0f, TFD::Settings::GetSweepRadius()));
+			BeginLeftForDeadCooldown(8);
+			SetGraceSeconds(8);
+			UpdatePreCombatState();
+			spdlog::info("[TFD][Defeat] bleed pay release complete reason={}", reason ? reason : "unknown");
+		}
+
+		static void CompleteBleedPleasureHandoff(const char* reason)
+		{
+			ClearPendingCinematicFadeIn();
+			ClearBleedoutBridgeAliases(nullptr, reason ? reason : "bleed_pleasure_handoff");
+			TFD::FactionMask::Clear();
+			ClearEscapeContext();
+			ResetLockpickWatch();
+			g_grace.store(false, std::memory_order_release);
+			g_lastAggressor.reset();
+			ResetBleedRuntimeState();
+			g_prevDialogueOpen = false;
+			g_prevLockpickOpen = false;
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
+			SetPlayerBleedImmune(false);
+			RecoverPlayerForTransition();
+			ApplyCalmBubble((std::max)(2200.0f, TFD::Settings::GetSweepRadius()));
+			BeginLeftForDeadCooldown(8);
+			SetGraceSeconds(8);
+			UpdatePreCombatState();
+			spdlog::info("[TFD][Defeat] bleed pleasure handoff complete reason={}", reason ? reason : "unknown");
+		}
+
 		static void SetGraceSeconds(int seconds)
 		{
 			g_grace.store(true, std::memory_order_release);
@@ -6233,14 +6368,18 @@ namespace TFD::DefeatMonitor
 				}
 				const bool dOpen = IsDialogueOpen();
 				const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
-				if (dOpen) {
-					g_bleedSawDialogue = true;
+				const bool pleasureCommitted = g_bleedDialogueOutcome == BleedDialogueOutcome::Pleasure;
+				if (dOpen || pleasureCommitted) {
+					if (dOpen) {
+						g_bleedSawDialogue = true;
+					}
 					if (!g_bleedPaused) {
 						g_bleedPaused = true;
 						g_bleedPauseStarted = Now();
-						spdlog::info("[TFD][Defeat] bleed countdown paused by dialogue");
+						spdlog::info("[TFD][Defeat] bleed countdown paused by {}",
+							pleasureCommitted && !dOpen ? "pleasure_commit" : "dialogue");
 					}
-					g_prevDialogueOpen = true;
+					g_prevDialogueOpen = dOpen;
 					return;
 				}
 				if (g_bleedPaused) {
@@ -6262,6 +6401,12 @@ namespace TFD::DefeatMonitor
 							spdlog::info("[TFD][Defeat] bleed no-speaker tick tameHeld=1 crowdSize={}", crowd.size());
 						}
 					}
+				}
+				if (g_bleedDialogueOutcome == BleedDialogueOutcome::PayRelease && g_bleedSawDialogue && g_prevDialogueOpen) {
+					g_prevDialogueOpen = false;
+					ClearBleedDialogueOutcome("dialogue_closed_pay_release");
+					CompleteBleedPayRelease("dialogue_closed_pay_release");
+					return;
 				}
 				if (g_bleedSawDialogue && g_prevDialogueOpen) {
 					g_prevDialogueOpen = false;
@@ -6373,6 +6518,55 @@ namespace TFD::DefeatMonitor
 
 		DefeatedRecruitEventSink g_defeatedRecruitEventSink{};
 
+		class BleedOutcomeEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
+			{
+				if (!ev) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const auto* rawName = ev->eventName.c_str();
+				const std::string_view name = rawName ? std::string_view(rawName) : std::string_view{};
+				if (name.empty()) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				if (name == kBleedoutOutcomePayEvent) {
+					if (g_inBleedState.load(std::memory_order_acquire)) {
+						SetBleedDialogueOutcome(BleedDialogueOutcome::PayRelease, "mod_event_pay");
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				if (name == kBleedoutOutcomePleasureEvent) {
+					if (g_inBleedState.load(std::memory_order_acquire)) {
+						SetBleedDialogueOutcome(BleedDialogueOutcome::Pleasure, "mod_event_pleasure");
+						PreparePlayerForBleedoutPleasureScene("mod_event_pleasure");
+						CompleteBleedPleasureHandoff("mod_event_pleasure");
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				if (name == kBleedoutOutcomeResetEvent) {
+					ClearBleedDialogueOutcome("mod_event_reset");
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				if (name == kPleasureEndedEvent || name == kPleasureFailedEvent) {
+					if (g_bleedDialogueOutcome == BleedDialogueOutcome::Pleasure) {
+						if (name == kPleasureEndedEvent) {
+							ClearBleedDialogueOutcome("pleasure_ended");
+							CompleteBleedPleasureHandoff("pleasure_ended");
+						} else {
+							ClearBleedDialogueOutcome("pleasure_failed");
+						}
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		BleedOutcomeEventSink g_bleedOutcomeEventSink{};
+
+
 		static void WorkerLoop()
 		{
 			while (g_running.load(std::memory_order_acquire)) {
@@ -6402,6 +6596,7 @@ namespace TFD::DefeatMonitor
 		TFD::Location::Initialize();
 		if (auto* src = SKSE::GetModCallbackEventSource()) {
 			src->AddEventSink(&g_defeatedRecruitEventSink);
+			src->AddEventSink(&g_bleedOutcomeEventSink);
 		}
 		ClearPendingDefeatedDialogueTargetInternal();
 		g_worker = std::thread([]() { WorkerLoop(); });
@@ -6428,6 +6623,7 @@ namespace TFD::DefeatMonitor
 		ClearLeftForDeadCooldown();
 		if (auto* src = SKSE::GetModCallbackEventSource()) {
 			src->RemoveEventSink(&g_defeatedRecruitEventSink);
+			src->RemoveEventSink(&g_bleedOutcomeEventSink);
 		}
 		ClearPendingDefeatedDialogueTargetInternal();
 		spdlog::info("[TFD][Defeat] monitor shutdown");

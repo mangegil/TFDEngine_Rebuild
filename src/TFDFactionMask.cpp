@@ -244,4 +244,30 @@ namespace TFD::FactionMask
 	{
 		return g_active;
 	}
+
+	bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs)
+	{
+		Initialize();
+
+		if (!lhs || !rhs) {
+			return false;
+		}
+
+		for (const auto& entry : g_allowedFactions) {
+			auto* faction = entry.faction;
+			if (!faction) {
+				continue;
+			}
+
+			if (!HasExactFaction(lhs, faction)) {
+				continue;
+			}
+
+			if (HasExactFaction(rhs, faction)) {
+				return true;
+			}
+		}
+
+		return false;
+	}
 }
