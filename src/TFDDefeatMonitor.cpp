@@ -191,6 +191,14 @@ namespace TFD::DefeatMonitor
 		bool g_prevDialogueOpen = false;
 		bool g_prevLockpickOpen = false;
 		bool g_captiveConfiscationApplied = false;
+		bool g_captiveConfiscationPending = false;
+		bool g_captiveStarterLockpickPending = false;
+		std::string g_captivePendingConfiscationReason{};
+		int g_captiveConfiscationAttemptCount = 0;
+		std::chrono::steady_clock::time_point g_captiveConfiscationNextAttempt{};
+		static constexpr int kCaptiveConfiscationInitialDelayMs = 300;
+		static constexpr int kCaptiveConfiscationRetryDelayMs = 250;
+		static constexpr int kCaptiveConfiscationMaxAttempts = 20;
 
 		struct TeammateRegistryCache
 		{
@@ -4132,6 +4140,39 @@ namespace TFD::DefeatMonitor
 			return (std::max)(0, it->second.first);
 		}
 
+		static std::int32_t GetReferenceTotalInventoryCount(RE::TESObjectREFR* ref)
+		{
+			if (!ref) {
+				return 0;
+			}
+
+			const auto inv = ref->GetInventory([](RE::TESBoundObject&) {
+				return true;
+				}, true);
+
+			std::int32_t totalUnits = 0;
+			for (const auto& [item, invData] : inv) {
+				const auto& [count, entry] = invData;
+				(void)entry;
+				if (!item || count <= 0) {
+					continue;
+				}
+
+				totalUnits += count;
+			}
+
+			return totalUnits;
+		}
+
+		static bool IsContainerStorageTarget(RE::TESObjectREFR* target)
+		{
+			if (!target) {
+				return false;
+			}
+			auto* base = target->GetBaseObject();
+			return base && base->As<RE::TESObjectCONT>();
+		}
+
 		static void EnsureCaptiveStarterLockpicks(std::int32_t targetCount, const char* reason)
 		{
 			auto* player = Player();
@@ -4159,6 +4200,12 @@ namespace TFD::DefeatMonitor
 
 		static bool TransferPlayerInventoryToCaptiveStorage(RE::TESObjectREFR* target, const char* reason)
 		{
+			struct PendingMove
+			{
+				RE::TESBoundObject* item{ nullptr };
+				std::int32_t count{ 0 };
+			};
+
 			auto* player = Player();
 			if (!player || !target || target == player) {
 				spdlog::info("[TFD][Captive] confiscation skipped player={:08X} target={:08X} reason={}",
@@ -4168,10 +4215,10 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
-			auto* changes = player->GetInventoryChanges();
-			if (!changes) {
-				spdlog::info("[TFD][Captive] confiscation skipped no_inventory_changes target={:08X} reason={}",
+			if (!IsContainerStorageTarget(target)) {
+				spdlog::warn("[TFD][Captive] confiscation rejected non-container target={:08X} base={:08X} reason={}",
 					target->GetFormID(),
+					target->GetBaseObject() ? target->GetBaseObject()->GetFormID() : 0u,
 					reason ? reason : "unknown");
 				return false;
 			}
@@ -4180,60 +4227,213 @@ namespace TFD::DefeatMonitor
 				return true;
 				}, true);
 
+			std::vector<PendingMove> pending{};
+			pending.reserve(inv.size());
+
 			std::int32_t totalStacks = 0;
 			std::int32_t totalUnits = 0;
 			for (const auto& [item, invData] : inv) {
 				const auto& [count, entry] = invData;
-				if (!item || count <= 0 || !entry) {
+				(void)entry;
+				if (!item || count <= 0) {
 					continue;
 				}
 
+				pending.push_back(PendingMove{ item, count });
 				++totalStacks;
 				totalUnits += count;
 			}
 
-			if (totalUnits <= 0) {
+			if (pending.empty() || totalUnits <= 0) {
 				spdlog::info("[TFD][Captive] confiscation skipped empty_inventory target={:08X} reason={}",
 					target->GetFormID(),
 					reason ? reason : "unknown");
 				return false;
 			}
 
-			changes->RemoveAllItems(
-				player,
-				target,
-				false,
-				false,
-				false);
+			std::int32_t removedUnits = 0;
+			std::int32_t addedUnits = 0;
+			std::int32_t movedStacks = 0;
+			std::int32_t partialStacks = 0;
+			std::int32_t failedStacks = 0;
+
+			for (const auto& move : pending) {
+				auto* item = move.item;
+				if (!item || move.count <= 0) {
+					continue;
+				}
+
+				const auto beforePlayer = GetReferenceItemCount(player, item);
+				if (beforePlayer <= 0) {
+					continue;
+				}
+
+				const auto requestCount = (std::min)(move.count, beforePlayer);
+				const auto beforeTarget = GetReferenceItemCount(target, item);
+
+				player->RemoveItem(
+					item,
+					requestCount,
+					RE::ITEM_REMOVE_REASON::kStoreInContainer,
+					nullptr,
+					target);
+
+				const auto afterPlayer = GetReferenceItemCount(player, item);
+				const auto afterTarget = GetReferenceItemCount(target, item);
+
+				const auto removedNow = (std::max)(0, beforePlayer - afterPlayer);
+				const auto addedNow = (std::max)(0, afterTarget - beforeTarget);
+
+				removedUnits += removedNow;
+				addedUnits += addedNow;
+
+				if (removedNow == requestCount && addedNow == requestCount) {
+					++movedStacks;
+					continue;
+				}
+
+				if (removedNow > 0 || addedNow > 0) {
+					++partialStacks;
+				}
+				else {
+					++failedStacks;
+				}
+
+				spdlog::warn(
+					"[TFD][Captive] confiscation stack mismatch item={:08X} requested={} removed={} added={} beforePlayer={} afterPlayer={} beforeTarget={} afterTarget={} reason={}",
+					item->GetFormID(),
+					requestCount,
+					removedNow,
+					addedNow,
+					beforePlayer,
+					afterPlayer,
+					beforeTarget,
+					afterTarget,
+					reason ? reason : "unknown");
+			}
+
+			const auto playerUnitsAfter = GetReferenceTotalInventoryCount(player);
 
 			spdlog::info(
-				"[TFD][Captive] confiscation moved_all target={:08X} stacks={} units={} keepOwnership=0 arg6=0 reason={}",
+				"[TFD][Captive] confiscation moved_manual target={:08X} stacks={} units={} movedStacks={} partialStacks={} failedStacks={} removedUnits={} addedUnits={} playerUnitsAfter={} reason={}",
 				target->GetFormID(),
 				totalStacks,
 				totalUnits,
+				movedStacks,
+				partialStacks,
+				failedStacks,
+				removedUnits,
+				addedUnits,
+				playerUnitsAfter,
 				reason ? reason : "unknown");
-			return true;
+
+			return removedUnits > 0 || addedUnits > 0;
 		}
 
-		static bool ProcessCaptiveConfiscation(const char* reason)
+		static void ClearPendingCaptiveConfiscation(const char* reason)
 		{
-			if (g_captiveConfiscationApplied) {
-				spdlog::info("[TFD][Captive] confiscation already applied reason={}", reason ? reason : "unknown");
-				SyncCaptiveStorageDebugAliases(reason ? reason : "confiscation_already_applied");
-				return false;
+			const bool hadPending = g_captiveConfiscationPending || g_captiveStarterLockpickPending || !g_captivePendingConfiscationReason.empty();
+			g_captiveConfiscationPending = false;
+			g_captiveStarterLockpickPending = false;
+			g_captivePendingConfiscationReason.clear();
+			g_captiveConfiscationAttemptCount = 0;
+			g_captiveConfiscationNextAttempt = {};
+			if (hadPending) {
+				spdlog::info("[TFD][Captive] confiscation pending cleared reason={}", reason ? reason : "unknown");
 			}
+		}
+
+		static void QueuePendingCaptiveConfiscation(const char* reason, bool starterKitWanted)
+		{
+			g_captiveConfiscationPending = true;
+			g_captiveStarterLockpickPending = starterKitWanted;
+			g_captivePendingConfiscationReason = reason ? reason : "unknown";
+			g_captiveConfiscationAttemptCount = 0;
+			g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationInitialDelayMs);
+			spdlog::info("[TFD][Captive] confiscation pending queued starterKitWanted={} delayMs={} reason={}",
+				starterKitWanted ? 1 : 0,
+				kCaptiveConfiscationInitialDelayMs,
+				g_captivePendingConfiscationReason.c_str());
+		}
+
+		static void ProcessPendingCaptiveConfiscation()
+		{
+			if (!g_captiveConfiscationPending) {
+				return;
+			}
+
+			if (g_captiveConfiscationApplied) {
+				ClearPendingCaptiveConfiscation("already_applied");
+				return;
+			}
+
+			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) {
+				ClearPendingCaptiveConfiscation("not_in_captive_phase");
+				return;
+			}
+
+			if (Now() < g_captiveConfiscationNextAttempt) {
+				return;
+			}
+
+			auto* ui = RE::UI::GetSingleton();
+			if (ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) {
+				g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
+				return;
+			}
+
+			auto* player = Player();
+			auto* marker = TFD::Location::GetCachedCaptiveMarker();
+			auto* playerCell = player ? player->GetParentCell() : nullptr;
+			auto* markerCell = marker ? marker->GetParentCell() : nullptr;
+			if (!player || !playerCell || !marker || !markerCell || playerCell != markerCell) {
+				g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
+				return;
+			}
+
+			const char* reason = g_captivePendingConfiscationReason.empty() ? "unknown" : g_captivePendingConfiscationReason.c_str();
+			++g_captiveConfiscationAttemptCount;
+			spdlog::info("[TFD][Captive] confiscation pending attempt={} cell={:08X} marker={:08X} reason={}",
+				g_captiveConfiscationAttemptCount,
+				playerCell->GetFormID(),
+				marker->GetFormID(),
+				reason);
 
 			auto* storage = TFD::Location::ResolveNearestCaptiveStorageTarget(nullptr);
-			SyncCaptiveStorageDebugAliases(reason ? reason : "confiscation_scan");
+			SyncCaptiveStorageDebugAliases(reason);
 			if (!storage) {
-				g_captiveConfiscationApplied = true;
-				spdlog::info("[TFD][Captive] no storage target found; skipping confiscation reason={}", reason ? reason : "unknown");
-				return false;
+				if (g_captiveConfiscationAttemptCount >= kCaptiveConfiscationMaxAttempts) {
+					spdlog::warn("[TFD][Captive] confiscation aborted no_container_target attempts={} reason={}",
+						g_captiveConfiscationAttemptCount,
+						reason);
+					ClearPendingCaptiveConfiscation("no_container_target");
+				}
+				else {
+					g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
+				}
+				return;
 			}
 
-			TransferPlayerInventoryToCaptiveStorage(storage, reason);
+			if (!IsContainerStorageTarget(storage)) {
+				if (g_captiveConfiscationAttemptCount >= kCaptiveConfiscationMaxAttempts) {
+					spdlog::warn("[TFD][Captive] confiscation aborted non_container_target target={:08X} attempts={} reason={}",
+						storage->GetFormID(),
+						g_captiveConfiscationAttemptCount,
+						reason);
+					ClearPendingCaptiveConfiscation("non_container_target");
+				}
+				else {
+					g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
+				}
+				return;
+			}
+
+			const bool moved = TransferPlayerInventoryToCaptiveStorage(storage, reason);
 			g_captiveConfiscationApplied = true;
-			return true;
+			if (moved && g_captiveStarterLockpickPending) {
+				EnsureCaptiveStarterLockpicks(3, reason);
+			}
+			ClearPendingCaptiveConfiscation(moved ? "completed" : "completed_no_items");
 		}
 
 		static void CompleteCaptiveTransitionNow(const char* reason)
@@ -4259,14 +4459,10 @@ namespace TFD::DefeatMonitor
 				g_captiveDoor.SealToInitial(true);
 			}
 			ApplyCalmBubble((std::max)(2000.0f, TFD::Settings::GetSweepRadius()));
-			const bool starterKitAllowed = ProcessCaptiveConfiscation(reason);
+			QueuePendingCaptiveConfiscation(reason, true);
 			SyncPlayerCaptiveAlias(Player(), reason ? reason : "captive_enter");
-			if (starterKitAllowed) {
-				EnsureCaptiveStarterLockpicks(3, reason ? reason : "captive_enter");
-			}
-			spdlog::info("[TFD][Captive] entered captivePhase reason={} starterKitAllowed={}",
-				reason ? reason : "unknown",
-				starterKitAllowed ? 1 : 0);
+			spdlog::info("[TFD][Captive] entered captivePhase reason={} confiscationQueued=1 starterKitPending=1",
+				reason ? reason : "unknown");
 		}
 
 		static void PollTransitionResult()
@@ -4358,6 +4554,7 @@ namespace TFD::DefeatMonitor
 			}
 			if (!stateActive || phase != CaptivePhaseValue::Captive) {
 				g_captiveConfiscationApplied = false;
+				ClearPendingCaptiveConfiscation("captive_state_reset");
 			}
 		}
 
@@ -5980,6 +6177,7 @@ namespace TFD::DefeatMonitor
 			auto* ui = RE::UI::GetSingleton();
 			PollTransitionResult();
 			ProcessPendingCinematicFadeIn();
+			ProcessPendingCaptiveConfiscation();
 			if (IsTransitionAwaiting() || g_pendingCinematicFadeIn) {
 				MaintainTransitionCalmWindow();
 				UpdatePreCombatState();

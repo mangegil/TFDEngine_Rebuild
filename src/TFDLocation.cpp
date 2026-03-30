@@ -29,6 +29,7 @@ namespace TFD::Location
 		// Common ref type EditorID
 		static constexpr const char* kBossRefTypeEditorId = "Boss";
 		static constexpr const char* kBossContainerRefTypeEditorId = "BossContainer";
+		static constexpr const char* kContainerRefTypeEditorId = "Container";
 		static constexpr const char* kLocationCenterRefTypeEditorId = "LocationCenterMarker";
 
 		RE::BGSLocationRefType* g_captiveType = nullptr;
@@ -37,6 +38,7 @@ namespace TFD::Location
 
 		RE::BGSLocationRefType* g_bossType = nullptr;
 		RE::BGSLocationRefType* g_bossContainerType = nullptr;
+		RE::BGSLocationRefType* g_containerType = nullptr;
 		RE::BGSLocationRefType* g_centerType = nullptr;
 
 		RE::ObjectRefHandle g_cachedMarker{};
@@ -214,6 +216,9 @@ namespace TFD::Location
 			}
 			if (!g_bossContainerType) {
 				g_bossContainerType = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>(kBossContainerRefTypeEditorId);
+			}
+			if (!g_containerType) {
+				g_containerType = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>(kContainerRefTypeEditorId);
 			}
 			if (!g_centerType) {
 				g_centerType = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>(kLocationCenterRefTypeEditorId);
@@ -1086,10 +1091,10 @@ namespace TFD::Location
 			std::vector<CaptiveStorageCandidate> bossActorCandidates;
 			std::vector<CaptiveStorageCandidate> bossContainerCandidates;
 			std::vector<CaptiveStorageCandidate> containerCandidates;
-			storageCandidates.reserve(24);
+			storageCandidates.reserve(16);
 			bossActorCandidates.reserve(8);
 			bossContainerCandidates.reserve(8);
-			containerCandidates.reserve(16);
+			containerCandidates.reserve(8);
 
 			for (auto* loc : locs) {
 				if (!loc) {
@@ -1108,31 +1113,26 @@ namespace TFD::Location
 						continue;
 					}
 
+					if (SameRefType(type, g_bossType)) {
+						PushBestStorageCandidate(bossActorCandidates, marker, ref, CaptiveStorageKind::BossActor);
+						continue;
+					}
+
 					if (SameRefType(type, g_bossContainerType)) {
 						PushBestStorageCandidate(storageCandidates, marker, ref, CaptiveStorageKind::BossContainer);
 						PushBestStorageCandidate(bossContainerCandidates, marker, ref, CaptiveStorageKind::BossContainer);
+						continue;
 					}
-					else if (SameRefType(type, g_bossType)) {
-						PushBestStorageCandidate(bossActorCandidates, marker, ref, CaptiveStorageKind::BossActor);
+
+					if (SameRefType(type, g_containerType)) {
+						PushBestStorageCandidate(storageCandidates, marker, ref, CaptiveStorageKind::Container);
+						PushBestStorageCandidate(containerCandidates, marker, ref, CaptiveStorageKind::Container);
 					}
 				}
 			}
 
-			auto* cell = marker->GetParentCell();
-			if (cell) {
-				const auto origin = marker->GetPosition();
-				cell->ForEachReferenceInRange(origin, kCaptiveStorageScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
-					auto* base = candidate ? candidate->GetBaseObject() : nullptr;
-					if (base && base->As<RE::TESObjectCONT>()) {
-						PushBestStorageCandidate(storageCandidates, marker, candidate, CaptiveStorageKind::Container);
-						PushBestStorageCandidate(containerCandidates, marker, candidate, CaptiveStorageKind::Container);
-					}
-					return RE::BSContainer::ForEachResult::kContinue;
-					});
-			}
-
 			spdlog::info(
-				"[TFD][Location] captive storage candidate summary marker={:08X} all={} bossActors={} bossContainers={} containers={}",
+				"[TFD][Location] captive storage candidate summary marker={:08X} all={} bossActors={} bossContainers={} containers={} specialRefOnly=1 noActorFallback=1",
 				marker->GetFormID(),
 				storageCandidates.size(),
 				bossActorCandidates.size(),
@@ -1162,9 +1162,8 @@ namespace TFD::Location
 
 			StoreCaptiveStorageDebugSnapshot(marker, bossActorCandidates, bossContainerCandidates, containerCandidates, nullptr, CaptiveStorageKind::Container);
 			spdlog::info(
-				"[TFD][Location] captive storage resolve miss marker={:08X} sameCellOnly=1 radius={:.1f} containerOnly=1 bossActors={} bossContainers={} containers={} -> keep player inventory",
+				"[TFD][Location] captive storage resolve miss marker={:08X} specialRefOnly=1 noActorFallback=1 bossActors={} bossContainers={} containers={} -> keep player inventory",
 				marker->GetFormID(),
-				kCaptiveStorageScanRadius,
 				bossActorCandidates.size(),
 				bossContainerCandidates.size(),
 				containerCandidates.size());
@@ -1265,12 +1264,13 @@ namespace TFD::Location
 		EnsureRefTypes();
 
 		spdlog::info(
-			"[TFD][Location] RefTypes: Captive={} Inside={} Outside={} BossType={} BossContainer={} CenterType={}",
+			"[TFD][Location] RefTypes: Captive={} Inside={} Outside={} BossType={} BossContainer={} ContainerType={} CenterType={}",
 			g_captiveType ? "OK" : "NULL",
 			g_insideType ? "OK" : "NULL",
 			g_outsideType ? "OK" : "NULL",
 			g_bossType ? "OK" : "NULL",
 			g_bossContainerType ? "OK" : "NULL",
+			g_containerType ? "OK" : "NULL",
 			g_centerType ? "OK" : "NULL");
 	}
 
