@@ -42,6 +42,11 @@ namespace TFD::DefeatMonitor
 		static void ClearBleedoutBridgeAliases(RE::TESForm* sender, const char* reason);
 		static void AssignBleedoutBridgeActor(RE::Actor* actor);
 		static float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b);
+		static RE::Actor* ResolveGenericPleasureSpeaker();
+		static void ActivateGenericPleasureHold(RE::Actor* actor, const char* reason, bool sceneStarted, double holdSeconds = 20.0);
+		static void ExtendGenericPleasureHold(const char* reason, double holdSeconds, bool sceneStarted);
+		static void ClearGenericPleasureHold(const char* reason, bool clearDisposition);
+		static void RefreshGenericPleasureHold();
 		enum class CaptivePhaseValue : int
 		{
 			None = 0,
@@ -54,6 +59,8 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
 		constexpr const char* kBleedoutOutcomePleasureEvent = "TFDBleedoutOutcomePleasure";
 		constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
+		constexpr const char* kPleasureStartPendingEvent = "TFDPreCombatPleasureStartPending";
+		constexpr const char* kPleasureStartedEvent = "TFDPreCombatPleasureStarted";
 		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
 		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
 
@@ -129,6 +136,11 @@ namespace TFD::DefeatMonitor
 		bool g_bleedPendingCaptiveOutcome = false;
 		bool g_bleedPendingNonCaptiveOutcome = false;
 		BleedDialogueOutcome g_bleedDialogueOutcome = BleedDialogueOutcome::None;
+		RE::ActorHandle g_genericPleasureSpeaker{};
+		bool g_genericPleasureHoldActive = false;
+		bool g_genericPleasureSceneStarted = false;
+		std::chrono::steady_clock::time_point g_genericPleasureHoldUntil{};
+		std::chrono::steady_clock::time_point g_genericPleasureLastPulse{};
 
 		struct BleedBattleObserverState
 		{
@@ -1254,6 +1266,7 @@ namespace TFD::DefeatMonitor
 			g_bleedBattlePreferredEnemy.reset();
 			g_bleedBattleObserver = {};
 			ClearLastEnemyTargetingPlayerInternal();
+			ClearGenericPleasureHold("reset_bleed_runtime", true);
 		}
 
 
@@ -1325,6 +1338,8 @@ namespace TFD::DefeatMonitor
 		static void CompleteBleedPleasureHandoff(const char* reason);
 		static void SetBleedDialogueOutcome(BleedDialogueOutcome outcome, const char* reason);
 		static void ClearBleedDialogueOutcome(const char* reason);
+		static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg);
+		static bool IsTransitionAwaiting();
 
 		enum class CinematicTransitionKind
 		{
@@ -5478,6 +5493,146 @@ namespace TFD::DefeatMonitor
 			g_bleedDialogueOutcome = BleedDialogueOutcome::None;
 		}
 
+		static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg)
+		{
+			if (arg.empty()) {
+				return nullptr;
+			}
+
+			std::string parsedArg(arg);
+			char* end = nullptr;
+			const auto raw = std::strtoul(parsedArg.c_str(), &end, 0);
+			if (end == nullptr || end == parsedArg.c_str()) {
+				return nullptr;
+			}
+
+			return RE::TESForm::LookupByID<RE::Actor>(static_cast<RE::FormID>(raw));
+		}
+
+		static RE::Actor* ResolveGenericPleasureSpeaker()
+		{
+			if (!g_genericPleasureSpeaker) {
+				return nullptr;
+			}
+			auto sp = RE::Actor::LookupByHandle(g_genericPleasureSpeaker.native_handle());
+			return sp.get();
+		}
+
+		static void ActivateGenericPleasureHold(RE::Actor* actor, const char* reason, bool sceneStarted, double holdSeconds)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			g_genericPleasureSpeaker = actor->GetHandle();
+			g_genericPleasureHoldActive = true;
+			g_genericPleasureSceneStarted = sceneStarted;
+			g_genericPleasureHoldUntil = Now() + std::chrono::milliseconds(static_cast<int>((std::max)(0.5, holdSeconds) * 1000.0));
+			g_genericPleasureLastPulse = {};
+
+			if (actor->Is3DLoaded()) {
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+			}
+
+			TFD::FactionMask::ApplyFromAggressor(actor);
+			ApplyCalmBubble((std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f));
+			spdlog::info("[TFD][Pleasure] hold active speaker={:08X} sceneStarted={} holdSeconds={:.1f} reason={}",
+				actor->GetFormID(),
+				sceneStarted ? 1 : 0,
+				holdSeconds,
+				reason ? reason : "unknown");
+		}
+
+		static void ExtendGenericPleasureHold(const char* reason, double holdSeconds, bool sceneStarted)
+		{
+			auto* actor = ResolveGenericPleasureSpeaker();
+			if (!actor) {
+				return;
+			}
+			ActivateGenericPleasureHold(actor, reason, sceneStarted, holdSeconds);
+		}
+
+		static void ClearGenericPleasureHold(const char* reason, bool clearDisposition)
+		{
+			if (!g_genericPleasureHoldActive && !g_genericPleasureSpeaker) {
+				return;
+			}
+
+			auto* actor = ResolveGenericPleasureSpeaker();
+			const auto actorId = actor ? actor->GetFormID() : 0u;
+			g_genericPleasureSpeaker = {};
+			g_genericPleasureHoldActive = false;
+			g_genericPleasureSceneStarted = false;
+			g_genericPleasureHoldUntil = {};
+			g_genericPleasureLastPulse = {};
+
+			if (clearDisposition && !g_inBleedState.load(std::memory_order_acquire) && !g_captiveState && !IsTransitionAwaiting() && !g_leftForDeadActive) {
+				TFD::AggressionClamp::Clear();
+				TFD::FactionMask::Clear();
+			}
+
+			spdlog::info("[TFD][Pleasure] hold cleared speaker={:08X} clearDisposition={} reason={}",
+				actorId,
+				clearDisposition ? 1 : 0,
+				reason ? reason : "unknown");
+		}
+
+		static void RefreshGenericPleasureHold()
+		{
+			if (!g_genericPleasureHoldActive) {
+				return;
+			}
+
+			auto* player = Player();
+			auto* actor = ResolveGenericPleasureSpeaker();
+			if (!player || !actor || actor->IsDead() || actor->IsDisabled()) {
+				ClearGenericPleasureHold("invalid", true);
+				return;
+			}
+
+			const auto now = Now();
+			if (!g_genericPleasureSceneStarted && now >= g_genericPleasureHoldUntil && !IsDialogueOpen()) {
+				ClearGenericPleasureHold("expired", true);
+				return;
+			}
+
+			if (g_genericPleasureLastPulse.time_since_epoch().count() != 0 && (now - g_genericPleasureLastPulse) < std::chrono::milliseconds(200)) {
+				return;
+			}
+			g_genericPleasureLastPulse = now;
+
+			if (actor->Is3DLoaded()) {
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+			}
+			if (player->IsInCombat()) {
+				player->StopCombat();
+			}
+			player->DrawWeaponMagicHands(false);
+
+			TFD::FactionMask::ApplyFromAggressor(actor);
+			ApplyCalmBubble((std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f));
+		}
+
 		static void PreparePlayerForBleedoutPleasureScene(const char* reason)
 		{
 			auto* p = Player();
@@ -6346,6 +6501,7 @@ namespace TFD::DefeatMonitor
 				SyncPreCombatGlobal(false);
 				return;
 			}
+			RefreshGenericPleasureHold();
 			TickBleedLocks();
 			UpdatePreCombatState();
 			if (IsLeftForDeadCooldownActive()) {
@@ -6537,9 +6693,24 @@ namespace TFD::DefeatMonitor
 					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
+				if (name == kPleasureStartPendingEvent || name == kPleasureStartedEvent) {
+					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
+					if (actor) {
+						ActivateGenericPleasureHold(actor,
+							name == kPleasureStartedEvent ? "generic_started" : "generic_start_pending",
+							name == kPleasureStartedEvent,
+							name == kPleasureStartedEvent ? 45.0 : 20.0);
+					}
+					return RE::BSEventNotifyControl::kContinue;
+				}
 				if (name == kBleedoutOutcomePleasureEvent) {
 					if (g_inBleedState.load(std::memory_order_acquire)) {
 						SetBleedDialogueOutcome(BleedDialogueOutcome::Pleasure, "mod_event_pleasure");
+						if (g_bleedSpeakerId != 0) {
+							if (auto* bleedSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId)) {
+								ActivateGenericPleasureHold(bleedSpeaker, "bleed_mod_event_pleasure", false, 20.0);
+							}
+						}
 						PreparePlayerForBleedoutPleasureScene("mod_event_pleasure");
 						CompleteBleedPleasureHandoff("mod_event_pleasure");
 					}
@@ -6554,10 +6725,14 @@ namespace TFD::DefeatMonitor
 						if (name == kPleasureEndedEvent) {
 							ClearBleedDialogueOutcome("pleasure_ended");
 							CompleteBleedPleasureHandoff("pleasure_ended");
-						} else {
+						}
+						else {
 							ClearBleedDialogueOutcome("pleasure_failed");
 						}
 					}
+					ExtendGenericPleasureHold(name == kPleasureEndedEvent ? "generic_ended" : "generic_failed",
+						name == kPleasureEndedEvent ? 6.0 : 2.0,
+						false);
 					return RE::BSEventNotifyControl::kContinue;
 				}
 				return RE::BSEventNotifyControl::kContinue;
