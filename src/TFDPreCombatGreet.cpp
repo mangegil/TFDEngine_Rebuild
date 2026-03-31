@@ -69,8 +69,6 @@ namespace TFD::PreCombatGreet
 		double gRecentActorCachedAtSec = 0.0;
 		double gRecentActorUntilSec = 0.0;
 
-		RE::TESGlobal* gKidnapAvailableGlobal = nullptr;
-		bool gLoggedKidnapAvailableGlobal = false;
 
 		double NowSec()
 		{
@@ -132,35 +130,11 @@ namespace TFD::PreCombatGreet
 			gRecentActorUntilSec = 0.0;
 		}
 
-		static RE::TESGlobal* ResolveKidnapAvailableGlobal()
-		{
-			if (!gKidnapAvailableGlobal) {
-				gKidnapAvailableGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDPreCombatKidnapAvailable");
-				if (gKidnapAvailableGlobal && !gLoggedKidnapAvailableGlobal) {
-					gLoggedKidnapAvailableGlobal = true;
-					spdlog::info("[TFD][PreCombatGreet] TFDPreCombatKidnapAvailable resolved {:08X}", gKidnapAvailableGlobal->GetFormID());
-				}
-			}
-			return gKidnapAvailableGlobal;
-		}
-
-		static void SetKidnapAvailable(bool available, const char* reason, RE::Actor* actor = nullptr)
-		{
-			if (auto* global = ResolveKidnapAvailableGlobal()) {
-				global->value = available ? 1.0f : 0.0f;
-			}
-
-			spdlog::info(
-				"[TFD][PreCombatGreet] kidnapAvailable={} actor={:08X} reason={}",
-				available ? 1 : 0,
-				actor ? actor->GetFormID() : 0,
-				reason ? reason : "unknown");
-		}
 
 		static bool RefreshKidnapAvailability(RE::Actor* actor)
 		{
 			if (!actor) {
-				SetKidnapAvailable(false, "no_actor", nullptr);
+				spdlog::info("[TFD][PreCombatGreet] kidnapAvailable=0 actor=00000000 reason=no_actor");
 				return false;
 			}
 
@@ -169,7 +143,11 @@ namespace TFD::PreCombatGreet
 				available = TFD::Location::RefreshCaptiveMarkerSilent(actor, false);
 			}
 
-			SetKidnapAvailable(available, available ? "marker_ready" : "marker_missing", actor);
+			spdlog::info(
+				"[TFD][PreCombatGreet] kidnapAvailable={} actor={:08X} reason={}",
+				available ? 1 : 0,
+				actor->GetFormID(),
+				available ? "marker_ready" : "marker_missing");
 			return available;
 		}
 
@@ -444,7 +422,6 @@ namespace TFD::PreCombatGreet
 					TFD::InteractionRouter::ToString(pending.action));
 			}
 
-			SetKidnapAvailable(false, "cleanup", actor);
 		}
 
 		void ClearAllPendingLocked()
@@ -469,7 +446,6 @@ namespace TFD::PreCombatGreet
 				}
 			}
 
-			SetKidnapAvailable(false, "clear_all_pending", nullptr);
 			gPending.clear();
 		}
 
@@ -743,7 +719,6 @@ namespace TFD::PreCombatGreet
 		gSuspended.store(false, std::memory_order_release);
 		gRunning.store(true, std::memory_order_release);
 		gWorker = std::thread(WorkerLoop);
-		SetKidnapAvailable(false, "install", nullptr);
 
 		spdlog::info("[TFD][PreCombatGreet] Install");
 	}
@@ -775,7 +750,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		gSuspended.store(false, std::memory_order_release);
-		SetKidnapAvailable(false, "shutdown", nullptr);
 
 		spdlog::info("[TFD][PreCombatGreet] Shutdown");
 	}
@@ -809,7 +783,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (!IsCandidate(actor, player)) {
-			SetKidnapAvailable(false, "invalid_candidate", actor);
 			return false;
 		}
 
@@ -851,7 +824,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (!result.executed || result.sessionId == 0) {
-			SetKidnapAvailable(false, "router_rejected", actor);
 			return false;
 		}
 
@@ -888,7 +860,6 @@ namespace TFD::PreCombatGreet
 			if (result.action == TFD::InteractionRouter::Action::TrucePreCombat) {
 				RefreshKidnapAvailability(actor);
 			} else {
-				SetKidnapAvailable(false, "non_precombat_dialogue", actor);
 			}
 
 			const auto bridge = GetBridgeEventNames(result.action);

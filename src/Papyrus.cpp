@@ -44,12 +44,12 @@ namespace FMN
 		spdlog::flush_on(debugEnabled.load() ? spdlog::level::debug : spdlog::level::info);
 	}
 
-	bool GetDebugEnabled(RE::StaticFunctionTag*)
+	static bool GetDebugEnabled(RE::StaticFunctionTag*)
 	{
 		return debugEnabled.load();
 	}
 
-	void SetDebugEnabled(RE::StaticFunctionTag*, bool enabled)
+	static void SetDebugEnabled(RE::StaticFunctionTag*, bool enabled)
 	{
 		debugEnabled.store(enabled);
 		ApplyLogLevel();
@@ -186,7 +186,7 @@ namespace FMN
 	// Interior  : Is3DLoaded + same cell as player
 	// Exterior  : Is3DLoaded + same worldspace as player
 	// =========================================================
-	std::int32_t Rescan(RE::StaticFunctionTag*, float radius, bool npcOnly, RE::BGSListForm* factionsToCheck, bool requireMatch)
+	static std::int32_t Rescan(RE::StaticFunctionTag*, float radius, bool npcOnly, RE::BGSListForm* factionsToCheck, bool requireMatch)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (!player) {
@@ -300,13 +300,13 @@ namespace FMN
 		return static_cast<std::int32_t>(scanList.size());
 	}
 
-	std::int32_t GetCount(RE::StaticFunctionTag*)
+	static std::int32_t GetCount(RE::StaticFunctionTag*)
 	{
 		std::scoped_lock lock(dataLock);
 		return static_cast<std::int32_t>(scanList.size());
 	}
 
-	RE::Actor* GetActor(RE::StaticFunctionTag*, std::int32_t index)
+	static RE::Actor* GetActor(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -318,7 +318,7 @@ namespace FMN
 		return sp.get();
 	}
 
-	std::string GetActorName(RE::StaticFunctionTag*, std::int32_t index)
+	static std::string GetActorName(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -330,7 +330,7 @@ namespace FMN
 		return GetActorNameSafe(sp.get());
 	}
 
-	RE::TESFaction* GetMatchedFaction(RE::StaticFunctionTag*, std::int32_t index)
+	static RE::TESFaction* GetMatchedFaction(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -346,7 +346,7 @@ namespace FMN
 		return RE::TESForm::LookupByID<RE::TESFaction>(id);
 	}
 
-	std::int32_t GetMatchedRank(RE::StaticFunctionTag*, std::int32_t index)
+	static std::int32_t GetMatchedRank(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -357,7 +357,7 @@ namespace FMN
 		return scanList[static_cast<std::size_t>(index)].matchedRank;
 	}
 
-	std::int32_t RescanPlayerFactions(RE::StaticFunctionTag*)
+	static std::int32_t RescanPlayerFactions(RE::StaticFunctionTag*)
 	{
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		auto* dh = RE::TESDataHandler::GetSingleton();
@@ -399,13 +399,13 @@ namespace FMN
 		return static_cast<std::int32_t>(playerFactionList.size());
 	}
 
-	std::int32_t GetPlayerFactionCount(RE::StaticFunctionTag*)
+	static std::int32_t GetPlayerFactionCount(RE::StaticFunctionTag*)
 	{
 		std::scoped_lock lock(dataLock);
 		return static_cast<std::int32_t>(playerFactionList.size());
 	}
 
-	RE::TESFaction* GetPlayerFaction(RE::StaticFunctionTag*, std::int32_t index)
+	static RE::TESFaction* GetPlayerFaction(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -416,7 +416,7 @@ namespace FMN
 		return RE::TESForm::LookupByID<RE::TESFaction>(playerFactionList[static_cast<std::size_t>(index)].factionId);
 	}
 
-	std::int32_t GetPlayerFactionRank(RE::StaticFunctionTag*, std::int32_t index)
+	static std::int32_t GetPlayerFactionRank(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -427,7 +427,7 @@ namespace FMN
 		return playerFactionList[static_cast<std::size_t>(index)].rank;
 	}
 
-	std::int32_t RescanActorFactions(RE::StaticFunctionTag*, RE::Actor* target)
+	static std::int32_t RescanActorFactions(RE::StaticFunctionTag*, RE::Actor* target)
 	{
 		auto* dh = RE::TESDataHandler::GetSingleton();
 
@@ -470,13 +470,13 @@ namespace FMN
 		return static_cast<std::int32_t>(actorFactionList.size());
 	}
 
-	std::int32_t GetActorFactionCount(RE::StaticFunctionTag*)
+	static std::int32_t GetActorFactionCount(RE::StaticFunctionTag*)
 	{
 		std::scoped_lock lock(dataLock);
 		return static_cast<std::int32_t>(actorFactionList.size());
 	}
 
-	RE::TESFaction* GetActorFaction(RE::StaticFunctionTag*, std::int32_t index)
+	static RE::TESFaction* GetActorFaction(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -487,7 +487,7 @@ namespace FMN
 		return RE::TESForm::LookupByID<RE::TESFaction>(actorFactionList[static_cast<std::size_t>(index)].factionId);
 	}
 
-	std::int32_t GetActorFactionRank(RE::StaticFunctionTag*, std::int32_t index)
+	static std::int32_t GetActorFactionRank(RE::StaticFunctionTag*, std::int32_t index)
 	{
 		std::scoped_lock lock(dataLock);
 
@@ -498,14 +498,14 @@ namespace FMN
 		return actorFactionList[static_cast<std::size_t>(index)].rank;
 	}
 
-	RE::Actor* GetActorFactionTarget(RE::StaticFunctionTag*)
+	static RE::Actor* GetActorFactionTarget(RE::StaticFunctionTag*)
 	{
 		std::scoped_lock lock(dataLock);
 		auto sp = actorFactionTarget.get();
 		return sp.get();
 	}
 
-	std::string GetFactionRankTitle(RE::StaticFunctionTag*, RE::TESFaction* faction, std::int32_t rank, bool female)
+	static std::string GetFactionRankTitle(RE::StaticFunctionTag*, RE::TESFaction* faction, std::int32_t rank, bool female)
 	{
 		if (!faction || rank < 0) {
 			return "";
@@ -537,7 +537,7 @@ namespace FMN
 		return "";
 	}
 
-	bool RegisterPapyrus(RE::BSScript::IVirtualMachine* vm)
+	static bool RegisterPapyrus(RE::BSScript::IVirtualMachine* vm)
 	{
 		ApplyLogLevel();
 

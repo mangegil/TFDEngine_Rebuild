@@ -69,7 +69,7 @@ namespace TFD::TeammateAliasSync
                 try {
                     const int slot = std::stoi(aliasName.substr(9));
                     if (slot >= 1 && slot <= 10) {
-                        g_registry.teammateAliases[slot - 1] = refAlias;
+                        g_registry.teammateAliases[static_cast<std::array<RE::BGSRefAlias*, 10Ui64>::size_type>(slot) - 1] = refAlias;
                     }
                 } catch (...) {
                 }

@@ -42,6 +42,8 @@ namespace TFD::Location
 		RE::BGSLocationRefType* g_centerType = nullptr;
 
 		RE::ObjectRefHandle g_cachedMarker{};
+		RE::TESGlobal* g_kidnapAvailableGlobal = nullptr;
+		bool g_loggedKidnapAvailableGlobal = false;
 
 		std::unordered_map<RE::FormID, SafeCheckpoint> g_safeCheckpointByLocation;
 		std::unordered_map<RE::FormID, ApprovedBed> g_approvedBedByLocation;
@@ -185,6 +187,31 @@ namespace TFD::Location
 		static RE::PlayerCharacter* Player()
 		{
 			return RE::PlayerCharacter::GetSingleton();
+		}
+
+		static RE::TESGlobal* ResolveKidnapAvailableGlobal()
+		{
+			if (!g_kidnapAvailableGlobal) {
+				g_kidnapAvailableGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDKidnapAvailable");
+				if (g_kidnapAvailableGlobal && !g_loggedKidnapAvailableGlobal) {
+					g_loggedKidnapAvailableGlobal = true;
+					spdlog::info("[TFD][Location] TFDKidnapAvailable resolved {:08X}", g_kidnapAvailableGlobal->GetFormID());
+				}
+			}
+			return g_kidnapAvailableGlobal;
+		}
+
+		static void SetKidnapAvailableGlobal(bool available, const char* reason, RE::TESObjectREFR* marker = nullptr)
+		{
+			if (auto* global = ResolveKidnapAvailableGlobal()) {
+				global->value = available ? 1.0f : 0.0f;
+			}
+
+			spdlog::info(
+				"[TFD][Location] kidnapAvailable={} marker={:08X} reason={}",
+				available ? 1 : 0,
+				marker ? marker->GetFormID() : 0,
+				reason ? reason : "unknown");
 		}
 
 		static bool IsPlayerInterior()
@@ -1178,6 +1205,7 @@ namespace TFD::Location
 			auto* p = Player();
 			if (!p) {
 				spdlog::warn("[TFD][Location] Rescan: player null");
+				SetKidnapAvailableGlobal(false, "player_null", nullptr);
 				return false;
 			}
 
@@ -1224,11 +1252,13 @@ namespace TFD::Location
 				DumpSpecialRefs(playerLoc ? playerLoc : aggressorLoc);
 
 				g_cachedMarker = {};
+				SetKidnapAvailableGlobal(false, "marker_missing", nullptr);
 				return false;
 			}
 
 			g_cachedMarker = marker->GetHandle();
 			spdlog::info("[TFD][Location] Marker resolved -> {:08X}", marker->GetFormID());
+			SetKidnapAvailableGlobal(true, "marker_ready", marker);
 			return true;
 		}
 

@@ -21,10 +21,13 @@ namespace TFD::Pacify
 {
     namespace
     {
+        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon);
         struct TruceState
         {
             bool spent{ false };
             bool betrayed{ false };
+
+            TruceState() = default;
         };
 
         struct RehostileRequest
@@ -159,6 +162,11 @@ namespace TFD::Pacify
         constexpr float kTrucePrimaryLinkRadius = 2400.0f;
 
         bool IsSessionSpaceCompatible(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget);
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
+        bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
+        bool IsActorStillValid(RE::Actor* actor);
+        void PulseGlobalDetection(const char* reason);
+        bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
 
         bool IsFiniteDurationMode(Mode mode)
         {
@@ -181,7 +189,64 @@ namespace TFD::Pacify
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
         bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
-        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon);
+        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                return false;
+            }
+
+            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+                spdlog::info(
+                    "TFDPacify: rehostile skipped actor={:08X} player={:08X} reason={} defeated_knock=1",
+                    actor->GetFormID(),
+                    player->GetFormID(),
+                    ToString(reason));
+                return false;
+            }
+
+            if (g_entries.find(actor->GetFormID()) != g_entries.end()) {
+                return false;
+            }
+
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->ClearCachedFactionFightReactions();
+            }
+
+            if (reason == ReleaseReason::DialogueClosed) {
+                PulseGlobalDetection(ToString(reason));
+            }
+
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            if (drawWeapon && !actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(true);
+            }
+
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+            actor->UpdateCombat();
+            player->UpdateCombat();
+
+            const auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            const bool inCombat = actor->IsInCombat();
+            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+            const bool hostile = IsEnemyToPlayer(player, actor);
+
+            spdlog::info(
+                "TFDPacify: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
+                actor->GetFormID(),
+                player->GetFormID(),
+                ToString(reason),
+                hostile ? 1 : 0,
+                inCombat ? 1 : 0,
+                targetingPlayer ? 1 : 0);
+
+            return inCombat || targetingPlayer;
+        }
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon);
         void ProcessRehostileRetries(double nowSec);
 
@@ -319,7 +384,7 @@ namespace TFD::Pacify
             return result;
         }
 
-        bool IsActorStillValid(RE::Actor* actor);
+        std::vector<RE::FormID> BuildTruceInCombatMemberIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t& cellBubbleCount, std::size_t& truceClusterCount);
 
         struct TruceCandidate
         {
@@ -1059,65 +1124,6 @@ namespace TFD::Pacify
                 reason ? reason : "<null>",
                 before ? 1 : 0,
                 process->runDetection ? 1 : 0);
-        }
-
-        bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
-        {
-            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
-                return false;
-            }
-
-            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
-                spdlog::info(
-                    "TFDPacify: rehostile skipped actor={:08X} player={:08X} reason={} defeated_knock=1",
-                    actor->GetFormID(),
-                    player->GetFormID(),
-                    ToString(reason));
-                return false;
-            }
-
-            if (g_entries.find(actor->GetFormID()) != g_entries.end()) {
-                return false;
-            }
-
-            if (auto* process = RE::ProcessLists::GetSingleton()) {
-                process->ClearCachedFactionFightReactions();
-            }
-
-            if (reason == ReleaseReason::DialogueClosed) {
-                PulseGlobalDetection(ToString(reason));
-            }
-
-            actor->SetBeenAttacked(true);
-            player->SetBeenAttacked(true);
-
-            actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
-            player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
-
-            if (drawWeapon && !actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(true);
-            }
-
-            actor->EvaluatePackage(false, true);
-            actor->EvaluatePackage(true, true);
-            actor->UpdateCombat();
-            player->UpdateCombat();
-
-            const auto* combatTarget = ResolveCurrentCombatTarget(actor);
-            const bool inCombat = actor->IsInCombat();
-            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
-            const bool hostile = IsEnemyToPlayer(player, actor);
-
-            spdlog::info(
-                "TFDPacify: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
-                actor->GetFormID(),
-                player->GetFormID(),
-                ToString(reason),
-                hostile ? 1 : 0,
-                inCombat ? 1 : 0,
-                targetingPlayer ? 1 : 0);
-
-            return inCombat || targetingPlayer;
         }
 
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon)
@@ -2106,7 +2112,7 @@ namespace TFD::Pacify
                 return a.actorName < b.actorName;
             }
             return a.actorId < b.actorId;
-        });
+            });
 
         return result;
     }
@@ -2145,13 +2151,16 @@ namespace TFD::Pacify
             if (action == FeedAction::Teammate) {
                 if (downed) {
                     std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
-                } else {
+                }
+                else {
                     std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
                 }
-            } else {
+            }
+            else {
                 if (downed) {
                     std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
-                } else {
+                }
+                else {
                     std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
                 }
             }
@@ -2177,7 +2186,7 @@ namespace TFD::Pacify
         const auto options = GetActiveTameFeedOptions(actor, action);
         const auto it = std::find_if(options.begin(), options.end(), [&](const FeedOptionSnapshot& opt) {
             return opt.itemId == itemId;
-        });
+            });
         if (it == options.end()) {
             return false;
         }
@@ -2191,10 +2200,12 @@ namespace TFD::Pacify
         if (action == FeedAction::Teammate) {
             if (IsCompanion(actor)) {
                 ok = ExtendActiveCompanionHours(actor, kCompanionFeedHours);
-            } else {
+            }
+            else {
                 ok = PromoteActiveTameToCompanion(actor, kCompanionFeedHours);
             }
-        } else {
+        }
+        else {
             ok = ExtendActiveTameSession(actor, it->calmExtendSec, 0.0);
         }
 

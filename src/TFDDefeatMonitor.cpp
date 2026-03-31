@@ -1474,7 +1474,7 @@ namespace TFD::DefeatMonitor
 				try {
 					int slot = std::stoi(aliasName.substr(9));
 					if (slot >= 1 && slot <= 10) {
-						g_teammateRegistry.teammateAliases[slot - 1] = refAlias;
+						g_teammateRegistry.teammateAliases[static_cast<std::array<RE::BGSRefAlias*, 10Ui64>::size_type>(slot) - 1] = refAlias;
 					}
 				}
 				catch (...) {
@@ -1555,7 +1555,7 @@ namespace TFD::DefeatMonitor
 				try {
 					int slot = std::stoi(aliasName.substr(5));
 					if (slot >= 1 && slot <= static_cast<int>(g_defeatedEnemyRegistry.enemyAliases.size())) {
-						g_defeatedEnemyRegistry.enemyAliases[slot - 1] = refAlias;
+						g_defeatedEnemyRegistry.enemyAliases[static_cast<std::array<RE::BGSRefAlias*, 10Ui64>::size_type>(slot) - 1] = refAlias;
 					}
 				}
 				catch (...) {
@@ -1604,7 +1604,7 @@ namespace TFD::DefeatMonitor
 					try {
 						int slot = std::stoi(aliasName.substr(10));
 						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossCaptorAliases.size())) {
-							g_captiveQuestRegistry.bossCaptorAliases[slot - 1] = refAlias;
+							g_captiveQuestRegistry.bossCaptorAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
 						}
 					}
 					catch (...) {}
@@ -1614,7 +1614,7 @@ namespace TFD::DefeatMonitor
 					try {
 						int slot = std::stoi(aliasName.substr(13));
 						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossContainerAliases.size())) {
-							g_captiveQuestRegistry.bossContainerAliases[slot - 1] = refAlias;
+							g_captiveQuestRegistry.bossContainerAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
 						}
 					}
 					catch (...) {}
@@ -1624,7 +1624,7 @@ namespace TFD::DefeatMonitor
 					try {
 						int slot = std::stoi(aliasName.substr(9));
 						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.containerAliases.size())) {
-							g_captiveQuestRegistry.containerAliases[slot - 1] = refAlias;
+							g_captiveQuestRegistry.containerAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
 						}
 					}
 					catch (...) {}
@@ -2981,7 +2981,7 @@ namespace TFD::DefeatMonitor
 			auto immediateEnemies = CollectCurrentObservedEnemies(player, immediateRadius, immediatePreferredEnemy, immediateFollowers);
 			UpdateBleedBattleObserverRoster(player, immediateFollowers, immediateEnemies, immediatePreferredEnemy);
 			auto immediateRosterEnemies = CollectBleedStandingEnemiesFromSnapshot();
-			auto immediateResolvedEnemies = immediateRosterEnemies.empty() ? immediateEnemies : immediateRosterEnemies;
+			auto& immediateResolvedEnemies = immediateRosterEnemies.empty() ? immediateEnemies : immediateRosterEnemies;
 			spdlog::info("[TFD][Defeat] bleed observe pending sentinel step=after_snapshot followers={} enemies={} rosterEnemies={} preferred={:08X}",
 				immediateFollowers.size(),
 				immediateEnemies.size(),
@@ -4364,6 +4364,11 @@ namespace TFD::DefeatMonitor
 			return removedUnits > 0 || addedUnits > 0;
 		}
 
+		bool ProcessCaptiveConfiscation(const char* reason)
+		{
+			return false;
+		}
+
 		static void ClearPendingCaptiveConfiscation(const char* reason)
 		{
 			const bool hadPending = g_captiveConfiscationPending || g_captiveStarterLockpickPending || !g_captivePendingConfiscationReason.empty();
@@ -5601,8 +5606,13 @@ namespace TFD::DefeatMonitor
 			}
 
 			const auto now = Now();
-			if (!g_genericPleasureSceneStarted && now >= g_genericPleasureHoldUntil && !IsDialogueOpen()) {
+			const bool dialogueOpen = IsDialogueOpen();
+			if (!g_genericPleasureSceneStarted && now >= g_genericPleasureHoldUntil && !dialogueOpen) {
 				ClearGenericPleasureHold("expired", true);
+				return;
+			}
+
+			if (dialogueOpen) {
 				return;
 			}
 

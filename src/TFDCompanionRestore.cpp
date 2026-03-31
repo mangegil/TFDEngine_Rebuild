@@ -122,7 +122,7 @@ namespace TFD::CompanionRestore
                 try {
                     const int slot = std::stoi(aliasName.substr(9));
                     if (slot >= 1 && slot <= static_cast<int>(g_cache.teammateAliases.size())) {
-                        g_cache.teammateAliases[slot - 1] = refAlias;
+                        g_cache.teammateAliases[static_cast<std::array<RE::BGSRefAlias*, 6Ui64>::size_type>(slot) - 1] = refAlias;
                     }
                 }
                 catch (...) {

@@ -40,7 +40,7 @@ static void SetupLog()
         return;
     }
 
-    auto path = *dir;
+    auto& path = *dir;
     path /= "TFDEngine.log";
 
     auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.string(), true);
