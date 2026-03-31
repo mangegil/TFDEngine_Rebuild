@@ -63,6 +63,7 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kPleasureStartedEvent = "TFDPreCombatPleasureStarted";
 		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
 		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
+		constexpr const char* kAfterPleasureLoopEnterEvent = "TFDAfterPleasureLoopEnter";
 
 		enum class BleedDialogueOutcome : std::uint8_t
 		{
@@ -5616,6 +5617,10 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
+			if (g_genericPleasureSceneStarted) {
+				return;
+			}
+
 			if (g_genericPleasureLastPulse.time_since_epoch().count() != 0 && (now - g_genericPleasureLastPulse) < std::chrono::milliseconds(200)) {
 				return;
 			}
@@ -6730,6 +6735,10 @@ namespace TFD::DefeatMonitor
 					ClearBleedDialogueOutcome("mod_event_reset");
 					return RE::BSEventNotifyControl::kContinue;
 				}
+				if (name == kAfterPleasureLoopEnterEvent) {
+					ClearGenericPleasureHold("after_pleasure_loop_enter", false);
+					return RE::BSEventNotifyControl::kContinue;
+				}
 				if (name == kPleasureEndedEvent || name == kPleasureFailedEvent) {
 					if (g_bleedDialogueOutcome == BleedDialogueOutcome::Pleasure) {
 						if (name == kPleasureEndedEvent) {
@@ -6740,9 +6749,7 @@ namespace TFD::DefeatMonitor
 							ClearBleedDialogueOutcome("pleasure_failed");
 						}
 					}
-					ExtendGenericPleasureHold(name == kPleasureEndedEvent ? "generic_ended" : "generic_failed",
-						name == kPleasureEndedEvent ? 6.0 : 2.0,
-						false);
+					ClearGenericPleasureHold(name == kPleasureEndedEvent ? "generic_final_end" : "generic_failed", false);
 					return RE::BSEventNotifyControl::kContinue;
 				}
 				return RE::BSEventNotifyControl::kContinue;
