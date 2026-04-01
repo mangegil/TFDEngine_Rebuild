@@ -45,6 +45,13 @@ namespace TFD::Location
 		RE::TESGlobal* g_kidnapAvailableGlobal = nullptr;
 		bool g_loggedKidnapAvailableGlobal = false;
 
+		RE::FormID g_lastAmbientCellId = 0;
+		RE::FormID g_lastAmbientWorldspaceId = 0;
+		RE::FormID g_lastAmbientLocationId = 0;
+		bool g_lastAmbientInterior = false;
+		bool g_lastAmbientWatcherPrimed = false;
+		bool g_lastAmbientKidnapAvailable = false;
+
 		std::unordered_map<RE::FormID, SafeCheckpoint> g_safeCheckpointByLocation;
 		std::unordered_map<RE::FormID, ApprovedBed> g_approvedBedByLocation;
 		std::uint32_t g_checkpointVisitSerial = 0;
@@ -219,6 +226,48 @@ namespace TFD::Location
 			auto* p = Player();
 			auto* cell = p ? p->GetParentCell() : nullptr;
 			return cell ? cell->IsInteriorCell() : false;
+		}
+
+		static bool ResolvePlayerAmbientContext(RE::FormID& outCellId, RE::FormID& outWorldspaceId, RE::FormID& outLocationId, bool& outInterior)
+		{
+			auto* player = Player();
+			auto* cell = player ? player->GetParentCell() : nullptr;
+			if (!player || !cell) {
+				return false;
+			}
+
+			outCellId = cell->GetFormID();
+			outInterior = cell->IsInteriorCell();
+			outWorldspaceId = 0;
+			if (auto* ws = player->GetWorldspace()) {
+				outWorldspaceId = ws->GetFormID();
+			}
+			outLocationId = 0;
+			if (auto* loc = GetLocationFromRef(player)) {
+				outLocationId = loc->GetFormID();
+			}
+			return true;
+		}
+
+		static bool AmbientContextChanged(RE::FormID cellId, RE::FormID worldspaceId, RE::FormID locationId, bool interior)
+		{
+			if (!g_lastAmbientWatcherPrimed) {
+				return true;
+			}
+			return g_lastAmbientCellId != cellId ||
+				g_lastAmbientWorldspaceId != worldspaceId ||
+				g_lastAmbientLocationId != locationId ||
+				g_lastAmbientInterior != interior;
+		}
+
+		static void RememberAmbientContext(RE::FormID cellId, RE::FormID worldspaceId, RE::FormID locationId, bool interior, bool kidnapAvailable)
+		{
+			g_lastAmbientCellId = cellId;
+			g_lastAmbientWorldspaceId = worldspaceId;
+			g_lastAmbientLocationId = locationId;
+			g_lastAmbientInterior = interior;
+			g_lastAmbientWatcherPrimed = true;
+			g_lastAmbientKidnapAvailable = kidnapAvailable;
 		}
 
 		static RE::BGSLocationRefType* ResolveRefType(std::uint32_t formId)
@@ -1302,6 +1351,49 @@ namespace TFD::Location
 			g_bossContainerType ? "OK" : "NULL",
 			g_containerType ? "OK" : "NULL",
 			g_centerType ? "OK" : "NULL");
+	}
+
+	void ResetAmbientKidnapAvailabilityWatcher()
+	{
+		g_lastAmbientCellId = 0;
+		g_lastAmbientWorldspaceId = 0;
+		g_lastAmbientLocationId = 0;
+		g_lastAmbientInterior = false;
+		g_lastAmbientWatcherPrimed = false;
+		g_lastAmbientKidnapAvailable = false;
+	}
+
+	bool UpdateAmbientKidnapAvailability(bool force)
+	{
+		RE::FormID cellId = 0;
+		RE::FormID worldspaceId = 0;
+		RE::FormID locationId = 0;
+		bool interior = false;
+
+		if (!ResolvePlayerAmbientContext(cellId, worldspaceId, locationId, interior)) {
+			return false;
+		}
+
+		const bool changed = AmbientContextChanged(cellId, worldspaceId, locationId, interior);
+		if (!force && !changed) {
+			return g_lastAmbientKidnapAvailable;
+		}
+
+		auto* player = Player();
+		const bool ok = DoRescanInternal(nullptr, interior);
+		RememberAmbientContext(cellId, worldspaceId, locationId, interior, ok);
+
+		spdlog::info(
+			"[TFD][Location] ambient kidnap refresh force={} changed={} cell={:08X} world={:08X} loc={:08X} interior={} result={}",
+			force ? 1 : 0,
+			changed ? 1 : 0,
+			cellId,
+			worldspaceId,
+			locationId,
+			interior ? 1 : 0,
+			ok ? 1 : 0);
+
+		return ok;
 	}
 
 	RE::BGSLocation* GetLocationFromRef(RE::TESObjectREFR* ref)

@@ -12,6 +12,7 @@
 #include <string_view>
 
 #include <RE/Skyrim.h>
+#include <RE/A/ActorValues.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
@@ -31,7 +32,7 @@ namespace TFD::PreCombatGreet
 		constexpr double kCooldownAfterDoneSec = 120.0;
 		constexpr double kCooldownAfterFailSec = 5.0;
 		constexpr double kCooldownAfterPlayerAttackSec = 1.0;
-		constexpr double kRecentActorHoldSec = 12.0;
+		constexpr double kRecentActorSoftAgeSec = 12.0;
 		constexpr double kPleasureStartHoldSec = 20.0;
 		constexpr double kPleasureSceneHoldSec = 900.0;
 
@@ -69,9 +70,9 @@ namespace TFD::PreCombatGreet
 		std::uint32_t gRecentActorHandle = 0;
 		double gRecentActorCachedAtSec = 0.0;
 		double gRecentActorUntilSec = 0.0;
-
-		RE::TESGlobal* gKidnapAvailableGlobal = nullptr;
-		bool gLoggedKidnapAvailableGlobal = false;
+		RE::FormID gRecentActorCellFormID = 0;
+		RE::FormID gRecentActorWorldspaceFormID = 0;
+		bool gRecentActorInterior = false;
 
 		double NowSec()
 		{
@@ -100,6 +101,45 @@ namespace TFD::PreCombatGreet
 			return state && state->IsBleedingOut();
 		}
 
+		static RE::TESObjectCELL* GetPlayerParentCell()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			return player ? player->GetParentCell() : nullptr;
+		}
+
+		static RE::TESWorldSpace* GetCellWorldspace(RE::TESObjectCELL* cell)
+		{
+			if (!cell || cell->IsInteriorCell()) {
+				return nullptr;
+			}
+			return cell->GetRuntimeData().worldSpace;
+		}
+
+		static bool IsPlayerStillInCachedSpace()
+		{
+			if (gRecentActorHandle == 0) {
+				return false;
+			}
+
+			auto* cell = GetPlayerParentCell();
+			if (!cell) {
+				return false;
+			}
+
+			const bool isInterior = cell->IsInteriorCell();
+			if (isInterior != gRecentActorInterior) {
+				return false;
+			}
+
+			if (isInterior) {
+				return cell->GetFormID() == gRecentActorCellFormID;
+			}
+
+			auto* ws = GetCellWorldspace(cell);
+			const auto wsid = ws ? ws->GetFormID() : 0u;
+			return wsid == gRecentActorWorldspaceFormID;
+		}
+
 		void CacheRecentActor(RE::Actor* actor, double holdSec, const char* reason)
 		{
 			if (!actor) {
@@ -109,6 +149,16 @@ namespace TFD::PreCombatGreet
 			gRecentActorHandle = actor->GetHandle().native_handle();
 			gRecentActorCachedAtSec = NowSec();
 			gRecentActorUntilSec = gRecentActorCachedAtSec + holdSec;
+			if (auto* cell = GetPlayerParentCell()) {
+				gRecentActorInterior = cell->IsInteriorCell();
+				gRecentActorCellFormID = cell->GetFormID();
+				auto* ws = GetCellWorldspace(cell);
+				gRecentActorWorldspaceFormID = ws ? ws->GetFormID() : 0u;
+			} else {
+				gRecentActorInterior = false;
+				gRecentActorCellFormID = 0;
+				gRecentActorWorldspaceFormID = 0;
+			}
 
 			spdlog::info(
 				"[TFD][PreCombatGreet] recent actor cached actor={:08X} hold={:.1f}s reason={}",
@@ -131,47 +181,9 @@ namespace TFD::PreCombatGreet
 			gRecentActorHandle = 0;
 			gRecentActorCachedAtSec = 0.0;
 			gRecentActorUntilSec = 0.0;
-		}
-
-		static RE::TESGlobal* ResolveKidnapAvailableGlobal()
-		{
-			if (!gKidnapAvailableGlobal) {
-				gKidnapAvailableGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDKidnapAvailable");
-				if (gKidnapAvailableGlobal && !gLoggedKidnapAvailableGlobal) {
-					gLoggedKidnapAvailableGlobal = true;
-					spdlog::info("[TFD][PreCombatGreet] TFDKidnapAvailable resolved {:08X}", gKidnapAvailableGlobal->GetFormID());
-				}
-			}
-			return gKidnapAvailableGlobal;
-		}
-
-		static void SetKidnapAvailable(bool available, const char* reason, RE::Actor* actor = nullptr)
-		{
-			if (auto* global = ResolveKidnapAvailableGlobal()) {
-				global->value = available ? 1.0f : 0.0f;
-			}
-
-			spdlog::info(
-				"[TFD][PreCombatGreet] kidnapAvailable={} actor={:08X} reason={}",
-				available ? 1 : 0,
-				actor ? actor->GetFormID() : 0,
-				reason ? reason : "unknown");
-		}
-
-		static bool RefreshKidnapAvailability(RE::Actor* actor)
-		{
-			if (!actor) {
-				SetKidnapAvailable(false, "no_actor", nullptr);
-				return false;
-			}
-
-			bool available = TFD::Location::RefreshCaptiveMarkerSilent(actor, true);
-			if (!available) {
-				available = TFD::Location::RefreshCaptiveMarkerSilent(actor, false);
-			}
-
-			SetKidnapAvailable(available, available ? "marker_ready" : "marker_missing", actor);
-			return available;
+			gRecentActorCellFormID = 0;
+			gRecentActorWorldspaceFormID = 0;
+			gRecentActorInterior = false;
 		}
 
 		void SendBridgeEvent(const char* eventName, RE::TESForm* sender)
@@ -326,7 +338,7 @@ namespace TFD::PreCombatGreet
 			pending->pleasureSceneActive = false;
 			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureStartHoldSec);
 
-			CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_start_pending");
+			CacheRecentActor(actor, 0.0, "pleasure_start_pending");
 			spdlog::info(
 				"[TFD][PreCombatGreet] pleasure handoff armed actor={:08X} session={} action={}",
 				actor->GetFormID(),
@@ -349,7 +361,7 @@ namespace TFD::PreCombatGreet
 			pending->pleasureSceneActive = true;
 			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureSceneHoldSec);
 
-			CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_scene_started");
+			CacheRecentActor(actor, 0.0, "pleasure_scene_started");
 			spdlog::info(
 				"[TFD][PreCombatGreet] pleasure scene started actor={:08X} session={} action={}",
 				actor->GetFormID(),
@@ -461,7 +473,6 @@ namespace TFD::PreCombatGreet
 					TFD::InteractionRouter::ToString(pending.action));
 			}
 
-			SetKidnapAvailable(false, "cleanup", actor);
 		}
 
 		void ClearAllPendingLocked()
@@ -486,7 +497,6 @@ namespace TFD::PreCombatGreet
 				}
 			}
 
-			SetKidnapAvailable(false, "clear_all_pending", nullptr);
 			gPending.clear();
 		}
 
@@ -585,7 +595,7 @@ namespace TFD::PreCombatGreet
 				if (name == kAfterPleasureLoopEnterEvent) {
 					std::scoped_lock lk(gLock);
 					MarkPleasureStartedLocked(actor);
-					CacheRecentActor(actor, kRecentActorHoldSec, "after_pleasure_loop_enter");
+					CacheRecentActor(actor, 0.0, "after_pleasure_loop_enter");
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
@@ -603,11 +613,11 @@ namespace TFD::PreCombatGreet
 					}
 
 					if (name == kPleasureFailedEvent) {
-						CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_failed");
+						CacheRecentActor(actor, 0.0, "pleasure_failed");
 						CleanupOne(actor, pending, kCooldownAfterFailSec, "pleasure_failed", TFD::Pacify::ReleaseReason::DialogueClosed);
 					}
 					else {
-						CacheRecentActor(actor, kRecentActorHoldSec, "pleasure_ended");
+						CacheRecentActor(actor, 0.0, "pleasure_ended");
 						CleanupOne(actor, pending, kCooldownAfterDoneSec, "pleasure_ended", TFD::Pacify::ReleaseReason::Generic);
 					}
 
@@ -700,7 +710,7 @@ namespace TFD::PreCombatGreet
 
 					if (pending.dialogSeen) {
 						if (pending.pleasureHandoff && IsPleasureDialogueHandoffAction(pending.action)) {
-							CacheRecentActor(actor, kRecentActorHoldSec, pending.pleasureSceneActive ? "pleasure_scene_active" : "pleasure_handoff_wait");
+							CacheRecentActor(actor, 0.0, pending.pleasureSceneActive ? "pleasure_scene_active" : "pleasure_handoff_wait");
 							++it;
 							continue;
 						}
@@ -708,7 +718,7 @@ namespace TFD::PreCombatGreet
 						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
 							LogInCombatDialogueState("dialogue_closed", actor, dialogueOpen);
 						}
-						CacheRecentActor(actor, kRecentActorHoldSec, "dialogue_closed");
+						CacheRecentActor(actor, 0.0, "dialogue_closed");
 						CleanupOne(actor, pending, kCooldownAfterDoneSec, "dialogue_closed", TFD::Pacify::ReleaseReason::DialogueClosed);
 						it = gPending.erase(it);
 						continue;
@@ -775,7 +785,6 @@ namespace TFD::PreCombatGreet
 		gSuspended.store(false, std::memory_order_release);
 		gRunning.store(true, std::memory_order_release);
 		gWorker = std::thread(WorkerLoop);
-		SetKidnapAvailable(false, "install", nullptr);
 
 		spdlog::info("[TFD][PreCombatGreet] Install");
 	}
@@ -807,7 +816,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		gSuspended.store(false, std::memory_order_release);
-		SetKidnapAvailable(false, "shutdown", nullptr);
 
 		spdlog::info("[TFD][PreCombatGreet] Shutdown");
 	}
@@ -841,7 +849,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (!IsCandidate(actor, player)) {
-			SetKidnapAvailable(false, "invalid_candidate", actor);
 			return false;
 		}
 
@@ -883,7 +890,6 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (!result.executed || result.sessionId == 0) {
-			SetKidnapAvailable(false, "router_rejected", actor);
 			return false;
 		}
 
@@ -917,12 +923,6 @@ namespace TFD::PreCombatGreet
 				return false;
 			}
 
-			if (result.action == TFD::InteractionRouter::Action::TrucePreCombat) {
-				RefreshKidnapAvailability(actor);
-			} else {
-				SetKidnapAvailable(false, "non_precombat_dialogue", actor);
-			}
-
 			const auto bridge = GetBridgeEventNames(result.action);
 			if (bridge.assign) {
 				if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
@@ -941,7 +941,7 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (result.dialogueRequested) {
-			CacheRecentActor(actor, kRecentActorHoldSec, "begin");
+			CacheRecentActor(actor, 0.0, "begin");
 		}
 
 		gPending.emplace(handle, pending);
@@ -957,14 +957,15 @@ namespace TFD::PreCombatGreet
 		}
 
 		const double now = NowSec();
-
-		if (gRecentActorUntilSec > 0.0 && now > gRecentActorUntilSec) {
-			ClearRecentActor("expired");
-			return nullptr;
+		if (maxAgeSec > 0.0 && (now - gRecentActorCachedAtSec) > maxAgeSec) {
+			spdlog::info("[TFD][PreCombatGreet] recent actor age exceeds soft limit but retained actorHandle={:08X} age={:.1f}s limit={:.1f}s",
+				gRecentActorHandle,
+				now - gRecentActorCachedAtSec,
+				maxAgeSec);
 		}
 
-		if (maxAgeSec > 0.0 && (now - gRecentActorCachedAtSec) > maxAgeSec) {
-			ClearRecentActor("age_limit");
+		if (!IsPlayerStillInCachedSpace()) {
+			ClearRecentActor("space_changed");
 			return nullptr;
 		}
 
@@ -1004,6 +1005,18 @@ namespace TFD::PreCombatGreet
 		}
 
 		spdlog::info("[TFD][PreCombatGreet] OnPostLoadGame -> resumed clean");
+	}
+
+	void OnLoadingScreenClosed()
+	{
+		std::scoped_lock lk(gLock);
+		ClearRecentActor("loading_screen_closed");
+	}
+
+	void OnCaptiveHandoffArrived()
+	{
+		std::scoped_lock lk(gLock);
+		ClearRecentActor("captive_handoff_complete");
 	}
 
 	void CancelAll()

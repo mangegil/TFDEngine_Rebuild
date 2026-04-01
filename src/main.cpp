@@ -267,6 +267,8 @@ public:
             if (cell->IsInteriorCell()) {
                 TFD::Location::RefreshPlayerInteriorSafeCheckpoint();
             }
+            TFD::Location::ResetAmbientKidnapAvailabilityWatcher();
+            TFD::Location::UpdateAmbientKidnapAvailability(true);
             FinalizeLoadAfterWorldReady();
         }
 

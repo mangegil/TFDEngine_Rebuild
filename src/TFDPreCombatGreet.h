@@ -17,6 +17,8 @@ namespace TFD::PreCombatGreet
 
 	void OnPreLoadGame();
 	void OnPostLoadGame();
+	void OnLoadingScreenClosed();
+	void OnCaptiveHandoffArrived();
 
-	RE::Actor* GetRecentActor(double maxAgeSec);
+	RE::Actor* GetRecentActor(double maxAgeSec = 0.0);
 }

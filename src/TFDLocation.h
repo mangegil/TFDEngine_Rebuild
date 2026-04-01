@@ -51,6 +51,8 @@ namespace TFD::Location
 	bool RescanCaptiveMarker();
 	bool RescanCaptiveMarkerWithAggressor(RE::Actor* aggressor, bool preferInterior);
 	bool RefreshCaptiveMarkerSilent(RE::Actor* aggressor, bool preferInterior);
+	bool UpdateAmbientKidnapAvailability(bool force = false);
+	void ResetAmbientKidnapAvailabilityWatcher();
 
 	RE::TESObjectREFR* GetCachedCaptiveMarker();
 	std::uint32_t GetCachedCaptiveMarkerFormID();

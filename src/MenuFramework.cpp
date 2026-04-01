@@ -688,6 +688,62 @@ namespace TFDMenu
 			TFD::Settings::SetHotkeyWave(uiHotkeyWave);
 		}
 
+		static bool IsMenuActorSameBleedSpace(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+
+			auto* actorCell = actor->GetParentCell();
+			auto* playerCell = player->GetParentCell();
+			if (!actorCell || !playerCell) {
+				return false;
+			}
+
+			const bool actorInterior = actorCell->IsInteriorCell();
+			const bool playerInterior = playerCell->IsInteriorCell();
+			if (actorInterior != playerInterior) {
+				return false;
+			}
+
+			if (playerInterior) {
+				return actorCell == playerCell;
+			}
+
+			auto* actorWs = actor->GetWorldspace();
+			auto* playerWs = player->GetWorldspace();
+			return actorWs && playerWs && actorWs == playerWs;
+		}
+
+		static bool MenuActorHasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+			bool hasLOSData = false;
+			return actor->HasLineOfSight(player, hasLOSData);
+		}
+
+		static bool IsCaptorPickerSupportedActor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || actor == player) {
+				return false;
+			}
+			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return false;
+			}
+			if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+				return false;
+			}
+			const bool isNPC = actor->HasKeywordString("ActorTypeNPC");
+			const bool isCreature = actor->HasKeywordString("ActorTypeCreature");
+			return isNPC || isCreature;
+		}
+
 		static RE::Actor* PickCaptorSameCellLoaded(float radius)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -695,31 +751,27 @@ namespace TFDMenu
 				return nullptr;
 			}
 
-			auto* pCell = player->GetParentCell();
-			if (!pCell) {
-				return nullptr;
-			}
-
-			// Captive hotkey should still find a captor even when the actor is far away
-			// inside the same loaded cell. Do not keep the old 3500 hard limit.
-			const float searchRadius = (std::max)(radius, 12000.0f);
-			TFD::ActorScan::Rescan(searchRadius, true);
+			const float searchRadius = (std::max)(radius, 12288.0f);
+			TFD::ActorScan::Rescan(searchRadius, false);
 
 			RE::Actor* best = nullptr;
-			float bestDist = 1.0e30f;
+			float bestScore = 1.0e30f;
 
 			const auto n = TFD::ActorScan::GetCount();
 			for (int i = 0; i < n; ++i) {
 				auto e = TFD::ActorScan::GetEntry(i);
 				auto* a = TFD::ActorScan::GetActor(i);
 				if (!a) continue;
-				if (a->IsDead() || a->IsDisabled()) continue;
-				if (!a->Is3DLoaded()) continue;
-				if (a->GetFormID() == player->GetFormID()) continue;
-				if (a->GetParentCell() != pCell) continue;
+				if (!IsCaptorPickerSupportedActor(a)) continue;
+				if (!IsMenuActorSameBleedSpace(a, player)) continue;
+				if (e.dist > searchRadius) continue;
+				if (!MenuActorHasLineOfSightToPlayer(a, player)) continue;
 
-				if (e.dist < bestDist) {
-					bestDist = e.dist;
+				float score = e.dist;
+				if (e.hostile || a->IsHostileToActor(player)) score -= 140.0f;
+				if (e.inCombat || a->IsInCombat()) score -= 100.0f;
+				if (score < bestScore) {
+					bestScore = score;
 					best = a;
 				}
 			}
@@ -1958,13 +2010,13 @@ namespace TFDMenu
 
 					// Captive
 					if (IsCaptivePhase()) {
-						auto* captor = PickCaptorSameCellLoaded(12000.0f);
+						auto* captor = PickCaptorSameCellLoaded(12288.0f);
 						if (!captor) {
 							RE::DebugNotification("TFD: No Response");
 							continue;
 						}
 
-						ApplyCellHotkeyCalmBubble(player, captor, 12000.0f);
+						ApplyCellHotkeyCalmBubble(player, captor, 12288.0f);
 						SendBridgeEvent("TFDCaptiveClearAll");
 						SendBridgeAssignActor("TFDCaptiveAssign", captor);
 
