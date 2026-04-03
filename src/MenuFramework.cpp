@@ -30,6 +30,7 @@
 #include "TFDTameBait.h"
 #include "TFDFeedPopup.h"
 #include "TFDCompanionRestore.h"
+#include "TFDFlowController.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -98,40 +99,253 @@ namespace TFDMenu
 		static RE::TESGlobal* gCaptiveState = nullptr;
 		static RE::TESGlobal* gCaptivePhase = nullptr;
 		static RE::TESGlobal* gPreCombatState = nullptr;
+		static RE::TESGlobal* gBleedOutState = nullptr;
+		static RE::TESGlobal* gActiveDialogueFlow = nullptr;
+		static RE::TESGlobal* gKidnapAvailable = nullptr;
+		static RE::TESGlobal* gTransitionPending = nullptr;
+		static RE::TESGlobal* gTransitionBusy = nullptr;
+		static RE::TESGlobal* gTransitionReason = nullptr;
+		static RE::TESGlobal* gTransitionResult = nullptr;
+		static RE::TESGlobal* gPreCombatResult = nullptr;
+		static RE::TESGlobal* gPreCombatJoinEnemyAvailable = nullptr;
+		static RE::TESGlobal* gAfterPleasureSource = nullptr;
 		static bool gLoggedCaptiveFound = false;
 		static bool gLoggedCaptivePhaseFound = false;
 		static bool gLoggedPreCombatFound = false;
+		static bool gLoggedBleedOutFound = false;
+		static bool gLoggedActiveDialogueFlowFound = false;
+		static bool gLoggedKidnapAvailableFound = false;
+		static bool gLoggedTransitionPendingFound = false;
+		static bool gLoggedTransitionBusyFound = false;
+		static bool gLoggedTransitionReasonFound = false;
+		static bool gLoggedTransitionResultFound = false;
+		static bool gLoggedPreCombatResultFound = false;
+		static bool gLoggedPreCombatJoinEnemyAvailableFound = false;
+		static bool gLoggedAfterPleasureSourceFound = false;
+
+		static void ResolveGlobal(RE::TESGlobal*& global, bool& logged, const char* editorId)
+		{
+			if (global || !editorId || !editorId[0]) {
+				return;
+			}
+
+			global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorId);
+			if (global && !logged) {
+				logged = true;
+				spdlog::info("[TFD][Menu] {} resolved {:08X}", editorId, global->GetFormID());
+			}
+		}
 
 		static void ResolveGlobals()
 		{
-			if (!gCaptiveState) {
-				gCaptiveState = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptiveState");
-				if (gCaptiveState && !gLoggedCaptiveFound) {
-					gLoggedCaptiveFound = true;
-					spdlog::info("[TFD][Menu] TFDCaptiveState resolved {:08X}", gCaptiveState->GetFormID());
-				}
-			}
-
-			if (!gCaptivePhase) {
-				gCaptivePhase = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptivePhase");
-				if (gCaptivePhase && !gLoggedCaptivePhaseFound) {
-					gLoggedCaptivePhaseFound = true;
-					spdlog::info("[TFD][Menu] TFDCaptivePhase resolved {:08X}", gCaptivePhase->GetFormID());
-				}
-			}
-
-			if (!gPreCombatState) {
-				gPreCombatState = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDPreCombatState");
-				if (gPreCombatState && !gLoggedPreCombatFound) {
-					gLoggedPreCombatFound = true;
-					spdlog::info("[TFD][Menu] TFDPreCombatState resolved {:08X}", gPreCombatState->GetFormID());
-				}
-			}
+			ResolveGlobal(gCaptiveState, gLoggedCaptiveFound, "TFDCaptiveState");
+			ResolveGlobal(gCaptivePhase, gLoggedCaptivePhaseFound, "TFDCaptivePhase");
+			ResolveGlobal(gPreCombatState, gLoggedPreCombatFound, "TFDPreCombatState");
+			ResolveGlobal(gBleedOutState, gLoggedBleedOutFound, "TFDBleedOutState");
+			ResolveGlobal(gActiveDialogueFlow, gLoggedActiveDialogueFlowFound, "TFDActiveDialogueFlow");
+			ResolveGlobal(gKidnapAvailable, gLoggedKidnapAvailableFound, "TFDKidnapAvailable");
+			ResolveGlobal(gTransitionPending, gLoggedTransitionPendingFound, "TFDTransitionPending");
+			ResolveGlobal(gTransitionBusy, gLoggedTransitionBusyFound, "TFDTransitionBusy");
+			ResolveGlobal(gTransitionReason, gLoggedTransitionReasonFound, "TFDTransitionReason");
+			ResolveGlobal(gTransitionResult, gLoggedTransitionResultFound, "TFDTransitionResult");
+			ResolveGlobal(gPreCombatResult, gLoggedPreCombatResultFound, "TFDPreCombatResult");
+			ResolveGlobal(gPreCombatJoinEnemyAvailable, gLoggedPreCombatJoinEnemyAvailableFound, "TFDJoinEnemy");
+			ResolveGlobal(gAfterPleasureSource, gLoggedAfterPleasureSourceFound, "TFDAfterPleasure");
 		}
 
 		static float GetGlobalValue(RE::TESGlobal* g)
 		{
 			return g ? g->value : 0.0f;
+		}
+
+		static int GetGlobalValueInt(RE::TESGlobal* g)
+		{
+			return static_cast<int>(std::lround(GetGlobalValue(g)));
+		}
+
+		static const char* DecodeBinaryState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "Off";
+			case 1:
+				return "On";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeCaptiveState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "Captive";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeCaptivePhase(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "Captive";
+			case 2:
+				return "Escape";
+			case 3:
+				return "ReleasedWork";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeActiveDialogueFlow(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "PreCombat";
+			case 2:
+				return "Bleedout";
+			case 3:
+				return "Captive";
+			case 4:
+				return "Victory";
+			case 5:
+				return "Savior";
+			case 6:
+				return "RecruitContract";
+			case 7:
+				return "CreatureBleedout";
+			case 8:
+				return "CreatureTruce";
+			case 9:
+				return "AfterPleasure";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeTransitionPending(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "LeftForDeadChoice";
+			case 2:
+				return "CaptiveCinematic";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeTransitionReason(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 11:
+				return "PreCombatKidnapFadeOut";
+			case 12:
+				return "BleedoutCaptiveFadeOut";
+			case 13:
+				return "RecoverFadeOut";
+			case 21:
+				return "CaptiveFadeIn";
+			case 22:
+				return "RecoverFadeIn";
+			case 23:
+				return "RescueFadeIn";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeTransitionResult(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 3:
+				return "RecoverChosen";
+			case 4:
+				return "RescueChosen";
+			case 101:
+				return "FadeOutPreCombatKidnapDone";
+			case 102:
+				return "FadeOutBleedCaptiveDone";
+			case 103:
+				return "FadeOutRecoverDone";
+			case 201:
+				return "FadeInCaptiveDone";
+			case 202:
+				return "FadeInRecoverDone";
+			case 203:
+				return "FadeInRescueDone";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeAfterPleasureSource(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "PreCombat";
+			case 2:
+				return "Captive";
+			case 3:
+				return "Bleedout";
+			case 4:
+				return "InCombat";
+			default:
+				return "Custom";
+			}
+		}
+
+		static void RenderGlobalStateLine(const char* label, const char* editorId, RE::TESGlobal* global, const char* decoded = nullptr)
+		{
+			if (!label || !editorId) {
+				return;
+			}
+
+			if (!global) {
+				ImGuiMCP::Text("%s [%s]: <missing>", label, editorId);
+				return;
+			}
+
+			if (decoded && decoded[0]) {
+				ImGuiMCP::Text("%s [%s]: %.0f (%s)", label, editorId, GetGlobalValue(global), decoded);
+			}
+			else {
+				ImGuiMCP::Text("%s [%s]: %.0f", label, editorId, GetGlobalValue(global));
+			}
+		}
+
+		static void DumpGlobalStateToLog()
+		{
+			ResolveGlobals();
+			spdlog::info("[TFD][Menu][GlobalState] TFDCaptiveState={} ({})", GetGlobalValueInt(gCaptiveState), DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDCaptivePhase={} ({})", GetGlobalValueInt(gCaptivePhase), DecodeCaptivePhase(GetGlobalValueInt(gCaptivePhase)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatState={} ({})", GetGlobalValueInt(gPreCombatState), DecodeBinaryState(GetGlobalValueInt(gPreCombatState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDBleedOutState={} ({})", GetGlobalValueInt(gBleedOutState), DecodeBinaryState(GetGlobalValueInt(gBleedOutState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDActiveDialogueFlow={} ({})", GetGlobalValueInt(gActiveDialogueFlow), DecodeActiveDialogueFlow(GetGlobalValueInt(gActiveDialogueFlow)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDKidnapAvailable={} ({})", GetGlobalValueInt(gKidnapAvailable), DecodeBinaryState(GetGlobalValueInt(gKidnapAvailable)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionPending={} ({})", GetGlobalValueInt(gTransitionPending), DecodeTransitionPending(GetGlobalValueInt(gTransitionPending)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionBusy={} ({})", GetGlobalValueInt(gTransitionBusy), DecodeBinaryState(GetGlobalValueInt(gTransitionBusy)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionReason={} ({})", GetGlobalValueInt(gTransitionReason), DecodeTransitionReason(GetGlobalValueInt(gTransitionReason)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionResult={} ({})", GetGlobalValueInt(gTransitionResult), DecodeTransitionResult(GetGlobalValueInt(gTransitionResult)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatResult={}", GetGlobalValueInt(gPreCombatResult));
+			spdlog::info("[TFD][Menu][GlobalState] TFDJoinEnemy={} ({})", GetGlobalValueInt(gPreCombatJoinEnemyAvailable), DecodeBinaryState(GetGlobalValueInt(gPreCombatJoinEnemyAvailable)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDAfterPleasure={} ({})", GetGlobalValueInt(gAfterPleasureSource), DecodeAfterPleasureSource(GetGlobalValueInt(gAfterPleasureSource)));
 		}
 
 		static const char* SafeStr(const char* s)
@@ -1651,6 +1865,59 @@ namespace TFDMenu
 			}
 		}
 
+		static void RenderGlobalStatePage()
+		{
+			ResolveGlobals();
+
+			const auto snap = TFD::Flow::Controller::GetSingleton().GetSnapshot();
+
+			ImGuiMCP::Text("Global State Monitor");
+			ImGuiMCP::Separator();
+
+			ImGuiMCP::Text("Native Flow Snapshot");
+			ImGuiMCP::Text("Root: %s", TFD::Flow::Controller::ToString(snap.root));
+			ImGuiMCP::Text("Context Root: %s", TFD::Flow::Controller::ToString(snap.contextRoot));
+			ImGuiMCP::Text("Gate: %s", TFD::Flow::Controller::ToString(snap.gate));
+			ImGuiMCP::Text("SubFlow: %s", TFD::Flow::Controller::ToString(snap.sub));
+			ImGuiMCP::Text("Captive Mode: %s", TFD::Flow::Controller::ToString(snap.captiveMode));
+			ImGuiMCP::Text("Token: %u", snap.token);
+			ImGuiMCP::Text("Primary Actor FormID: %08X", snap.primaryActorFormID);
+			ImGuiMCP::Text("Terminal Resolved: %s", YesNo(snap.terminalResolved));
+			ImGuiMCP::Text("Locked: %s", YesNo(snap.locked));
+
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("Native Defeat State");
+			ImGuiMCP::Text("IsCaptivePhase(): %s", YesNo(TFD::DefeatMonitor::IsCaptivePhase()));
+			ImGuiMCP::Text("IsCaptiveFamily(): %s", YesNo(TFD::DefeatMonitor::IsCaptiveFamily()));
+			ImGuiMCP::Text("CaptivePhaseRaw(): %u", TFD::DefeatMonitor::GetCaptivePhaseRaw());
+			ImGuiMCP::Text("CaptivePhaseName(): %s", SafeStr(TFD::DefeatMonitor::GetCaptivePhaseName()));
+			ImGuiMCP::Text("IsBleedoutActive(): %s", YesNo(TFD::DefeatMonitor::IsBleedoutActive()));
+			ImGuiMCP::Text("IsLeftForDeadRecoveryActive(): %s", YesNo(TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()));
+			ImGuiMCP::Text("IsPlayerBleedHoldTargetBlocked(): %s", YesNo(TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()));
+			ImGuiMCP::Text("IsObservedCombatCommitInProgress(): %s", YesNo(TFD::DefeatMonitor::IsObservedCombatCommitInProgress()));
+
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("State Globals");
+			RenderGlobalStateLine("Captive State", "TFDCaptiveState", gCaptiveState, DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
+			RenderGlobalStateLine("Captive Phase", "TFDCaptivePhase", gCaptivePhase, DecodeCaptivePhase(GetGlobalValueInt(gCaptivePhase)));
+			RenderGlobalStateLine("PreCombat State", "TFDPreCombatState", gPreCombatState, DecodeBinaryState(GetGlobalValueInt(gPreCombatState)));
+			RenderGlobalStateLine("BleedOut State", "TFDBleedOutState", gBleedOutState, DecodeBinaryState(GetGlobalValueInt(gBleedOutState)));
+			RenderGlobalStateLine("Active Dialogue Flow", "TFDActiveDialogueFlow", gActiveDialogueFlow, DecodeActiveDialogueFlow(GetGlobalValueInt(gActiveDialogueFlow)));
+			RenderGlobalStateLine("Kidnap Available", "TFDKidnapAvailable", gKidnapAvailable, DecodeBinaryState(GetGlobalValueInt(gKidnapAvailable)));
+			RenderGlobalStateLine("Transition Pending", "TFDTransitionPending", gTransitionPending, DecodeTransitionPending(GetGlobalValueInt(gTransitionPending)));
+			RenderGlobalStateLine("Transition Busy", "TFDTransitionBusy", gTransitionBusy, DecodeBinaryState(GetGlobalValueInt(gTransitionBusy)));
+			RenderGlobalStateLine("Transition Reason", "TFDTransitionReason", gTransitionReason, DecodeTransitionReason(GetGlobalValueInt(gTransitionReason)));
+			RenderGlobalStateLine("Transition Result", "TFDTransitionResult", gTransitionResult, DecodeTransitionResult(GetGlobalValueInt(gTransitionResult)));
+			RenderGlobalStateLine("PreCombat Result", "TFDPreCombatResult", gPreCombatResult);
+			RenderGlobalStateLine("Join Enemy", "TFDJoinEnemy", gPreCombatJoinEnemyAvailable, DecodeBinaryState(GetGlobalValueInt(gPreCombatJoinEnemyAvailable)));
+			RenderGlobalStateLine("After Pleasure", "TFDAfterPleasure", gAfterPleasureSource, DecodeAfterPleasureSource(GetGlobalValueInt(gAfterPleasureSource)));
+
+			ImGuiMCP::Separator();
+			if (ImGuiMCP::Button("Dump Global State To Log")) {
+				DumpGlobalStateToLog();
+			}
+		}
+
 		static void RenderDebugPage()
 		{
 			ResolveGlobals();
@@ -1857,6 +2124,7 @@ namespace TFDMenu
 
 			SKSEMenuFramework::SetSection("TFD");
 			SKSEMenuFramework::AddSectionItem("Combat Rules", RenderCombatRulesPage);
+			SKSEMenuFramework::AddSectionItem("Global State", RenderGlobalStatePage);
 			SKSEMenuFramework::AddSectionItem("Debug", RenderDebugPage);
 			SKSEMenuFramework::AddSectionItem("Quest Alias Monitor", RenderQuestAliasMonitorPage);
 			TFD::FeedPopup::Init();
@@ -2008,8 +2276,22 @@ namespace TFDMenu
 						player->NotifyAnimationGraph("IdleWave");
 					}
 
-					// Captive
-					if (IsCaptivePhase()) {
+					const bool captiveStateActive = GetGlobalValue(gCaptiveState) >= 0.5f;
+					const int captivePhaseRaw = GetGlobalValueInt(gCaptivePhase);
+					const bool bleedStateActive = GetGlobalValue(gBleedOutState) >= 0.5f || TFD::DefeatMonitor::IsBleedoutActive();
+
+					// Captive matrix
+					if (captiveStateActive && captivePhaseRaw == 1 && bleedStateActive) {
+						if (TFD::DefeatMonitor::HandleBleedoutHotkey()) {
+							RE::DebugNotification("TFD: BleedOut Truce");
+						}
+						else {
+							RE::DebugNotification("TFD: No Response");
+						}
+						continue;
+					}
+
+					if (captiveStateActive && captivePhaseRaw == 1 && !bleedStateActive) {
 						auto* captor = PickCaptorSameCellLoaded(12288.0f);
 						if (!captor) {
 							RE::DebugNotification("TFD: No Response");
@@ -2021,6 +2303,16 @@ namespace TFDMenu
 						SendBridgeAssignActor("TFDCaptiveAssign", captor);
 
 						RE::DebugNotification("TFD: Calling Captor");
+						continue;
+					}
+
+					if (TFD::DefeatMonitor::IsBleedoutActive()) {
+						if (TFD::DefeatMonitor::HandleBleedoutHotkey()) {
+							RE::DebugNotification("TFD: BleedOut Truce");
+						}
+						else {
+							RE::DebugNotification("TFD: No Response");
+						}
 						continue;
 					}
 

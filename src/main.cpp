@@ -21,6 +21,7 @@
 #include "TFDPacify.h"
 #include "TFDPacifyHooks.h"
 #include "TFDTeammateAliasSync.h"
+#include "TFDFlowController.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -80,13 +81,14 @@ static void ResetTransientStateForLoad()
     TFD::Pacify::Reset();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
+    TFD::Flow::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
 
     spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, pacify cleared)");
 }
 
 static constexpr std::uint32_t kSerializationID = 'TFDE';
 static constexpr std::uint32_t kProgressRecord = 'TDSP';
-static constexpr std::uint32_t kProgressVersion = 1;
+static constexpr std::uint32_t kProgressVersion = 2;
 static constexpr std::uint32_t kLocationCacheRecord = 'TDLC';
 static constexpr std::uint32_t kLocationCacheVersion = 1;
 
@@ -94,6 +96,7 @@ struct SavedProgressRecord
 {
     std::uint32_t captiveState{ 0 };
     std::uint32_t captivePhase{ 0 };
+    std::uint32_t bleedOutState{ 0 };
 };
 
 static std::atomic_bool gInitDone{ false };
@@ -148,6 +151,7 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
     SavedProgressRecord rec{};
     rec.captiveState = TFD::DefeatMonitor::GetCaptiveStateForSave() ? 1u : 0u;
     rec.captivePhase = TFD::DefeatMonitor::GetCaptivePhaseForSave();
+    rec.bleedOutState = TFD::DefeatMonitor::GetBleedOutStateForSave() ? 1u : 0u;
 
     if (!intfc->OpenRecord(kProgressRecord, kProgressVersion)) {
         spdlog::error("[TFD] Serialization Save -> OpenRecord failed");
@@ -159,7 +163,7 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
         return;
     }
 
-    spdlog::info("[TFD] Serialization Save -> state={} phase={}", rec.captiveState, rec.captivePhase);
+    spdlog::info("[TFD] Serialization Save -> state={} phase={} bleed={}", rec.captiveState, rec.captivePhase, rec.bleedOutState);
 
     if (!intfc->OpenRecord(kLocationCacheRecord, kLocationCacheVersion)) {
         spdlog::error("[TFD] Serialization Save -> OpenRecord location cache failed");
@@ -216,7 +220,8 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
             }
 
             TFD::DefeatMonitor::QueueLoadedProgressState(rec.captiveState >= 1u, rec.captivePhase);
-            spdlog::info("[TFD] Serialization Load -> state={} phase={} version={}", rec.captiveState, rec.captivePhase, version);
+            TFD::DefeatMonitor::QueueLoadedBleedOutState(rec.bleedOutState >= 1u);
+            spdlog::info("[TFD] Serialization Load -> state={} phase={} bleed={} version={}", rec.captiveState, rec.captivePhase, rec.bleedOutState, version);
             sawProgress = true;
             continue;
         }

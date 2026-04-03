@@ -16,7 +16,9 @@ namespace TFD::DefeatMonitor
 
 	bool GetCaptiveStateForSave();
 	std::uint32_t GetCaptivePhaseForSave();
+	bool GetBleedOutStateForSave();
 
+	void QueueLoadedBleedOutState(bool active);
 	void QueueLoadedProgressState(bool stateActive, std::uint32_t phaseRaw);
 	void QueueDefaultProgressState();
 	bool HasQueuedProgressState();
@@ -30,6 +32,8 @@ namespace TFD::DefeatMonitor
 	std::uint32_t GetCaptivePhaseRaw();
 	const char* GetCaptivePhaseName();
 	bool IsCaptiveFamily();
+	bool IsBleedoutActive();
+	bool HandleBleedoutHotkey();
 	bool IsLeftForDeadRecoveryActive();
 	bool IsPlayerBleedHoldTargetBlocked();
 	bool IsObservedCombatCommitInProgress();

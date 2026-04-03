@@ -50,6 +50,8 @@ add_library(TFDEngine SHARED
     src/TFDCaptiveDoorController.cpp
     src/TFDTeammateAliasSync.cpp
     src/TFDCompanionRestore.cpp
+    src/TFDFlowController.cpp
+    src/TFDForceGreet.cpp
 )
 
 if(TFDEnableSmf)

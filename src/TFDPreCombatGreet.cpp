@@ -21,6 +21,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDLocation.h"
 #include "TFDPacify.h"
+#include "TFDFlowController.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -41,6 +42,12 @@ namespace TFD::PreCombatGreet
 		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
 		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
 		constexpr const char* kAfterPleasureLoopEnterEvent = "TFDAfterPleasureLoopEnter";
+
+		constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
+		constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
+		constexpr const char* kPreCombatOutcomeCaptiveEvent = "TFDPreCombatOutcomeCaptive";
+		constexpr const char* kPreCombatOutcomeJoinEnemyEvent = "TFDPreCombatOutcomeJoinEnemy";
+		constexpr const char* kPreCombatOutcomeRecruitEvent = "TFDPreCombatOutcomeRecruit";
 
 		struct Pending
 		{
@@ -73,6 +80,8 @@ namespace TFD::PreCombatGreet
 		RE::FormID gRecentActorCellFormID = 0;
 		RE::FormID gRecentActorWorldspaceFormID = 0;
 		bool gRecentActorInterior = false;
+
+		void ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
 
 		double NowSec()
 		{
@@ -339,6 +348,10 @@ namespace TFD::PreCombatGreet
 			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureStartHoldSec);
 
 			CacheRecentActor(actor, 0.0, "pleasure_start_pending");
+			if (pending->action == TFD::InteractionRouter::Action::TrucePreCombat) {
+				ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Pleasure, actor->GetFormID(), "precombat_pleasure_pending");
+			}
+
 			spdlog::info(
 				"[TFD][PreCombatGreet] pleasure handoff armed actor={:08X} session={} action={}",
 				actor->GetFormID(),
@@ -393,7 +406,60 @@ namespace TFD::PreCombatGreet
 			}
 		}
 
-		bool HasProtectedPleasurePendingLocked()
+		
+		std::uint32_t ResolveSinglePendingActorFormIDLocked()
+		{
+			if (gPending.size() != 1) {
+				return 0;
+			}
+
+			auto it = gPending.begin();
+			auto sp = RE::Actor::LookupByHandle(it->first);
+			auto* actor = sp.get();
+			return actor ? actor->GetFormID() : 0;
+		}
+
+		std::uint32_t ResolveFlowActorFormIDLocked(RE::Actor* preferred)
+		{
+			if (preferred) {
+				return preferred->GetFormID();
+			}
+
+			const auto pendingFormID = ResolveSinglePendingActorFormIDLocked();
+			if (pendingFormID != 0) {
+				return pendingFormID;
+			}
+
+			return TFD::Flow::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
+		}
+
+		void ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason)
+		{
+			if (actorFormID == 0) {
+				return;
+			}
+
+			auto& flow = TFD::Flow::Controller::GetSingleton();
+			if (!flow.ResolvePreCombatOutcome(outcome, actorFormID, reason ? reason : "unknown")) {
+				return;
+			}
+
+			if (outcome == TFD::Flow::PreCombatOutcome::Pay ||
+				outcome == TFD::Flow::PreCombatOutcome::Cancel ||
+				outcome == TFD::Flow::PreCombatOutcome::Failed) {
+				flow.CompleteTerminalContext(reason ? reason : "unknown");
+			}
+		}
+
+		void FinalizePreCombatPleasureContext(const char* reason)
+		{
+			auto& flow = TFD::Flow::Controller::GetSingleton();
+			if (!flow.CompleteAfterPleasure(reason ? reason : "unknown")) {
+				(void)flow.CompleteTerminalContext(reason ? reason : "unknown");
+			}
+		}
+
+bool HasProtectedPleasurePendingLocked()
 		{
 			for (auto& [handle, pending] : gPending) {
 				if (!pending.dialogueRequested) {
@@ -576,30 +642,65 @@ namespace TFD::PreCombatGreet
 				}
 
 				auto* actor = ResolvePleasureEventActor(ev);
-				if (!actor) {
+
+				if (name == kPreCombatOutcomePayEvent ||
+					name == kPreCombatOutcomeFightEvent ||
+					name == kPreCombatOutcomeCaptiveEvent ||
+					name == kPreCombatOutcomeJoinEnemyEvent ||
+					name == kPreCombatOutcomeRecruitEvent) {
+					std::scoped_lock lk(gLock);
+					const auto actorFormID = ResolveFlowActorFormIDLocked(actor);
+					if (name == kPreCombatOutcomePayEvent) {
+						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay");
+					} else if (name == kPreCombatOutcomeFightEvent) {
+						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight");
+					} else if (name == kPreCombatOutcomeCaptiveEvent) {
+						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive");
+					} else if (name == kPreCombatOutcomeJoinEnemyEvent) {
+						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy");
+					} else {
+						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
+					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
 				if (name == kPleasureStartPendingEvent) {
+					if (!actor) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
 					std::scoped_lock lk(gLock);
 					ArmPleasureHandoffLocked(actor);
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
 				if (name == kPleasureStartedEvent) {
+					if (!actor) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
 					std::scoped_lock lk(gLock);
 					MarkPleasureStartedLocked(actor);
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
 				if (name == kAfterPleasureLoopEnterEvent) {
+					if (!actor) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
 					std::scoped_lock lk(gLock);
 					MarkPleasureStartedLocked(actor);
 					CacheRecentActor(actor, 0.0, "after_pleasure_loop_enter");
+					const auto actorFormID = ResolveFlowActorFormIDLocked(actor);
+					if (actorFormID != 0) {
+						(void)TFD::Flow::Controller::GetSingleton().BeginAfterPleasure(actorFormID, "after_pleasure_loop_enter");
+					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
 				if (name == kPleasureFailedEvent || name == kPleasureEndedEvent) {
+					if (!actor) {
+						FinalizePreCombatPleasureContext(name == kPleasureEndedEvent ? "precombat_pleasure_ended" : "precombat_pleasure_failed");
+						return RE::BSEventNotifyControl::kContinue;
+					}
 					std::scoped_lock lk(gLock);
 
 					auto it = gPending.find(GetHandleId(actor));
@@ -622,6 +723,7 @@ namespace TFD::PreCombatGreet
 					}
 
 					gPending.erase(it);
+					FinalizePreCombatPleasureContext(name == kPleasureEndedEvent ? "precombat_pleasure_ended" : "precombat_pleasure_failed");
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
@@ -645,6 +747,13 @@ namespace TFD::PreCombatGreet
 				std::scoped_lock lk(gLock);
 				ClearAllPendingLocked();
 				return;
+			}
+
+			if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->IsInCombat()) {
+				std::scoped_lock lk(gLock);
+				if (gRecentActorHandle != 0) {
+					ClearRecentActor("player_entered_combat");
+				}
 			}
 
 			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
@@ -944,6 +1053,19 @@ namespace TFD::PreCombatGreet
 			CacheRecentActor(actor, 0.0, "begin");
 		}
 
+		auto& flow = TFD::Flow::Controller::GetSingleton();
+		if (result.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+			(void)flow.BeginPreCombat(actor->GetFormID(), "precombat_begin");
+			if (result.dialogueRequested) {
+				(void)flow.BeginTruceDecision(actor->GetFormID(), "precombat_dialogue_begin");
+			}
+		} else if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
+			(void)flow.BeginInCombat(actor->GetFormID(), "incombat_truce_begin");
+			if (result.dialogueRequested) {
+				(void)flow.BeginTruceDecision(actor->GetFormID(), "incombat_truce_dialogue_begin");
+			}
+		}
+
 		gPending.emplace(handle, pending);
 		return true;
 	}
@@ -953,6 +1075,12 @@ namespace TFD::PreCombatGreet
 		std::scoped_lock lk(gLock);
 
 		if (gRecentActorHandle == 0) {
+			return nullptr;
+		}
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (player && player->IsInCombat()) {
+			ClearRecentActor("player_entered_combat");
 			return nullptr;
 		}
 

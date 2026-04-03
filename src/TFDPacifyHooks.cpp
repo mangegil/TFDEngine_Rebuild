@@ -54,13 +54,22 @@ namespace TFD::PacifyHooks
                 return !TFD::DefeatMonitor::IsThresholdCombatTargetValid(actor);
             }
 
+            static bool ShouldPreservePlayerBleedTarget(RE::Character* actor, RE::Actor* target)
+            {
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (!actor || !player || target != player) {
+                    return false;
+                }
+                if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+                    return false;
+                }
+                return TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() ||
+                    TFD::DefeatMonitor::IsThresholdDownedActor(player);
+            }
+
             static void ClearInvalidCombatTarget(RE::Character* actor)
             {
                 if (!actor) {
-                    return;
-                }
-
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
                     return;
                 }
 
@@ -70,6 +79,14 @@ namespace TFD::PacifyHooks
                 if (player && target == player) {
                     TFD::DefeatMonitor::NoteEnemyTargetingPlayer(actor);
                 }
+
+                if (ShouldPreservePlayerBleedTarget(actor, target)) {
+                    spdlog::info("[TFD][PacifyHooks] preserved combat target actor={:08X} target={:08X} reason=player_bleed_threshold",
+                        actor->GetFormID(),
+                        target ? target->GetFormID() : 0u);
+                    return;
+                }
+
                 if (!target || !IsInvalidCombatTarget(target)) {
                     return;
                 }
@@ -91,8 +108,8 @@ namespace TFD::PacifyHooks
                     }
                     actor->SetBeenAttacked(true);
                     replacement->SetBeenAttacked(true);
-                    actor->RequestDetectionLevel(replacement, RE::DETECTION_PRIORITY::kCritical);
-                    replacement->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+                    (void)actor->RequestDetectionLevel(replacement, RE::DETECTION_PRIORITY::kCritical);
+                    (void)replacement->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         process->ClearCachedFactionFightReactions();
                     }
@@ -145,7 +162,9 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                auto targetSp = actor ? actor->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
+                auto* currentTarget = targetSp.get();
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() || ShouldPreservePlayerBleedTarget(actor, currentTarget)) {
                     _UpdateCombat(actor);
                     return;
                 }
@@ -183,7 +202,8 @@ namespace TFD::PacifyHooks
                     TFD::DefeatMonitor::NoteEnemyTargetingPlayer(viewer);
                 }
 
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() ||
+                    (player && target == player && TFD::DefeatMonitor::IsThresholdDownedActor(player))) {
                     return _DoDetect(viewer, target, detectVal, unk04, unk05, unk06, pos, unk08, unk09, unk10);
                 }
 
