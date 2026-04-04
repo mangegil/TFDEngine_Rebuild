@@ -66,9 +66,6 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kBleedoutPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
 		constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
 		constexpr const char* kBleedoutOutcomePleasureEvent = "TFDBleedoutOutcomePleasure";
-		constexpr const char* kBleedoutOutcomeReleaseEvent = "TFDBleedoutOutcomeRelease";
-		constexpr const char* kPreCombatOutcomeReleaseEvent = "TFDPreCombatOutcomeRelease";
-		constexpr const char* kPreCombatOutcomeReleaseEndEvent = "TFDPreCombatOutcomeReleaseEnd";
 		constexpr const char* kBleedoutOutcomeCaptiveEvent = "TFDBleedoutOutcomeCaptive";
 		constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
 		constexpr const char* kPleasureStartPendingEvent = "TFDPreCombatPleasureStartPending";
@@ -91,6 +88,7 @@ namespace TFD::DefeatMonitor
 		static void ClearBleedoutCaptorAliases(const char* reason);
 		static bool BindBleedoutCaptorAliases(RE::Actor* actor, const char* reason);
 		static bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason);
+		static void ApplyBleedForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet);
 		static bool PromoteNextBleedSpeakerFromTruceQueue(RE::Actor* player, const char* reason, bool rejectCurrent);
 		static void MaintainBleedPrimaryCaptorBinding();
 
@@ -1580,8 +1578,6 @@ namespace TFD::DefeatMonitor
 		static void DoBlackoutTeleport();
 		static void CompleteBleedPayRelease(const char* reason);
 		static void CompleteBleedPleasureHandoff(const char* reason);
-		static void BeginReleaseMercyWindow(RE::Actor* actor, int seconds, const char* reason);
-		static void EndReleaseMercyWindow(RE::Actor* actor, bool restoreHostility, const char* reason);
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor);
 		static bool BeginBleedoutDialogueHotkey();
 		static bool HandlePendingEscapeBreakBleed();
@@ -2047,6 +2043,11 @@ namespace TFD::DefeatMonitor
 			AssignBleedoutBridgeActor(speaker);
 			BindBleedoutCaptorAliases(speaker, reason ? reason : "bleed_retry");
 			PrimeBleedoutBridgeActor(speaker, reason ? reason : "bleed_retry");
+			if (!speaker->IsAIEnabled()) {
+				speaker->EnableAI(true);
+			}
+			speaker->AllowPCDialogue(true);
+			speaker->SetDialogueWithPlayer(false, false, nullptr);
 			if (speaker->IsInCombat()) {
 				speaker->StopCombat();
 			}
@@ -2064,12 +2065,76 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 			g_bleedTruceSessionId = *sessionId;
+			ApplyBleedForceGreetOverdrive(player, speaker, reason ? reason : "bleed_retry", false);
 			speaker->EvaluatePackage(false, true);
+			speaker->EvaluatePackage(true, true);
 			spdlog::info("[TFD][Defeat] bleed speaker restart id={} actor={:08X} reason={}",
 				g_bleedTruceSessionId,
 				speaker->GetFormID(),
 				reason ? reason : "unknown");
 			return true;
+		}
+
+		static void ApplyBleedForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet)
+		{
+			if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
+				return;
+			}
+
+			if (!speaker->IsAIEnabled()) {
+				speaker->EnableAI(true);
+			}
+			speaker->AllowPCDialogue(true);
+			speaker->SetDialogueWithPlayer(false, false, nullptr);
+
+			if (speaker->IsInCombat()) {
+				speaker->StopCombat();
+			}
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->StopCombatAndAlarmOnActor(speaker, false);
+			}
+			if (speaker->IsWeaponDrawn()) {
+				speaker->DrawWeaponMagicHands(false);
+			}
+
+			if (!IsBleedoutCaptorAliasPrimary(speaker)) {
+				BindBleedoutCaptorAliases(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+			}
+			PrimeBleedoutBridgeActor(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+
+			const float crowdRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
+			auto crowd = CollectBleedoutCrowd(crowdRadius, speaker, false);
+			bool speakerPresent = false;
+			for (auto* actor : crowd) {
+				if (actor && actor->GetFormID() == speaker->GetFormID()) {
+					speakerPresent = true;
+					break;
+				}
+			}
+			if (!speakerPresent) {
+				crowd.insert(crowd.begin(), speaker);
+			}
+			AssignBleedSupportBridgeActors(crowd, speaker, reason ? reason : "bleed_forcegreet_overdrive");
+			RefreshBleedoutBridgeCrowd(crowdRadius, speaker, true, &crowd);
+
+			auto burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+
+			player->DrawWeaponMagicHands(false);
+			player->EvaluatePackage(false, true);
+			player->EvaluatePackage(true, true);
+			speaker->EvaluatePackage(false, true);
+			speaker->EvaluatePackage(true, true);
+
+			if (restartForceGreet) {
+				TFD::ForceGreet::BeginBleedout(speaker);
+			}
+
+			spdlog::info("[TFD][Defeat] bleed forcegreet overdrive speaker={:08X} crowdSize={} burst={} restartFG={} reason={}",
+				speaker->GetFormID(),
+				crowd.size(),
+				burstId.has_value() ? 1 : 0,
+				restartForceGreet ? 1 : 0,
+				reason ? reason : "unknown");
 		}
 
 		static bool PromoteNextBleedSpeakerFromTruceQueue(RE::Actor* player, const char* reason, bool rejectCurrent)
@@ -6665,54 +6730,6 @@ namespace TFD::DefeatMonitor
 			spdlog::info("[TFD][Defeat] captive pleasure handoff complete reason={}", reason ? reason : "unknown");
 		}
 
-		static void BeginReleaseMercyWindow(RE::Actor* actor, int seconds, const char* reason)
-		{
-			if (seconds <= 0) {
-				seconds = 8;
-			}
-			ClearPendingCinematicFadeIn();
-			TFD::AggressionClamp::Clear();
-			TFD::FactionMask::Clear();
-			if (actor && !actor->IsDead()) {
-				const bool maskApplied = TFD::FactionMask::ApplyFromAggressor(actor);
-				actor->StopCombat();
-				if (auto* process = RE::ProcessLists::GetSingleton()) {
-					process->StopCombatAndAlarmOnActor(actor, false);
-				}
-				actor->EvaluatePackage();
-				spdlog::info("[TFD][Defeat] mercy release start actor={:08X} seconds={} maskApplied={} reason={}",
-					actor->GetFormID(), seconds, maskApplied ? 1 : 0, reason ? reason : "unknown");
-			}
-			else {
-				spdlog::info("[TFD][Defeat] mercy release start actor={:08X} seconds={} maskApplied=0 reason={}",
-					actor ? actor->GetFormID() : 0u, seconds, reason ? reason : "unknown");
-			}
-			g_leftForDeadNeedsAggroKick = true;
-			ApplyCalmBubble((std::max)(2200.0f, TFD::Settings::GetSweepRadius()));
-			BeginLeftForDeadCooldown(seconds);
-			SetGraceSeconds(seconds);
-			UpdatePreCombatState();
-		}
-
-		static void EndReleaseMercyWindow(RE::Actor* actor, bool restoreHostility, const char* reason)
-		{
-			g_leftForDeadNeedsAggroKick = restoreHostility;
-			g_grace.store(false, std::memory_order_release);
-			ClearLeftForDeadCooldown();
-			if (actor && !actor->IsDead()) {
-				actor->StopCombat();
-				if (auto* process = RE::ProcessLists::GetSingleton()) {
-					process->StopCombatAndAlarmOnActor(actor, false);
-				}
-				actor->EvaluatePackage();
-			}
-			UpdatePreCombatState();
-			spdlog::info("[TFD][Defeat] mercy release end actor={:08X} restoreHostility={} reason={}",
-				actor ? actor->GetFormID() : 0u,
-				restoreHostility ? 1 : 0,
-				reason ? reason : "unknown");
-		}
-
 		static void CompleteBleedPayRelease(const char* reason)
 		{
 			ClearBleedSystemEventOutcomeWindow(reason ? reason : "CompleteBleedPayRelease");
@@ -6733,8 +6750,8 @@ namespace TFD::DefeatMonitor
 			SetPlayerBleedImmune(false);
 			RecoverPlayerForTransition();
 			ApplyCalmBubble((std::max)(2200.0f, TFD::Settings::GetSweepRadius()));
-			BeginLeftForDeadCooldown(20);
-			SetGraceSeconds(20);
+			BeginLeftForDeadCooldown(8);
+			SetGraceSeconds(8);
 			UpdatePreCombatState();
 			spdlog::info("[TFD][Defeat] bleed pay release complete reason={}", reason ? reason : "unknown");
 		}
@@ -7979,14 +7996,11 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
-			if (!IsBleedoutCaptorAliasPrimary(actor)) {
-				BindBleedoutCaptorAliases(actor, "speaker_prime_missing_alias");
-			}
-			PrimeBleedoutBridgeActor(actor, "speaker_prime_retry");
+			ApplyBleedForceGreetOverdrive(player, actor, "speaker_prime_retry", true);
 			g_bleedSpeakerKickLast = now;
 			++g_bleedSpeakerKickCount;
 
-			spdlog::info("[TFD][Defeat] bleed speaker prime retry actor={:08X} dist={:.1f} attempt={}",
+			spdlog::info("[TFD][Defeat] bleed speaker overdrive retry actor={:08X} dist={:.1f} attempt={}",
 				actor->GetFormID(),
 				dist,
 				g_bleedSpeakerKickCount);
@@ -8096,6 +8110,26 @@ namespace TFD::DefeatMonitor
 					g_prevDialogueOpen = dOpen;
 					return;
 				}
+				if (g_bleedPaused && !g_bleedSawDialogue && !g_prevDialogueOpen && !HasBleedTerminalCommit() &&
+					g_bleedDialogueOutcome == BleedDialogueOutcome::None && !IsOStimBridgeBlocking() &&
+					g_bleedSpeakerId != 0 && g_bleedStickyRetryCount < 3) {
+					auto* timeoutSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
+					float timeoutDist = 99999.0f;
+					if (player && timeoutSpeaker && CanUseAggressorForBleedoutGreet(player, timeoutSpeaker, timeoutDist)) {
+						ApplyBleedForceGreetOverdrive(player, timeoutSpeaker, "forcegreet_timeout_rearm", true);
+						g_bleedPauseStarted = Now();
+						g_bleedLastSeconds = -1;
+						g_bleedSpeakerKickLast = {};
+						g_bleedSpeakerKickCount = 0;
+						++g_bleedStickyRetryCount;
+						g_bleedStickyNextRetry = Now() + std::chrono::milliseconds(650);
+						spdlog::info("[TFD][Defeat] bleed forcegreet timeout rearm speaker={:08X} retry={} dist={:.1f}",
+							timeoutSpeaker->GetFormID(),
+							g_bleedStickyRetryCount,
+							timeoutDist);
+						return;
+					}
+				}
 				if (g_bleedPaused) {
 					g_bleedStart += (Now() - g_bleedPauseStarted);
 					g_bleedPaused = false;
@@ -8110,7 +8144,7 @@ namespace TFD::DefeatMonitor
 						auto* reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
 						float reopenDist = 99999.0f;
 						if (player && reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist)) {
-							TFD::ForceGreet::BeginBleedout(reopenSpeaker);
+							ApplyBleedForceGreetOverdrive(player, reopenSpeaker, "sticky_watchdog_reopen", true);
 							g_bleedStickyNextRetry = nowBleed + std::chrono::milliseconds(900);
 							++g_bleedStickyRetryCount;
 							spdlog::info("[TFD][Defeat] bleed sticky watchdog reopen speaker={:08X} retry={} dist={:.1f}",
@@ -8205,11 +8239,7 @@ namespace TFD::DefeatMonitor
 						return reopenDist <= 2048.0f;
 						}();
 					if (forceReopenReady) {
-						if (!IsBleedoutCaptorAliasPrimary(reopenSpeaker)) {
-							BindBleedoutCaptorAliases(reopenSpeaker, "dialogue_closed_sticky_reopen");
-						}
-						PrimeBleedoutBridgeActor(reopenSpeaker, "dialogue_closed_sticky_reopen");
-						TFD::ForceGreet::BeginBleedout(reopenSpeaker);
+						ApplyBleedForceGreetOverdrive(player, reopenSpeaker, "dialogue_closed_sticky_reopen", true);
 						g_bleedPaused = true;
 						g_bleedPauseStarted = Now();
 						spdlog::info("[TFD][Defeat] bleedout dialogue closed without committed outcome -> sticky reopen forced speaker={:08X} dist={:.1f}",
@@ -8374,17 +8404,6 @@ namespace TFD::DefeatMonitor
 				if (name.empty()) {
 					return RE::BSEventNotifyControl::kContinue;
 				}
-				if (name == kPreCombatOutcomeReleaseEvent) {
-					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
-					const int seconds = ev->numArg > 0.0f ? static_cast<int>(std::round(ev->numArg)) : 8;
-					BeginReleaseMercyWindow(actor, seconds, "mod_event_precombat_release");
-					return RE::BSEventNotifyControl::kContinue;
-				}
-				if (name == kPreCombatOutcomeReleaseEndEvent) {
-					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
-					EndReleaseMercyWindow(actor, ev->numArg >= 0.5f, "mod_event_precombat_release_end");
-					return RE::BSEventNotifyControl::kContinue;
-				}
 				if (name == kBleedoutOutcomePayEvent) {
 					if (ShouldDropBleedSystemEventBecauseFallback(rawName)) {
 						return RE::BSEventNotifyControl::kContinue;
@@ -8397,27 +8416,6 @@ namespace TFD::DefeatMonitor
 						if (flow.ResolveBleedoutOutcome(TFD::Flow::BleedoutOutcome::Pay, actorFormID, "mod_event_pay")) {
 							(void)flow.CompleteTerminalContext("mod_event_pay");
 						}
-						CompleteBleedPayRelease("mod_event_pay");
-					}
-					return RE::BSEventNotifyControl::kContinue;
-				}
-				if (name == kBleedoutOutcomeReleaseEvent) {
-					if (ShouldDropBleedSystemEventBecauseFallback(rawName)) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-					ArmBleedSystemEventOutcomeWindow("mod_event_release", 3.0);
-					if (g_inBleedState.load(std::memory_order_acquire)) {
-						const auto actorFormID = ResolveBleedFlowActorFormID();
-						auto& flow = TFD::Flow::Controller::GetSingleton();
-						if (flow.ResolveBleedoutOutcome(TFD::Flow::BleedoutOutcome::Cancel, actorFormID, "mod_event_release")) {
-							(void)flow.CompleteTerminalContext("mod_event_release");
-						}
-						CompleteBleedPayRelease("mod_event_release");
-					}
-					else {
-						auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
-						const int seconds = ev->numArg > 0.0f ? static_cast<int>(std::round(ev->numArg)) : 20;
-						BeginReleaseMercyWindow(actor, seconds, "mod_event_afterpleasure_release");
 					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
