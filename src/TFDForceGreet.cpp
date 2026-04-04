@@ -17,8 +17,9 @@ namespace TFD::ForceGreet
 		constexpr auto kRetryDelay = std::chrono::milliseconds(180);
 		constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
 		constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
+		constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
 		constexpr float kDefaultOpenDistance = 192.0f;
-		constexpr float kBleedoutOpenDistance = 220.0f;
+		constexpr float kBleedoutOpenDistance = 256.0f;
 
 		struct PendingState
 		{
@@ -178,7 +179,7 @@ namespace TFD::ForceGreet
 			g_pending.maxDistance = mode == Mode::Bleedout ? kBleedoutOpenDistance : kDefaultOpenDistance;
 			g_pending.started = now;
 			g_pending.nextAttempt = now + kInitialDelay;
-			g_pending.deadline = now + kDefaultTimeout;
+			g_pending.deadline = now + (mode == Mode::Bleedout ? kBleedoutTimeout : kDefaultTimeout);
 			g_pending.lastPackageRefresh = {};
 
 			spdlog::info(

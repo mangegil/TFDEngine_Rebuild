@@ -25,6 +25,7 @@ namespace TFD::Pacify
         PlayerAggression,
         PlayerArmed,
         DialogueClosed,
+        FlowHandoff,
         TooFar,
         TameBroken,
         TameExpired

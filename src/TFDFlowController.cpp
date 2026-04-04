@@ -323,6 +323,11 @@ namespace TFD::Flow
         case SubFlow::VictoryPleasure:
             _snapshot.sub = SubFlow::VictoryAfterPleasure;
             break;
+        case SubFlow::PreCombatAfterPleasure:
+        case SubFlow::InCombatAfterPleasure:
+        case SubFlow::CaptiveAfterPleasure:
+        case SubFlow::VictoryAfterPleasure:
+            break;
         default:
             return RejectLocked("BeginAfterPleasure", reason);
         }

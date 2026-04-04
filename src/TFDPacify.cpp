@@ -2587,6 +2587,8 @@ namespace TFD::Pacify
         }
 
         const double releaseNowSec = PacifyNowSec();
+        const bool suppressRehostile = reason == ReleaseReason::FlowHandoff;
+        const bool suppressUnassign = reason == ReleaseReason::FlowHandoff;
 
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);
@@ -2609,12 +2611,14 @@ namespace TFD::Pacify
                 const bool shouldRehostileTruce =
                     IsTruceMode(releasedEntry.mode) &&
                     player &&
-                    (reason == ReleaseReason::DialogueClosed ||
-                        reason == ReleaseReason::PlayerArmed);
+                    (!suppressRehostile &&
+                        (reason == ReleaseReason::DialogueClosed ||
+                        reason == ReleaseReason::PlayerArmed));
 
                 const bool immediateInCombatRehostile =
                     releasedEntry.mode == Mode::TruceInCombat &&
                     player &&
+                    !suppressRehostile &&
                     reason == ReleaseReason::DialogueClosed;
 
                 if (immediateInCombatRehostile) {
@@ -2647,7 +2651,7 @@ namespace TFD::Pacify
         RE::Actor* primaryActor = ResolveActor(primaryTargetId);
         if (IsTruceMode(primaryMode)) {
             if (primaryActor) {
-                if (DoesReasonCountAsBetrayal(reason)) {
+                if (!suppressRehostile && DoesReasonCountAsBetrayal(reason)) {
                     MarkTruceBetrayed(primaryActor);
                 }
             }
@@ -2657,25 +2661,33 @@ namespace TFD::Pacify
         const char* unassignEvent = (primaryMode == Mode::Tame && primaryDisposition == TameDisposition::Companion) ?
             kCreatureTeammateUnassignEvent :
             GetUnassignEventName(primaryMode);
-        const auto sent = SendModEventToActors(unassignEvent, eventIds);
-        spdlog::info(
-            "TFDPacify: unassign events event={} session={} sent={} primary={:08X} disposition={}",
-            unassignEvent ? unassignEvent : "<none>",
-            sessionId,
-            static_cast<unsigned int>(sent),
-            primaryTargetId,
-            ToString(primaryDisposition));
-
-        if (const auto* supplementalUnassign = GetSupplementalUnassignEventName(primaryMode)) {
-            const auto supplementalSent = SendModEventToActors(supplementalUnassign, eventIds);
+        if (suppressUnassign) {
             spdlog::info(
-                "TFDPacify: supplemental unassign event={} session={} sent={} primary={:08X}",
-                supplementalUnassign,
+                "TFDPacify: suppress unassign/rehostile session={} reason={} mode={} primary={:08X}",
                 sessionId,
-                static_cast<unsigned int>(supplementalSent),
+                ToString(reason),
+                ToString(primaryMode),
                 primaryTargetId);
-        }
+        } else {
+            const auto sent = SendModEventToActors(unassignEvent, eventIds);
+            spdlog::info(
+                "TFDPacify: unassign events event={} session={} sent={} primary={:08X} disposition={}",
+                unassignEvent ? unassignEvent : "<none>",
+                sessionId,
+                static_cast<unsigned int>(sent),
+                primaryTargetId,
+                ToString(primaryDisposition));
 
+            if (const auto* supplementalUnassign = GetSupplementalUnassignEventName(primaryMode)) {
+                const auto supplementalSent = SendModEventToActors(supplementalUnassign, eventIds);
+                spdlog::info(
+                    "TFDPacify: supplemental unassign event={} session={} sent={} primary={:08X}",
+                    supplementalUnassign,
+                    sessionId,
+                    static_cast<unsigned int>(supplementalSent),
+                    primaryTargetId);
+            }
+        }
         spdlog::info(
             "TFDPacify: release session id={} reason={} mode={} disposition={} target={:08X} packSize={}",
             sessionId,
@@ -2800,6 +2812,8 @@ namespace TFD::Pacify
             return "PlayerArmed";
         case ReleaseReason::DialogueClosed:
             return "DialogueClosed";
+        case ReleaseReason::FlowHandoff:
+            return "FlowHandoff";
         case ReleaseReason::TooFar:
             return "TooFar";
         case ReleaseReason::TameBroken:
