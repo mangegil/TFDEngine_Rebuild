@@ -2057,7 +2057,13 @@ namespace TFD::DefeatMonitor
 			if (speaker->IsWeaponDrawn()) {
 				speaker->DrawWeaponMagicHands(false);
 			}
-			auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true);
+			auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false);
+			if (!sessionId.has_value() && g_inBleedState.load(std::memory_order_relaxed)) {
+				spdlog::info("[TFD][Defeat] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
+					speaker->GetFormID(),
+					reason ? reason : "unknown");
+				sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true);
+			}
 			if (!sessionId.has_value()) {
 				spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
 					speaker->GetFormID(),
@@ -2117,7 +2123,16 @@ namespace TFD::DefeatMonitor
 			AssignBleedSupportBridgeActors(crowd, speaker, reason ? reason : "bleed_forcegreet_overdrive");
 			RefreshBleedoutBridgeCrowd(crowdRadius, speaker, true, &crowd);
 
-			auto burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+			std::optional<RE::FormID> burstId;
+			const bool preserveDialogueSession = g_inBleedState.load(std::memory_order_relaxed);
+			if (!preserveDialogueSession) {
+				burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+			}
+			else {
+				spdlog::info("[TFD][Defeat] bleed forcegreet preserve dialogue session speaker={:08X} reason={}",
+					speaker->GetFormID(),
+					reason ? reason : "unknown");
+			}
 
 			player->DrawWeaponMagicHands(false);
 			player->EvaluatePackage(false, true);

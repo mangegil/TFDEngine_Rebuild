@@ -16,6 +16,7 @@ namespace TFD::ForceGreet
 		constexpr auto kInitialDelay = std::chrono::milliseconds(90);
 		constexpr auto kRetryDelay = std::chrono::milliseconds(180);
 		constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
+		constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
 		constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
 		constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
 		constexpr float kDefaultOpenDistance = 192.0f;
@@ -35,6 +36,7 @@ namespace TFD::ForceGreet
 			Clock::time_point nextAttempt{};
 			Clock::time_point deadline{};
 			Clock::time_point lastPackageRefresh{};
+			Clock::time_point lastHardReset{};
 		};
 
 		PendingState g_pending{};
@@ -138,6 +140,7 @@ namespace TFD::ForceGreet
 			g_pending.nextAttempt = {};
 			g_pending.deadline = {};
 			g_pending.lastPackageRefresh = {};
+			g_pending.lastHardReset = {};
 		}
 
 		void CancelLocked(const char* reason)
@@ -155,6 +158,42 @@ namespace TFD::ForceGreet
 			ResetLocked();
 		}
 
+		void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
+		{
+			if (!player || !speaker) {
+				return;
+			}
+
+			if (!speaker->IsAIEnabled()) {
+				speaker->EnableAI(true);
+			}
+
+			speaker->AllowPCDialogue(true);
+
+			if (hardReset) {
+				speaker->SetDialogueWithPlayer(false, false, nullptr);
+			}
+
+			if (speaker->IsInCombat()) {
+				speaker->StopCombat();
+			}
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->StopCombatAndAlarmOnActor(speaker, false);
+			}
+
+			if (player->IsWeaponDrawn()) {
+				player->DrawWeaponMagicHands(false);
+			}
+			if (speaker->IsWeaponDrawn()) {
+				speaker->DrawWeaponMagicHands(false);
+			}
+
+			player->EvaluatePackage(false, true);
+			player->EvaluatePackage(true, true);
+			speaker->EvaluatePackage(false, true);
+			speaker->EvaluatePackage(true, true);
+		}
+
 		void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
 		{
 			std::scoped_lock lk(g_pending.lock);
@@ -170,6 +209,7 @@ namespace TFD::ForceGreet
 			}
 
 			const auto now = Clock::now();
+			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : kDefaultTimeout;
 			g_pending.speaker = speaker->GetHandle();
 			g_pending.mode = mode;
 			g_pending.active = true;
@@ -179,8 +219,9 @@ namespace TFD::ForceGreet
 			g_pending.maxDistance = mode == Mode::Bleedout ? kBleedoutOpenDistance : kDefaultOpenDistance;
 			g_pending.started = now;
 			g_pending.nextAttempt = now + kInitialDelay;
-			g_pending.deadline = now + (mode == Mode::Bleedout ? kBleedoutTimeout : kDefaultTimeout);
+			g_pending.deadline = now + timeout;
 			g_pending.lastPackageRefresh = {};
+			g_pending.lastHardReset = {};
 
 			spdlog::info(
 				"[TFD][ForceGreet] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={} maxDist={:.1f}",
@@ -188,7 +229,7 @@ namespace TFD::ForceGreet
 				reason ? reason : "unknown",
 				speaker->GetFormID(),
 				static_cast<int>(kInitialDelay.count()),
-				static_cast<int>(kDefaultTimeout.count()),
+				static_cast<int>(timeout.count()),
 				g_pending.maxDistance);
 		}
 	}
@@ -266,7 +307,7 @@ namespace TFD::ForceGreet
 		if (!canAttempt) {
 			if (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
 				(now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay) {
-				speaker->EvaluatePackage(false, true);
+				PrepareSpeakerForDialogue(player, speaker, false);
 				g_pending.lastPackageRefresh = now;
 				spdlog::info(
 					"[TFD][ForceGreet] wait mode={} speaker={:08X} dist={:.1f} attempts={} requestIssued={} -> refresh package",
@@ -277,6 +318,29 @@ namespace TFD::ForceGreet
 					g_pending.requestIssued ? 1 : 0);
 			}
 			return;
+		}
+
+		const bool shouldHardReset =
+			g_pending.lastHardReset.time_since_epoch().count() == 0 ||
+			(!g_pending.requestIssued && g_pending.attempts == 0) ||
+			(now - g_pending.lastHardReset) >= kHardResetDelay ||
+			(g_pending.requestIssued && (g_pending.attempts >= 3) && ((g_pending.attempts % 4) == 0));
+
+		if (shouldHardReset) {
+			PrepareSpeakerForDialogue(player, speaker, true);
+			g_pending.lastHardReset = now;
+			spdlog::info(
+				"[TFD][ForceGreet] handshake reset mode={} speaker={:08X} dist={:.1f} attempts={} requestIssued={}",
+				ModeName(g_pending.mode),
+				speaker->GetFormID(),
+				dist,
+				g_pending.attempts,
+				g_pending.requestIssued ? 1 : 0);
+		}
+		else if (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
+			(now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay) {
+			PrepareSpeakerForDialogue(player, speaker, false);
+			g_pending.lastPackageRefresh = now;
 		}
 
 		if (now < g_pending.nextAttempt) {
