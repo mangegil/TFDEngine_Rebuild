@@ -6561,6 +6561,12 @@ namespace TFD::DefeatMonitor
 			g_genericPleasureHoldUntil = Now() + std::chrono::milliseconds(static_cast<int>((std::max)(0.5, holdSeconds) * 1000.0));
 			g_genericPleasureLastPulse = {};
 
+			const bool suppressGenericDialogue = !sceneStarted && g_ostimBridgeState == OStimBridgeState::AwaitAfterPleasure;
+			if (suppressGenericDialogue) {
+				actor->AllowPCDialogue(false);
+				actor->SetDialogueWithPlayer(false, false, nullptr);
+			}
+
 			if (actor->Is3DLoaded()) {
 				if (actor->IsInCombat()) {
 					actor->StopCombat();
@@ -6601,6 +6607,10 @@ namespace TFD::DefeatMonitor
 
 			auto* actor = ResolveGenericPleasureSpeaker();
 			const auto actorId = actor ? actor->GetFormID() : 0u;
+			if (actor && !actor->IsDead() && !actor->IsDisabled()) {
+				actor->AllowPCDialogue(true);
+				actor->SetDialogueWithPlayer(false, false, nullptr);
+			}
 			g_genericPleasureSpeaker = {};
 			g_genericPleasureHoldActive = false;
 			g_genericPleasureSceneStarted = false;
@@ -6650,6 +6660,12 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 			g_genericPleasureLastPulse = now;
+
+			const bool suppressGenericDialogue = g_ostimBridgeState == OStimBridgeState::AwaitAfterPleasure && !g_genericPleasureSceneStarted;
+			if (suppressGenericDialogue) {
+				actor->AllowPCDialogue(false);
+				actor->SetDialogueWithPlayer(false, false, nullptr);
+			}
 
 			if (actor->Is3DLoaded()) {
 				if (actor->IsInCombat()) {
@@ -6850,6 +6866,24 @@ namespace TFD::DefeatMonitor
 			}
 			auto& flow = TFD::Flow::Controller::GetSingleton();
 			const auto actorFormID = info.actorFormID != 0 ? info.actorFormID : ResolveBleedFlowActorFormID();
+			if (info.actor && !info.actor->IsDead() && !info.actor->IsDisabled()) {
+				info.actor->AllowPCDialogue(true);
+				info.actor->SetDialogueWithPlayer(false, false, nullptr);
+				if (info.actor->IsInCombat()) {
+					info.actor->StopCombat();
+				}
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(info.actor, false);
+				}
+				if (info.actor->IsWeaponDrawn()) {
+					info.actor->DrawWeaponMagicHands(false);
+				}
+				info.actor->EvaluatePackage(false, true);
+				info.actor->EvaluatePackage(true, true);
+				spdlog::info("[TFD][Pleasure] after pleasure stabilizer release speaker={:08X} reason={}",
+					info.actor->GetFormID(),
+					reason ? reason : "after_pleasure_enter");
+			}
 			if (!flow.BeginAfterPleasure(actorFormID, reason ? reason : "after_pleasure_enter")) {
 				spdlog::warn("[TFD][Defeat] ignore after_pleasure_enter reason=flow_reject actor={:08X}", actorFormID);
 				return;

@@ -96,32 +96,38 @@ namespace TFDMenu
 		static RE::FormID gCreatureTeammateFeedSessionId = 0;
 		static RE::FormID gCreatureTeammateReleaseConfirmSessionId = 0;
 
+		static RE::TESGlobal* gBossContainerMarkerState = nullptr;
+		static RE::TESGlobal* gBossMarkerState = nullptr;
+		static RE::TESGlobal* gCaptiveMarkerState = nullptr;
 		static RE::TESGlobal* gCaptiveState = nullptr;
-		static RE::TESGlobal* gCaptivePhase = nullptr;
+		static RE::TESGlobal* gContainerMarkerState = nullptr;
+		static RE::TESGlobal* gDefeatState = nullptr;
+		static RE::TESGlobal* gDialogueState = nullptr;
+		static RE::TESGlobal* gEscapeRouteState = nullptr;
+		static RE::TESGlobal* gHostileState = nullptr;
+		static RE::TESGlobal* gInCombatState = nullptr;
+		static RE::TESGlobal* gInteractionState = nullptr;
+		static RE::TESGlobal* gJoinEnemyState = nullptr;
+		static RE::TESGlobal* gPleasureState = nullptr;
 		static RE::TESGlobal* gPreCombatState = nullptr;
-		static RE::TESGlobal* gBleedOutState = nullptr;
-		static RE::TESGlobal* gActiveDialogueFlow = nullptr;
-		static RE::TESGlobal* gKidnapAvailable = nullptr;
-		static RE::TESGlobal* gTransitionPending = nullptr;
-		static RE::TESGlobal* gTransitionBusy = nullptr;
-		static RE::TESGlobal* gTransitionReason = nullptr;
-		static RE::TESGlobal* gTransitionResult = nullptr;
-		static RE::TESGlobal* gPreCombatResult = nullptr;
-		static RE::TESGlobal* gPreCombatJoinEnemyAvailable = nullptr;
-		static RE::TESGlobal* gAfterPleasureSource = nullptr;
-		static bool gLoggedCaptiveFound = false;
-		static bool gLoggedCaptivePhaseFound = false;
-		static bool gLoggedPreCombatFound = false;
-		static bool gLoggedBleedOutFound = false;
-		static bool gLoggedActiveDialogueFlowFound = false;
-		static bool gLoggedKidnapAvailableFound = false;
-		static bool gLoggedTransitionPendingFound = false;
-		static bool gLoggedTransitionBusyFound = false;
-		static bool gLoggedTransitionReasonFound = false;
-		static bool gLoggedTransitionResultFound = false;
-		static bool gLoggedPreCombatResultFound = false;
-		static bool gLoggedPreCombatJoinEnemyAvailableFound = false;
-		static bool gLoggedAfterPleasureSourceFound = false;
+		static RE::TESGlobal* gTeammateState = nullptr;
+		static RE::TESGlobal* gVictoryState = nullptr;
+		static bool gLoggedBossContainerMarkerStateFound = false;
+		static bool gLoggedBossMarkerStateFound = false;
+		static bool gLoggedCaptiveMarkerStateFound = false;
+		static bool gLoggedCaptiveStateFound = false;
+		static bool gLoggedContainerMarkerStateFound = false;
+		static bool gLoggedDefeatStateFound = false;
+		static bool gLoggedDialogueStateFound = false;
+		static bool gLoggedEscapeRouteStateFound = false;
+		static bool gLoggedHostileStateFound = false;
+		static bool gLoggedInCombatStateFound = false;
+		static bool gLoggedInteractionStateFound = false;
+		static bool gLoggedJoinEnemyStateFound = false;
+		static bool gLoggedPleasureStateFound = false;
+		static bool gLoggedPreCombatStateFound = false;
+		static bool gLoggedTeammateStateFound = false;
+		static bool gLoggedVictoryStateFound = false;
 
 		static void ResolveGlobal(RE::TESGlobal*& global, bool& logged, const char* editorId)
 		{
@@ -138,19 +144,22 @@ namespace TFDMenu
 
 		static void ResolveGlobals()
 		{
-			ResolveGlobal(gCaptiveState, gLoggedCaptiveFound, "TFDCaptiveState");
-			ResolveGlobal(gCaptivePhase, gLoggedCaptivePhaseFound, "TFDCaptivePhase");
-			ResolveGlobal(gPreCombatState, gLoggedPreCombatFound, "TFDPreCombatState");
-			ResolveGlobal(gBleedOutState, gLoggedBleedOutFound, "TFDBleedOutState");
-			ResolveGlobal(gActiveDialogueFlow, gLoggedActiveDialogueFlowFound, "TFDActiveDialogueFlow");
-			ResolveGlobal(gKidnapAvailable, gLoggedKidnapAvailableFound, "TFDKidnapAvailable");
-			ResolveGlobal(gTransitionPending, gLoggedTransitionPendingFound, "TFDTransitionPending");
-			ResolveGlobal(gTransitionBusy, gLoggedTransitionBusyFound, "TFDTransitionBusy");
-			ResolveGlobal(gTransitionReason, gLoggedTransitionReasonFound, "TFDTransitionReason");
-			ResolveGlobal(gTransitionResult, gLoggedTransitionResultFound, "TFDTransitionResult");
-			ResolveGlobal(gPreCombatResult, gLoggedPreCombatResultFound, "TFDPreCombatResult");
-			ResolveGlobal(gPreCombatJoinEnemyAvailable, gLoggedPreCombatJoinEnemyAvailableFound, "TFDJoinEnemy");
-			ResolveGlobal(gAfterPleasureSource, gLoggedAfterPleasureSourceFound, "TFDAfterPleasure");
+			ResolveGlobal(gBossContainerMarkerState, gLoggedBossContainerMarkerStateFound, "TFDBossContainerMarkerState");
+			ResolveGlobal(gBossMarkerState, gLoggedBossMarkerStateFound, "TFDBossMarkerState");
+			ResolveGlobal(gCaptiveMarkerState, gLoggedCaptiveMarkerStateFound, "TFDCaptiveMarkerState");
+			ResolveGlobal(gCaptiveState, gLoggedCaptiveStateFound, "TFDCaptiveState");
+			ResolveGlobal(gContainerMarkerState, gLoggedContainerMarkerStateFound, "TFDContainerMarkerState");
+			ResolveGlobal(gDefeatState, gLoggedDefeatStateFound, "TFDDefeatState");
+			ResolveGlobal(gDialogueState, gLoggedDialogueStateFound, "TFDDialogueState");
+			ResolveGlobal(gEscapeRouteState, gLoggedEscapeRouteStateFound, "TFDEscapeRouteState");
+			ResolveGlobal(gHostileState, gLoggedHostileStateFound, "TFDHostileState");
+			ResolveGlobal(gInCombatState, gLoggedInCombatStateFound, "TFDInCombatState");
+			ResolveGlobal(gInteractionState, gLoggedInteractionStateFound, "TFDInteractionState");
+			ResolveGlobal(gJoinEnemyState, gLoggedJoinEnemyStateFound, "TFDJoinEnemyState");
+			ResolveGlobal(gPleasureState, gLoggedPleasureStateFound, "TFDPleasureState");
+			ResolveGlobal(gPreCombatState, gLoggedPreCombatStateFound, "TFDPreCombatState");
+			ResolveGlobal(gTeammateState, gLoggedTeammateStateFound, "TFDTeammateState");
+			ResolveGlobal(gVictoryState, gLoggedVictoryStateFound, "TFDVictoryState");
 		}
 
 		static float GetGlobalValue(RE::TESGlobal* g)
@@ -163,13 +172,13 @@ namespace TFDMenu
 			return static_cast<int>(std::lround(GetGlobalValue(g)));
 		}
 
-		static const char* DecodeBinaryState(int value)
+		static const char* DecodeAvailabilityState(int value)
 		{
 			switch (value) {
 			case 0:
-				return "Off";
+				return "Unavailable";
 			case 1:
-				return "On";
+				return "Available";
 			default:
 				return "Custom";
 			}
@@ -179,173 +188,202 @@ namespace TFDMenu
 		{
 			switch (value) {
 			case 0:
-				return "None";
+				return "Free";
 			case 1:
-				return "Captive";
+				return "Kidnapped";
+			case 2:
+				return "Escape Phase";
 			default:
 				return "Custom";
 			}
 		}
 
-		static const char* DecodeCaptivePhase(int value)
+		static const char* DecodeDefeatState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "No";
+			case 1:
+				return "Yes";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeDialogueState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "Out";
+			case 1:
+				return "In";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeEscapeRouteState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "Unavailable";
+			case 1:
+				return "Lockpicking";
+			case 2:
+				return "Get Away";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeHostileState(int value)
 		{
 			switch (value) {
 			case 0:
 				return "None";
 			case 1:
-				return "Captive";
+				return "Duel";
 			case 2:
-				return "Escape";
+				return "War";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeInCombatState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "No";
+			case 1:
+				return "Yes";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeInteractionState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "None";
+			case 1:
+				return "Truce";
+			case 2:
+				return "Tame";
 			case 3:
-				return "ReleasedWork";
-			default:
-				return "Custom";
-			}
-		}
-
-		static const char* DecodeActiveDialogueFlow(int value)
-		{
-			switch (value) {
-			case 0:
-				return "None";
-			case 1:
-				return "PreCombat";
-			case 2:
 				return "Bleedout";
-			case 3:
-				return "Captive";
 			case 4:
-				return "Victory";
-			case 5:
-				return "Savior";
-			case 6:
-				return "RecruitContract";
-			case 7:
-				return "CreatureBleedout";
-			case 8:
-				return "CreatureTruce";
-			case 9:
+				return "Call Captor";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodeJoinEnemyState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "Unavailable";
+			case 1:
+				return "In Faction";
+			case 2:
+				return "Multiple Factions";
+			default:
+				return "Custom";
+			}
+		}
+
+		static const char* DecodePleasureState(int value)
+		{
+			switch (value) {
+			case 0:
+				return "Unavailable";
+			case 1:
+				return "Pleasure";
+			case 2:
 				return "AfterPleasure";
 			default:
 				return "Custom";
 			}
 		}
 
-		static const char* DecodeTransitionPending(int value)
+		static const char* DecodePreCombatState(int value)
 		{
 			switch (value) {
 			case 0:
-				return "None";
+				return "No";
 			case 1:
-				return "LeftForDeadChoice";
-			case 2:
-				return "CaptiveCinematic";
+				return "Yes";
 			default:
 				return "Custom";
 			}
 		}
 
-		static const char* DecodeTransitionReason(int value)
+		static const char* DecodeTeammateState(int value)
 		{
 			switch (value) {
 			case 0:
-				return "None";
-			case 11:
-				return "PreCombatKidnapFadeOut";
-			case 12:
-				return "BleedoutCaptiveFadeOut";
-			case 13:
-				return "RecoverFadeOut";
-			case 21:
-				return "CaptiveFadeIn";
-			case 22:
-				return "RecoverFadeIn";
-			case 23:
-				return "RescueFadeIn";
-			default:
-				return "Custom";
-			}
-		}
-
-		static const char* DecodeTransitionResult(int value)
-		{
-			switch (value) {
-			case 0:
-				return "None";
-			case 3:
-				return "RecoverChosen";
-			case 4:
-				return "RescueChosen";
-			case 101:
-				return "FadeOutPreCombatKidnapDone";
-			case 102:
-				return "FadeOutBleedCaptiveDone";
-			case 103:
-				return "FadeOutRecoverDone";
-			case 201:
-				return "FadeInCaptiveDone";
-			case 202:
-				return "FadeInRecoverDone";
-			case 203:
-				return "FadeInRescueDone";
-			default:
-				return "Custom";
-			}
-		}
-
-		static const char* DecodeAfterPleasureSource(int value)
-		{
-			switch (value) {
-			case 0:
-				return "None";
+				return "Unavailable";
 			case 1:
-				return "PreCombat";
+				return "Has Teammate";
 			case 2:
-				return "Captive";
-			case 3:
-				return "Bleedout";
-			case 4:
-				return "InCombat";
+				return "Has Teammates";
 			default:
 				return "Custom";
 			}
 		}
 
-		static void RenderGlobalStateLine(const char* label, const char* editorId, RE::TESGlobal* global, const char* decoded = nullptr)
+		static const char* DecodeVictoryState(int value)
 		{
-			if (!label || !editorId) {
+			switch (value) {
+			case 0:
+				return "No";
+			case 1:
+				return "Yes";
+			default:
+				return "Custom";
+			}
+		}
+
+		static void RenderGlobalStateLine(const char* label, RE::TESGlobal* global, const char* decoded = nullptr)
+		{
+			if (!label) {
 				return;
 			}
 
 			if (!global) {
-				ImGuiMCP::Text("%s [%s]: <missing>", label, editorId);
+				ImGuiMCP::Text("%s: <missing>", label);
 				return;
 			}
 
 			if (decoded && decoded[0]) {
-				ImGuiMCP::Text("%s [%s]: %.0f (%s)", label, editorId, GetGlobalValue(global), decoded);
+				ImGuiMCP::Text("%s: %s", label, decoded);
 			}
 			else {
-				ImGuiMCP::Text("%s [%s]: %.0f", label, editorId, GetGlobalValue(global));
+				ImGuiMCP::Text("%s: %.0f", label, GetGlobalValue(global));
 			}
 		}
 
 		static void DumpGlobalStateToLog()
 		{
 			ResolveGlobals();
+			spdlog::info("[TFD][Menu][GlobalState] TFDBossContainerMarkerState={} ({})", GetGlobalValueInt(gBossContainerMarkerState), DecodeAvailabilityState(GetGlobalValueInt(gBossContainerMarkerState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDBossMarkerState={} ({})", GetGlobalValueInt(gBossMarkerState), DecodeAvailabilityState(GetGlobalValueInt(gBossMarkerState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDCaptiveMarkerState={} ({})", GetGlobalValueInt(gCaptiveMarkerState), DecodeAvailabilityState(GetGlobalValueInt(gCaptiveMarkerState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDCaptiveState={} ({})", GetGlobalValueInt(gCaptiveState), DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDCaptivePhase={} ({})", GetGlobalValueInt(gCaptivePhase), DecodeCaptivePhase(GetGlobalValueInt(gCaptivePhase)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatState={} ({})", GetGlobalValueInt(gPreCombatState), DecodeBinaryState(GetGlobalValueInt(gPreCombatState)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDBleedOutState={} ({})", GetGlobalValueInt(gBleedOutState), DecodeBinaryState(GetGlobalValueInt(gBleedOutState)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDActiveDialogueFlow={} ({})", GetGlobalValueInt(gActiveDialogueFlow), DecodeActiveDialogueFlow(GetGlobalValueInt(gActiveDialogueFlow)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDKidnapAvailable={} ({})", GetGlobalValueInt(gKidnapAvailable), DecodeBinaryState(GetGlobalValueInt(gKidnapAvailable)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionPending={} ({})", GetGlobalValueInt(gTransitionPending), DecodeTransitionPending(GetGlobalValueInt(gTransitionPending)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionBusy={} ({})", GetGlobalValueInt(gTransitionBusy), DecodeBinaryState(GetGlobalValueInt(gTransitionBusy)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionReason={} ({})", GetGlobalValueInt(gTransitionReason), DecodeTransitionReason(GetGlobalValueInt(gTransitionReason)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDTransitionResult={} ({})", GetGlobalValueInt(gTransitionResult), DecodeTransitionResult(GetGlobalValueInt(gTransitionResult)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatResult={}", GetGlobalValueInt(gPreCombatResult));
-			spdlog::info("[TFD][Menu][GlobalState] TFDJoinEnemy={} ({})", GetGlobalValueInt(gPreCombatJoinEnemyAvailable), DecodeBinaryState(GetGlobalValueInt(gPreCombatJoinEnemyAvailable)));
-			spdlog::info("[TFD][Menu][GlobalState] TFDAfterPleasure={} ({})", GetGlobalValueInt(gAfterPleasureSource), DecodeAfterPleasureSource(GetGlobalValueInt(gAfterPleasureSource)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDContainerMarkerState={} ({})", GetGlobalValueInt(gContainerMarkerState), DecodeAvailabilityState(GetGlobalValueInt(gContainerMarkerState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDDefeatState={} ({})", GetGlobalValueInt(gDefeatState), DecodeDefeatState(GetGlobalValueInt(gDefeatState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDDialogueState={} ({})", GetGlobalValueInt(gDialogueState), DecodeDialogueState(GetGlobalValueInt(gDialogueState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDEscapeRouteState={} ({})", GetGlobalValueInt(gEscapeRouteState), DecodeEscapeRouteState(GetGlobalValueInt(gEscapeRouteState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDHostileState={} ({})", GetGlobalValueInt(gHostileState), DecodeHostileState(GetGlobalValueInt(gHostileState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDInCombatState={} ({})", GetGlobalValueInt(gInCombatState), DecodeInCombatState(GetGlobalValueInt(gInCombatState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDInteractionState={} ({})", GetGlobalValueInt(gInteractionState), DecodeInteractionState(GetGlobalValueInt(gInteractionState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDJoinEnemyState={} ({})", GetGlobalValueInt(gJoinEnemyState), DecodeJoinEnemyState(GetGlobalValueInt(gJoinEnemyState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDPleasureState={} ({})", GetGlobalValueInt(gPleasureState), DecodePleasureState(GetGlobalValueInt(gPleasureState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatState={} ({})", GetGlobalValueInt(gPreCombatState), DecodePreCombatState(GetGlobalValueInt(gPreCombatState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDTeammateState={} ({})", GetGlobalValueInt(gTeammateState), DecodeTeammateState(GetGlobalValueInt(gTeammateState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDVictoryState={} ({})", GetGlobalValueInt(gVictoryState), DecodeVictoryState(GetGlobalValueInt(gVictoryState)));
 		}
 
 		static const char* SafeStr(const char* s)
@@ -1744,173 +1782,158 @@ namespace TFDMenu
 		{
 			ResolveGlobals();
 
-			ImGuiMCP::Text("Combat Rules");
+			ImGuiMCP::Text("RULES OF COMBAT");
 			ImGuiMCP::Separator();
 
-			if (ImGuiMCP::Checkbox("Enable TFD", &uiEnabled)) {
-				ApplyToCore();
-			}
-
-			if (ImGuiMCP::SliderFloat("Player Health Threshold (%)", &uiThreshold, 2.0f, 95.0f, "%.0f%%")) {
-				ApplyToCore();
-			}
-
-			if (ImGuiMCP::SliderFloat("Ally Downed Threshold (%)", &uiAllyThreshold, 2.0f, 95.0f, "%.0f%%")) {
-				ApplyToCore();
-			}
-
-			if (ImGuiMCP::SliderFloat("Enemy Downed Threshold (%)", &uiEnemyThreshold, 2.0f, 95.0f, "%.0f%%")) {
-				ApplyToCore();
-			}
-
-			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Signal Hotkey");
-
-			if (ImGuiMCP::Checkbox("Enable Signal Hotkey", &uiHotkeyEnabled)) {
-				ApplyToCore();
-			}
-
-			ImGuiMCP::Text("Current Key: %s", KeyLabel(static_cast<std::uint32_t>(uiHotkeyScanCode)).c_str());
-			ImGuiMCP::Text("Default Key: H");
-
-			if (!gCaptureHotkey) {
-				if (ImGuiMCP::Button("Rebind Signal Hotkey")) {
-					gCaptureHotkey = true;
-				}
-			}
-			else {
-				ImGuiMCP::Text("Press a key now... (Esc = cancel)");
-
-				std::uint32_t newCode = 0;
-				switch (PollRebindKey(newCode)) {
-				case CaptureResult::Cancel:
-					gCaptureHotkey = false;
-					RE::DebugNotification("TFD: Rebind cancelled");
-					break;
-
-				case CaptureResult::Captured:
-					uiHotkeyScanCode = static_cast<int>(newCode);
+			if (ImGuiMCP::CollapsingHeader("A. TFD")) {
+				if (ImGuiMCP::Checkbox("Enable TFD", &uiEnabled)) {
 					ApplyToCore();
-					gCaptureHotkey = false;
-					{
-						std::string msg = "TFD: Hotkey = ";
-						msg += KeyLabel(newCode);
-						RE::DebugNotification(msg.c_str());
-					}
-					break;
-
-				case CaptureResult::None:
-				default:
-					break;
 				}
 			}
 
-			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Creature Teammates");
+			if (ImGuiMCP::CollapsingHeader("B. Threshold")) {
+				if (ImGuiMCP::SliderFloat("Player Threshold (%)", &uiThreshold, 2.0f, 95.0f, "%.0f%%")) {
+					ApplyToCore();
+				}
 
-			const double nowMenu = NowSec();
-			const bool creaturePanelJustOpened = (nowMenu - gCreatureTeammateMenuLastRenderSec) > 0.75;
-			gCreatureTeammateMenuLastRenderSec = nowMenu;
-			if (creaturePanelJustOpened) {
-				RefreshCreatureTeammateMenuRows(true);
+				if (ImGuiMCP::SliderFloat("Ally Threshold (%)", &uiAllyThreshold, 2.0f, 95.0f, "%.0f%%")) {
+					ApplyToCore();
+				}
+
+				if (ImGuiMCP::SliderFloat("Enemy Threshold (%)", &uiEnemyThreshold, 2.0f, 95.0f, "%.0f%%")) {
+					ApplyToCore();
+				}
+
+				ImGuiMCP::Text("General Threshold: pending native setting");
 			}
 
-			if (gCreatureTeammateMenuRows.empty()) {
-				ImGuiMCP::Text("No active creature tame or teammate sessions.");
-			}
-			else {
-				for (const auto& snap : gCreatureTeammateMenuRows) {
-					RE::Actor* actor = snap.loaded ? RE::TESForm::LookupByID<RE::Actor>(snap.actorId) : nullptr;
-					const bool actorDowned = actor && TFD::DefeatMonitor::IsThresholdDownedActor(actor);
-					ImGuiMCP::Separator();
-					ImGuiMCP::Text("%s", snap.actorName.c_str());
-					if (actorDowned) {
-						ImGuiMCP::Text("State: Downed %s", CreatureStateLabel(snap));
-					}
-					else {
-						ImGuiMCP::Text("State: %s", CreatureStateLabel(snap));
-					}
-					ImGuiMCP::Text("Remaining: %s", FormatCreatureTimer(snap).c_str());
-					ImGuiMCP::Text("Actor: 0x%08X | Session: %u%s", snap.actorId, snap.sessionId, snap.loaded ? "" : " | not loaded");
-					char feedLabel[64];
-					char releaseLabel[64];
-					const char* feedText = gCreatureTeammateFeedSessionId == snap.sessionId ? "Hide Feed" : (actorDowned ? "Feed / Revive" : "Feed");
-					std::snprintf(feedLabel, sizeof(feedLabel), "%s##%u", feedText, snap.sessionId);
-					std::snprintf(releaseLabel, sizeof(releaseLabel), "%s##%u", gCreatureTeammateReleaseConfirmSessionId == snap.sessionId ? "Cancel Release" : "Release", snap.sessionId);
+			if (ImGuiMCP::CollapsingHeader("C. Interaction")) {
+				if (ImGuiMCP::Checkbox("Enable Interaction (H / Shift+H)", &uiHotkeyEnabled)) {
+					ApplyToCore();
+				}
 
-					ImGuiMCP::BeginDisabled(actor == nullptr);
-					if (ImGuiMCP::Button(feedLabel)) {
-						gCreatureTeammateFeedSessionId = (gCreatureTeammateFeedSessionId == snap.sessionId) ? 0 : snap.sessionId;
-						gCreatureTeammateReleaseConfirmSessionId = 0;
+				ImGuiMCP::Text("Current Key: %s", KeyLabel(static_cast<std::uint32_t>(uiHotkeyScanCode)).c_str());
+				ImGuiMCP::Text("Default Key: H / Shift+H");
+
+				if (!gCaptureHotkey) {
+					if (ImGuiMCP::Button("Rebind Interaction Hotkey")) {
+						gCaptureHotkey = true;
 					}
-					ImGuiMCP::EndDisabled();
-					ImGuiMCP::SameLine();
-					if (ImGuiMCP::Button(releaseLabel)) {
-						if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
+				}
+				else {
+					ImGuiMCP::Text("Press a key now... (Esc = cancel)");
+
+					std::uint32_t newCode = 0;
+					switch (PollRebindKey(newCode)) {
+					case CaptureResult::Cancel:
+						gCaptureHotkey = false;
+						RE::DebugNotification("TFD: Rebind cancelled");
+						break;
+
+					case CaptureResult::Captured:
+						uiHotkeyScanCode = static_cast<int>(newCode);
+						ApplyToCore();
+						gCaptureHotkey = false;
+						{
+							std::string msg = "TFD: Hotkey = ";
+							msg += KeyLabel(newCode);
+							RE::DebugNotification(msg.c_str());
+						}
+						break;
+
+					case CaptureResult::None:
+					default:
+						break;
+					}
+				}
+			}
+
+			if (ImGuiMCP::CollapsingHeader("D. Teammate List")) {
+				const double nowMenu = NowSec();
+				const bool creaturePanelJustOpened = (nowMenu - gCreatureTeammateMenuLastRenderSec) > 0.75;
+				gCreatureTeammateMenuLastRenderSec = nowMenu;
+				if (creaturePanelJustOpened) {
+					RefreshCreatureTeammateMenuRows(true);
+				}
+
+				if (gCreatureTeammateMenuRows.empty()) {
+					ImGuiMCP::Text("No active creature tame or teammate sessions.");
+				}
+				else {
+					for (const auto& snap : gCreatureTeammateMenuRows) {
+						RE::Actor* actor = snap.loaded ? RE::TESForm::LookupByID<RE::Actor>(snap.actorId) : nullptr;
+						const bool actorDowned = actor && TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+						ImGuiMCP::Separator();
+						ImGuiMCP::Text("%s", snap.actorName.c_str());
+						ImGuiMCP::Text("State: %s%s", actorDowned ? "Downed | " : "", CreatureStateLabel(snap));
+						ImGuiMCP::Text("Remaining: %s", FormatCreatureTimer(snap).c_str());
+						ImGuiMCP::Text("Actor: 0x%08X | Session: %u%s", snap.actorId, snap.sessionId, snap.loaded ? "" : " | not loaded");
+						char feedLabel[64];
+						char releaseLabel[64];
+						const char* feedText = gCreatureTeammateFeedSessionId == snap.sessionId ? "Hide Feed" : (actorDowned ? "Feed / Revive" : "Feed");
+						std::snprintf(feedLabel, sizeof(feedLabel), "%s##%u", feedText, snap.sessionId);
+						std::snprintf(releaseLabel, sizeof(releaseLabel), "%s##%u", gCreatureTeammateReleaseConfirmSessionId == snap.sessionId ? "Cancel Release" : "Release", snap.sessionId);
+
+						ImGuiMCP::BeginDisabled(actor == nullptr);
+						if (ImGuiMCP::Button(feedLabel)) {
+							gCreatureTeammateFeedSessionId = (gCreatureTeammateFeedSessionId == snap.sessionId) ? 0 : snap.sessionId;
 							gCreatureTeammateReleaseConfirmSessionId = 0;
 						}
-						else {
-							gCreatureTeammateReleaseConfirmSessionId = snap.sessionId;
-							gCreatureTeammateFeedSessionId = 0;
+						ImGuiMCP::EndDisabled();
+						ImGuiMCP::SameLine();
+						if (ImGuiMCP::Button(releaseLabel)) {
+							if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
+								gCreatureTeammateReleaseConfirmSessionId = 0;
+							}
+							else {
+								gCreatureTeammateReleaseConfirmSessionId = snap.sessionId;
+								gCreatureTeammateFeedSessionId = 0;
+							}
 						}
-					}
 
-					if (gCreatureTeammateFeedSessionId == snap.sessionId) {
-						RenderInlineFeedChoices(actor, snap);
-					}
-					if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
-						RenderInlineReleaseConfirm(actor, snap);
+						if (gCreatureTeammateFeedSessionId == snap.sessionId) {
+							RenderInlineFeedChoices(actor, snap);
+						}
+						if (gCreatureTeammateReleaseConfirmSessionId == snap.sessionId) {
+							RenderInlineReleaseConfirm(actor, snap);
+						}
 					}
 				}
 			}
 		}
 
-		static void RenderGlobalStatePage()
+		static void RenderFlowIndicatorSection()
 		{
-			ResolveGlobals();
-
 			const auto snap = TFD::Flow::Controller::GetSingleton().GetSnapshot();
-
-			ImGuiMCP::Text("Global State Monitor");
-			ImGuiMCP::Separator();
-
-			ImGuiMCP::Text("Native Flow Snapshot");
 			ImGuiMCP::Text("Root: %s", TFD::Flow::Controller::ToString(snap.root));
 			ImGuiMCP::Text("Context Root: %s", TFD::Flow::Controller::ToString(snap.contextRoot));
 			ImGuiMCP::Text("Gate: %s", TFD::Flow::Controller::ToString(snap.gate));
 			ImGuiMCP::Text("SubFlow: %s", TFD::Flow::Controller::ToString(snap.sub));
 			ImGuiMCP::Text("Captive Mode: %s", TFD::Flow::Controller::ToString(snap.captiveMode));
 			ImGuiMCP::Text("Token: %u", snap.token);
-			ImGuiMCP::Text("Primary Actor FormID: %08X", snap.primaryActorFormID);
+			ImGuiMCP::Text("Primary Actor: %08X", snap.primaryActorFormID);
 			ImGuiMCP::Text("Terminal Resolved: %s", YesNo(snap.terminalResolved));
 			ImGuiMCP::Text("Locked: %s", YesNo(snap.locked));
+		}
 
-			ImGuiMCP::Separator();
-			ImGuiMCP::Text("Native Defeat State");
-			ImGuiMCP::Text("IsCaptivePhase(): %s", YesNo(TFD::DefeatMonitor::IsCaptivePhase()));
-			ImGuiMCP::Text("IsCaptiveFamily(): %s", YesNo(TFD::DefeatMonitor::IsCaptiveFamily()));
-			ImGuiMCP::Text("CaptivePhaseRaw(): %u", TFD::DefeatMonitor::GetCaptivePhaseRaw());
-			ImGuiMCP::Text("CaptivePhaseName(): %s", SafeStr(TFD::DefeatMonitor::GetCaptivePhaseName()));
-			ImGuiMCP::Text("IsBleedoutActive(): %s", YesNo(TFD::DefeatMonitor::IsBleedoutActive()));
-			ImGuiMCP::Text("IsLeftForDeadRecoveryActive(): %s", YesNo(TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()));
-			ImGuiMCP::Text("IsPlayerBleedHoldTargetBlocked(): %s", YesNo(TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()));
-			ImGuiMCP::Text("IsObservedCombatCommitInProgress(): %s", YesNo(TFD::DefeatMonitor::IsObservedCombatCommitInProgress()));
-
-			ImGuiMCP::Separator();
-			ImGuiMCP::Text("State Globals");
-			RenderGlobalStateLine("Captive State", "TFDCaptiveState", gCaptiveState, DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
-			RenderGlobalStateLine("Captive Phase", "TFDCaptivePhase", gCaptivePhase, DecodeCaptivePhase(GetGlobalValueInt(gCaptivePhase)));
-			RenderGlobalStateLine("PreCombat State", "TFDPreCombatState", gPreCombatState, DecodeBinaryState(GetGlobalValueInt(gPreCombatState)));
-			RenderGlobalStateLine("BleedOut State", "TFDBleedOutState", gBleedOutState, DecodeBinaryState(GetGlobalValueInt(gBleedOutState)));
-			RenderGlobalStateLine("Active Dialogue Flow", "TFDActiveDialogueFlow", gActiveDialogueFlow, DecodeActiveDialogueFlow(GetGlobalValueInt(gActiveDialogueFlow)));
-			RenderGlobalStateLine("Kidnap Available", "TFDKidnapAvailable", gKidnapAvailable, DecodeBinaryState(GetGlobalValueInt(gKidnapAvailable)));
-			RenderGlobalStateLine("Transition Pending", "TFDTransitionPending", gTransitionPending, DecodeTransitionPending(GetGlobalValueInt(gTransitionPending)));
-			RenderGlobalStateLine("Transition Busy", "TFDTransitionBusy", gTransitionBusy, DecodeBinaryState(GetGlobalValueInt(gTransitionBusy)));
-			RenderGlobalStateLine("Transition Reason", "TFDTransitionReason", gTransitionReason, DecodeTransitionReason(GetGlobalValueInt(gTransitionReason)));
-			RenderGlobalStateLine("Transition Result", "TFDTransitionResult", gTransitionResult, DecodeTransitionResult(GetGlobalValueInt(gTransitionResult)));
-			RenderGlobalStateLine("PreCombat Result", "TFDPreCombatResult", gPreCombatResult);
-			RenderGlobalStateLine("Join Enemy", "TFDJoinEnemy", gPreCombatJoinEnemyAvailable, DecodeBinaryState(GetGlobalValueInt(gPreCombatJoinEnemyAvailable)));
-			RenderGlobalStateLine("After Pleasure", "TFDAfterPleasure", gAfterPleasureSource, DecodeAfterPleasureSource(GetGlobalValueInt(gAfterPleasureSource)));
+		static void RenderDebugGlobalsSection()
+		{
+			RenderGlobalStateLine("Boss Container", gBossContainerMarkerState, DecodeAvailabilityState(GetGlobalValueInt(gBossContainerMarkerState)));
+			RenderGlobalStateLine("Boss", gBossMarkerState, DecodeAvailabilityState(GetGlobalValueInt(gBossMarkerState)));
+			RenderGlobalStateLine("Captive Marker", gCaptiveMarkerState, DecodeAvailabilityState(GetGlobalValueInt(gCaptiveMarkerState)));
+			RenderGlobalStateLine("Captive", gCaptiveState, DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
+			RenderGlobalStateLine("Container", gContainerMarkerState, DecodeAvailabilityState(GetGlobalValueInt(gContainerMarkerState)));
+			RenderGlobalStateLine("Defeat", gDefeatState, DecodeDefeatState(GetGlobalValueInt(gDefeatState)));
+			RenderGlobalStateLine("Dialogue", gDialogueState, DecodeDialogueState(GetGlobalValueInt(gDialogueState)));
+			RenderGlobalStateLine("Escape Route", gEscapeRouteState, DecodeEscapeRouteState(GetGlobalValueInt(gEscapeRouteState)));
+			RenderGlobalStateLine("Hostile", gHostileState, DecodeHostileState(GetGlobalValueInt(gHostileState)));
+			RenderGlobalStateLine("In Combat", gInCombatState, DecodeInCombatState(GetGlobalValueInt(gInCombatState)));
+			RenderGlobalStateLine("Interaction", gInteractionState, DecodeInteractionState(GetGlobalValueInt(gInteractionState)));
+			RenderGlobalStateLine("Join Enemy", gJoinEnemyState, DecodeJoinEnemyState(GetGlobalValueInt(gJoinEnemyState)));
+			RenderGlobalStateLine("Pleasure", gPleasureState, DecodePleasureState(GetGlobalValueInt(gPleasureState)));
+			RenderGlobalStateLine("Pre Combat", gPreCombatState, DecodePreCombatState(GetGlobalValueInt(gPreCombatState)));
+			RenderGlobalStateLine("Teammate", gTeammateState, DecodeTeammateState(GetGlobalValueInt(gTeammateState)));
+			RenderGlobalStateLine("Victory", gVictoryState, DecodeVictoryState(GetGlobalValueInt(gVictoryState)));
 
 			ImGuiMCP::Separator();
 			if (ImGuiMCP::Button("Dump Global State To Log")) {
@@ -1918,30 +1941,14 @@ namespace TFDMenu
 			}
 		}
 
-		static void RenderDebugPage()
+		static void RenderQuestAliasMonitorSection();
+
+		static void RenderCaptiveRescueToolsSection()
 		{
-			ResolveGlobals();
-
-			const bool captivePhase = IsCaptivePhase();
-			const bool escapeStart = GetGlobalValue(gCaptiveState) >= 0.5f && GetCaptivePhaseRaw() == 2u;
-			const bool escapeDone = TFD::DefeatMonitor::IsLeftForDeadRecoveryActive();
-			const char* flowName = captivePhase ? "Captive" : (escapeStart ? "Escape" : (escapeDone ? "Recovery" : "None"));
-
-			ImGuiMCP::Text("Debug");
-			ImGuiMCP::Separator();
-
-			ImGuiMCP::Text("Captive / Escape Flow");
-			ImGuiMCP::Text("Current Flow: %s", flowName);
-			ImGuiMCP::Text("Captive Phase: %s", YesNo(captivePhase));
-			ImGuiMCP::Text("Escape Start: %s", YesNo(escapeStart));
-			ImGuiMCP::Text("Escape Done / Recovery: %s", YesNo(escapeDone));
-			ImGuiMCP::Text("CaptiveState(Global): %.0f", GetGlobalValue(gCaptiveState));
-			ImGuiMCP::Text("CaptivePhase(Global): %.0f", GetGlobalValue(gCaptivePhase));
-			ImGuiMCP::Text("PreCombatState(Global): %.0f", GetGlobalValue(gPreCombatState));
-
-			ImGuiMCP::Separator();
 			ImGuiMCP::Text("Captive Marker");
 			RenderRefBrief("Location Captive Marker", TFD::Location::GetCachedCaptiveMarker());
+			ImGuiMCP::Text("Captive State: %s", DecodeCaptiveState(GetGlobalValueInt(gCaptiveState)));
+			ImGuiMCP::Text("Escape Route: %s", DecodeEscapeRouteState(GetGlobalValueInt(gEscapeRouteState)));
 
 			if (ImGuiMCP::Button("Rescan Captive Marker")) {
 				TFD::Location::RescanCaptiveMarker();
@@ -1979,6 +1986,31 @@ namespace TFDMenu
 			ImGuiMCP::SameLine();
 			if (ImGuiMCP::Button("Clear Rescue Cache")) {
 				TFD::Location::ClearRescueCache();
+			}
+		}
+
+		static void RenderDebugPage()
+		{
+			ResolveGlobals();
+
+			ImGuiMCP::Text("DEBUG");
+			ImGuiMCP::Separator();
+
+			if (ImGuiMCP::CollapsingHeader("Flow Indicator")) {
+				RenderFlowIndicatorSection();
+			}
+
+			if (ImGuiMCP::CollapsingHeader("Global State")) {
+				RenderDebugGlobalsSection();
+			}
+
+			if (ImGuiMCP::CollapsingHeader("Quest Alias Monitor")) {
+				RenderQuestAliasMonitorSection();
+
+			}
+
+			if (ImGuiMCP::CollapsingHeader("Captive / Rescue Tools")) {
+				RenderCaptiveRescueToolsSection();
 			}
 		}
 
@@ -2023,11 +2055,8 @@ namespace TFDMenu
 			ImGuiMCP::BulletText("%s | %s", SafeStr(aliasName), SafeStr(typeName));
 		}
 
-		static void RenderQuestAliasMonitorPage()
+		static void RenderQuestAliasMonitorSection()
 		{
-			ImGuiMCP::Text("Quest Alias Monitor");
-			ImGuiMCP::Separator();
-
 			auto* data = RE::TESDataHandler::GetSingleton();
 			if (!data) {
 				ImGuiMCP::Text("TESDataHandler not ready");
@@ -2123,10 +2152,8 @@ namespace TFDMenu
 			SyncFromCore();
 
 			SKSEMenuFramework::SetSection("TFD");
-			SKSEMenuFramework::AddSectionItem("Combat Rules", RenderCombatRulesPage);
-			SKSEMenuFramework::AddSectionItem("Global State", RenderGlobalStatePage);
-			SKSEMenuFramework::AddSectionItem("Debug", RenderDebugPage);
-			SKSEMenuFramework::AddSectionItem("Quest Alias Monitor", RenderQuestAliasMonitorPage);
+			SKSEMenuFramework::AddSectionItem("RULES OF COMBAT", RenderCombatRulesPage);
+			SKSEMenuFramework::AddSectionItem("DEBUG", RenderDebugPage);
 			TFD::FeedPopup::Init();
 
 			menuRegistered = true;
@@ -2276,12 +2303,13 @@ namespace TFDMenu
 						player->NotifyAnimationGraph("IdleWave");
 					}
 
-					const bool captiveStateActive = GetGlobalValue(gCaptiveState) >= 0.5f;
-					const int captivePhaseRaw = GetGlobalValueInt(gCaptivePhase);
-					const bool bleedStateActive = GetGlobalValue(gBleedOutState) >= 0.5f || TFD::DefeatMonitor::IsBleedoutActive();
+					const int captiveStateRaw = GetGlobalValueInt(gCaptiveState);
+					const bool captiveStateActive = captiveStateRaw >= 1;
+					const bool inEscapePhase = captiveStateRaw == 2;
+					const bool bleedStateActive = TFD::DefeatMonitor::IsBleedoutActive();
 
 					// Captive matrix
-					if (captiveStateActive && captivePhaseRaw == 1 && bleedStateActive) {
+					if (captiveStateActive && !inEscapePhase && bleedStateActive) {
 						if (TFD::DefeatMonitor::HandleBleedoutHotkey()) {
 							RE::DebugNotification("TFD: BleedOut Truce");
 						}
@@ -2291,7 +2319,7 @@ namespace TFDMenu
 						continue;
 					}
 
-					if (captiveStateActive && captivePhaseRaw == 1 && !bleedStateActive) {
+					if (captiveStateActive && !inEscapePhase && !bleedStateActive) {
 						auto* captor = PickCaptorSameCellLoaded(12288.0f);
 						if (!captor) {
 							RE::DebugNotification("TFD: No Response");
