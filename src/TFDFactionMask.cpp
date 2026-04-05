@@ -30,6 +30,23 @@ namespace TFD::FactionMask
 		std::vector<AllowedFactionEntry> g_allowedFactions{};
 		std::vector<SavedFactionEntry> g_savedPlayerFactions{};
 
+		static RE::TESGlobal* g_joinEnemyStateGlobal = nullptr;
+
+		static void ResolveJoinEnemyStateGlobal()
+		{
+			if (!g_joinEnemyStateGlobal) {
+				g_joinEnemyStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDJoinEnemyState");
+			}
+		}
+
+		static void SetJoinEnemyState(int value)
+		{
+			ResolveJoinEnemyStateGlobal();
+			if (g_joinEnemyStateGlobal) {
+				g_joinEnemyStateGlobal->value = static_cast<float>(value);
+			}
+		}
+
 		static constexpr const char* kAllowedFactionEditorIDs[] = {
 			"BanditFaction",
 			"ForswornFaction",
@@ -140,6 +157,7 @@ namespace TFD::FactionMask
 		g_active = false;
 		g_allowedFactions.clear();
 		g_savedPlayerFactions.clear();
+		SetJoinEnemyState(0);
 
 		for (auto* editorID : kAllowedFactionEditorIDs) {
 			AddAllowedFaction(editorID);
@@ -157,6 +175,7 @@ namespace TFD::FactionMask
 		auto* player = Player();
 		if (!player || !aggressor) {
 			g_active = false;
+			SetJoinEnemyState(0);
 			return false;
 		}
 
@@ -182,6 +201,7 @@ namespace TFD::FactionMask
 
 		if (matchedCount <= 0) {
 			g_active = false;
+			SetJoinEnemyState(0);
 			spdlog::info(
 				"[TFD][FactionMask] aggressor {:08X} had no matching allowlist faction",
 				aggressor->GetFormID());
@@ -189,6 +209,7 @@ namespace TFD::FactionMask
 		}
 
 		g_active = true;
+		SetJoinEnemyState(matchedCount == 1 ? 1 : 2);
 
 		spdlog::info(
 			"[TFD][FactionMask] applied mask from aggressor {:08X} matchedCount={} savedCount={}",
@@ -205,6 +226,7 @@ namespace TFD::FactionMask
 		if (!player) {
 			g_savedPlayerFactions.clear();
 			g_active = false;
+			SetJoinEnemyState(0);
 			return;
 		}
 
@@ -236,6 +258,7 @@ namespace TFD::FactionMask
 		const auto clearedCount = g_savedPlayerFactions.size();
 		g_savedPlayerFactions.clear();
 		g_active = false;
+		SetJoinEnemyState(0);
 
 		spdlog::info("[TFD][FactionMask] cleared/restored {} entries", clearedCount);
 	}

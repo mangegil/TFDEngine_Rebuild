@@ -16,6 +16,7 @@
 
 #include "RE/B/BSAtomic.h"
 #include "TFDActorScan.h"
+#include "TFDDefeatMonitor.h"
 
 namespace TFD::TeammateAliasSync
 {
@@ -31,6 +32,7 @@ namespace TFD::TeammateAliasSync
             RE::TESFaction* teammateFaction{ nullptr };
             RE::TESFaction* currentFollowerFaction{ nullptr };
             RE::TESFaction* playerFollowerFaction{ nullptr };
+            RE::TESGlobal* teammateStateGlobal{ nullptr };
         };
 
         RegistryCache g_registry{};
@@ -54,10 +56,10 @@ namespace TFD::TeammateAliasSync
             g_registry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDPlayerTeammateQuest");
             if (!g_registry.quest) {
                 spdlog::warn("[TFD][TeammateAlias] quest TFDPlayerTeammateQuest not found");
-                return;
             }
 
-            for (auto* baseAlias : g_registry.quest->aliases) {
+            if (g_registry.quest) {
+                for (auto* baseAlias : g_registry.quest->aliases) {
                 auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
                 if (!refAlias) {
                     continue;
@@ -73,11 +75,13 @@ namespace TFD::TeammateAliasSync
                     }
                 } catch (...) {
                 }
+                }
             }
 
             g_registry.teammateFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTeammateFaction");
             g_registry.currentFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("CurrentFollowerFaction");
             g_registry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
+            g_registry.teammateStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTeammateState");
             if (!g_registry.teammateFaction) {
                 spdlog::warn("[TFD][TeammateAlias] faction TFDTeammateFaction not found");
             }
@@ -88,12 +92,13 @@ namespace TFD::TeammateAliasSync
                     ++found;
                 }
             }
-            spdlog::info("[TFD][TeammateAlias] registry resolved quest={:08X} aliases={} faction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X}",
+            spdlog::info("[TFD][TeammateAlias] registry resolved quest={:08X} aliases={} faction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X}",
                 g_registry.quest ? g_registry.quest->GetFormID() : 0u,
                 found,
                 g_registry.teammateFaction ? g_registry.teammateFaction->GetFormID() : 0u,
                 g_registry.currentFollowerFaction ? g_registry.currentFollowerFaction->GetFormID() : 0u,
-                g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u);
+                g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u,
+                g_registry.teammateStateGlobal ? g_registry.teammateStateGlobal->GetFormID() : 0u);
         }
 
         static bool IsValidTeammate(RE::Actor* actor)
@@ -115,6 +120,51 @@ namespace TFD::TeammateAliasSync
                 return true;
             }
             return false;
+        }
+
+        static bool IsCombatCapableTeammate(RE::Actor* actor)
+        {
+            if (!IsValidTeammate(actor)) {
+                return false;
+            }
+
+            if (TFD::DefeatMonitor::IsThresholdDownedActor(actor)) {
+                return false;
+            }
+
+            const auto boolFlags = actor->GetActorRuntimeData().boolFlags;
+            if (boolFlags.all(RE::Actor::BOOL_FLAGS::kIsInKillMove)) {
+                return false;
+            }
+
+            return true;
+        }
+
+        static int ComputeTeammateStateValue(const std::vector<RE::Actor*>& teammates)
+        {
+            int activeCount = 0;
+            for (auto* actor : teammates) {
+                if (!IsCombatCapableTeammate(actor)) {
+                    continue;
+                }
+
+                ++activeCount;
+                if (activeCount > 1) {
+                    return 2;
+                }
+            }
+
+            return activeCount == 1 ? 1 : 0;
+        }
+
+        static void WriteTeammateState(int value)
+        {
+            ResolveRegistry();
+            if (!g_registry.teammateStateGlobal) {
+                return;
+            }
+
+            g_registry.teammateStateGlobal->value = static_cast<float>(value);
         }
 
         static void SyncTeammateFaction(RE::Actor* actor, bool shouldHaveFaction)
@@ -204,16 +254,13 @@ namespace TFD::TeammateAliasSync
         {
             std::scoped_lock lock(g_syncLock);
             ResolveRegistry();
-            if (!g_registry.quest) {
-                return;
-            }
 
             auto desired = CollectNearbyPlayerTeammates(8000.0f);
-            std::unordered_set<RE::FormID> keepIDs;
-            for (auto* actor : desired) {
-                if (actor) {
-                    keepIDs.insert(actor->GetFormID());
-                }
+            const int teammateState = ComputeTeammateStateValue(desired);
+            WriteTeammateState(teammateState);
+
+            if (!g_registry.quest) {
+                return;
             }
 
             std::vector<RE::Actor*> remaining;
@@ -246,7 +293,6 @@ namespace TFD::TeammateAliasSync
                 // Keep already-registered valid teammates sticky even if the current scan
                 // temporarily misses them. This avoids clear/fill churn for freshly promoted
                 // creature companions whose follow state can take a moment to settle.
-                keepIDs.insert(current->GetFormID());
                 remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](RE::Actor* a) {
                     return a == current || (a && current && a->GetFormID() == current->GetFormID());
                 }), remaining.end());

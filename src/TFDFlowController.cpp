@@ -1,9 +1,31 @@
 #include "TFDFlowController.h"
 
+#include <cmath>
+#include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
 namespace
 {
+
+    static RE::TESGlobal* g_preCombatState = nullptr;
+    static RE::TESGlobal* g_inCombatState = nullptr;
+    static RE::TESGlobal* g_captiveState = nullptr;
+    static RE::TESGlobal* g_pleasureState = nullptr;
+
+    static void ResolveGlobal(RE::TESGlobal*& global, const char* editorId)
+    {
+        if (!global) {
+            global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorId);
+        }
+    }
+
+    static void SetGlobalInt(RE::TESGlobal* global, int value)
+    {
+        if (global) {
+            global->value = static_cast<float>(value);
+        }
+    }
+
     void LogFlowSnapshot(const char* op, std::string_view reason, const TFD::Flow::Snapshot& s, std::uint32_t actorFormID = 0, const char* detail = nullptr)
     {
         spdlog::info(
@@ -41,6 +63,55 @@ namespace
 
 namespace TFD::Flow
 {
+
+    void Controller::RefreshFlowGlobalsLocked()
+    {
+        ResolveGlobal(g_preCombatState, "TFDPreCombatState");
+        ResolveGlobal(g_inCombatState, "TFDInCombatState");
+        ResolveGlobal(g_captiveState, "TFDCaptiveState");
+        ResolveGlobal(g_pleasureState, "TFDPleasureState");
+
+        const int preCombat = (_snapshot.root == RootFlow::PreCombat) ? 1 : 0;
+        const int inCombat = _combatActive ? 1 : 0;
+
+        int captive = 0;
+        if (_snapshot.root == RootFlow::Captive && _snapshot.captiveMode != CaptiveMode::JoinedEnemy) {
+            switch (_snapshot.sub) {
+            case SubFlow::EscapeAttempt:
+            case SubFlow::EscapeFailed:
+            case SubFlow::Recapture:
+                captive = 2;
+                break;
+            default:
+                captive = 1;
+                break;
+            }
+        }
+
+        int pleasure = 0;
+        switch (_snapshot.sub) {
+        case SubFlow::PreCombatPleasure:
+        case SubFlow::InCombatPleasure:
+        case SubFlow::CaptivePleasure:
+        case SubFlow::VictoryPleasure:
+            pleasure = 1;
+            break;
+        case SubFlow::PreCombatAfterPleasure:
+        case SubFlow::InCombatAfterPleasure:
+        case SubFlow::CaptiveAfterPleasure:
+        case SubFlow::VictoryAfterPleasure:
+            pleasure = 2;
+            break;
+        default:
+            break;
+        }
+
+        SetGlobalInt(g_preCombatState, preCombat);
+        SetGlobalInt(g_inCombatState, inCombat);
+        SetGlobalInt(g_captiveState, captive);
+        SetGlobalInt(g_pleasureState, pleasure);
+    }
+
     Controller& Controller::GetSingleton()
     {
         static Controller singleton;
@@ -55,17 +126,19 @@ namespace TFD::Flow
 
     void Controller::ResetRuntime(std::string_view reason)
     {
-        (void)reason;
         std::scoped_lock lk(_lock);
+        _combatActive = false;
         ClearAllLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResetRuntime", reason, _snapshot);
     }
 
     void Controller::ResetForLoad(std::string_view reason)
     {
-        (void)reason;
         std::scoped_lock lk(_lock);
+        _combatActive = false;
         ClearAllLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResetForLoad", reason, _snapshot);
     }
 
@@ -76,7 +149,10 @@ namespace TFD::Flow
             _snapshot.sub != SubFlow::None || _snapshot.terminalResolved) {
             return RejectLocked("BeginPreCombat", reason);
         }
-        return BeginRootLocked(RootFlow::PreCombat, actorFormID, reason);
+        _combatActive = false;
+        const bool ok = BeginRootLocked(RootFlow::PreCombat, actorFormID, reason);
+        RefreshFlowGlobalsLocked();
+        return ok;
     }
 
     bool Controller::BeginInCombat(std::uint32_t actorFormID, std::string_view reason)
@@ -85,13 +161,18 @@ namespace TFD::Flow
         if (_snapshot.root == RootFlow::Captive || _snapshot.root == RootFlow::Victory) {
             return RejectLocked("BeginInCombat", reason);
         }
-        return BeginRootLocked(RootFlow::InCombat, actorFormID, reason);
+        _combatActive = true;
+        const bool ok = BeginRootLocked(RootFlow::InCombat, actorFormID, reason);
+        RefreshFlowGlobalsLocked();
+        return ok;
     }
 
     bool Controller::BeginCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason)
     {
         std::scoped_lock lk(_lock);
-        return BeginCaptiveLocked(actorFormID, mode, reason);
+        const bool ok = BeginCaptiveLocked(actorFormID, mode, reason);
+        RefreshFlowGlobalsLocked();
+        return ok;
     }
 
     bool Controller::BeginVictory(std::uint32_t actorFormID, std::string_view reason)
@@ -100,7 +181,10 @@ namespace TFD::Flow
         if (_snapshot.root == RootFlow::Captive) {
             return RejectLocked("BeginVictory", reason);
         }
-        return TransitionRootLocked(RootFlow::Victory, actorFormID, reason);
+        _combatActive = false;
+        const bool ok = TransitionRootLocked(RootFlow::Victory, actorFormID, reason);
+        RefreshFlowGlobalsLocked();
+        return ok;
     }
 
     bool Controller::BeginTruceDecision(std::uint32_t actorFormID, std::string_view reason)
@@ -111,6 +195,7 @@ namespace TFD::Flow
         }
         _snapshot.gate = DecisionGate::Truce;
         SetPrimaryActorLocked(actorFormID);
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginTruceDecision", reason, _snapshot, actorFormID);
         return true;
     }
@@ -130,6 +215,8 @@ namespace TFD::Flow
                 _snapshot.gate = DecisionGate::PlayerBleedout;
                 SetPrimaryActorLocked(actorFormID);
                 BumpTokenLocked();
+                _combatActive = true;
+                RefreshFlowGlobalsLocked();
                 LogFlowSnapshot("BeginPlayerBleedoutDecision", reason, _snapshot, actorFormID, "escape_failed_rebleed");
                 return true;
             }
@@ -142,6 +229,8 @@ namespace TFD::Flow
 
         _snapshot.gate = DecisionGate::PlayerBleedout;
         SetPrimaryActorLocked(actorFormID);
+        _combatActive = true;
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginPlayerBleedoutDecision", reason, _snapshot, actorFormID);
         return true;
     }
@@ -154,6 +243,7 @@ namespace TFD::Flow
         }
         _snapshot.gate = DecisionGate::EnemyBleedout;
         SetPrimaryActorLocked(actorFormID);
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginEnemyBleedoutDecision", reason, _snapshot, actorFormID);
         return true;
     }
@@ -174,6 +264,7 @@ namespace TFD::Flow
             handled = EnterTerminalContextLocked(RootFlow::PreCombat, SubFlow::PreCombatPleasure, actorFormID, reason);
             break;
         case PreCombatOutcome::Fight:
+            _combatActive = true;
             handled = TransitionRootLocked(RootFlow::InCombat, actorFormID, reason);
             break;
         case PreCombatOutcome::Captive:
@@ -190,6 +281,7 @@ namespace TFD::Flow
         default:
             return RejectLocked("ResolvePreCombatOutcome", reason);
         }
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResolvePreCombatOutcome", reason, _snapshot, actorFormID, ToString(outcome));
         return handled;
     }
@@ -220,6 +312,7 @@ namespace TFD::Flow
         default:
             return RejectLocked("ResolveBleedoutOutcome", reason);
         }
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResolveBleedoutOutcome", reason, _snapshot, actorFormID, ToString(outcome));
         return handled;
     }
@@ -246,6 +339,7 @@ namespace TFD::Flow
         default:
             return RejectLocked("ResolveVictoryOutcome", reason);
         }
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResolveVictoryOutcome", reason, _snapshot, actorFormID, ToString(outcome));
         return handled;
     }
@@ -303,6 +397,7 @@ namespace TFD::Flow
             return RejectLocked("ResolveCaptiveOutcome", reason);
         }
 
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResolveCaptiveOutcome", reason, _snapshot, actorFormID, ToString(outcome));
         return true;
     }
@@ -332,6 +427,7 @@ namespace TFD::Flow
             return RejectLocked("BeginAfterPleasure", reason);
         }
         SetPrimaryActorLocked(actorFormID);
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginAfterPleasure", reason, _snapshot, actorFormID);
         return true;
     }
@@ -346,6 +442,7 @@ namespace TFD::Flow
             return CompleteTerminalContextLocked(reason);
         case SubFlow::CaptiveAfterPleasure:
             SetCaptiveIdleLocked();
+            RefreshFlowGlobalsLocked();
             LogFlowSnapshot("CompleteAfterPleasure", reason, _snapshot);
             return true;
         default:
@@ -362,21 +459,31 @@ namespace TFD::Flow
     void Controller::NotifyCombatStarted(std::uint32_t actorFormID, std::string_view reason)
     {
         std::scoped_lock lk(_lock);
-        if (_snapshot.root == RootFlow::Captive || _snapshot.root == RootFlow::Victory) {
-            (void)reason;
+        if (_snapshot.root == RootFlow::Victory) {
             return;
         }
+        if (_snapshot.root == RootFlow::Captive && (_snapshot.sub == SubFlow::EscapeAttempt || _snapshot.sub == SubFlow::EscapeFailed || _snapshot.sub == SubFlow::Recapture)) {
+            _combatActive = true;
+            RefreshFlowGlobalsLocked();
+            return;
+        }
+        if (_snapshot.root == RootFlow::Captive) {
+            return;
+        }
+        _combatActive = true;
         (void)BeginRootLocked(RootFlow::InCombat, actorFormID, reason);
+        RefreshFlowGlobalsLocked();
     }
 
     void Controller::NotifyCombatEnded(std::string_view reason)
     {
         std::scoped_lock lk(_lock);
+        _combatActive = false;
         if (_snapshot.root == RootFlow::InCombat && _snapshot.gate == DecisionGate::None && _snapshot.sub == SubFlow::None) {
-            (void)reason;
             ClearAllLocked();
-            LogFlowSnapshot("NotifyCombatEnded", reason, _snapshot);
         }
+        RefreshFlowGlobalsLocked();
+        LogFlowSnapshot("NotifyCombatEnded", reason, _snapshot);
     }
 
     void Controller::NotifyPlayerBleedout(std::uint32_t actorFormID, std::string_view reason)
@@ -446,6 +553,7 @@ namespace TFD::Flow
         _snapshot.captiveMode = CaptiveMode::None;
         SetPrimaryActorLocked(actorFormID);
         BumpTokenLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginRootLocked", reason, _snapshot, actorFormID, ToString(next));
         return true;
     }
@@ -465,6 +573,7 @@ namespace TFD::Flow
         _snapshot.captiveMode = CaptiveMode::None;
         SetPrimaryActorLocked(actorFormID);
         BumpTokenLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("TransitionRootLocked", reason, _snapshot, actorFormID, ToString(next));
         return true;
     }
@@ -478,8 +587,10 @@ namespace TFD::Flow
         if (!TransitionRootLocked(RootFlow::Captive, actorFormID, reason)) {
             return false;
         }
+        _combatActive = false;
         _snapshot.captiveMode = mode;
         SetCaptiveIdleLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("BeginCaptiveLocked", reason, _snapshot, actorFormID, ToString(mode));
         return true;
     }
@@ -495,6 +606,7 @@ namespace TFD::Flow
         _snapshot.terminalResolved = true;
         SetPrimaryActorLocked(actorFormID);
         BumpTokenLocked();
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("EnterTerminalContextLocked", reason, _snapshot, actorFormID, ToString(contextRoot));
         return true;
     }
@@ -506,6 +618,8 @@ namespace TFD::Flow
             return RejectLocked("CompleteTerminalContext", reason);
         }
         ClearAllLocked();
+        _combatActive = false;
+        RefreshFlowGlobalsLocked();
         LogFlowSnapshot("CompleteTerminalContextLocked", reason, _snapshot);
         return true;
     }

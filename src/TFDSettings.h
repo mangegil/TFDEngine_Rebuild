@@ -13,6 +13,12 @@ namespace TFD::Settings
 	float GetDefeatThresholdPct();
 	void  SetDefeatThresholdPct(float a_pct);
 
+	float GetPlayerGuardThresholdPct();
+	void  SetPlayerGuardThresholdPct(float a_pct);
+
+	float GetPlayerGuardDamageScale();
+	void  SetPlayerGuardDamageScale(float a_scale);
+
 	float GetAllyDownedThresholdPct();
 	void  SetAllyDownedThresholdPct(float a_pct);
 

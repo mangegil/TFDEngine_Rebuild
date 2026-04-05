@@ -1373,7 +1373,8 @@ namespace TFD::Pacify
             bool applyCellBubble,
             bool allowLocalSplash,
             float cellBubbleRadius,
-            bool ignoreSpent = false)
+            bool ignoreSpent = false,
+            bool suppressBridgeEvents = false)
         {
             (void)nowSec;
             if (!IsActorStillValid(player) || !IsActorStillValid(primaryTarget)) {
@@ -1511,6 +1512,7 @@ namespace TFD::Pacify
             session.disposition = (mode == Mode::Tame) ? TameDisposition::Calm : TameDisposition::None;
             session.temporaryTeammateApplied = false;
             session.dialogueRequested = allowDialogue;
+            session.suppressBridgeEvents = suppressBridgeEvents;
             session.finished = false;
 
             if (!AddOrRefreshEntry(
@@ -1731,22 +1733,30 @@ namespace TFD::Pacify
                 endTimeSec);
 
             const auto eventIds = IsTruceMode(mode) ? SelectTruceEventTargets(applyIds, targetId) : SelectCrowdEventTargets(applyIds, player, targetId);
-            const auto sent = SendModEventToActors(GetAssignEventName(mode), eventIds);
-            spdlog::info(
-                "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
-                GetAssignEventName(mode) ? GetAssignEventName(mode) : "<none>",
-                sessionId,
-                static_cast<unsigned int>(sent),
-                targetId);
-
-            if (const auto* supplementalAssign = GetSupplementalAssignEventName(mode)) {
-                const auto supplementalSent = SendModEventToActors(supplementalAssign, eventIds);
+            if (suppressBridgeEvents) {
                 spdlog::info(
-                    "TFDPacify: supplemental assign event={} session={} sent={} primary={:08X}",
-                    supplementalAssign,
+                    "TFDPacify: suppress assign events session={} mode={} primary={:08X}",
                     sessionId,
-                    static_cast<unsigned int>(supplementalSent),
+                    ToString(mode),
                     targetId);
+            } else {
+                const auto sent = SendModEventToActors(GetAssignEventName(mode), eventIds);
+                spdlog::info(
+                    "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
+                    GetAssignEventName(mode) ? GetAssignEventName(mode) : "<none>",
+                    sessionId,
+                    static_cast<unsigned int>(sent),
+                    targetId);
+
+                if (const auto* supplementalAssign = GetSupplementalAssignEventName(mode)) {
+                    const auto supplementalSent = SendModEventToActors(supplementalAssign, eventIds);
+                    spdlog::info(
+                        "TFDPacify: supplemental assign event={} session={} sent={} primary={:08X}",
+                        supplementalAssign,
+                        sessionId,
+                        static_cast<unsigned int>(supplementalSent),
+                        targetId);
+                }
             }
             return sessionId;
         }
@@ -1956,7 +1966,8 @@ namespace TFD::Pacify
         RE::Actor* primaryTarget,
         double nowSec,
         bool allowDialogue,
-        bool ignoreSpent)
+        bool ignoreSpent,
+        bool suppressBridgeEvents)
     {
         const bool applyCellBubble = allowDialogue;
         const float cellBubbleRadius = allowDialogue ? 12000.0f : 0.0f;
@@ -1971,7 +1982,8 @@ namespace TFD::Pacify
             applyCellBubble,
             false,
             cellBubbleRadius,
-            ignoreSpent);
+            ignoreSpent,
+            suppressBridgeEvents);
     }
 
     std::optional<RE::FormID> BeginCellTruceBurst(
@@ -2564,12 +2576,14 @@ namespace TFD::Pacify
         RE::FormID primaryTargetId = 0;
         Mode primaryMode = Mode::None;
         TameDisposition primaryDisposition = TameDisposition::None;
+        bool primarySuppressBridgeEvents = false;
 
         auto sessionIt = g_sessions.find(sessionId);
         if (sessionIt != g_sessions.end()) {
             primaryTargetId = sessionIt->second.primaryTargetId;
             primaryMode = sessionIt->second.primaryMode;
             primaryDisposition = sessionIt->second.disposition;
+            primarySuppressBridgeEvents = sessionIt->second.suppressBridgeEvents;
         }
 
         std::vector<RE::FormID> actorIds;
@@ -2588,7 +2602,7 @@ namespace TFD::Pacify
 
         const double releaseNowSec = PacifyNowSec();
         const bool suppressRehostile = reason == ReleaseReason::FlowHandoff;
-        const bool suppressUnassign = reason == ReleaseReason::FlowHandoff;
+        const bool suppressUnassign = reason == ReleaseReason::FlowHandoff || primarySuppressBridgeEvents;
 
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);

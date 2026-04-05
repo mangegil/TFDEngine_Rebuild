@@ -2,7 +2,6 @@
 #include "TFDForceGreet.h"
 
 #include <chrono>
-#include <cmath>
 #include <mutex>
 
 #include <spdlog/spdlog.h>
@@ -19,8 +18,7 @@ namespace TFD::ForceGreet
 		constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
 		constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
 		constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
-		constexpr float kDefaultOpenDistance = 192.0f;
-		constexpr float kBleedoutOpenDistance = 256.0f;
+		constexpr auto kCommitQuietWindow = std::chrono::milliseconds(900);
 
 		struct PendingState
 		{
@@ -31,15 +29,17 @@ namespace TFD::ForceGreet
 			bool succeeded = false;
 			bool requestIssued = false;
 			std::uint32_t attempts = 0;
-			float maxDistance = kDefaultOpenDistance;
 			Clock::time_point started{};
 			Clock::time_point nextAttempt{};
 			Clock::time_point deadline{};
+			Clock::time_point quietUntil{};
 			Clock::time_point lastPackageRefresh{};
 			Clock::time_point lastHardReset{};
 		};
 
 		PendingState g_pending{};
+		RE::TESGlobal* g_dialogueStateGlobal = nullptr;
+		bool g_loggedDialogueStateMissing = false;
 
 		const char* ModeName(Mode mode)
 		{
@@ -57,67 +57,44 @@ namespace TFD::ForceGreet
 			}
 		}
 
+		void ResolveDialogueStateGlobal()
+		{
+			if (g_dialogueStateGlobal) {
+				return;
+			}
+			g_dialogueStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDialogueState");
+			if (!g_dialogueStateGlobal && !g_loggedDialogueStateMissing) {
+				g_loggedDialogueStateMissing = true;
+				spdlog::warn("[TFD][ForceGreet] global TFDDialogueState not found");
+			}
+		}
+
 		bool IsDialogueOpen()
 		{
 			auto* ui = RE::UI::GetSingleton();
 			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
 		}
 
-		float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b)
+		void SetDialogueStateValue(int value)
 		{
-			const auto dx = a.x - b.x;
-			const auto dy = a.y - b.y;
-			const auto dz = a.z - b.z;
-			return std::sqrt(dx * dx + dy * dy + dz * dz);
+			ResolveDialogueStateGlobal();
+			if (!g_dialogueStateGlobal) {
+				return;
+			}
+			const float desired = static_cast<float>(value);
+			if (g_dialogueStateGlobal->value != desired) {
+				g_dialogueStateGlobal->value = desired;
+			}
 		}
 
-		bool IsSpaceCompatible(RE::Actor* speaker, RE::PlayerCharacter* player)
+		void SyncDialogueStateLocked(bool dialogueOpen)
 		{
-			if (!speaker || !player) {
-				return false;
-			}
-
-			auto* speakerCell = speaker->GetParentCell();
-			auto* playerCell = player->GetParentCell();
-			if (!speakerCell || !playerCell) {
-				return false;
-			}
-
-			const bool speakerInterior = speakerCell->IsInteriorCell();
-			const bool playerInterior = playerCell->IsInteriorCell();
-			if (speakerInterior != playerInterior) {
-				return false;
-			}
-
-			if (playerInterior) {
-				return speakerCell == playerCell;
-			}
-
-			auto* speakerWs = speaker->GetWorldspace();
-			auto* playerWs = player->GetWorldspace();
-			return speakerWs && playerWs && speakerWs == playerWs;
+			SetDialogueStateValue((g_pending.active || dialogueOpen) ? 1 : 0);
 		}
 
-		bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker, float maxDistance, float* outDistance)
+		bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
 		{
-			if (outDistance) {
-				*outDistance = 99999.0f;
-			}
-			if (!player || !speaker || speaker == player) {
-				return false;
-			}
-			if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
-				return false;
-			}
-			if (!IsSpaceCompatible(speaker, player)) {
-				return false;
-			}
-
-			const float dist = Distance3D(speaker->GetPosition(), player->GetPosition());
-			if (outDistance) {
-				*outDistance = dist;
-			}
-			return dist <= maxDistance;
+			return player && speaker && speaker != player && !speaker->IsDead() && !speaker->IsDisabled();
 		}
 
 		std::uint32_t PendingSpeakerFormID()
@@ -135,10 +112,10 @@ namespace TFD::ForceGreet
 			g_pending.succeeded = false;
 			g_pending.requestIssued = false;
 			g_pending.attempts = 0;
-			g_pending.maxDistance = kDefaultOpenDistance;
 			g_pending.started = {};
 			g_pending.nextAttempt = {};
 			g_pending.deadline = {};
+			g_pending.quietUntil = {};
 			g_pending.lastPackageRefresh = {};
 			g_pending.lastHardReset = {};
 		}
@@ -156,6 +133,7 @@ namespace TFD::ForceGreet
 					g_pending.succeeded ? 1 : 0);
 			}
 			ResetLocked();
+			SyncDialogueStateLocked(IsDialogueOpen());
 		}
 
 		void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
@@ -174,22 +152,6 @@ namespace TFD::ForceGreet
 				speaker->SetDialogueWithPlayer(false, false, nullptr);
 			}
 
-			if (speaker->IsInCombat()) {
-				speaker->StopCombat();
-			}
-			if (auto* process = RE::ProcessLists::GetSingleton()) {
-				process->StopCombatAndAlarmOnActor(speaker, false);
-			}
-
-			if (player->IsWeaponDrawn()) {
-				player->DrawWeaponMagicHands(false);
-			}
-			if (speaker->IsWeaponDrawn()) {
-				speaker->DrawWeaponMagicHands(false);
-			}
-
-			player->EvaluatePackage(false, true);
-			player->EvaluatePackage(true, true);
 			speaker->EvaluatePackage(false, true);
 			speaker->EvaluatePackage(true, true);
 		}
@@ -200,6 +162,7 @@ namespace TFD::ForceGreet
 			ResetLocked();
 
 			if (!speaker || speaker->IsDead() || speaker->IsDisabled()) {
+				SyncDialogueStateLocked(IsDialogueOpen());
 				spdlog::warn(
 					"[TFD][ForceGreet] begin rejected mode={} reason={} speaker={:08X}",
 					ModeName(mode),
@@ -216,21 +179,21 @@ namespace TFD::ForceGreet
 			g_pending.succeeded = false;
 			g_pending.requestIssued = false;
 			g_pending.attempts = 0;
-			g_pending.maxDistance = mode == Mode::Bleedout ? kBleedoutOpenDistance : kDefaultOpenDistance;
 			g_pending.started = now;
 			g_pending.nextAttempt = now + kInitialDelay;
 			g_pending.deadline = now + timeout;
+			g_pending.quietUntil = {};
 			g_pending.lastPackageRefresh = {};
 			g_pending.lastHardReset = {};
+			SyncDialogueStateLocked(IsDialogueOpen());
 
 			spdlog::info(
-				"[TFD][ForceGreet] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={} maxDist={:.1f}",
+				"[TFD][ForceGreet] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={}",
 				ModeName(mode),
 				reason ? reason : "unknown",
 				speaker->GetFormID(),
 				static_cast<int>(kInitialDelay.count()),
-				static_cast<int>(timeout.count()),
-				g_pending.maxDistance);
+				static_cast<int>(timeout.count()));
 		}
 	}
 
@@ -238,6 +201,8 @@ namespace TFD::ForceGreet
 	{
 		std::scoped_lock lk(g_pending.lock);
 		ResetLocked();
+		ResolveDialogueStateGlobal();
+		SyncDialogueStateLocked(IsDialogueOpen());
 		spdlog::info("[TFD][ForceGreet] Install active (native open pending)");
 	}
 
@@ -264,20 +229,24 @@ namespace TFD::ForceGreet
 	void Tick()
 	{
 		std::scoped_lock lk(g_pending.lock);
+		const bool dialogueOpen = IsDialogueOpen();
+		SyncDialogueStateLocked(dialogueOpen);
 		if (!g_pending.active) {
 			return;
 		}
 
-		if (IsDialogueOpen()) {
+		if (dialogueOpen) {
+			const auto completedMode = g_pending.mode;
 			g_pending.succeeded = true;
+			g_pending.active = false;
+			g_pending.mode = Mode::None;
+			SyncDialogueStateLocked(true);
 			spdlog::info(
 				"[TFD][ForceGreet] success mode={} speaker={:08X} attempts={} requestIssued={}",
-				ModeName(g_pending.mode),
+				ModeName(completedMode),
 				PendingSpeakerFormID(),
 				g_pending.attempts,
 				g_pending.requestIssued ? 1 : 0);
-			g_pending.active = false;
-			g_pending.mode = Mode::None;
 			return;
 		}
 
@@ -286,7 +255,7 @@ namespace TFD::ForceGreet
 		auto* speaker = speakerSp.get();
 		const auto now = Clock::now();
 
-		if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
+		if (!CanAttemptOpen(player, speaker)) {
 			CancelLocked("invalid_target");
 			return;
 		}
@@ -299,46 +268,33 @@ namespace TFD::ForceGreet
 				g_pending.attempts,
 				g_pending.requestIssued ? 1 : 0);
 			ResetLocked();
+			SyncDialogueStateLocked(IsDialogueOpen());
 			return;
 		}
 
-		float dist = 99999.0f;
-		const bool canAttempt = CanAttemptOpen(player, speaker, g_pending.maxDistance, &dist);
-		if (!canAttempt) {
-			if (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
-				(now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay) {
-				PrepareSpeakerForDialogue(player, speaker, false);
-				g_pending.lastPackageRefresh = now;
-				spdlog::info(
-					"[TFD][ForceGreet] wait mode={} speaker={:08X} dist={:.1f} attempts={} requestIssued={} -> refresh package",
-					ModeName(g_pending.mode),
-					speaker->GetFormID(),
-					dist,
-					g_pending.attempts,
-					g_pending.requestIssued ? 1 : 0);
-			}
+		if (g_pending.requestIssued && g_pending.quietUntil.time_since_epoch().count() != 0 && now < g_pending.quietUntil) {
 			return;
 		}
 
 		const bool shouldHardReset =
-			g_pending.lastHardReset.time_since_epoch().count() == 0 ||
-			(!g_pending.requestIssued && g_pending.attempts == 0) ||
-			(now - g_pending.lastHardReset) >= kHardResetDelay ||
-			(g_pending.requestIssued && (g_pending.attempts >= 3) && ((g_pending.attempts % 4) == 0));
+			!g_pending.requestIssued &&
+			(g_pending.lastHardReset.time_since_epoch().count() == 0 ||
+			 g_pending.attempts == 0 ||
+			 (now - g_pending.lastHardReset) >= kHardResetDelay);
 
 		if (shouldHardReset) {
 			PrepareSpeakerForDialogue(player, speaker, true);
 			g_pending.lastHardReset = now;
 			spdlog::info(
-				"[TFD][ForceGreet] handshake reset mode={} speaker={:08X} dist={:.1f} attempts={} requestIssued={}",
+				"[TFD][ForceGreet] handshake reset mode={} speaker={:08X} attempts={} requestIssued={}",
 				ModeName(g_pending.mode),
 				speaker->GetFormID(),
-				dist,
 				g_pending.attempts,
 				g_pending.requestIssued ? 1 : 0);
 		}
-		else if (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
-			(now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay) {
+		else if (!g_pending.requestIssued &&
+			(g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
+			 (now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay)) {
 			PrepareSpeakerForDialogue(player, speaker, false);
 			g_pending.lastPackageRefresh = now;
 		}
@@ -349,17 +305,32 @@ namespace TFD::ForceGreet
 
 		const bool ok = speaker->SetDialogueWithPlayer(true, false, nullptr);
 		++g_pending.attempts;
+		const bool firstIssued = ok && !g_pending.requestIssued;
 		g_pending.requestIssued = g_pending.requestIssued || ok;
-		g_pending.nextAttempt = now + kRetryDelay;
+		if (g_pending.requestIssued) {
+			g_pending.quietUntil = now + kCommitQuietWindow;
+			g_pending.nextAttempt = g_pending.quietUntil;
+		} else {
+			g_pending.nextAttempt = now + kRetryDelay;
+		}
+		SyncDialogueStateLocked(IsDialogueOpen());
 
 		spdlog::info(
-			"[TFD][ForceGreet] try mode={} speaker={:08X} dist={:.1f} attempt={} ok={} requestIssued={}",
+			"[TFD][ForceGreet] try mode={} speaker={:08X} attempt={} ok={} requestIssued={}",
 			ModeName(g_pending.mode),
 			speaker->GetFormID(),
-			dist,
 			g_pending.attempts,
 			ok ? 1 : 0,
 			g_pending.requestIssued ? 1 : 0);
+
+		if (firstIssued) {
+			spdlog::info(
+				"[TFD][ForceGreet] quiet window mode={} speaker={:08X} holdMs={} attempt={}",
+				ModeName(g_pending.mode),
+				speaker->GetFormID(),
+				static_cast<int>(kCommitQuietWindow.count()),
+				g_pending.attempts);
+		}
 	}
 
 	void Cancel()
@@ -377,7 +348,9 @@ namespace TFD::ForceGreet
 	bool DidSucceed()
 	{
 		std::scoped_lock lk(g_pending.lock);
-		return g_pending.succeeded;
+		const bool result = g_pending.succeeded;
+		g_pending.succeeded = false;
+		return result;
 	}
 
 	Mode GetMode()

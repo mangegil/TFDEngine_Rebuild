@@ -177,8 +177,10 @@ namespace TFD::Flow
         void ClearTerminalLocked();
         void ClearAllLocked();
         void SetCaptiveIdleLocked();
+        void RefreshFlowGlobalsLocked();
 
         mutable std::mutex _lock;
         Snapshot _snapshot{};
+        bool _combatActive{ false };
     };
 }

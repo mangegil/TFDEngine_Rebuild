@@ -115,22 +115,24 @@ namespace TFD::DefeatMonitor
 		std::atomic_flag g_tickPending = ATOMIC_FLAG_INIT;
 		std::thread g_worker{};
 
-		static RE::TESGlobal* g_captiveStateGlobal = nullptr;
-		static RE::TESGlobal* g_captivePhaseGlobal = nullptr;
-		static RE::TESGlobal* g_preCombatStateGlobal = nullptr;
-		static RE::TESGlobal* g_bleedOutStateGlobal = nullptr;
-		static RE::TESGlobal* g_transitionPendingGlobal = nullptr;
-		static RE::TESGlobal* g_transitionBusyGlobal = nullptr;
-		static RE::TESGlobal* g_transitionReasonGlobal = nullptr;
-		static RE::TESGlobal* g_transitionResultGlobal = nullptr;
-		static bool g_loggedCaptiveStateGlobal = false;
-		static bool g_loggedCaptivePhaseGlobal = false;
-		static bool g_loggedPreCombatStateGlobal = false;
-		static bool g_loggedBleedOutStateGlobal = false;
-		static bool g_loggedTransitionPendingGlobal = false;
-		static bool g_loggedTransitionBusyGlobal = false;
-		static bool g_loggedTransitionReasonGlobal = false;
-		static bool g_loggedTransitionResultGlobal = false;
+		static RE::TESGlobal* g_defeatStateGlobal = nullptr;
+		static RE::TESGlobal* g_victoryStateGlobal = nullptr;
+		static RE::TESGlobal* g_hostileStateGlobal = nullptr;
+		static RE::TESGlobal* g_enemyFactionStateGlobal = nullptr;
+		static RE::TESGlobal* g_enemyRaceStateGlobal = nullptr;
+		static RE::TESGlobal* g_recoveryStateGlobal = nullptr;
+		static RE::TESGlobal* g_leftForDeadStateGlobal = nullptr;
+		static RE::TESGlobal* g_rescueStateGlobal = nullptr;
+		static bool g_loggedDefeatStateGlobal = false;
+		static bool g_loggedVictoryStateGlobal = false;
+		static bool g_loggedHostileStateGlobal = false;
+		static bool g_loggedEnemyFactionStateGlobal = false;
+		static bool g_loggedEnemyRaceStateGlobal = false;
+		static bool g_loggedRecoveryStateGlobal = false;
+		static bool g_loggedLeftForDeadStateGlobal = false;
+		static bool g_loggedRescueStateGlobal = false;
+		static std::chrono::steady_clock::time_point g_victoryCombatContextUntil{};
+		static constexpr int kVictoryContextLingerMs = 2500;
 
 		static inline std::chrono::steady_clock::time_point Now()
 		{
@@ -764,8 +766,9 @@ namespace TFD::DefeatMonitor
 		static void ResolveLeftForDeadDestination(NoMarkerFallbackState& state);
 		static void ClampHealth(RE::Actor* actor, float minHp);
 		static bool ComputePlayerBleedOutState(RE::Actor* player);
-		static void SyncBleedOutGlobal(bool active);
-		static void RefreshBleedOutStateGlobal();
+		static void ResolveMonitorGlobals();
+		static void RefreshPostDefeatGlobals();
+		static void SetRescueStateValue(int value);
 
 		static void QueuePostRecoveryAggroKick(const char* reason)
 		{
@@ -922,6 +925,8 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadNextPulse = {};
 			g_leftForDeadNeedsAggroKick = false;
 			ClearNoMarkerFallbackState();
+			SetRescueStateValue(0);
+			RefreshPostDefeatGlobals();
 		}
 
 		static void BeginLeftForDeadCooldown(int seconds)
@@ -2057,12 +2062,12 @@ namespace TFD::DefeatMonitor
 			if (speaker->IsWeaponDrawn()) {
 				speaker->DrawWeaponMagicHands(false);
 			}
-			auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false);
+			auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false, true);
 			if (!sessionId.has_value() && g_inBleedState.load(std::memory_order_relaxed)) {
 				spdlog::info("[TFD][Defeat] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
 					speaker->GetFormID(),
 					reason ? reason : "unknown");
-				sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true);
+				sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true, true);
 			}
 			if (!sessionId.has_value()) {
 				spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
@@ -4432,6 +4437,8 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadNeedsAggroKick = false;
 			BeginLeftForDeadCooldown(5);
 			SetGraceSeconds(5);
+			SetRescueStateValue(0);
+			RefreshPostDefeatGlobals();
 			UpdatePreCombatState();
 			spdlog::info("[TFD][Transition] left-for-dead complete branch={} reason={}",
 				NoMarkerBranchName(g_noMarkerFallback.branch),
@@ -4440,60 +4447,65 @@ namespace TFD::DefeatMonitor
 
 		static void ResolveGlobals()
 		{
-			if (!g_captiveStateGlobal) {
-				g_captiveStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptiveState");
-				if (g_captiveStateGlobal && !g_loggedCaptiveStateGlobal) {
-					g_loggedCaptiveStateGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDCaptiveState resolved {:08X}", g_captiveStateGlobal->GetFormID());
+			// TFDTransition* globals removed from ESP.
+		}
+
+		static void ResolveMonitorGlobals()
+		{
+			if (!g_defeatStateGlobal) {
+				g_defeatStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDefeatState");
+				if (g_defeatStateGlobal && !g_loggedDefeatStateGlobal) {
+					g_loggedDefeatStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDDefeatState resolved {:08X}", g_defeatStateGlobal->GetFormID());
 				}
 			}
-			if (!g_captivePhaseGlobal) {
-				g_captivePhaseGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptivePhase");
-				if (g_captivePhaseGlobal && !g_loggedCaptivePhaseGlobal) {
-					g_loggedCaptivePhaseGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDCaptivePhase resolved {:08X}", g_captivePhaseGlobal->GetFormID());
+			if (!g_victoryStateGlobal) {
+				g_victoryStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDVictoryState");
+				if (g_victoryStateGlobal && !g_loggedVictoryStateGlobal) {
+					g_loggedVictoryStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDVictoryState resolved {:08X}", g_victoryStateGlobal->GetFormID());
 				}
 			}
-			if (!g_preCombatStateGlobal) {
-				g_preCombatStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDPreCombatState");
-				if (g_preCombatStateGlobal && !g_loggedPreCombatStateGlobal) {
-					g_loggedPreCombatStateGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDPreCombatState resolved {:08X}", g_preCombatStateGlobal->GetFormID());
+			if (!g_hostileStateGlobal) {
+				g_hostileStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDHostileState");
+				if (g_hostileStateGlobal && !g_loggedHostileStateGlobal) {
+					g_loggedHostileStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDHostileState resolved {:08X}", g_hostileStateGlobal->GetFormID());
 				}
 			}
-			if (!g_bleedOutStateGlobal) {
-				g_bleedOutStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDBleedOutState");
-				if (g_bleedOutStateGlobal && !g_loggedBleedOutStateGlobal) {
-					g_loggedBleedOutStateGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDBleedOutState resolved {:08X}", g_bleedOutStateGlobal->GetFormID());
+			if (!g_enemyFactionStateGlobal) {
+				g_enemyFactionStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyFactionState");
+				if (g_enemyFactionStateGlobal && !g_loggedEnemyFactionStateGlobal) {
+					g_loggedEnemyFactionStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDEnemyFactionState resolved {:08X}", g_enemyFactionStateGlobal->GetFormID());
 				}
 			}
-			if (!g_transitionPendingGlobal) {
-				g_transitionPendingGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTransitionPending");
-				if (g_transitionPendingGlobal && !g_loggedTransitionPendingGlobal) {
-					g_loggedTransitionPendingGlobal = true;
-					spdlog::info("[TFD][Transition] TFDTransitionPending resolved {:08X}", g_transitionPendingGlobal->GetFormID());
+			if (!g_enemyRaceStateGlobal) {
+				g_enemyRaceStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyRaceState");
+				if (g_enemyRaceStateGlobal && !g_loggedEnemyRaceStateGlobal) {
+					g_loggedEnemyRaceStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDEnemyRaceState resolved {:08X}", g_enemyRaceStateGlobal->GetFormID());
 				}
 			}
-			if (!g_transitionBusyGlobal) {
-				g_transitionBusyGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTransitionBusy");
-				if (g_transitionBusyGlobal && !g_loggedTransitionBusyGlobal) {
-					g_loggedTransitionBusyGlobal = true;
-					spdlog::info("[TFD][Transition] TFDTransitionBusy resolved {:08X}", g_transitionBusyGlobal->GetFormID());
+			if (!g_recoveryStateGlobal) {
+				g_recoveryStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRecoveryState");
+				if (g_recoveryStateGlobal && !g_loggedRecoveryStateGlobal) {
+					g_loggedRecoveryStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDRecoveryState resolved {:08X}", g_recoveryStateGlobal->GetFormID());
 				}
 			}
-			if (!g_transitionReasonGlobal) {
-				g_transitionReasonGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTransitionReason");
-				if (g_transitionReasonGlobal && !g_loggedTransitionReasonGlobal) {
-					g_loggedTransitionReasonGlobal = true;
-					spdlog::info("[TFD][Transition] TFDTransitionReason resolved {:08X}", g_transitionReasonGlobal->GetFormID());
+			if (!g_leftForDeadStateGlobal) {
+				g_leftForDeadStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDLeftForDeadState");
+				if (g_leftForDeadStateGlobal && !g_loggedLeftForDeadStateGlobal) {
+					g_loggedLeftForDeadStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDLeftForDeadState resolved {:08X}", g_leftForDeadStateGlobal->GetFormID());
 				}
 			}
-			if (!g_transitionResultGlobal) {
-				g_transitionResultGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTransitionResult");
-				if (g_transitionResultGlobal && !g_loggedTransitionResultGlobal) {
-					g_loggedTransitionResultGlobal = true;
-					spdlog::info("[TFD][Transition] TFDTransitionResult resolved {:08X}", g_transitionResultGlobal->GetFormID());
+			if (!g_rescueStateGlobal) {
+				g_rescueStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRescueState");
+				if (g_rescueStateGlobal && !g_loggedRescueStateGlobal) {
+					g_loggedRescueStateGlobal = true;
+					spdlog::info("[TFD][Defeat] TFDRescueState resolved {:08X}", g_rescueStateGlobal->GetFormID());
 				}
 			}
 		}
@@ -4520,32 +4532,9 @@ namespace TFD::DefeatMonitor
 
 		static bool QueueCinematicTransitionRequest(CinematicTransitionKind kind, bool fadeIn, const char* reason)
 		{
-			ResolveGlobals();
-			if (!g_transitionPendingGlobal || !g_transitionReasonGlobal || !g_transitionResultGlobal) {
-				spdlog::warn("[TFD][Transition] cinematic request unavailable kind={} phase={} reason={}",
-					CinematicKindName(kind), fadeIn ? "fadein" : "fadeout", reason ? reason : "unknown");
-				return false;
-			}
-			if (g_transitionBusyGlobal && g_transitionBusyGlobal->value >= 0.5f) {
-				spdlog::info("[TFD][Transition] cinematic request skipped (busy) kind={} phase={} reason={}",
-					CinematicKindName(kind), fadeIn ? "fadein" : "fadeout", reason ? reason : "unknown");
-				return false;
-			}
-			if (g_transitionPendingGlobal->value >= 0.5f) {
-				spdlog::info("[TFD][Transition] cinematic request skipped (pending={}) kind={} phase={} reason={}",
-					g_transitionPendingGlobal->value, CinematicKindName(kind), fadeIn ? "fadein" : "fadeout", reason ? reason : "unknown");
-				return false;
-			}
-			const int code = CinematicReasonCode(kind, fadeIn);
-			if (code == 0) {
-				return false;
-			}
-			g_transitionReasonGlobal->value = static_cast<float>(code);
-			g_transitionResultGlobal->value = 0.0f;
-			g_transitionPendingGlobal->value = 2.0f;
-			spdlog::info("[TFD][Transition] queued cinematic kind={} phase={} code={} reason={}",
-				CinematicKindName(kind), fadeIn ? "fadein" : "fadeout", code, reason ? reason : "unknown");
-			return true;
+			spdlog::info("[TFD][Transition] cinematic request skipped (globals removed) kind={} phase={} reason={}",
+				CinematicKindName(kind), fadeIn ? "fadein" : "fadeout", reason ? reason : "unknown");
+			return false;
 		}
 
 		static void ClearPendingCinematicFadeIn()
@@ -4654,49 +4643,18 @@ namespace TFD::DefeatMonitor
 
 		static void QueueNonCaptiveChoiceRequest(const char* reason)
 		{
-			ResolveGlobals();
-			if (!g_transitionPendingGlobal) {
-				spdlog::warn("[TFD][Transition] non-captive choice skipped (globals missing) reason={}", reason ? reason : "unknown");
-				return;
-			}
-			if (g_transitionBusyGlobal && g_transitionBusyGlobal->value >= 0.5f) {
-				spdlog::info("[TFD][Transition] non-captive choice skipped (busy) reason={}", reason ? reason : "unknown");
-				return;
-			}
-			if (g_transitionPendingGlobal->value >= 0.5f) {
-				spdlog::info("[TFD][Transition] non-captive choice skipped (already pending={}) reason={}", g_transitionPendingGlobal->value, reason ? reason : "unknown");
-				return;
-			}
-			const int mappedReason = ResolveNonCaptiveChoiceReason(reason);
-			if (g_transitionReasonGlobal) {
-				g_transitionReasonGlobal->value = static_cast<float>(mappedReason);
-			}
-			if (g_transitionResultGlobal) {
-				g_transitionResultGlobal->value = 0.0f;
-			}
-			g_transitionPendingGlobal->value = 1.0f;
-			spdlog::info("[TFD][Transition] queued non-captive choice reason={} source={}", mappedReason, reason ? reason : "unknown");
+			spdlog::info("[TFD][Transition] non-captive choice skipped (globals removed) reason={}",
+				reason ? reason : "unknown");
 		}
 
 		static int ConsumeTransitionResult()
 		{
-			ResolveGlobals();
-			if (!g_transitionResultGlobal) {
-				return 0;
-			}
-			const int result = static_cast<int>(std::lround(g_transitionResultGlobal->value));
-			if (result != 0) {
-				g_transitionResultGlobal->value = 0.0f;
-			}
-			return result;
+			return 0;
 		}
 
 		static bool IsTransitionAwaiting()
 		{
-			ResolveGlobals();
-			const bool pending = g_transitionPendingGlobal && g_transitionPendingGlobal->value >= 0.5f;
-			const bool busy = g_transitionBusyGlobal && g_transitionBusyGlobal->value >= 0.5f;
-			return pending || busy;
+			return false;
 		}
 
 		static void MaintainTransitionCalmWindow()
@@ -4845,6 +4803,8 @@ namespace TFD::DefeatMonitor
 			const int grace = (g_noMarkerFallback.branch == NoMarkerFallbackBranch::RescueCached) ? 1 : 4;
 			BeginLeftForDeadCooldown(grace);
 			SetGraceSeconds(grace);
+			SetRescueStateValue(1);
+			RefreshPostDefeatGlobals();
 			UpdatePreCombatState();
 			if (g_noMarkerFallback.follower) {
 				auto followerSp = RE::Actor::LookupByHandle(g_noMarkerFallback.follower.native_handle());
@@ -4863,6 +4823,7 @@ namespace TFD::DefeatMonitor
 
 		static bool BeginRescueTransition(const char* reason)
 		{
+			SetRescueStateValue(0);
 			ClearPendingCinematicFadeIn();
 			if (QueueCinematicTransitionRequest(CinematicTransitionKind::Rescue, false, reason)) {
 				return true;
@@ -4893,6 +4854,8 @@ namespace TFD::DefeatMonitor
 				g_leftForDeadNeedsAggroKick = false;
 				BeginLeftForDeadCooldown(3);
 				SetGraceSeconds(3);
+				SetRescueStateValue(0);
+				RefreshPostDefeatGlobals();
 				UpdatePreCombatState();
 				spdlog::info("[TFD][Transition] recover complete branch={} reason={} follower={:08X}",
 					NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown", follower->GetFormID());
@@ -4905,6 +4868,8 @@ namespace TFD::DefeatMonitor
 				g_leftForDeadNeedsAggroKick = false;
 				BeginLeftForDeadCooldown(3);
 				SetGraceSeconds(3);
+				SetRescueStateValue(0);
+				RefreshPostDefeatGlobals();
 				UpdatePreCombatState();
 				spdlog::info("[TFD][Transition] recover complete branch={} reason={} potion={:08X}",
 					NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown", g_noMarkerFallback.potionFormId);
@@ -4922,12 +4887,15 @@ namespace TFD::DefeatMonitor
 			g_leftForDeadNeedsAggroKick = false;
 			BeginLeftForDeadCooldown(3);
 			SetGraceSeconds(3);
+			SetRescueStateValue(0);
+			RefreshPostDefeatGlobals();
 			UpdatePreCombatState();
 			spdlog::info("[TFD][Transition] recover complete branch={} reason={}", NoMarkerBranchName(g_noMarkerFallback.branch), reason ? reason : "unknown");
 		}
 
 		static void BeginRecoverTransition(const char* reason)
 		{
+			SetRescueStateValue(0);
 			ClearPendingCinematicFadeIn();
 			if (QueueCinematicTransitionRequest(CinematicTransitionKind::Recover, false, reason)) {
 				return;
@@ -5304,62 +5272,7 @@ namespace TFD::DefeatMonitor
 
 		static void PollTransitionResult()
 		{
-			const int result = ConsumeTransitionResult();
-			if (result == 0) {
-				return;
-			}
-			if (result == 1) {
-				spdlog::info("[TFD][Transition] result=completed");
-				return;
-			}
-			if (result == 2) {
-				spdlog::info("[TFD][Transition] result=cancelled");
-				return;
-			}
-			if (result == 3) {
-				spdlog::info("[TFD][Transition] result=recover_chosen");
-				BeginRecoverTransition("recover_chosen");
-				return;
-			}
-			if (result == 4) {
-				spdlog::info("[TFD][Transition] result=rescue_chosen");
-				if (!BeginRescueTransition("rescue_chosen")) {
-					BeginRecoverTransition("rescue_fallback_recover");
-				}
-				return;
-			}
-			if (result == 101) {
-				spdlog::info("[TFD][Transition] result=captive_blackout_ready");
-				CompleteCaptiveTransitionNow("captived_blackout_ready");
-				SchedulePendingCinematicFadeIn(CinematicTransitionKind::Captive, "captived_fadein", 350);
-				return;
-			}
-			if (result == 102) {
-				spdlog::info("[TFD][Transition] result=rescue_blackout_ready");
-				if (!CompleteRescueTransitionNow("rescue_blackout_ready")) {
-					g_noMarkerFallback.branch = NoMarkerFallbackBranch::LeftForDeadSolo;
-					g_noMarkerFallback.destination.reset();
-					g_noMarkerFallback.hasFallbackPos = false;
-					ResolveLeftForDeadDestination(g_noMarkerFallback);
-					CompleteRecoverTransitionNow("rescue_fallback_left_for_dead");
-					SchedulePendingCinematicFadeIn(CinematicTransitionKind::Recover, "rescue_fallback_left_for_dead_fadein", 300);
-				}
-				else {
-					SchedulePendingCinematicFadeIn(CinematicTransitionKind::Rescue, "rescue_fadein", 350);
-				}
-				return;
-			}
-			if (result == 103) {
-				spdlog::info("[TFD][Transition] result=recover_blackout_ready");
-				CompleteRecoverTransitionNow("recover_blackout_ready");
-				SchedulePendingCinematicFadeIn(CinematicTransitionKind::Recover, "recover_fadein", 300);
-				return;
-			}
-			if (result == 201 || result == 202 || result == 203) {
-				spdlog::info("[TFD][Transition] result=fadein_complete code={}", result);
-				return;
-			}
-			spdlog::info("[TFD][Transition] result={} (unknown)", result);
+			// TFDTransition* globals removed from ESP.
 		}
 
 		static bool ComputePlayerBleedOutState(RE::Actor* player)
@@ -5375,37 +5288,204 @@ namespace TFD::DefeatMonitor
 			return pct <= thresh;
 		}
 
-		static void SyncBleedOutGlobal(bool active)
+		static void SetGlobalInt(RE::TESGlobal* global, int value)
 		{
-			ResolveGlobals();
-			if (g_bleedOutStateGlobal) {
-				g_bleedOutStateGlobal->value = active ? 1.0f : 0.0f;
+			if (global) {
+				global->value = static_cast<float>(value);
 			}
 		}
 
-		static void RefreshBleedOutStateGlobal()
+		static std::vector<RE::Actor*> CollectLiveStandingObservedEnemies(RE::Actor* player, float radius, RE::Actor* preferredEnemy, const std::vector<RE::Actor*>& allies)
 		{
+			std::vector<RE::Actor*> out;
+			auto enemies = CollectCurrentObservedEnemies(player, radius, preferredEnemy, allies);
+			out.reserve(enemies.size());
+			for (auto* enemy : enemies) {
+				if (enemy && IsValidBleedBattleEnemyRosterActor(enemy, player)) {
+					out.push_back(enemy);
+				}
+			}
+			return out;
+		}
+
+		static bool IsVictoryCombatContextActive(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+		{
+			if (!player) {
+				return false;
+			}
+			if (!enemies.empty() || player->IsInCombat()) {
+				return true;
+			}
+			const auto snapshot = TFD::Flow::Controller::GetSingleton().GetSnapshot();
+			if (snapshot.root == TFD::Flow::RootFlow::InCombat) {
+				return true;
+			}
+			if (snapshot.root == TFD::Flow::RootFlow::Captive &&
+				(snapshot.sub == TFD::Flow::SubFlow::EscapeAttempt ||
+					snapshot.sub == TFD::Flow::SubFlow::EscapeFailed ||
+					snapshot.sub == TFD::Flow::SubFlow::Recapture)) {
+				return true;
+			}
+			return false;
+		}
+
+		static bool IsDefeatCombatContextActive(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+		{
+			if (IsVictoryCombatContextActive(player, enemies)) {
+				return true;
+			}
+			if (g_inBleedState.load(std::memory_order_acquire)) {
+				return true;
+			}
+			if (g_bleedBattleObservePending || g_bleedBattleObserveActive) {
+				return true;
+			}
+			return false;
+		}
+
+		static int ComputeDefeatState(RE::Actor* player, bool combatContext)
+		{
+			if (!player || !combatContext) {
+				return 0;
+			}
+			return ComputePlayerBleedOutState(player) ? 2 : 1;
+		}
+
+		static int ComputeVictoryState(RE::Actor* player, bool combatContext, const std::vector<RE::Actor*>& enemies)
+		{
+			if (!player) {
+				g_victoryCombatContextUntil = {};
+				return 0;
+			}
+			if (combatContext) {
+				g_victoryCombatContextUntil = Now() + std::chrono::milliseconds(kVictoryContextLingerMs);
+			}
+			if (!enemies.empty()) {
+				return 1;
+			}
+			if (g_victoryCombatContextUntil != std::chrono::steady_clock::time_point{} && Now() < g_victoryCombatContextUntil) {
+				return 2;
+			}
+			return 0;
+		}
+
+		static int ComputeHostileState(const std::vector<RE::Actor*>& enemies)
+		{
+			const int count = static_cast<int>(enemies.size());
+			if (count <= 0) {
+				return 0;
+			}
+			if (count == 1) {
+				return 1;
+			}
+			return 2;
+		}
+
+		static std::uint32_t ComputeEnemyRaceKey(RE::Actor* actor)
+		{
+			if (!actor) {
+				return 0;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return 1;
+			}
+			if (auto* race = actor->GetRace()) {
+				return race->GetFormID();
+			}
+			return 0;
+		}
+
+		static int ComputeEnemyRaceState(const std::vector<RE::Actor*>& enemies)
+		{
+			if (enemies.empty()) {
+				return 0;
+			}
+			if (enemies.size() == 1) {
+				return 1;
+			}
+			std::uint32_t firstKey = 0;
+			for (auto* enemy : enemies) {
+				const auto key = ComputeEnemyRaceKey(enemy);
+				if (key == 0) {
+					continue;
+				}
+				if (firstKey == 0) {
+					firstKey = key;
+					continue;
+				}
+				if (key != firstKey) {
+					return 2;
+				}
+			}
+			return 1;
+		}
+
+		static int ComputeEnemyFactionState(const std::vector<RE::Actor*>& enemies)
+		{
+			if (enemies.empty()) {
+				return 0;
+			}
+			if (enemies.size() == 1) {
+				return 1;
+			}
+			for (std::size_t i = 0; i < enemies.size(); ++i) {
+				auto* lhs = enemies[i];
+				if (!lhs) {
+					continue;
+				}
+				for (std::size_t j = i + 1; j < enemies.size(); ++j) {
+					auto* rhs = enemies[j];
+					if (!rhs) {
+						continue;
+					}
+					if (lhs->IsHostileToActor(rhs) || rhs->IsHostileToActor(lhs)) {
+						return 2;
+					}
+				}
+			}
+			return 1;
+		}
+
+		static int ComputeRecoveryState()
+		{
+			return ResolveRecoveryPotionCandidate() ? 1 : 0;
+		}
+
+		static int ComputeLeftForDeadState(RE::Actor* player)
+		{
+			(void)player;
+			const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+			auto followers = ResolveFollowerCandidates(followerRadius);
+			const bool hasLivingFollower = (followers.standing != nullptr);
+			const bool hasRescueMarker = (TFD::Location::ResolveMostRecentCachedRescueDestination(true) != nullptr) ||
+				(TFD::Location::ResolveMostRecentCachedRescueDestination(false) != nullptr);
+			const bool hasRescueFactor = hasLivingFollower && hasRescueMarker;
+			const bool hasRecoveryFactor = (ResolveRecoveryPotionCandidate() != nullptr);
+			return (hasRescueFactor || hasRecoveryFactor) ? 0 : 1;
+		}
+
+		static void SetRescueStateValue(int value)
+		{
+			ResolveMonitorGlobals();
+			SetGlobalInt(g_rescueStateGlobal, value);
+		}
+
+		static void RefreshPostDefeatGlobals()
+		{
+			ResolveMonitorGlobals();
 			auto* player = Player();
-			SyncBleedOutGlobal(ComputePlayerBleedOutState(player));
-		}
-
-		static void SyncCaptiveGlobals(bool stateActive, CaptivePhaseValue phase)
-		{
-			ResolveGlobals();
-			if (g_captiveStateGlobal) {
-				g_captiveStateGlobal->value = stateActive ? 1.0f : 0.0f;
-			}
-			if (g_captivePhaseGlobal) {
-				g_captivePhaseGlobal->value = static_cast<float>(static_cast<int>(phase));
-			}
-		}
-
-		static void SyncPreCombatGlobal(bool active)
-		{
-			ResolveGlobals();
-			if (g_preCombatStateGlobal) {
-				g_preCombatStateGlobal->value = active ? 1.0f : 0.0f;
-			}
+			const float radius = (std::max)(2200.0f, TFD::Settings::GetSweepRadius() + 200.0f);
+			auto followers = CollectBleedStandingFollowers(radius);
+			auto enemies = CollectLiveStandingObservedEnemies(player, radius, nullptr, followers);
+			const bool defeatContext = IsDefeatCombatContextActive(player, enemies);
+			const bool victoryContext = IsVictoryCombatContextActive(player, enemies);
+			SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(player, defeatContext));
+			SetGlobalInt(g_victoryStateGlobal, ComputeVictoryState(player, victoryContext, enemies));
+			SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(enemies));
+			SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(enemies));
+			SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(enemies));
+			SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+			SetGlobalInt(g_leftForDeadStateGlobal, ComputeLeftForDeadState(player));
 		}
 
 		static void SetCaptiveRuntimeOnly(bool stateActive, CaptivePhaseValue phase)
@@ -5425,24 +5505,11 @@ namespace TFD::DefeatMonitor
 		static void SetCaptiveRuntime(bool stateActive, CaptivePhaseValue phase)
 		{
 			SetCaptiveRuntimeOnly(stateActive, phase);
-			SyncCaptiveGlobals(stateActive, phase);
 		}
 
 		static void UpdatePreCombatState()
 		{
-			auto* player = Player();
-			bool preCombat = false;
-			if (player) {
-				preCombat = true;
-				if (g_loadTransition.load(std::memory_order_acquire)) preCombat = false;
-				if (g_inBleedState.load(std::memory_order_acquire)) preCombat = false;
-				if (g_captiveState) preCombat = false;
-				if (player->IsInCombat()) preCombat = false;
-				if (g_leftForDeadActive) preCombat = false;
-				auto* st = player->AsActorState();
-				if (st && st->IsBleedingOut()) preCombat = false;
-			}
-			SyncPreCombatGlobal(preCombat);
+			// ownership moved to TFDFlowController.cpp
 		}
 
 		static bool IsDialogueOpen()
@@ -8072,7 +8139,7 @@ namespace TFD::DefeatMonitor
 				UpdatePreCombatState();
 				return;
 			}
-			RefreshBleedOutStateGlobal();
+			RefreshPostDefeatGlobals();
 			NormalizeInvalidCaptivePair();
 			const bool captiveBleedOverlay = g_escapeBreakBleedPending || g_inBleedState.load(std::memory_order_acquire);
 			if (g_captiveState && g_captivePhase == CaptivePhaseValue::Captive) {
@@ -8100,8 +8167,7 @@ namespace TFD::DefeatMonitor
 			if (ui && ui->GameIsPaused()) return;
 			auto* player = Player();
 			if (!player) {
-				SyncBleedOutGlobal(false);
-				SyncPreCombatGlobal(false);
+				RefreshPostDefeatGlobals();
 				return;
 			}
 			TFD::ForceGreet::Tick();
@@ -8649,6 +8715,8 @@ namespace TFD::DefeatMonitor
 		ClearPendingDefeatedDialogueTargetInternal();
 		g_worker = std::thread([]() { WorkerLoop(); });
 		TFD::DefeatMonitor::ApplyQueuedProgressState();
+		SetRescueStateValue(0);
+		RefreshPostDefeatGlobals();
 		spdlog::info("[TFD][Defeat] monitor installed");
 	}
 
@@ -8676,6 +8744,8 @@ namespace TFD::DefeatMonitor
 			src->RemoveEventSink(&g_bleedOutcomeEventSink);
 		}
 		ClearPendingDefeatedDialogueTargetInternal();
+		SetRescueStateValue(0);
+		RefreshPostDefeatGlobals();
 		spdlog::info("[TFD][Defeat] monitor shutdown");
 	}
 
@@ -8751,7 +8821,8 @@ namespace TFD::DefeatMonitor
 		}
 		SetPlayerBleedImmune(false);
 		ClearBleedoutBridgeAliases(nullptr, "apply_queued_state");
-		SyncBleedOutGlobal(g_queuedBleedOutState);
+		SetRescueStateValue(0);
+		RefreshPostDefeatGlobals();
 		UpdatePreCombatState();
 		spdlog::info("[TFD][Defeat] ApplyQueuedProgressState state={} phase={} bleed={}", g_queuedCaptiveState ? 1 : 0, static_cast<int>(g_queuedCaptivePhase), g_queuedBleedOutState ? 1 : 0);
 	}
@@ -8772,6 +8843,8 @@ namespace TFD::DefeatMonitor
 		TFD::FactionMask::Clear();
 		TFD::AggressionClamp::Clear();
 		ClearLeftForDeadCooldown();
+		SetRescueStateValue(0);
+		RefreshPostDefeatGlobals();
 		spdlog::info("[TFD][Defeat] ResetForLoad -> runtime only");
 	}
 

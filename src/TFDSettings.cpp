@@ -28,6 +28,8 @@ namespace TFD::Settings
 	{
 		std::atomic_bool   g_enabled{ true };
 		std::atomic<float> g_defeatThresholdPct{ 30.0f };
+		std::atomic<float> g_playerGuardThresholdPct{ 40.0f };
+		std::atomic<float> g_playerGuardDamageScale{ 0.10f };
 		std::atomic<float> g_allyDownedThresholdPct{ 20.0f };
 		std::atomic<float> g_enemyDownedThresholdPct{ 10.0f };
 		std::atomic<int>   g_bleedWindowSeconds{ 30 };
@@ -53,6 +55,7 @@ namespace TFD::Settings
 		fs::path g_settingsPath;
 
 		static float ClampPct(float v) { return std::clamp(v, 2.0f, 95.0f); }
+		static float ClampScale(float v) { return std::clamp(v, 0.0f, 1.0f); }
 		static int   ClampBleed(int v) { return std::clamp(v, 10, 30); }
 		static float ClampRadius(float v) { return std::clamp(v, 128.0f, 20000.0f); }
 		static int   ClampCooldown(int v) { return std::clamp(v, 0, 5000); }
@@ -178,6 +181,8 @@ namespace TFD::Settings
 			std::string s;
 			s += "enabled=" + std::to_string(GetEnabled() ? 1 : 0) + "\n";
 			s += "defeatThresholdPct=" + std::to_string(GetDefeatThresholdPct()) + "\n";
+			s += "playerGuardThresholdPct=" + std::to_string(GetPlayerGuardThresholdPct()) + "\n";
+			s += "playerGuardDamageScale=" + std::to_string(GetPlayerGuardDamageScale()) + "\n";
 			s += "allyDownedThresholdPct=" + std::to_string(GetAllyDownedThresholdPct()) + "\n";
 			s += "enemyDownedThresholdPct=" + std::to_string(GetEnemyDownedThresholdPct()) + "\n";
 			s += "bleedWindowSeconds=" + std::to_string(GetBleedWindowSeconds()) + "\n";
@@ -234,6 +239,8 @@ namespace TFD::Settings
 
 			g_enabled.store(getBool("enabled", g_enabled.load()));
 			g_defeatThresholdPct.store(ClampPct(getFloat("defeatThresholdPct", g_defeatThresholdPct.load())));
+			g_playerGuardThresholdPct.store(ClampPct(getFloat("playerGuardThresholdPct", g_playerGuardThresholdPct.load())));
+			g_playerGuardDamageScale.store(ClampScale(getFloat("playerGuardDamageScale", g_playerGuardDamageScale.load())));
 			g_allyDownedThresholdPct.store(ClampPct(getFloat("allyDownedThresholdPct", g_allyDownedThresholdPct.load())));
 			g_enemyDownedThresholdPct.store(ClampPct(getFloat("enemyDownedThresholdPct", g_enemyDownedThresholdPct.load())));
 			g_bleedWindowSeconds.store(ClampBleed(getInt("bleedWindowSeconds", g_bleedWindowSeconds.load())));
@@ -315,6 +322,23 @@ namespace TFD::Settings
 	void SetDefeatThresholdPct(float a_pct)
 	{
 		g_defeatThresholdPct.store(ClampPct(a_pct));
+		if (g_playerGuardThresholdPct.load() < g_defeatThresholdPct.load()) {
+			g_playerGuardThresholdPct.store(g_defeatThresholdPct.load());
+		}
+		MarkDirty();
+	}
+
+	float GetPlayerGuardThresholdPct() { return (std::max)(g_playerGuardThresholdPct.load(), g_defeatThresholdPct.load()); }
+	void SetPlayerGuardThresholdPct(float a_pct)
+	{
+		g_playerGuardThresholdPct.store((std::max)(ClampPct(a_pct), g_defeatThresholdPct.load()));
+		MarkDirty();
+	}
+
+	float GetPlayerGuardDamageScale() { return ClampScale(g_playerGuardDamageScale.load()); }
+	void SetPlayerGuardDamageScale(float a_scale)
+	{
+		g_playerGuardDamageScale.store(ClampScale(a_scale));
 		MarkDirty();
 	}
 

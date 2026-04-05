@@ -45,6 +45,16 @@ namespace TFD::Location
 		RE::TESGlobal* g_kidnapAvailableGlobal = nullptr;
 		bool g_loggedKidnapAvailableGlobal = false;
 
+		RE::TESGlobal* g_bossContainerMarkerStateGlobal = nullptr;
+		RE::TESGlobal* g_bossMarkerStateGlobal = nullptr;
+		RE::TESGlobal* g_captiveMarkerStateGlobal = nullptr;
+		RE::TESGlobal* g_containerMarkerStateGlobal = nullptr;
+		RE::TESGlobal* g_escapeRouteStateGlobal = nullptr;
+		RE::TESGlobal* g_rescueMarkerStateGlobal = nullptr;
+
+		static RE::TESObjectREFR* ResolveSpecialRef(RE::BGSLocation* loc, RE::BGSLocationRefType* type, bool preferInterior);
+		TFD::Location::CaptiveStorageDebugSnapshot g_lastCaptiveStorageDebugSnapshot{};
+
 		RE::FormID g_lastAmbientCellId = 0;
 		RE::FormID g_lastAmbientWorldspaceId = 0;
 		RE::FormID g_lastAmbientLocationId = 0;
@@ -196,6 +206,83 @@ namespace TFD::Location
 			return RE::PlayerCharacter::GetSingleton();
 		}
 
+		static void ResolveGlobal(RE::TESGlobal*& global, const char* editorId)
+		{
+			if (!global) {
+				global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorId);
+			}
+		}
+
+		static void SetGlobalInt(RE::TESGlobal* global, int value)
+		{
+			if (global) {
+				global->value = static_cast<float>(value);
+			}
+		}
+
+		static void ResolveMarkerGlobals()
+		{
+			ResolveGlobal(g_bossContainerMarkerStateGlobal, "TFDBossContainerMarkerState");
+			ResolveGlobal(g_bossMarkerStateGlobal, "TFDBossMarkerState");
+			ResolveGlobal(g_captiveMarkerStateGlobal, "TFDCaptiveMarkerState");
+			ResolveGlobal(g_containerMarkerStateGlobal, "TFDContainerMarkerState");
+			ResolveGlobal(g_escapeRouteStateGlobal, "TFDEscapeRouteState");
+			ResolveGlobal(g_rescueMarkerStateGlobal, "TFDRescueMarkerState");
+		}
+
+		static int CountNonZero3(const std::array<std::uint32_t, 3>& ids)
+		{
+			int count = 0;
+			for (auto id : ids) {
+				if (id != 0) {
+					++count;
+				}
+			}
+			return count;
+		}
+
+		static int ComputeEscapeRouteState(RE::TESObjectREFR* marker)
+		{
+			if (!marker) {
+				return 0;
+			}
+
+			auto* loc = GetLocationFromRef(marker);
+			if (loc && g_insideType) {
+				if (auto* insideRef = ResolveSpecialRef(loc, g_insideType, true)) {
+					if (insideRef->GetParentCell() == marker->GetParentCell()) {
+						return 1;
+					}
+				}
+			}
+
+			return 2;
+		}
+
+		static void RefreshMarkerGlobals()
+		{
+			ResolveMarkerGlobals();
+
+			RE::TESObjectREFR* marker = nullptr;
+			if (g_cachedMarker) {
+				marker = g_cachedMarker.get().get();
+			}
+
+			const int captiveMarker = marker ? 1 : 0;
+			const int escapeRoute = ComputeEscapeRouteState(marker);
+			const int bossMarker = CountNonZero3(g_lastCaptiveStorageDebugSnapshot.bossActorFormIDs) > 0 ? 1 : 0;
+			const int bossContainer = CountNonZero3(g_lastCaptiveStorageDebugSnapshot.bossContainerFormIDs) > 0 ? 1 : 0;
+			const int containerMarker = CountNonZero3(g_lastCaptiveStorageDebugSnapshot.containerFormIDs) > 0 ? 1 : 0;
+			const int rescueMarker = ResolveMostRecentCachedSafeLocation() ? 1 : 0;
+
+			SetGlobalInt(g_bossContainerMarkerStateGlobal, bossContainer);
+			SetGlobalInt(g_bossMarkerStateGlobal, bossMarker);
+			SetGlobalInt(g_captiveMarkerStateGlobal, captiveMarker);
+			SetGlobalInt(g_containerMarkerStateGlobal, containerMarker);
+			SetGlobalInt(g_escapeRouteStateGlobal, escapeRoute);
+			SetGlobalInt(g_rescueMarkerStateGlobal, rescueMarker);
+		}
+
 		static RE::TESGlobal* ResolveKidnapAvailableGlobal()
 		{
 			if (!g_kidnapAvailableGlobal) {
@@ -210,15 +297,9 @@ namespace TFD::Location
 
 		static void SetKidnapAvailableGlobal(bool available, const char* reason, RE::TESObjectREFR* marker = nullptr)
 		{
-			if (auto* global = ResolveKidnapAvailableGlobal()) {
-				global->value = available ? 1.0f : 0.0f;
-			}
-
-			spdlog::info(
-				"[TFD][Location] kidnapAvailable={} marker={:08X} reason={}",
-				available ? 1 : 0,
-				marker ? marker->GetFormID() : 0,
-				reason ? reason : "unknown");
+			(void)available;
+			(void)reason;
+			(void)marker;
 		}
 
 		static bool IsPlayerInterior()
@@ -820,12 +901,12 @@ namespace TFD::Location
 			double distSq{ 0.0 };
 		};
 
-		TFD::Location::CaptiveStorageDebugSnapshot g_lastCaptiveStorageDebugSnapshot{};
 
 		static void ClearCaptiveStorageDebugSnapshot(bool hasMarker)
 		{
 			g_lastCaptiveStorageDebugSnapshot = {};
 			g_lastCaptiveStorageDebugSnapshot.hasMarker = hasMarker;
+			RefreshMarkerGlobals();
 		}
 
 		static std::uint32_t CaptiveStorageKindCode(CaptiveStorageKind kind)
@@ -1103,6 +1184,7 @@ namespace TFD::Location
 
 			g_lastCaptiveStorageDebugSnapshot.finalTargetFormID = finalTarget ? finalTarget->GetFormID() : 0u;
 			g_lastCaptiveStorageDebugSnapshot.finalTargetKind = finalTarget ? CaptiveStorageKindCode(finalKind) : 0u;
+			RefreshMarkerGlobals();
 		}
 
 		static RE::TESObjectREFR* ResolveNearestFallbackActor(RE::TESObjectREFR* marker, RE::Actor* preferredActor)
@@ -1254,7 +1336,9 @@ namespace TFD::Location
 			auto* p = Player();
 			if (!p) {
 				spdlog::warn("[TFD][Location] Rescan: player null");
-				SetKidnapAvailableGlobal(false, "player_null", nullptr);
+				g_cachedMarker = {};
+				ClearCaptiveStorageDebugSnapshot(false);
+				RefreshMarkerGlobals();
 				return false;
 			}
 
@@ -1301,13 +1385,14 @@ namespace TFD::Location
 				DumpSpecialRefs(playerLoc ? playerLoc : aggressorLoc);
 
 				g_cachedMarker = {};
-				SetKidnapAvailableGlobal(false, "marker_missing", nullptr);
+				ClearCaptiveStorageDebugSnapshot(false);
+				RefreshMarkerGlobals();
 				return false;
 			}
 
 			g_cachedMarker = marker->GetHandle();
 			spdlog::info("[TFD][Location] Marker resolved -> {:08X}", marker->GetFormID());
-			SetKidnapAvailableGlobal(true, "marker_ready", marker);
+			RefreshMarkerGlobals();
 			return true;
 		}
 
@@ -1351,6 +1436,8 @@ namespace TFD::Location
 			g_bossContainerType ? "OK" : "NULL",
 			g_containerType ? "OK" : "NULL",
 			g_centerType ? "OK" : "NULL");
+
+		RefreshMarkerGlobals();
 	}
 
 	void ResetAmbientKidnapAvailabilityWatcher()
@@ -1795,6 +1882,7 @@ namespace TFD::Location
 		g_bedUseSerial = 0;
 		g_rescueResolveMemo = {};
 		spdlog::info("[TFD][Location] Rescue cache cleared");
+		RefreshMarkerGlobals();
 	}
 
 	bool SaveRescueCache(SKSE::SerializationInterface* intfc)

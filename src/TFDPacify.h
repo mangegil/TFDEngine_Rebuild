@@ -84,6 +84,7 @@ namespace TFD::Pacify
         bool temporaryTeammateApplied{ false };
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
+        bool suppressBridgeEvents{ false };
         bool finished{ false };
     };
 
@@ -136,7 +137,8 @@ namespace TFD::Pacify
         RE::Actor* primaryTarget,
         double nowSec,
         bool allowDialogue,
-        bool ignoreSpent = false);
+        bool ignoreSpent = false,
+        bool suppressBridgeEvents = false);
 
     bool IsPacified(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
