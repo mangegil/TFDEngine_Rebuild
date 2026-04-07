@@ -1116,6 +1116,35 @@ namespace TFDMenu
 			return isNPC || isCreature;
 		}
 
+		static RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+		{
+			if (!actor) {
+				return nullptr;
+			}
+			auto sp = actor->GetActorRuntimeData().currentCombatTarget.get();
+			return sp.get();
+		}
+
+		static bool IsPlayerSideActor(RE::Actor* actor, RE::PlayerCharacter* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+			if (actor == player) {
+				return true;
+			}
+			return actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor);
+		}
+
+		static bool IsActorActivelyTargetingPlayerSide(RE::Actor* actor, RE::PlayerCharacter* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+			auto* currentTarget = ResolveCurrentCombatTarget(actor);
+			return IsPlayerSideActor(currentTarget, player);
+		}
+
 		static RE::Actor* PickCaptorSameCellLoaded(float radius)
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1507,7 +1536,7 @@ namespace TFDMenu
 			}
 
 			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-			const bool inCombat = actor->IsInCombat();
+			const bool inCombat = IsActorActivelyTargetingPlayerSide(actor, player);
 			const bool weaponDrawn = actor->IsWeaponDrawn();
 
 			const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
@@ -1703,8 +1732,7 @@ namespace TFDMenu
 
 			HotkeyPickMode truceMode = HotkeyPickMode::None;
 			if (auto* truceTarget = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &truceMode)) {
-				if (truceMode == HotkeyPickMode::TrucePreCombat ||
-					truceMode == HotkeyPickMode::TruceInCombat) {
+				if (truceMode == HotkeyPickMode::TrucePreCombat) {
 					if (outMode) {
 						*outMode = truceMode;
 					}
@@ -2465,8 +2493,6 @@ namespace TFDMenu
 					const int defeatStateRaw = GetGlobalValueInt(gDefeatState);
 					const int preCombatStateRaw = GetGlobalValueInt(gPreCombatState);
 					const int inCombatStateRaw = GetGlobalValueInt(gInCombatState);
-					const int recoveryStateRaw = GetGlobalValueInt(gRecoveryState);
-					const int leftForDeadStateRaw = GetGlobalValueInt(gLeftForDeadState);
 					const int rescueStateRaw = GetGlobalValueInt(gRescueState);
 					const int pleasureStateRaw = GetGlobalValueInt(gPleasureState);
 
@@ -2475,7 +2501,7 @@ namespace TFDMenu
 						continue;
 					}
 
-					if (recoveryStateRaw != 0 || leftForDeadStateRaw != 0 || rescueStateRaw != 0 || pleasureStateRaw != 0) {
+					if (rescueStateRaw != 0 || pleasureStateRaw != 0) {
 						RE::DebugNotification("TFD: Busy");
 						continue;
 					}
@@ -2552,7 +2578,8 @@ namespace TFDMenu
 						target = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TruceInCombat, &pickMode);
 					}
 					else {
-						target = PickPreCombatTargetSameCellLoaded(3500.0f, &pickMode);
+						TFD::ActorScan::Rescan(3500.0f, false);
+						target = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &pickMode);
 					}
 
 					if (!target || pickMode == HotkeyPickMode::None) {

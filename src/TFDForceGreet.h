@@ -14,7 +14,8 @@ namespace TFD::ForceGreet
 		Bleedout = 1,
 		CaptiveMarker = 2,
 		InCombatTruce = 3,
-		PreCombatTruce = 4
+		PreCombatTruce = 4,
+		AfterPleasure = 5
 	};
 
 	void Install();
@@ -23,6 +24,7 @@ namespace TFD::ForceGreet
 	void BeginCaptiveMarker(RE::Actor* speaker);
 	void BeginInCombatTruce(RE::Actor* speaker);
 	void BeginPreCombatTruce(RE::Actor* speaker);
+	void BeginAfterPleasure(RE::Actor* speaker);
 
 	void Tick();
 

@@ -52,6 +52,8 @@ namespace TFD::ForceGreet
 				return "InCombatTruce";
 			case Mode::PreCombatTruce:
 				return "PreCombatTruce";
+			case Mode::AfterPleasure:
+				return "AfterPleasure";
 			default:
 				return "None";
 			}
@@ -172,7 +174,7 @@ namespace TFD::ForceGreet
 			}
 
 			const auto now = Clock::now();
-			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : kDefaultTimeout;
+			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : (mode == Mode::AfterPleasure ? std::chrono::milliseconds(2500) : kDefaultTimeout);
 			g_pending.speaker = speaker->GetHandle();
 			g_pending.mode = mode;
 			g_pending.active = true;
@@ -224,6 +226,11 @@ namespace TFD::ForceGreet
 	void BeginPreCombatTruce(RE::Actor* speaker)
 	{
 		BeginCommon(speaker, Mode::PreCombatTruce, "precombat_truce");
+	}
+
+	void BeginAfterPleasure(RE::Actor* speaker)
+	{
+		BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
 	}
 
 	void Tick()

@@ -42,8 +42,6 @@ namespace TFD::Location
 		RE::BGSLocationRefType* g_centerType = nullptr;
 
 		RE::ObjectRefHandle g_cachedMarker{};
-		RE::TESGlobal* g_kidnapAvailableGlobal = nullptr;
-		bool g_loggedKidnapAvailableGlobal = false;
 
 		RE::TESGlobal* g_bossContainerMarkerStateGlobal = nullptr;
 		RE::TESGlobal* g_bossMarkerStateGlobal = nullptr;
@@ -60,7 +58,7 @@ namespace TFD::Location
 		RE::FormID g_lastAmbientLocationId = 0;
 		bool g_lastAmbientInterior = false;
 		bool g_lastAmbientWatcherPrimed = false;
-		bool g_lastAmbientKidnapAvailable = false;
+		bool g_lastAmbientMarkerAvailable = false;
 
 		std::unordered_map<RE::FormID, SafeCheckpoint> g_safeCheckpointByLocation;
 		std::unordered_map<RE::FormID, ApprovedBed> g_approvedBedByLocation;
@@ -283,24 +281,6 @@ namespace TFD::Location
 			SetGlobalInt(g_rescueMarkerStateGlobal, rescueMarker);
 		}
 
-		static RE::TESGlobal* ResolveKidnapAvailableGlobal()
-		{
-			if (!g_kidnapAvailableGlobal) {
-				g_kidnapAvailableGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDKidnapAvailable");
-				if (g_kidnapAvailableGlobal && !g_loggedKidnapAvailableGlobal) {
-					g_loggedKidnapAvailableGlobal = true;
-					spdlog::info("[TFD][Location] TFDKidnapAvailable resolved {:08X}", g_kidnapAvailableGlobal->GetFormID());
-				}
-			}
-			return g_kidnapAvailableGlobal;
-		}
-
-		static void SetKidnapAvailableGlobal(bool available, const char* reason, RE::TESObjectREFR* marker = nullptr)
-		{
-			(void)available;
-			(void)reason;
-			(void)marker;
-		}
 
 		static bool IsPlayerInterior()
 		{
@@ -341,14 +321,14 @@ namespace TFD::Location
 				g_lastAmbientInterior != interior;
 		}
 
-		static void RememberAmbientContext(RE::FormID cellId, RE::FormID worldspaceId, RE::FormID locationId, bool interior, bool kidnapAvailable)
+		static void RememberAmbientContext(RE::FormID cellId, RE::FormID worldspaceId, RE::FormID locationId, bool interior, bool markerAvailable)
 		{
 			g_lastAmbientCellId = cellId;
 			g_lastAmbientWorldspaceId = worldspaceId;
 			g_lastAmbientLocationId = locationId;
 			g_lastAmbientInterior = interior;
 			g_lastAmbientWatcherPrimed = true;
-			g_lastAmbientKidnapAvailable = kidnapAvailable;
+			g_lastAmbientMarkerAvailable = markerAvailable;
 		}
 
 		static RE::BGSLocationRefType* ResolveRefType(std::uint32_t formId)
@@ -1447,7 +1427,7 @@ namespace TFD::Location
 		g_lastAmbientLocationId = 0;
 		g_lastAmbientInterior = false;
 		g_lastAmbientWatcherPrimed = false;
-		g_lastAmbientKidnapAvailable = false;
+		g_lastAmbientMarkerAvailable = false;
 	}
 
 	bool UpdateAmbientKidnapAvailability(bool force)
@@ -1463,7 +1443,7 @@ namespace TFD::Location
 
 		const bool changed = AmbientContextChanged(cellId, worldspaceId, locationId, interior);
 		if (!force && !changed) {
-			return g_lastAmbientKidnapAvailable;
+			return g_lastAmbientMarkerAvailable;
 		}
 
 		auto* player = Player();
@@ -1471,7 +1451,7 @@ namespace TFD::Location
 		RememberAmbientContext(cellId, worldspaceId, locationId, interior, ok);
 
 		spdlog::info(
-			"[TFD][Location] ambient kidnap refresh force={} changed={} cell={:08X} world={:08X} loc={:08X} interior={} result={}",
+			"[TFD][Location] ambient captive marker refresh force={} changed={} cell={:08X} world={:08X} loc={:08X} interior={} result={}",
 			force ? 1 : 0,
 			changed ? 1 : 0,
 			cellId,

@@ -11,6 +11,7 @@ namespace
     static RE::TESGlobal* g_inCombatState = nullptr;
     static RE::TESGlobal* g_captiveState = nullptr;
     static RE::TESGlobal* g_pleasureState = nullptr;
+    static RE::TESGlobal* g_defeatState = nullptr;
 
     static void ResolveGlobal(RE::TESGlobal*& global, const char* editorId)
     {
@@ -32,7 +33,7 @@ namespace
             "[TFD][Flow] {} detail={} reason={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} terminal={} actor={:08X}",
             op ? op : "unknown",
             detail ? detail : "-",
-            reason.empty() ? std::string{"-"} : std::string{reason},
+            reason.empty() ? std::string{ "-" } : std::string{ reason },
             TFD::Flow::Controller::ToString(s.root),
             TFD::Flow::Controller::ToString(s.contextRoot),
             TFD::Flow::Controller::ToString(s.gate),
@@ -49,7 +50,7 @@ namespace
         spdlog::warn(
             "[TFD][Flow] reject op={} reason={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} terminal={}",
             op ? op : "unknown",
-            reason.empty() ? std::string{"-"} : std::string{reason},
+            reason.empty() ? std::string{ "-" } : std::string{ reason },
             TFD::Flow::Controller::ToString(s.root),
             TFD::Flow::Controller::ToString(s.contextRoot),
             TFD::Flow::Controller::ToString(s.gate),
@@ -70,9 +71,11 @@ namespace TFD::Flow
         ResolveGlobal(g_inCombatState, "TFDInCombatState");
         ResolveGlobal(g_captiveState, "TFDCaptiveState");
         ResolveGlobal(g_pleasureState, "TFDPleasureState");
+        ResolveGlobal(g_defeatState, "TFDDefeatState");
 
         const int preCombat = (_snapshot.root == RootFlow::PreCombat) ? 1 : 0;
-        const int inCombat = _combatActive ? 1 : 0;
+        const int defeat = g_defeatState ? static_cast<int>(std::lround(g_defeatState->value)) : 0;
+        const int inCombat = (defeat == 2) ? 0 : (_combatActive ? 1 : 0);
 
         int captive = 0;
         if (_snapshot.root == RootFlow::Captive && _snapshot.captiveMode != CaptiveMode::JoinedEnemy) {
@@ -206,18 +209,10 @@ namespace TFD::Flow
 
         if (_snapshot.root == RootFlow::Captive) {
             if (_snapshot.sub == SubFlow::EscapeAttempt || _snapshot.sub == SubFlow::EscapeFailed || _snapshot.sub == SubFlow::Recapture) {
-                ClearDecisionLocked();
-                ClearSubLocked();
-                ClearTerminalLocked();
-                _snapshot.root = RootFlow::InCombat;
-                _snapshot.contextRoot = RootFlow::InCombat;
-                _snapshot.captiveMode = CaptiveMode::None;
-                _snapshot.gate = DecisionGate::PlayerBleedout;
                 SetPrimaryActorLocked(actorFormID);
-                BumpTokenLocked();
                 _combatActive = true;
                 RefreshFlowGlobalsLocked();
-                LogFlowSnapshot("BeginPlayerBleedoutDecision", reason, _snapshot, actorFormID, "escape_failed_rebleed");
+                LogFlowSnapshot("BeginPlayerBleedoutDecision", reason, _snapshot, actorFormID, "escape_rebleed_preserve_captive");
                 return true;
             }
             return RejectLocked("BeginPlayerBleedoutDecision", reason);

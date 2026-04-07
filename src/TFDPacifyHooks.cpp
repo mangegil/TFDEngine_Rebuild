@@ -54,18 +54,11 @@ namespace TFD::PacifyHooks
                 return !TFD::DefeatMonitor::IsThresholdCombatTargetValid(actor);
             }
 
-            static bool ShouldPreservePlayerBleedTarget(RE::Character* actor, RE::Actor* target)
+            static bool ShouldPreservePlayerBleedTarget(RE::Character*, RE::Actor*)
             {
-                auto* player = RE::PlayerCharacter::GetSingleton();
-                if (!actor || !player || target != player) {
-                    return false;
-                }
-                if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
-                    return false;
-                }
-                return TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() ||
-                    TFD::DefeatMonitor::IsThresholdDownedActor(player);
+                return false;
             }
+
 
             static void ClearInvalidCombatTarget(RE::Character* actor)
             {
@@ -78,13 +71,6 @@ namespace TFD::PacifyHooks
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (player && target == player) {
                     TFD::DefeatMonitor::NoteEnemyTargetingPlayer(actor);
-                }
-
-                if (ShouldPreservePlayerBleedTarget(actor, target)) {
-                    spdlog::info("[TFD][PacifyHooks] preserved combat target actor={:08X} target={:08X} reason=player_bleed_threshold",
-                        actor->GetFormID(),
-                        target ? target->GetFormID() : 0u);
-                    return;
                 }
 
                 if (!target || !IsInvalidCombatTarget(target)) {
@@ -125,13 +111,6 @@ namespace TFD::PacifyHooks
                     return;
                 }
 
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
-                    spdlog::info("[TFD][PacifyHooks] preserved invalid combat target actor={:08X} target={:08X} reason=bleed observe wait redirect",
-                        actor->GetFormID(),
-                        target ? target->GetFormID() : 0u);
-                    return;
-                }
-
                 actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     process->ClearCachedFactionFightReactions();
@@ -164,11 +143,6 @@ namespace TFD::PacifyHooks
 
                 auto targetSp = actor ? actor->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
                 auto* currentTarget = targetSp.get();
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() || ShouldPreservePlayerBleedTarget(actor, currentTarget)) {
-                    _UpdateCombat(actor);
-                    return;
-                }
-
                 if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
                     _UpdateCombat(actor);
                     return;
@@ -200,11 +174,6 @@ namespace TFD::PacifyHooks
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (viewer && target && player && target == player) {
                     TFD::DefeatMonitor::NoteEnemyTargetingPlayer(viewer);
-                }
-
-                if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked() ||
-                    (player && target == player && TFD::DefeatMonitor::IsThresholdDownedActor(player))) {
-                    return _DoDetect(viewer, target, detectVal, unk04, unk05, unk06, pos, unk08, unk09, unk10);
                 }
 
                 if (target && !TFD::DefeatMonitor::IsThresholdCombatTargetValid(target)) {

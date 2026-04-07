@@ -2,6 +2,7 @@
 
 #include "TFDActorScan.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDFactionMask.h"
 #include "TFDSettings.h"
 #include "TFDTargetClassifier.h"
 #include "TFDTameBait.h"
@@ -50,7 +51,7 @@ namespace TFD::Pacify
         std::unordered_map<RE::FormID, RehostileRequest> g_rehostileRequests;
         RE::FormID g_nextSessionId = 1;
 
-        const char* GetAssignEventName(Mode mode)
+        const char* GetPrimaryAssignEventName(Mode mode)
         {
             switch (mode) {
             case Mode::Tame:
@@ -58,13 +59,13 @@ namespace TFD::Pacify
             case Mode::TrucePreCombat:
                 return "TFDPreCombatAssign";
             case Mode::TruceInCombat:
-                return "TFDTruceAssign";
+                return "TFDInCombatAssign";
             default:
                 return nullptr;
             }
         }
 
-        const char* GetUnassignEventName(Mode mode)
+        const char* GetPrimaryUnassignEventName(Mode mode)
         {
             switch (mode) {
             case Mode::Tame:
@@ -72,27 +73,29 @@ namespace TFD::Pacify
             case Mode::TrucePreCombat:
                 return "TFDPreCombatClear";
             case Mode::TruceInCombat:
-                return "TFDTruceUnassign";
-            default:
-                return nullptr;
-            }
-        }
-
-        const char* GetSupplementalAssignEventName(Mode mode)
-        {
-            switch (mode) {
-            case Mode::TruceInCombat:
-                return "TFDInCombatAssign";
-            default:
-                return nullptr;
-            }
-        }
-
-        const char* GetSupplementalUnassignEventName(Mode mode)
-        {
-            switch (mode) {
-            case Mode::TruceInCombat:
                 return "TFDInCombatClear";
+            default:
+                return nullptr;
+            }
+        }
+
+        const char* GetCrowdAssignEventName(Mode mode)
+        {
+            switch (mode) {
+            case Mode::TrucePreCombat:
+            case Mode::TruceInCombat:
+                return "TFDTruceAssign";
+            default:
+                return nullptr;
+            }
+        }
+
+        const char* GetCrowdUnassignEventName(Mode mode)
+        {
+            switch (mode) {
+            case Mode::TrucePreCombat:
+            case Mode::TruceInCombat:
+                return "TFDTruceUnassign";
             default:
                 return nullptr;
             }
@@ -284,42 +287,153 @@ namespace TFD::Pacify
             return TFD::TargetClassifier::IsNegotiable(actor);
         }
 
-        std::vector<RE::FormID> SelectTruceEventTargets(
-            const std::vector<RE::FormID>& actorIds,
-            RE::FormID primaryTargetId)
+        bool ActorHasAnyExactFaction(RE::Actor* actor)
         {
-            if (actorIds.empty()) {
-                return {};
+            if (!actor) {
+                return false;
             }
 
-            std::vector<RE::FormID> result;
-            result.reserve(actorIds.size());
+            auto* dh = RE::TESDataHandler::GetSingleton();
+            if (!dh) {
+                return false;
+            }
 
-            auto addUnique = [&](RE::FormID actorId) {
-                if (actorId == 0) {
+            auto& factions = dh->GetFormArray<RE::TESFaction>();
+            for (auto* faction : factions) {
+                if (!faction) {
+                    continue;
+                }
+                if (actor->GetFactionRank(faction, false) != -2) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool SharesAnyExactFaction(RE::Actor* lhs, RE::Actor* rhs)
+        {
+            if (!lhs || !rhs) {
+                return false;
+            }
+
+            auto* dh = RE::TESDataHandler::GetSingleton();
+            if (!dh) {
+                return false;
+            }
+
+            auto& factions = dh->GetFormArray<RE::TESFaction>();
+            for (auto* faction : factions) {
+                if (!faction) {
+                    continue;
+                }
+                if (lhs->GetFactionRank(faction, false) == -2) {
+                    continue;
+                }
+                if (rhs->GetFactionRank(faction, false) != -2) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool SharesSpeakerCrowdSide(RE::Actor* actor, RE::Actor* primaryTarget, RE::Actor* player)
+        {
+            if (!actor || !primaryTarget) {
+                return false;
+            }
+
+            if (actor->GetFormID() == primaryTarget->GetFormID()) {
+                return true;
+            }
+
+            if (SharesAnyExactFaction(actor, primaryTarget)) {
+                return true;
+            }
+
+            const bool actorHasFaction = ActorHasAnyExactFaction(actor);
+            const bool primaryHasFaction = ActorHasAnyExactFaction(primaryTarget);
+            if (actorHasFaction && primaryHasFaction) {
+                return false;
+            }
+
+            if (TFD::FactionMask::SharesAllowedFactionExact(actor, primaryTarget)) {
+                return true;
+            }
+
+            if (!player) {
+                return false;
+            }
+
+            auto* actorTarget = ResolveCurrentCombatTarget(actor);
+            auto* primaryTargetTarget = ResolveCurrentCombatTarget(primaryTarget);
+            if (!actorTarget || !primaryTargetTarget) {
+                return false;
+            }
+
+            const auto playerId = player->GetFormID();
+            if (actorTarget->GetFormID() != playerId || primaryTargetTarget->GetFormID() != playerId) {
+                return false;
+            }
+
+            if (actor->IsHostileToActor(primaryTarget) || primaryTarget->IsHostileToActor(actor)) {
+                return false;
+            }
+
+            return true;
+        }
+
+        struct TruceEventTargets
+        {
+            std::vector<RE::FormID> primaryIds{};
+            std::vector<RE::FormID> crowdIds{};
+        };
+
+        TruceEventTargets PartitionTruceEventTargets(
+            const std::vector<RE::FormID>& actorIds,
+            RE::Actor* player,
+            RE::FormID primaryTargetId)
+        {
+            TruceEventTargets result;
+            if (actorIds.empty()) {
+                return result;
+            }
+
+            auto* primaryTarget = ResolveActor(primaryTargetId);
+            if (primaryTargetId != 0) {
+                result.primaryIds.push_back(primaryTargetId);
+            }
+
+            result.crowdIds.reserve((std::min)(actorIds.size(), kCrowdAliasCap));
+
+            auto addCrowdUnique = [&](RE::FormID actorId) {
+                if (actorId == 0 || actorId == primaryTargetId) {
                     return;
                 }
-                if (std::find(result.begin(), result.end(), actorId) == result.end()) {
-                    result.push_back(actorId);
+                if (std::find(result.crowdIds.begin(), result.crowdIds.end(), actorId) == result.crowdIds.end()) {
+                    result.crowdIds.push_back(actorId);
                 }
-                };
-
-            addUnique(primaryTargetId);
+            };
 
             for (auto actorId : actorIds) {
+                if (result.crowdIds.size() >= kCrowdAliasCap) {
+                    break;
+                }
                 if (actorId == primaryTargetId) {
                     continue;
                 }
 
                 auto* actor = ResolveActor(actorId);
+                if (!actor) {
+                    continue;
+                }
                 if (!IsDialogueCapableTruceEventActor(actor)) {
                     continue;
                 }
-
-                addUnique(actorId);
-                if (result.size() >= kCrowdAliasCap) {
-                    break;
+                if (primaryTarget && !SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                    continue;
                 }
+
+                addCrowdUnique(actorId);
             }
 
             return result;
@@ -420,6 +534,10 @@ namespace TFD::Pacify
             }
 
             if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
                 return false;
             }
 
@@ -763,7 +881,11 @@ namespace TFD::Pacify
                 return true;
             }
 
-            return IsEnemyToPlayer(player, actor);
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            return SharesSpeakerCrowdSide(actor, primaryTarget, player);
         }
 
         bool IsEligibleTruceClusterActor(
@@ -789,6 +911,10 @@ namespace TFD::Pacify
             }
 
             if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
                 return false;
             }
 
@@ -1610,6 +1736,9 @@ namespace TFD::Pacify
                     if (!actor) {
                         continue;
                     }
+                    if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                        continue;
+                    }
                     const bool alreadyInSession = [&]() {
                         auto it = g_entries.find(actorId);
                         return it != g_entries.end() && it->second.sessionId == sessionId;
@@ -1732,31 +1861,35 @@ namespace TFD::Pacify
                 effectiveDurationSec,
                 endTimeSec);
 
-            const auto eventIds = IsTruceMode(mode) ? SelectTruceEventTargets(applyIds, targetId) : SelectCrowdEventTargets(applyIds, player, targetId);
             if (suppressBridgeEvents) {
                 spdlog::info(
                     "TFDPacify: suppress assign events session={} mode={} primary={:08X}",
                     sessionId,
                     ToString(mode),
                     targetId);
+            } else if (IsTruceMode(mode)) {
+                const auto splitTargets = PartitionTruceEventTargets(applyIds, player, targetId);
+                const auto primarySent = SendModEventToActors(GetPrimaryAssignEventName(mode), splitTargets.primaryIds);
+                const auto crowdSent = SendModEventToActors(GetCrowdAssignEventName(mode), splitTargets.crowdIds);
+                spdlog::info(
+                    "TFDPacify: assign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} crowdSize={}",
+                    ToString(mode),
+                    sessionId,
+                    GetPrimaryAssignEventName(mode) ? GetPrimaryAssignEventName(mode) : "<none>",
+                    static_cast<unsigned int>(primarySent),
+                    GetCrowdAssignEventName(mode) ? GetCrowdAssignEventName(mode) : "<none>",
+                    static_cast<unsigned int>(crowdSent),
+                    targetId,
+                    static_cast<unsigned int>(splitTargets.crowdIds.size()));
             } else {
-                const auto sent = SendModEventToActors(GetAssignEventName(mode), eventIds);
+                const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
+                const auto sent = SendModEventToActors(GetPrimaryAssignEventName(mode), eventIds);
                 spdlog::info(
                     "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
-                    GetAssignEventName(mode) ? GetAssignEventName(mode) : "<none>",
+                    GetPrimaryAssignEventName(mode) ? GetPrimaryAssignEventName(mode) : "<none>",
                     sessionId,
                     static_cast<unsigned int>(sent),
                     targetId);
-
-                if (const auto* supplementalAssign = GetSupplementalAssignEventName(mode)) {
-                    const auto supplementalSent = SendModEventToActors(supplementalAssign, eventIds);
-                    spdlog::info(
-                        "TFDPacify: supplemental assign event={} session={} sent={} primary={:08X}",
-                        supplementalAssign,
-                        sessionId,
-                        static_cast<unsigned int>(supplementalSent),
-                        targetId);
-                }
             }
             return sessionId;
         }
@@ -2002,7 +2135,9 @@ namespace TFD::Pacify
             false,
             true,
             false,
-            radius);
+            radius,
+            false,
+            true);
     }
 
     bool IsPacified(RE::Actor* actor)
@@ -2671,10 +2806,6 @@ namespace TFD::Pacify
             }
         }
 
-        const auto eventIds = IsTruceMode(primaryMode) ? SelectTruceEventTargets(actorIds, primaryTargetId) : SelectCrowdEventTargets(actorIds, player, primaryTargetId);
-        const char* unassignEvent = (primaryMode == Mode::Tame && primaryDisposition == TameDisposition::Companion) ?
-            kCreatureTeammateUnassignEvent :
-            GetUnassignEventName(primaryMode);
         if (suppressUnassign) {
             spdlog::info(
                 "TFDPacify: suppress unassign/rehostile session={} reason={} mode={} primary={:08X}",
@@ -2682,7 +2813,26 @@ namespace TFD::Pacify
                 ToString(reason),
                 ToString(primaryMode),
                 primaryTargetId);
+        } else if (IsTruceMode(primaryMode)) {
+            const auto splitTargets = PartitionTruceEventTargets(actorIds, player, primaryTargetId);
+            const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), splitTargets.primaryIds);
+            const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), splitTargets.crowdIds);
+            spdlog::info(
+                "TFDPacify: unassign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} disposition={} crowdSize={}",
+                ToString(primaryMode),
+                sessionId,
+                GetPrimaryUnassignEventName(primaryMode) ? GetPrimaryUnassignEventName(primaryMode) : "<none>",
+                static_cast<unsigned int>(primarySent),
+                GetCrowdUnassignEventName(primaryMode) ? GetCrowdUnassignEventName(primaryMode) : "<none>",
+                static_cast<unsigned int>(crowdSent),
+                primaryTargetId,
+                ToString(primaryDisposition),
+                static_cast<unsigned int>(splitTargets.crowdIds.size()));
         } else {
+            const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);
+            const char* unassignEvent = (primaryMode == Mode::Tame && primaryDisposition == TameDisposition::Companion) ?
+                kCreatureTeammateUnassignEvent :
+                GetPrimaryUnassignEventName(primaryMode);
             const auto sent = SendModEventToActors(unassignEvent, eventIds);
             spdlog::info(
                 "TFDPacify: unassign events event={} session={} sent={} primary={:08X} disposition={}",
@@ -2691,16 +2841,6 @@ namespace TFD::Pacify
                 static_cast<unsigned int>(sent),
                 primaryTargetId,
                 ToString(primaryDisposition));
-
-            if (const auto* supplementalUnassign = GetSupplementalUnassignEventName(primaryMode)) {
-                const auto supplementalSent = SendModEventToActors(supplementalUnassign, eventIds);
-                spdlog::info(
-                    "TFDPacify: supplemental unassign event={} session={} sent={} primary={:08X}",
-                    supplementalUnassign,
-                    sessionId,
-                    static_cast<unsigned int>(supplementalSent),
-                    primaryTargetId);
-            }
         }
         spdlog::info(
             "TFDPacify: release session id={} reason={} mode={} disposition={} target={:08X} packSize={}",
