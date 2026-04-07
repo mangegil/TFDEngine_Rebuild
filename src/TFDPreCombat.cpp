@@ -13,6 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDActorScan.h"
+#include "TFDDefeatMonitor.h"
 #include "TFDFactionMask.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPacify.h"
@@ -124,10 +125,7 @@ namespace TFD::PreCombat
 
 		bool IsCaptiveLikeBlocked()
 		{
-			if (TFD::FactionMask::IsActive()) {
-				return true;
-			}
-			return false;
+			return TFD::DefeatMonitor::IsPreCombatBlocked();
 		}
 
 		bool IsActorStillValid(RE::Actor* actor)

@@ -299,7 +299,7 @@ namespace TFD::PreCombatGreet
 				return false;
 			}
 
-			if (TFD::FactionMask::IsActive()) {
+			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
 				return false;
 			}
 
@@ -953,12 +953,18 @@ bool HasProtectedPleasurePendingLocked()
 				return;
 			}
 
-			if (TFD::FactionMask::IsActive()) {
+			if (TFD::DefeatMonitor::IsPleasureLockActive()) {
 				std::scoped_lock lk(gLock);
 				if (!HasProtectedPleasurePendingLocked()) {
 					ClearAllPendingLocked();
 					return;
 				}
+			}
+
+			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
+				std::scoped_lock lk(gLock);
+				ClearAllPendingLocked();
+				return;
 			}
 
 			const bool dialogueOpen = IsDialogueOpen();

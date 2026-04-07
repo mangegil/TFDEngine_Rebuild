@@ -9640,6 +9640,25 @@ namespace TFD::DefeatMonitor
 		return g_leftForDeadActive;
 	}
 
+	bool IsPleasureLockActive()
+	{
+		return IsPleasurePassiveLockActive();
+	}
+
+	bool IsPreCombatBlocked()
+	{
+		if (g_leftForDeadActive) {
+			return true;
+		}
+		if (IsCaptiveFamily()) {
+			return true;
+		}
+		if (g_inBleedState.load(std::memory_order_acquire)) {
+			return true;
+		}
+		return IsPleasurePassiveLockActive();
+	}
+
 	bool IsCaptivePhase()
 	{
 		return g_captiveState && g_captivePhase == CaptivePhaseValue::Captive;

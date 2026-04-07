@@ -35,6 +35,8 @@ namespace TFD::DefeatMonitor
 	bool IsBleedoutActive();
 	bool HandleBleedoutHotkey();
 	bool IsLeftForDeadRecoveryActive();
+	bool IsPleasureLockActive();
+	bool IsPreCombatBlocked();
 	bool IsPlayerBleedHoldTargetBlocked();
 	bool IsObservedCombatCommitInProgress();
 	bool IsThresholdDownedActor(RE::Actor* actor);

@@ -170,8 +170,10 @@ namespace TFD::CaptiveHostility
             return;
         }
 
-        // kita anggap “mode captive” = FactionMask aktif
-        const bool captive = TFD::FactionMask::IsActive();
+        // Patch 1B: captive hostility hanya boleh aktif saat runtime benar-benar berada di fase Captive.
+        // Jangan lagi pakai FactionMask::IsActive(), karena classifier faction juga bisa hidup
+        // pada bleed/generic pleasure path dan itu bukan captive mode.
+        const bool captive = TFD::DefeatMonitor::IsCaptivePhase();
         if (!captive) {
             RestoreAll();
             return;

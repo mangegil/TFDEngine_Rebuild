@@ -11,13 +11,6 @@ namespace TFD::FactionMask
 {
 	namespace
 	{
-		struct SavedFactionEntry
-		{
-			RE::TESFaction* faction = nullptr;
-			std::int8_t oldRank = -2;
-			bool hadMembership = false;
-		};
-
 		struct AllowedFactionEntry
 		{
 			const char* editorID = nullptr;
@@ -26,9 +19,10 @@ namespace TFD::FactionMask
 
 		bool g_initialized = false;
 		bool g_active = false;
+		int g_matchCount = 0;
+		std::uint32_t g_sourceActorFormID = 0;
 
 		std::vector<AllowedFactionEntry> g_allowedFactions{};
-		std::vector<SavedFactionEntry> g_savedPlayerFactions{};
 
 		static RE::TESGlobal* g_joinEnemyStateGlobal = nullptr;
 
@@ -72,11 +66,6 @@ namespace TFD::FactionMask
 			"dunHaltedStreamFaction"
 		};
 
-		static RE::PlayerCharacter* Player()
-		{
-			return RE::PlayerCharacter::GetSingleton();
-		}
-
 		static std::int8_t GetExactFactionRank(RE::Actor* actor, RE::TESFaction* faction)
 		{
 			if (!actor || !faction) {
@@ -89,6 +78,16 @@ namespace TFD::FactionMask
 		static bool HasExactFaction(RE::Actor* actor, RE::TESFaction* faction)
 		{
 			return GetExactFactionRank(actor, faction) > -2;
+		}
+
+		static void ResetState(bool resetGlobal)
+		{
+			g_active = false;
+			g_matchCount = 0;
+			g_sourceActorFormID = 0;
+			if (resetGlobal) {
+				SetJoinEnemyState(0);
+			}
 		}
 
 		static void AddAllowedFaction(const char* editorID)
@@ -114,37 +113,6 @@ namespace TFD::FactionMask
 
 			g_allowedFactions.push_back({ editorID, faction });
 		}
-
-		static void SaveAndApplyFaction(RE::PlayerCharacter* player, RE::TESFaction* faction)
-		{
-			if (!player || !faction) {
-				return;
-			}
-
-			const std::int8_t oldRank = GetExactFactionRank(player, faction);
-			const bool hadMembership = oldRank > -2;
-
-			const auto exists = std::find_if(
-				g_savedPlayerFactions.begin(),
-				g_savedPlayerFactions.end(),
-				[faction](const SavedFactionEntry& e) { return e.faction == faction; });
-
-			if (exists == g_savedPlayerFactions.end()) {
-				g_savedPlayerFactions.push_back({ faction, oldRank, hadMembership });
-			}
-
-			player->RemoveFromFaction(faction);
-			player->AddToFaction(faction, 0);
-
-			const std::int8_t afterRank = GetExactFactionRank(player, faction);
-
-			spdlog::info(
-				"[TFD][FactionMask] save/apply fac={:08X} oldRank={} had={} afterRank={}",
-				faction->GetFormID(),
-				static_cast<int>(oldRank),
-				hadMembership ? 1 : 0,
-				static_cast<int>(afterRank));
-		}
 	}
 
 	void Initialize()
@@ -154,10 +122,8 @@ namespace TFD::FactionMask
 		}
 
 		g_initialized = true;
-		g_active = false;
 		g_allowedFactions.clear();
-		g_savedPlayerFactions.clear();
-		SetJoinEnemyState(0);
+		ResetState(true);
 
 		for (auto* editorID : kAllowedFactionEditorIDs) {
 			AddAllowedFaction(editorID);
@@ -171,16 +137,12 @@ namespace TFD::FactionMask
 	bool ApplyFromAggressor(RE::Actor* aggressor)
 	{
 		Initialize();
+		ResetState(false);
 
-		auto* player = Player();
-		if (!player || !aggressor) {
-			g_active = false;
+		if (!aggressor) {
 			SetJoinEnemyState(0);
+			spdlog::info("[TFD][FactionMask] apply skipped: aggressor missing");
 			return false;
-		}
-
-		if (!g_savedPlayerFactions.empty()) {
-			Clear();
 		}
 
 		int matchedCount = 0;
@@ -195,12 +157,15 @@ namespace TFD::FactionMask
 				continue;
 			}
 
-			SaveAndApplyFaction(player, faction);
 			++matchedCount;
+			spdlog::info(
+				"[TFD][FactionMask] classifier match actor={:08X} fac={:08X} editorID={}",
+				aggressor->GetFormID(),
+				faction->GetFormID(),
+				entry.editorID ? entry.editorID : "unknown");
 		}
 
 		if (matchedCount <= 0) {
-			g_active = false;
 			SetJoinEnemyState(0);
 			spdlog::info(
 				"[TFD][FactionMask] aggressor {:08X} had no matching allowlist faction",
@@ -209,58 +174,31 @@ namespace TFD::FactionMask
 		}
 
 		g_active = true;
+		g_matchCount = matchedCount;
+		g_sourceActorFormID = aggressor->GetFormID();
 		SetJoinEnemyState(matchedCount == 1 ? 1 : 2);
 
 		spdlog::info(
-			"[TFD][FactionMask] applied mask from aggressor {:08X} matchedCount={} savedCount={}",
-			aggressor->GetFormID(),
-			matchedCount,
-			g_savedPlayerFactions.size());
+			"[TFD][FactionMask] classified aggressor {:08X} matchedCount={} joinEnemyState={} (no faction copied to player)",
+			g_sourceActorFormID,
+			g_matchCount,
+			matchedCount == 1 ? 1 : 2);
 
 		return true;
 	}
 
 	void Clear()
 	{
-		auto* player = Player();
-		if (!player) {
-			g_savedPlayerFactions.clear();
-			g_active = false;
-			SetJoinEnemyState(0);
-			return;
-		}
+		Initialize();
 
-		for (auto it = g_savedPlayerFactions.rbegin(); it != g_savedPlayerFactions.rend(); ++it) {
-			auto* faction = it->faction;
-			if (!faction) {
-				continue;
-			}
+		const auto sourceActorFormID = g_sourceActorFormID;
+		const auto matchCount = g_matchCount;
+		ResetState(true);
 
-			const std::int8_t beforeRank = GetExactFactionRank(player, faction);
-
-			player->RemoveFromFaction(faction);
-
-			if (it->hadMembership) {
-				player->AddToFaction(faction, it->oldRank);
-			}
-
-			const std::int8_t afterRank = GetExactFactionRank(player, faction);
-
-			spdlog::info(
-				"[TFD][FactionMask] restore fac={:08X} beforeRank={} oldRank={} had={} afterRank={}",
-				faction->GetFormID(),
-				static_cast<int>(beforeRank),
-				static_cast<int>(it->oldRank),
-				it->hadMembership ? 1 : 0,
-				static_cast<int>(afterRank));
-		}
-
-		const auto clearedCount = g_savedPlayerFactions.size();
-		g_savedPlayerFactions.clear();
-		g_active = false;
-		SetJoinEnemyState(0);
-
-		spdlog::info("[TFD][FactionMask] cleared/restored {} entries", clearedCount);
+		spdlog::info(
+			"[TFD][FactionMask] cleared classifier state source={:08X} matchedCount={} (player faction membership unchanged)",
+			sourceActorFormID,
+			matchCount);
 	}
 
 	bool IsActive()
