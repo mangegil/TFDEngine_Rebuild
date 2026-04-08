@@ -8,6 +8,10 @@
 
 #include <spdlog/spdlog.h>
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4099 5054)
+#endif
 #include "SKSEMenuFramework.h"
 #include "TFDPacify.h"
 #include "TFDTameBait.h"
@@ -539,3 +543,7 @@ namespace TFD::FeedPopup
         return true;
     }
 }
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

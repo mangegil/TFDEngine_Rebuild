@@ -412,7 +412,9 @@ namespace TFD::PreCombat
 	bool TryStartFromHotkey()
 	{
 		if (IsCaptiveLikeBlocked()) {
-			spdlog::info("[TFD][PreCombat] blocked by captive-like state");
+			spdlog::info("[TFD][PreCombat] blocked ctx={} hold={}",
+				TFD::DefeatMonitor::GetDialogueContextName(),
+				TFD::DefeatMonitor::GetPassiveHoldName());
 			return false;
 		}
 

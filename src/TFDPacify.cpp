@@ -716,6 +716,7 @@ namespace TFD::Pacify
             const TFD::ActorScan::Entry& scanEntry,
             float radius)
         {
+            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -860,6 +861,7 @@ namespace TFD::Pacify
             RE::Actor* primaryTarget,
             const TFD::ActorScan::Entry& scanEntry)
         {
+            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -894,6 +896,7 @@ namespace TFD::Pacify
             RE::Actor* primaryTarget,
             const TFD::ActorScan::Entry& scanEntry)
         {
+            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }

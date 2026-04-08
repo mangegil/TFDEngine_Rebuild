@@ -23,6 +23,7 @@
 #include "TFDPacify.h"
 #include "TFDFlowController.h"
 #include "TFDForceGreet.h"
+#include "TFDPleasureRuntime.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -35,17 +36,8 @@ namespace TFD::PreCombatGreet
 		constexpr double kCooldownAfterFailSec = 5.0;
 		constexpr double kCooldownAfterPlayerAttackSec = 1.0;
 		constexpr double kRecentActorSoftAgeSec = 12.0;
-		constexpr double kPleasureStartHoldSec = 20.0;
-		constexpr double kPleasureSceneHoldSec = 900.0;
-
 		constexpr double kStickyReopenRetrySec = 0.90;
 		constexpr double kStickyTerminalSuppressSec = 0.75;
-
-		constexpr const char* kPleasureStartPendingEvent = "TFDPreCombatPleasureStartPending";
-		constexpr const char* kPleasureStartedEvent = "TFDPreCombatPleasureStarted";
-		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
-		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
-		constexpr const char* kAfterPleasureLoopEnterEvent = "TFDAfterPleasureLoopEnter";
 
 		constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
 		constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -63,8 +55,6 @@ namespace TFD::PreCombatGreet
 			bool dialogueRequested{ false };
 			bool dialogSeen{ false };
 			bool assignSent{ false };
-			bool pleasureHandoff{ false };
-			bool pleasureSceneActive{ false };
 			double nextDebugLogSec{ 0.0 };
 
 			bool stickyReopenPending{ false };
@@ -354,57 +344,7 @@ namespace TFD::PreCombatGreet
 			return std::addressof(it->second);
 		}
 
-		void ArmPleasureHandoffLocked(RE::Actor* actor)
-		{
-			auto* pending = FindPendingLocked(actor);
-			if (!pending) {
-				return;
-			}
 
-			if (!pending->dialogueRequested || !IsPleasureDialogueHandoffAction(pending->action)) {
-				return;
-			}
-
-			MarkTerminalChoiceCommittedLocked(*pending, "pleasure_start_pending");
-			pending->pleasureHandoff = true;
-			pending->pleasureSceneActive = false;
-			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureStartHoldSec);
-
-			CacheRecentActor(actor, 0.0, "pleasure_start_pending");
-			if (pending->action == TFD::InteractionRouter::Action::TrucePreCombat) {
-				ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Pleasure, actor->GetFormID(), "precombat_pleasure_pending");
-			}
-
-			spdlog::info(
-				"[TFD][PreCombatGreet] pleasure handoff armed actor={:08X} session={} action={}",
-				actor->GetFormID(),
-				pending->pacifySessionId,
-				TFD::InteractionRouter::ToString(pending->action));
-		}
-
-		void MarkPleasureStartedLocked(RE::Actor* actor)
-		{
-			auto* pending = FindPendingLocked(actor);
-			if (!pending) {
-				return;
-			}
-
-			if (!pending->dialogueRequested || !IsPleasureDialogueHandoffAction(pending->action)) {
-				return;
-			}
-
-			MarkTerminalChoiceCommittedLocked(*pending, "pleasure_scene_started");
-			pending->pleasureHandoff = true;
-			pending->pleasureSceneActive = true;
-			pending->expiresSec = (std::max)(pending->expiresSec, NowSec() + kPleasureSceneHoldSec);
-
-			CacheRecentActor(actor, 0.0, "pleasure_scene_started");
-			spdlog::info(
-				"[TFD][PreCombatGreet] pleasure scene started actor={:08X} session={} action={}",
-				actor->GetFormID(),
-				pending->pacifySessionId,
-				TFD::InteractionRouter::ToString(pending->action));
-		}
 
 		RE::Actor* ResolvePleasureEventActor(const SKSE::ModCallbackEvent* ev)
 		{
@@ -606,13 +546,6 @@ namespace TFD::PreCombatGreet
 				reason ? reason : "unknown");
 		}
 
-		void FinalizePreCombatPleasureContext(const char* reason)
-		{
-			auto& flow = TFD::Flow::Controller::GetSingleton();
-			if (!flow.CompleteAfterPleasure(reason ? reason : "unknown")) {
-				(void)flow.CompleteTerminalContext(reason ? reason : "unknown");
-			}
-		}
 
 bool HasProtectedPleasurePendingLocked()
 		{
@@ -620,10 +553,12 @@ bool HasProtectedPleasurePendingLocked()
 				if (!pending.dialogueRequested) {
 					continue;
 				}
-				if (!IsPleasureDialogueHandoffAction(pending.action)) {
+				auto sp = RE::Actor::LookupByHandle(handle);
+				auto* actor = sp.get();
+				if (!actor) {
 					continue;
 				}
-				if (pending.pleasureHandoff || pending.pleasureSceneActive) {
+				if (TFD::PleasureRuntime::ShouldProtectPendingDialogue(actor)) {
 					return true;
 				}
 			}
@@ -849,68 +784,7 @@ bool HasProtectedPleasurePendingLocked()
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
-				if (name == kPleasureStartPendingEvent) {
-					if (!actor) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-					std::scoped_lock lk(gLock);
-					ArmPleasureHandoffLocked(actor);
-					return RE::BSEventNotifyControl::kContinue;
-				}
 
-				if (name == kPleasureStartedEvent) {
-					if (!actor) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-					std::scoped_lock lk(gLock);
-					MarkPleasureStartedLocked(actor);
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				if (name == kAfterPleasureLoopEnterEvent) {
-					if (!actor) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-					std::scoped_lock lk(gLock);
-					MarkPleasureStartedLocked(actor);
-					CacheRecentActor(actor, 0.0, "after_pleasure_loop_enter");
-					const auto actorFormID = ResolveFlowActorFormIDLocked(actor);
-					if (actorFormID != 0) {
-						(void)TFD::Flow::Controller::GetSingleton().BeginAfterPleasure(actorFormID, "after_pleasure_loop_enter");
-					}
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
-				if (name == kPleasureFailedEvent || name == kPleasureEndedEvent) {
-					if (!actor) {
-						FinalizePreCombatPleasureContext(name == kPleasureEndedEvent ? "precombat_pleasure_ended" : "precombat_pleasure_failed");
-						return RE::BSEventNotifyControl::kContinue;
-					}
-					std::scoped_lock lk(gLock);
-
-					auto it = gPending.find(GetHandleId(actor));
-					if (it == gPending.end()) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-
-					auto& pending = it->second;
-					if (!pending.dialogueRequested || !IsPleasureDialogueHandoffAction(pending.action)) {
-						return RE::BSEventNotifyControl::kContinue;
-					}
-
-					if (name == kPleasureFailedEvent) {
-						CacheRecentActor(actor, 0.0, "pleasure_failed");
-						CleanupOne(actor, pending, kCooldownAfterFailSec, "pleasure_failed", TFD::Pacify::ReleaseReason::DialogueClosed);
-					}
-					else {
-						CacheRecentActor(actor, 0.0, "pleasure_ended");
-						CleanupOne(actor, pending, kCooldownAfterDoneSec, "pleasure_ended", TFD::Pacify::ReleaseReason::Generic);
-					}
-
-					gPending.erase(it);
-					FinalizePreCombatPleasureContext(name == kPleasureEndedEvent ? "precombat_pleasure_ended" : "precombat_pleasure_failed");
-					return RE::BSEventNotifyControl::kContinue;
-				}
 
 				return RE::BSEventNotifyControl::kContinue;
 			}
@@ -953,18 +827,23 @@ bool HasProtectedPleasurePendingLocked()
 				return;
 			}
 
-			if (TFD::DefeatMonitor::IsPleasureLockActive()) {
+			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
 				std::scoped_lock lk(gLock);
-				if (!HasProtectedPleasurePendingLocked()) {
+				const bool preserveProtectedHandoff =
+					TFD::DefeatMonitor::IsPassiveHoldProtectedHandoff() &&
+					HasProtectedPleasurePendingLocked();
+
+				if (!preserveProtectedHandoff) {
+					spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} -> clear pending",
+						TFD::DefeatMonitor::GetDialogueContextName(),
+						TFD::DefeatMonitor::GetPassiveHoldName());
 					ClearAllPendingLocked();
 					return;
 				}
-			}
 
-			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
-				std::scoped_lock lk(gLock);
-				ClearAllPendingLocked();
-				return;
+				spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} but preserve protected handoff",
+					TFD::DefeatMonitor::GetDialogueContextName(),
+					TFD::DefeatMonitor::GetPassiveHoldName());
 			}
 
 			const bool dialogueOpen = IsDialogueOpen();
@@ -1028,8 +907,8 @@ bool HasProtectedPleasurePendingLocked()
 					}
 
 					if (pending.dialogSeen) {
-						if (pending.pleasureHandoff && IsPleasureDialogueHandoffAction(pending.action)) {
-							CacheRecentActor(actor, 0.0, pending.pleasureSceneActive ? "pleasure_scene_active" : "pleasure_handoff_wait");
+						if (TFD::PleasureRuntime::ShouldProtectPendingDialogue(actor)) {
+							CacheRecentActor(actor, 0.0, "pleasure_runtime_handoff");
 							++it;
 							continue;
 						}
@@ -1230,8 +1109,6 @@ bool HasProtectedPleasurePendingLocked()
 		pending.dialogueRequested = result.dialogueRequested;
 		pending.dialogSeen = false;
 		pending.assignSent = false;
-		pending.pleasureHandoff = false;
-		pending.pleasureSceneActive = false;
 		pending.nextDebugLogSec = now;
 		pending.stickyReopenPending = false;
 		pending.terminalChoiceCommitted = false;

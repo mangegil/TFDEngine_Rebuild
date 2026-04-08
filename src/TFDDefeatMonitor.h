@@ -27,7 +27,28 @@ namespace TFD::DefeatMonitor
 	void ResetForLoad();
 	void SetLoadTransition(bool active);
 	void SetPendingDefeatedDialogueTarget(RE::Actor* actor);
+	bool HandlePassiveInvalidationAgainstActor(RE::Actor* actor, const char* reason = nullptr);
 
+	enum class DialogueContextKind : std::uint8_t
+	{
+		None = 0,
+		PreCombat,
+		InCombat,
+		Bleedout,
+		Captive,
+		AfterPleasure,
+		JoinedEnemy
+	};
+
+	enum class PassiveHoldKind : std::uint8_t
+	{
+		None = 0,
+		Dialogue,
+		Grace,
+		Pleasure,
+		Captive,
+		JoinedEnemy
+	};
 	bool IsCaptivePhase();
 	std::uint32_t GetCaptivePhaseRaw();
 	const char* GetCaptivePhaseName();
@@ -35,6 +56,13 @@ namespace TFD::DefeatMonitor
 	bool IsBleedoutActive();
 	bool HandleBleedoutHotkey();
 	bool IsLeftForDeadRecoveryActive();
+	DialogueContextKind GetDialogueContextKind();
+	const char* GetDialogueContextName();
+	bool IsDialogueContextActive();
+	PassiveHoldKind GetPassiveHoldKind();
+	const char* GetPassiveHoldName();
+	bool IsPassiveHoldActive();
+	bool IsPassiveHoldProtectedHandoff();
 	bool IsPleasureLockActive();
 	bool IsPreCombatBlocked();
 	bool IsPlayerBleedHoldTargetBlocked();

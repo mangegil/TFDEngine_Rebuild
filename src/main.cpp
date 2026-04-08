@@ -1,6 +1,6 @@
-#include <type_traits>
-#include <RE/A/ActorValues.h>
 #include <RE/Skyrim.h>
+#include <RE/A/ActorValues.h>
+#include <type_traits>
 #include "SKSE/SKSE.h"
 #include "SKSE/Interfaces.h"
 #include "SKSE/Version.h"

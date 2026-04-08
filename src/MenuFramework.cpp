@@ -2,6 +2,11 @@
 #include "RE/Skyrim.h"
 #include "SKSE/SKSE.h"
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4099 4505 5054)
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2769,3 +2774,7 @@ namespace TFDMenu
 		}
 	}
 }
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

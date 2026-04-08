@@ -1,5 +1,10 @@
 #include "TFDLocation.h"
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4505)
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -1446,7 +1451,6 @@ namespace TFD::Location
 			return g_lastAmbientMarkerAvailable;
 		}
 
-		auto* player = Player();
 		const bool ok = DoRescanInternal(nullptr, interior);
 		RememberAmbientContext(cellId, worldspaceId, locationId, interior, ok);
 
@@ -2147,3 +2151,6 @@ namespace TFD::Location
 		return true;
 	}
 }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif

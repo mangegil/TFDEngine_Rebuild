@@ -142,7 +142,6 @@ namespace TFD::PacifyHooks
                 }
 
                 auto targetSp = actor ? actor->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
-                auto* currentTarget = targetSp.get();
                 if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
                     _UpdateCombat(actor);
                     return;
