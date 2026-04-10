@@ -8858,7 +8858,25 @@ namespace TFD::DefeatMonitor
 
 				if (name == kPreCombatOutcomeReleaseEvent ||
 					name == kPreCombatOutcomeFollowEvent ||
-					name == kBleedoutOutcomeReleaseEvent ||
+					name == kPreCombatOutcomeReleaseEndEvent) {
+					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
+					const double durationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 20.0;
+					(void)TFD::PreCombatGreet::HandleGraceModEvent(
+						rawName,
+						actor,
+						durationSec,
+						TFD::PreCombatGreet::GraceEventHandlers{
+							[&](RE::Actor* graceActor, double seconds, const char* graceReason) {
+								ApplyReleaseFollowGraceToSpeakerAndCrowd(graceActor, seconds, graceReason);
+							},
+							[&](RE::Actor* graceActor, const char* graceReason) {
+								RemoveReleaseFollowGraceFromSpeakerAndCrowd(graceActor, graceReason);
+							}
+						});
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (name == kBleedoutOutcomeReleaseEvent ||
 					name == kPleasureOutcomeReleaseEvent) {
 					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
 					const double durationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 20.0;
@@ -8866,19 +8884,9 @@ namespace TFD::DefeatMonitor
 						spdlog::warn("[TFD][Grace] event={} ignored reason=invalid_actor arg={}", std::string(name), ev->strArg.c_str() ? ev->strArg.c_str() : "");
 						return RE::BSEventNotifyControl::kContinue;
 					}
-					const char* graceReason = name == kPreCombatOutcomeFollowEvent ? "precombat_follow" :
-						(name == kInCombatOutcomeReleaseEvent ? "incombat_release" :
-							(name == kInCombatOutcomeFollowEvent ? "incombat_follow" :
-								(name == kBleedoutOutcomeReleaseEvent ? "bleedout_release" :
-									(name == kPleasureOutcomeReleaseEvent ? "pleasure_release" : "precombat_release"))));
+					const char* graceReason =
+						name == kBleedoutOutcomeReleaseEvent ? "bleedout_release" : "pleasure_release";
 					ApplyReleaseFollowGraceToSpeakerAndCrowd(actor, durationSec, graceReason);
-					return RE::BSEventNotifyControl::kContinue;
-				}
-				if (name == kPreCombatOutcomeReleaseEndEvent) {
-					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
-					if (actor) {
-						RemoveReleaseFollowGraceFromSpeakerAndCrowd(actor, "precombat_release_end");
-					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
 

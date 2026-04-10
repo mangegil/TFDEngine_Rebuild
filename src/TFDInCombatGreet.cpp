@@ -37,6 +37,25 @@ namespace TFD::InCombatGreet
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
 		}
+
+		bool CompleteDialogueClosedInternal(const char* reason)
+		{
+			return TFD::InCombat::CompleteDialogueClosedFlow(
+				reason,
+				TFD::InCombat::CompletionHandlers{
+					[](const char* r) { TFD::InCombat::ClearDialogueOutcome(r); },
+					[](const char* r) { TFD::InCombat::Complete(r); },
+					[](const char* r) { TFD::InCombatGreet::CancelAll(r); } });
+		}
+
+		bool TryBeginStickyReopen(std::uint32_t speakerFormID, const char* reason)
+		{
+			auto* reopenSpeaker = speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(speakerFormID) : nullptr;
+			if (!reopenSpeaker) {
+				return false;
+			}
+			return TFD::InCombatGreet::Begin(reopenSpeaker, reason);
+		}
 	}
 
 	bool OwnsCurrentFlow()
@@ -75,9 +94,12 @@ namespace TFD::InCombatGreet
 			spdlog::warn("[TFD][InCombatGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", formID, reason ? reason : "incombat");
 			return false;
 		}
+
+		ResetRuntime("begin");
 		g_state.store(State::Armed, std::memory_order_release);
 		g_speakerFormID.store(formID, std::memory_order_release);
-		TFD::ForceGreet::BeginPreCombatTruce(speaker);
+		TFD::ForceGreet::BeginInCombatTruce(speaker);
+
 		spdlog::info("[TFD][InCombatGreet] Begin speaker={:08X} reason={}", formID, reason ? reason : "incombat");
 		return true;
 	}
@@ -89,9 +111,12 @@ namespace TFD::InCombatGreet
 			spdlog::warn("[TFD][InCombatGreet] after pleasure ignored speaker={:08X} reason={} flowOwnerMismatch=1", formID, reason ? reason : "after_pleasure");
 			return false;
 		}
+
+		ResetRuntime("begin_after_pleasure");
 		g_state.store(State::AfterPleasure, std::memory_order_release);
 		g_speakerFormID.store(formID, std::memory_order_release);
 		TFD::ForceGreet::BeginAfterPleasure(speaker);
+
 		spdlog::info("[TFD][InCombatGreet] AfterPleasure speaker={:08X} reason={}", formID, reason ? reason : "after_pleasure");
 		return true;
 	}
@@ -99,7 +124,10 @@ namespace TFD::InCombatGreet
 	void CancelAll(const char* reason)
 	{
 		const auto formID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
+		ResetRuntime("cancel");
+		TFD::ForceGreet::Cancel();
 		g_state.store(State::Idle, std::memory_order_release);
+
 		spdlog::info("[TFD][InCombatGreet] CancelAll speaker={:08X} reason={}", formID, reason ? reason : "-");
 	}
 
@@ -108,6 +136,10 @@ namespace TFD::InCombatGreet
 		std::scoped_lock lk(g_runtime.lock);
 		g_runtime.sawDialogue = true;
 		g_runtime.stickyReopenPending = false;
+
+		if (g_state.load(std::memory_order_acquire) == State::Armed) {
+			g_state.store(State::Running, std::memory_order_release);
+		}
 	}
 
 	bool HasSeenDialogue()
@@ -228,6 +260,79 @@ namespace TFD::InCombatGreet
 			handlers.onComplete();
 		}
 		return true;
+	}
+
+	bool TickDialogueRuntime(bool& prevDialogueOpen,
+		bool dialogueOpen,
+		bool pleasureBlocking,
+		RE::Actor* player)
+	{
+		if (dialogueOpen) {
+			NotifyDialogueOpened();
+			return false;
+		}
+
+		const auto now = Clock::now();
+		const auto speakerFormID = TFD::InCombat::GetPrimaryActorFormID();
+
+		if (TryStickyWatchdog(
+			prevDialogueOpen,
+			dialogueOpen,
+			pleasureBlocking,
+			speakerFormID,
+			now,
+			[&](const char* reopenReason) -> bool {
+				return TryBeginStickyReopen(speakerFormID, reopenReason);
+			})) {
+			prevDialogueOpen = false;
+			return true;
+		}
+
+		if (HandleDialogueClosedFlow(
+			DialogueClosedContext{
+				HasSeenDialogue(),
+				prevDialogueOpen,
+				pleasureBlocking,
+				TFD::InCombat::GetState() == TFD::InCombat::State::AfterPleasure },
+				player,
+				speakerFormID,
+				DialogueClosedHandlers{
+					[&]() {
+						prevDialogueOpen = false;
+						spdlog::info("[TFD][InCombatGreet] dialogue closed -> hold after pleasure/runtime");
+					},
+					[&]() {
+						prevDialogueOpen = false;
+						(void)CompleteDialogueClosedInternal("dialogue_closed_complete");
+						spdlog::info("[TFD][InCombatGreet] dialogue closed -> complete");
+					},
+					[&](const StickyReopenProbe& probe) {
+						prevDialogueOpen = false;
+						if (TryBeginStickyReopen(probe.speakerFormID, "dialogue_closed_sticky_reopen")) {
+							spdlog::info("[TFD][InCombatGreet] dialogue closed -> sticky reopen speaker={:08X} dist={:.1f}",
+								probe.speakerFormID,
+								probe.distance);
+						}
+ else {
+  (void)CompleteDialogueClosedInternal("dialogue_closed_sticky_reopen_unavailable");
+  spdlog::warn("[TFD][InCombatGreet] dialogue closed -> sticky reopen missing speaker={:08X}",
+	  probe.speakerFormID);
+}
+},
+[&](const StickyReopenProbe& probe) {
+	prevDialogueOpen = false;
+	(void)CompleteDialogueClosedInternal("dialogue_closed_no_sticky_reopen");
+	spdlog::info("[TFD][InCombatGreet] dialogue closed -> complete no sticky reopen speaker={:08X} loaded={} dead={} dist={:.1f}",
+		probe.speakerFormID,
+		probe.loaded ? 1 : 0,
+		probe.dead ? 1 : 0,
+		probe.distance);
+}
+			})) {
+			return true;
+		}
+
+		return false;
 	}
 
 	bool IsRunning()

@@ -72,6 +72,11 @@ namespace TFD::InCombatGreet
 		std::uint32_t speakerFormID,
 		const DialogueClosedHandlers& handlers);
 
+	bool TickDialogueRuntime(bool& prevDialogueOpen,
+		bool dialogueOpen,
+		bool pleasureBlocking,
+		RE::Actor* player);
+
 	bool IsRunning();
 	State GetState();
 	const char* GetStateName();

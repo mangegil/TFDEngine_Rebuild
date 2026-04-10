@@ -72,6 +72,10 @@ namespace TFD::InCombat
 	bool HandleOutcomePleasureEvent(const OutcomeEventContext& context, const OutcomeEventHandlers& handlers);
 	bool HandleOutcomeCaptiveEvent(const OutcomeEventContext& context, const OutcomeEventHandlers& handlers);
 	bool HandleOutcomeResetEvent(const OutcomeEventContext& context, const OutcomeEventHandlers& handlers);
+	bool DispatchOutcomeModEvent(const char* rawEventName,
+		std::uint32_t actorFormID,
+		bool preserveCaptive,
+		const OutcomeEventHandlers& handlers);
 
 	struct CompletionHandlers
 	{

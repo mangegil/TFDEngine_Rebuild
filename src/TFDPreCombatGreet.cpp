@@ -1172,6 +1172,72 @@ bool HasProtectedPleasurePendingLocked()
 		return true;
 	}
 
+
+	bool HandleReleaseFollowEvent(const GraceEventContext& context, const GraceEventHandlers& handlers)
+	{
+		auto* actor = context.actor;
+		if (!actor) {
+			return false;
+		}
+
+		const char* eventName = context.eventName ? context.eventName : "";
+		const char* graceReason =
+			std::string_view(eventName) == std::string_view("TFDPreCombatOutcomeFollow") ?
+			"precombat_follow" :
+			"precombat_release";
+
+		const double durationSec = context.durationSec > 0.0 ? context.durationSec : 20.0;
+		if (handlers.applyGrace) {
+			handlers.applyGrace(actor, durationSec, graceReason);
+		}
+
+		spdlog::info(
+			"[TFD][PreCombatGreet] release/follow handled actor={:08X} reason={} duration={}",
+			actor->GetFormID(),
+			graceReason,
+			durationSec);
+		return true;
+	}
+
+	bool HandleReleaseEndEvent(RE::Actor* actor, const GraceEventHandlers& handlers)
+	{
+		if (!actor) {
+			return false;
+		}
+
+		if (handlers.removeGrace) {
+			handlers.removeGrace(actor, "precombat_release_end");
+		}
+
+		spdlog::info(
+			"[TFD][PreCombatGreet] release end handled actor={:08X}",
+			actor->GetFormID());
+		return true;
+	}
+
+	bool HandleGraceModEvent(const char* rawEventName, RE::Actor* actor, double durationSec, const GraceEventHandlers& handlers)
+	{
+		const std::string_view name = rawEventName ? std::string_view(rawEventName) : std::string_view{};
+		if (name.empty()) {
+			return false;
+		}
+
+		if (name == std::string_view("TFDPreCombatOutcomeRelease") ||
+			name == std::string_view("TFDPreCombatOutcomeFollow")) {
+			GraceEventContext context{};
+			context.eventName = rawEventName;
+			context.actor = actor;
+			context.durationSec = durationSec;
+			return HandleReleaseFollowEvent(context, handlers);
+		}
+
+		if (name == std::string_view("TFDPreCombatOutcomeReleaseEnd")) {
+			return HandleReleaseEndEvent(actor, handlers);
+		}
+
+		return false;
+	}
+
 	RE::Actor* GetRecentActor(double maxAgeSec)
 	{
 		std::scoped_lock lk(gLock);

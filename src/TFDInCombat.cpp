@@ -2,7 +2,9 @@
 
 #include <atomic>
 #include <mutex>
+#include <string_view>
 
+#include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
 #include "TFDFlowController.h"
@@ -250,6 +252,47 @@ namespace TFD::InCombat
 			handlers.clearDialogueOutcome("mod_event_reset");
 		}
 		return true;
+	}
+
+	bool DispatchOutcomeModEvent(const char* rawEventName,
+		std::uint32_t actorFormID,
+		bool preserveCaptive,
+		const OutcomeEventHandlers& handlers)
+	{
+		const auto eventName = rawEventName ? std::string_view(rawEventName) : std::string_view{};
+		if (eventName.empty()) {
+			return false;
+		}
+
+		if (!actorFormID) {
+			actorFormID = GetPrimaryActorFormID();
+		}
+
+		OutcomeEventContext context{};
+		context.rawEventName = rawEventName;
+		context.actorFormID = actorFormID;
+		context.actor = actorFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(actorFormID) : nullptr;
+		context.inCombatState = IsActive();
+		context.preserveCaptive = preserveCaptive;
+
+		if (eventName == std::string_view("TFDInCombatOutcomePay")) {
+			context.eventName = "mod_event_pay";
+			return HandleOutcomePayEvent(context, handlers);
+		}
+		if (eventName == std::string_view("TFDInCombatOutcomePleasure")) {
+			context.eventName = "mod_event_pleasure";
+			return HandleOutcomePleasureEvent(context, handlers);
+		}
+		if (eventName == std::string_view("TFDInCombatOutcomeCaptive")) {
+			context.eventName = "mod_event_captive";
+			return HandleOutcomeCaptiveEvent(context, handlers);
+		}
+		if (eventName == std::string_view("TFDInCombatOutcomeReset")) {
+			context.eventName = "mod_event_reset";
+			return HandleOutcomeResetEvent(context, handlers);
+		}
+
+		return false;
 	}
 	bool CompletePayRelease(const char* reason, const CompletionHandlers& handlers)
 	{
