@@ -26,6 +26,9 @@
 
 #include "TFDSettings.h"
 #include "TFDLocation.h"
+#include "TFDCaptiveRuntime.h"
+#include "TFDRescueRuntime.h"
+#include "TFDVictoryRuntime.h"
 #include "TFDCaptiveDoorController.h"
 #include "TFDAntiAggro.h"
 #include "TFDFactionMask.h"
@@ -59,14 +62,7 @@ namespace TFD::DefeatMonitor
 		static bool ActorHasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player);
 		static bool IsBleedoutCaptorAliasPrimary(RE::Actor* actor);
 		static float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b);
-		enum class CaptivePhaseValue : int
-		{
-			None = 0,
-			Captive = 1,
-			Escape = 2,
-			ReleasedWork = 3,
-			Scene = 4
-		};
+		using CaptivePhaseValue = TFD::CaptiveRuntime::PhaseValue;
 
 		constexpr const char* kBleedoutPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
 		constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
@@ -119,21 +115,17 @@ namespace TFD::DefeatMonitor
 		std::thread g_worker{};
 
 		static RE::TESGlobal* g_defeatStateGlobal = nullptr;
-		static RE::TESGlobal* g_victoryStateGlobal = nullptr;
 		static RE::TESGlobal* g_hostileStateGlobal = nullptr;
 		static RE::TESGlobal* g_enemyFactionStateGlobal = nullptr;
 		static RE::TESGlobal* g_enemyRaceStateGlobal = nullptr;
 		static RE::TESGlobal* g_recoveryStateGlobal = nullptr;
 		static RE::TESGlobal* g_leftForDeadStateGlobal = nullptr;
-		static RE::TESGlobal* g_rescueStateGlobal = nullptr;
 		static bool g_loggedDefeatStateGlobal = false;
-		static bool g_loggedVictoryStateGlobal = false;
 		static bool g_loggedHostileStateGlobal = false;
 		static bool g_loggedEnemyFactionStateGlobal = false;
 		static bool g_loggedEnemyRaceStateGlobal = false;
 		static bool g_loggedRecoveryStateGlobal = false;
 		static bool g_loggedLeftForDeadStateGlobal = false;
-		static bool g_loggedRescueStateGlobal = false;
 		static std::chrono::steady_clock::time_point g_victoryCombatContextUntil{};
 		static constexpr int kVictoryContextLingerMs = 2500;
 		static bool g_lastRouterCombatContextActive = false;
@@ -265,16 +257,16 @@ namespace TFD::DefeatMonitor
 		std::unordered_map<RE::FormID, BleedLockEntry> g_bleedLocks{};
 		std::chrono::steady_clock::time_point g_bleedLockLastScan{};
 
-		bool g_captiveState = false;
-		CaptivePhaseValue g_captivePhase = CaptivePhaseValue::None;
+		bool& g_captiveState = TFD::CaptiveRuntime::StateRef();
+		CaptivePhaseValue& g_captivePhase = TFD::CaptiveRuntime::PhaseRef();
 		bool g_prevDialogueOpen = false;
 		bool g_prevLockpickOpen = false;
-		bool g_captiveConfiscationApplied = false;
-		bool g_captiveConfiscationPending = false;
-		bool g_captiveStarterLockpickPending = false;
-		std::string g_captivePendingConfiscationReason{};
-		int g_captiveConfiscationAttemptCount = 0;
-		std::chrono::steady_clock::time_point g_captiveConfiscationNextAttempt{};
+		bool& g_captiveConfiscationApplied = TFD::CaptiveRuntime::ConfiscationAppliedRef();
+		bool& g_captiveConfiscationPending = TFD::CaptiveRuntime::ConfiscationPendingRef();
+		bool& g_captiveStarterLockpickPending = TFD::CaptiveRuntime::StarterLockpickPendingRef();
+		std::string& g_captivePendingConfiscationReason = TFD::CaptiveRuntime::PendingConfiscationReasonRef();
+		int& g_captiveConfiscationAttemptCount = TFD::CaptiveRuntime::ConfiscationAttemptCountRef();
+		std::chrono::steady_clock::time_point& g_captiveConfiscationNextAttempt = TFD::CaptiveRuntime::ConfiscationNextAttemptRef();
 		static constexpr int kCaptiveConfiscationInitialDelayMs = 300;
 		static constexpr int kCaptiveConfiscationRetryDelayMs = 250;
 		static constexpr int kCaptiveConfiscationMaxAttempts = 20;
@@ -300,18 +292,8 @@ namespace TFD::DefeatMonitor
 
 		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
 
-		struct CaptiveQuestRegistryCache
-		{
-			RE::TESQuest* quest{ nullptr };
-			RE::BGSRefAlias* playerCaptiveAlias{ nullptr };
-			std::array<RE::BGSRefAlias*, 3> bossCaptorAliases{};
-			std::array<RE::BGSRefAlias*, 3> bossContainerAliases{};
-			std::array<RE::BGSRefAlias*, 3> containerAliases{};
-			RE::BGSRefAlias* lootTargetAlias{ nullptr };
-			bool resolved{ false };
-		};
-
-		CaptiveQuestRegistryCache g_captiveQuestRegistry{};
+		using CaptiveQuestRegistryCache = TFD::CaptiveRuntime::QuestRegistryCache;
+		CaptiveQuestRegistryCache& g_captiveQuestRegistry = TFD::CaptiveRuntime::QuestRegistryRef();
 
 		struct BleedoutQuestRegistryCache
 		{
@@ -382,10 +364,10 @@ namespace TFD::DefeatMonitor
 
 		RE::ObjectRefHandle g_lockpickDoorCandidate{};
 		bool g_lockpickDoorWasLocked = false;
-		TFD::CaptiveDoorController g_captiveDoor{};
-		RE::ObjectRefHandle g_captiveMarker{};
-		RE::FormID g_captiveCellFormID = 0;
-		RE::FormID g_captiveLocationFormID = 0;
+		TFD::CaptiveDoorController& g_captiveDoor = TFD::CaptiveRuntime::DoorControllerRef();
+		RE::ObjectRefHandle& g_captiveMarker = TFD::CaptiveRuntime::MarkerRef();
+		RE::FormID& g_captiveCellFormID = TFD::CaptiveRuntime::CellFormIDRef();
+		RE::FormID& g_captiveLocationFormID = TFD::CaptiveRuntime::LocationFormIDRef();
 		bool g_escapeRadiusActive = false;
 		std::chrono::steady_clock::time_point g_escapeRadiusSince{};
 		RE::ObjectRefHandle g_boundEscapeDoor{};
@@ -394,8 +376,8 @@ namespace TFD::DefeatMonitor
 		static constexpr std::size_t kBleedBridgeMaxActors = 10;
 
 		bool g_hasQueuedProgressState = false;
-		bool g_queuedCaptiveState = false;
-		CaptivePhaseValue g_queuedCaptivePhase = CaptivePhaseValue::None;
+		bool& g_queuedCaptiveState = TFD::CaptiveRuntime::QueuedStateRef();
+		CaptivePhaseValue& g_queuedCaptivePhase = TFD::CaptiveRuntime::QueuedPhaseRef();
 		bool g_queuedBleedOutState = false;
 
 		static RE::PlayerCharacter* Player()
@@ -696,18 +678,18 @@ namespace TFD::DefeatMonitor
 		}
 
 		static void ClearAllDefeatedEnemyAliases(const char* reason);
-		static void SnapshotBleedFollowerDownState(float radius);
+		[[maybe_unused]] static void SnapshotBleedFollowerDownState(float radius);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowers(float radius);
-		static std::vector<RE::Actor*> CollectBleedStandingEnemies(float radius);
+		[[maybe_unused]] static std::vector<RE::Actor*> CollectBleedStandingEnemies(float radius);
 		static bool IsStandingObserverActor(RE::Actor* actor);
 		static bool IsObserverAlly(RE::Actor* actor);
 		static bool IsObserverEnemy(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& allies, bool hostileHint, bool inCombatHint);
 		static bool IsValidBleedBattleEnemyRosterActor(RE::Actor* actor, RE::Actor* player);
-		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers);
+		[[maybe_unused]] static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers);
 		static bool BuildBleedBattleObserveSnapshot(RE::Actor* player, float radius, RE::Actor* preferredEnemy);
 		static std::vector<RE::Actor*> CollectBleedStandingFollowersFromSnapshot();
 		static std::vector<RE::Actor*> CollectBleedStandingEnemiesFromSnapshot();
-		static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
+		[[maybe_unused]] static void RedirectBleedObserverAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
 		{
 			(void)player;
 			(void)followers;
@@ -715,7 +697,7 @@ namespace TFD::DefeatMonitor
 			return;
 		}
 
-		static void MaintainBleedObserverFollowerAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
+		[[maybe_unused]] static void MaintainBleedObserverFollowerAggro(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies)
 		{
 			(void)player;
 			(void)followers;
@@ -725,7 +707,7 @@ namespace TFD::DefeatMonitor
 
 		static bool StartBleedBattleObservePending(RE::Actor* player);
 		static void TickBleedBattleObservePending();
-		static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy);
+		[[maybe_unused]] static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy);
 		static void TickBleedBattleObserve();
 		static RE::Actor* ResolveBleedRedirectTargetInternal(RE::Actor* actor);
 		static void EnterObservedBattleWin();
@@ -1061,7 +1043,7 @@ namespace TFD::DefeatMonitor
 		}
 
 		static void ClearBleedSupportBridgeAliases(const char* reason);
-		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason);
+		[[maybe_unused]] static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason);
 		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason);
 		static void ReleaseBleedNoSpeakerTameSession(const char* reason);
 		static bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason);
@@ -1106,7 +1088,7 @@ namespace TFD::DefeatMonitor
 				inCombatQueued ? 1 : 0);
 		}
 
-		static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason)
+		[[maybe_unused]] static void AssignBleedSupportBridgeActors(const std::vector<RE::Actor*>& actors, RE::Actor* speaker, const char* reason)
 		{
 			if (g_inBleedState.load(std::memory_order_acquire)) {
 				g_bleedCrowdAssigned.clear();
@@ -1380,7 +1362,7 @@ namespace TFD::DefeatMonitor
 				!actors.empty() && actors.front() ? actors.front()->GetFormID() : 0u);
 		}
 
-		static void RefreshBleedoutBridgeCrowd(float radius, RE::Actor* preferred, bool forceClear, std::vector<RE::Actor*>* explicitCrowd = nullptr)
+		[[maybe_unused]] static void RefreshBleedoutBridgeCrowd(float radius, RE::Actor* preferred, bool forceClear, std::vector<RE::Actor*>* explicitCrowd = nullptr)
 		{
 			std::vector<RE::Actor*> crowd = explicitCrowd ? *explicitCrowd : CollectBleedoutCrowd(radius, preferred, !forceClear);
 			std::vector<RE::FormID> next;
@@ -1432,7 +1414,7 @@ namespace TFD::DefeatMonitor
 
 		static void ArmBleedSystemEventOutcomeWindow(const char* reason, double seconds = 2.5);
 		static void ClearBleedSystemEventOutcomeWindow(const char* reason);
-		static bool IsBleedSystemEventOutcomeWindowActive();
+		[[maybe_unused]] static bool IsBleedSystemEventOutcomeWindowActive();
 		static bool IsBleedSystemEventPendingForFallback(const char** outReason = nullptr);
 		static bool ResolveBleedPendingSystemEventFallback(RE::Actor* player, const char* reason);
 		static bool ResolveBleedPostDialogueSystemEventOutcome(RE::Actor* player, const char* reason);
@@ -1447,7 +1429,7 @@ namespace TFD::DefeatMonitor
 			TFD::Bleedout::ClearSystemEventOutcomeWindow(reason);
 		}
 
-		static bool IsBleedSystemEventOutcomeWindowActive()
+		[[maybe_unused]] static bool IsBleedSystemEventOutcomeWindowActive()
 		{
 			return TFD::Bleedout::IsSystemEventOutcomeWindowActive();
 		}
@@ -1642,7 +1624,7 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
-		static void BlackoutAndAdvanceHours(float hours, int holdMs, const char* reason)
+		[[maybe_unused]] static void BlackoutAndAdvanceHours(float hours, int holdMs, const char* reason)
 		{
 			ShowBlackoutFader();
 			std::this_thread::sleep_for(std::chrono::milliseconds(350));
@@ -1656,13 +1638,7 @@ namespace TFD::DefeatMonitor
 
 		static CaptivePhaseValue PhaseFromRaw(std::uint32_t raw)
 		{
-			switch (raw) {
-			case 1: return CaptivePhaseValue::Captive;
-			case 2: return CaptivePhaseValue::Escape;
-			case 3: return CaptivePhaseValue::ReleasedWork;
-			case 4: return CaptivePhaseValue::Scene;
-			default: return CaptivePhaseValue::None;
-			}
+			return TFD::CaptiveRuntime::PhaseFromRaw(raw);
 		}
 
 
@@ -3177,7 +3153,7 @@ namespace TFD::DefeatMonitor
 			return best;
 		}
 
-		static void SnapshotBleedFollowerDownState(float radius)
+		[[maybe_unused]] static void SnapshotBleedFollowerDownState(float radius)
 		{
 			(void)radius;
 			auto* player = Player();
@@ -3374,7 +3350,7 @@ namespace TFD::DefeatMonitor
 			return out;
 		}
 
-		static std::vector<RE::Actor*> CollectBleedStandingEnemies(float radius)
+		[[maybe_unused]] static std::vector<RE::Actor*> CollectBleedStandingEnemies(float radius)
 		{
 			std::vector<RE::Actor*> out;
 			auto* player = Player();
@@ -3466,7 +3442,7 @@ namespace TFD::DefeatMonitor
 			return hostileToSide || hostileHint || inCombatHint || actor->IsInCombat();
 		}
 
-		static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers)
+		[[maybe_unused]] static bool HasStandingHumanoidFollowers(const std::vector<RE::Actor*>& followers)
 		{
 			for (auto* actor : followers) {
 				if (!IsStandingAllyThresholdActor(actor)) {
@@ -3889,7 +3865,7 @@ namespace TFD::DefeatMonitor
 			return best;
 		}
 
-		static void ForceObservedCombatCommit(RE::Actor* actor, RE::Actor* target, bool drawWeapon)
+		[[maybe_unused]] static void ForceObservedCombatCommit(RE::Actor* actor, RE::Actor* target, bool drawWeapon)
 		{
 			if (!actor || !target) {
 				return;
@@ -3906,14 +3882,14 @@ namespace TFD::DefeatMonitor
 			}
 			actor->SetBeenAttacked(true);
 			target->SetBeenAttacked(true);
-			actor->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
-			target->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+			[[maybe_unused]] const auto actorTargetDetectionRequested = actor->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
+			[[maybe_unused]] const auto targetActorDetectionRequested = target->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
 			if (player) {
 				player->SetBeenAttacked(true);
-				actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
-				player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
-				player->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
-				target->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+				[[maybe_unused]] const auto actorPlayerDetectionRequested = actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+				[[maybe_unused]] const auto playerActorDetectionRequested = player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+				[[maybe_unused]] const auto playerTargetDetectionRequested = player->RequestDetectionLevel(target, RE::DETECTION_PRIORITY::kCritical);
+				[[maybe_unused]] const auto targetPlayerDetectionRequested = target->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
 			}
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				process->ClearCachedFactionFightReactions();
@@ -4089,7 +4065,7 @@ namespace TFD::DefeatMonitor
 			g_bleedBattleObservePendingUntil = now + std::chrono::milliseconds(750);
 		}
 
-		static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy)
+		[[maybe_unused]] static bool StartBleedBattleObserve(RE::Actor* player, RE::Actor* preferredEnemy)
 		{
 			if (!player) {
 				return false;
@@ -4672,7 +4648,7 @@ namespace TFD::DefeatMonitor
 				reason ? reason : "unknown");
 		}
 
-		static void ResolveGlobals()
+		[[maybe_unused]] static void ResolveGlobals()
 		{
 			// TFDTransition* globals removed from ESP.
 		}
@@ -4684,13 +4660,6 @@ namespace TFD::DefeatMonitor
 				if (g_defeatStateGlobal && !g_loggedDefeatStateGlobal) {
 					g_loggedDefeatStateGlobal = true;
 					spdlog::info("[TFD][Defeat] TFDDefeatState resolved {:08X}", g_defeatStateGlobal->GetFormID());
-				}
-			}
-			if (!g_victoryStateGlobal) {
-				g_victoryStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDVictoryState");
-				if (g_victoryStateGlobal && !g_loggedVictoryStateGlobal) {
-					g_loggedVictoryStateGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDVictoryState resolved {:08X}", g_victoryStateGlobal->GetFormID());
 				}
 			}
 			if (!g_hostileStateGlobal) {
@@ -4728,16 +4697,9 @@ namespace TFD::DefeatMonitor
 					spdlog::info("[TFD][Defeat] TFDLeftForDeadState resolved {:08X}", g_leftForDeadStateGlobal->GetFormID());
 				}
 			}
-			if (!g_rescueStateGlobal) {
-				g_rescueStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRescueState");
-				if (g_rescueStateGlobal && !g_loggedRescueStateGlobal) {
-					g_loggedRescueStateGlobal = true;
-					spdlog::info("[TFD][Defeat] TFDRescueState resolved {:08X}", g_rescueStateGlobal->GetFormID());
-				}
-			}
 		}
 
-		static int CinematicReasonCode(CinematicTransitionKind kind, bool fadeIn)
+		[[maybe_unused]] static int CinematicReasonCode(CinematicTransitionKind kind, bool fadeIn)
 		{
 			switch (kind) {
 			case CinematicTransitionKind::Captive: return fadeIn ? 21 : 11;
@@ -4772,7 +4734,7 @@ namespace TFD::DefeatMonitor
 			g_pendingCinematicFadeInSawLoadingMenu = false;
 		}
 
-		static void SchedulePendingCinematicFadeIn(CinematicTransitionKind kind, const char* reason, int settleMs = 300)
+		[[maybe_unused]] static void SchedulePendingCinematicFadeIn(CinematicTransitionKind kind, const char* reason, int settleMs = 300)
 		{
 			if (kind == CinematicTransitionKind::None) {
 				ClearPendingCinematicFadeIn();
@@ -4849,7 +4811,7 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
-		static int ResolveNonCaptiveChoiceReason(const char* reason)
+		[[maybe_unused]] static int ResolveNonCaptiveChoiceReason(const char* reason)
 		{
 			if (!reason || !reason[0]) {
 				return 4;
@@ -4874,7 +4836,7 @@ namespace TFD::DefeatMonitor
 				reason ? reason : "unknown");
 		}
 
-		static int ConsumeTransitionResult()
+		[[maybe_unused]] static int ConsumeTransitionResult()
 		{
 			return 0;
 		}
@@ -5359,7 +5321,7 @@ namespace TFD::DefeatMonitor
 			return removedUnits > 0 || addedUnits > 0;
 		}
 
-		bool ProcessCaptiveConfiscation(const char* reason)
+		[[maybe_unused]] bool ProcessCaptiveConfiscation(const char* /*reason*/)
 		{
 			return false;
 		}
@@ -5734,8 +5696,7 @@ namespace TFD::DefeatMonitor
 
 		static void SetRescueStateValue(int value)
 		{
-			ResolveMonitorGlobals();
-			SetGlobalInt(g_rescueStateGlobal, value);
+			TFD::RescueRuntime::SetStateValue(value);
 		}
 
 		static void RefreshPostDefeatGlobals()
@@ -5749,7 +5710,6 @@ namespace TFD::DefeatMonitor
 			const bool victoryContext = IsVictoryCombatContextActive(player, enemies);
 			const bool routerCombatContext = IsRouterCombatContextActive(player, enemies);
 			const auto routerCombatActorFormID = ResolveRouterCombatActorFormID(player, enemies);
-			auto& flow = TFD::Flow::Controller::GetSingleton();
 			const bool pleasurePassiveLock = TFD::PleasureRuntime::IsPassiveLockActive();
 			if (pleasurePassiveLock) {
 				if (g_lastRouterCombatContextActive) {
@@ -5757,7 +5717,7 @@ namespace TFD::DefeatMonitor
 				}
 				g_lastRouterCombatContextActive = false;
 				SetGlobalInt(g_defeatStateGlobal, 0);
-				SetGlobalInt(g_victoryStateGlobal, 0);
+				TFD::VictoryRuntime::SetStateValue(0);
 				SetGlobalInt(g_hostileStateGlobal, 0);
 				SetGlobalInt(g_enemyFactionStateGlobal, 0);
 				SetGlobalInt(g_enemyRaceStateGlobal, 0);
@@ -5768,7 +5728,7 @@ namespace TFD::DefeatMonitor
 			TFD::InCombat::ObserveCombat(routerCombatActorFormID, routerCombatContext, "observed_combat_tick");
 			g_lastRouterCombatContextActive = routerCombatContext;
 			SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(player, defeatContext));
-			SetGlobalInt(g_victoryStateGlobal, ComputeVictoryState(player, victoryContext, enemies));
+			TFD::VictoryRuntime::SetStateValue(ComputeVictoryState(player, victoryContext, enemies));
 			SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(player, enemies));
 			SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(enemies));
 			SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(enemies));
@@ -5848,7 +5808,7 @@ namespace TFD::DefeatMonitor
 			g_boundEscapeDoor = door->GetHandle();
 		}
 
-		static RE::TESObjectCELL* GetParentCell(RE::TESObjectREFR* ref)
+		[[maybe_unused]] static RE::TESObjectCELL* GetParentCell(RE::TESObjectREFR* ref)
 		{
 			return ref ? ref->GetParentCell() : nullptr;
 		}
@@ -6496,7 +6456,6 @@ namespace TFD::DefeatMonitor
 
 		static void TickBleedLocks()
 		{
-			auto* player = Player();
 			const auto now = Now();
 			if (g_bleedLockLastScan.time_since_epoch().count() == 0 || (now - g_bleedLockLastScan) >= std::chrono::milliseconds(250)) {
 				g_bleedLockLastScan = now;
@@ -6668,7 +6627,7 @@ namespace TFD::DefeatMonitor
 		}
 
 
-		static const char* BleedDialogueOutcomeName(BleedDialogueOutcome outcome)
+		[[maybe_unused]] static const char* BleedDialogueOutcomeName(BleedDialogueOutcome outcome)
 		{
 			return TFD::Bleedout::GetDialogueOutcomeName(outcome);
 		}
@@ -7649,12 +7608,12 @@ namespace TFD::DefeatMonitor
 			MaintainTransitionCalmWindow();
 		}
 
-		static void BeginLeftForDeadBlackout(int, const char*)
+		[[maybe_unused]] static void BeginLeftForDeadBlackout(int, const char*)
 		{
 			// Disabled on C++ side. Native wait / blackout will be handled by CK/Papyrus.
 		}
 
-		static bool TickLeftForDeadBlackout()
+		[[maybe_unused]] static bool TickLeftForDeadBlackout()
 		{
 			return false;
 		}
@@ -8831,6 +8790,18 @@ namespace TFD::DefeatMonitor
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
+				if (TFD::PreCombatGreet::HandleModCallbackEvent(
+						ev,
+						TFD::PreCombatGreet::GraceEventHandlers{
+							[&](RE::Actor* graceActor, double seconds, const char* graceReason) {
+								ApplyReleaseFollowGraceToSpeakerAndCrowd(graceActor, seconds, graceReason);
+							},
+							[&](RE::Actor* graceActor, const char* graceReason) {
+								RemoveReleaseFollowGraceFromSpeakerAndCrowd(graceActor, graceReason);
+							}
+						})) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
 
 				if (name == kBleedoutOutcomeReleaseEvent ||
 					name == kPleasureOutcomeReleaseEvent) {
@@ -8851,12 +8822,12 @@ namespace TFD::DefeatMonitor
 					[&](TFD::InCombat::DialogueOutcome outcome, const char* reason) { TFD::InCombat::SetDialogueOutcome(outcome, reason); },
 					[&](const char* reason) { TFD::InCombat::ClearDialogueOutcome(reason); },
 					[&](std::uint32_t actorFormID, const char* reason) -> bool {
-						auto& flow = TFD::Flow::Controller::GetSingleton();
-						return flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, reason ? reason : "mod_event_captive");
+							auto& flow = TFD::Flow::Controller::GetSingleton();
+							return flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, reason ? reason : "mod_event_captive");
 					},
 					[&](std::uint32_t actorFormID, const char* reason) -> bool {
-						auto& flow = TFD::Flow::Controller::GetSingleton();
-						if (!flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
+							auto& flow = TFD::Flow::Controller::GetSingleton();
+							if (!flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
 							spdlog::warn("[TFD][Defeat] ignore mod_event_pleasure reason=begin_captive_reject actor={:08X}", actorFormID);
 							return false;
 						}
@@ -8936,8 +8907,8 @@ namespace TFD::DefeatMonitor
 					[&](const char* reason) { ClearBleedDialogueOutcome(reason); },
 					[&](const char* reason) { ClearBleedSystemEventOutcomeWindow(reason); },
 					[&](std::uint32_t actorFormID, const char* reason) -> bool {
-						auto& flow = TFD::Flow::Controller::GetSingleton();
-						if (!flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
+							auto& flow = TFD::Flow::Controller::GetSingleton();
+							if (!flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
 							spdlog::warn("[TFD][Defeat] ignore mod_event_pleasure reason=begin_captive_reject actor={:08X}", actorFormID);
 							return false;
 						}
@@ -9089,6 +9060,7 @@ namespace TFD::DefeatMonitor
 		if (g_installed.exchange(true, std::memory_order_acq_rel)) return;
 		g_running.store(true, std::memory_order_release);
 		g_loadTransition.store(false, std::memory_order_release);
+		TFD::CaptiveRuntime::ResetForLoad();
 		SetCaptiveRuntimeOnly(false, CaptivePhaseValue::None);
 		g_prevDialogueOpen = false;
 		ResetLockpickWatch();
@@ -9172,8 +9144,7 @@ namespace TFD::DefeatMonitor
 
 	std::uint32_t GetCaptivePhaseForSave()
 	{
-		if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) return 2u;
-		return static_cast<std::uint32_t>(static_cast<int>(g_captivePhase));
+		return TFD::CaptiveRuntime::GetPhaseRaw(g_captiveState, g_captivePhase);
 	}
 
 	bool GetBleedOutStateForSave()
@@ -9622,29 +9593,17 @@ namespace TFD::DefeatMonitor
 
 	std::uint32_t GetCaptivePhaseRaw()
 	{
-		if (g_captiveState && g_captivePhase == CaptivePhaseValue::None) {
-			return 2u;  // legacy/normalized escape fallback
-		}
-		return static_cast<std::uint32_t>(static_cast<int>(g_captivePhase));
+		return TFD::CaptiveRuntime::GetPhaseRaw(g_captiveState, g_captivePhase);
 	}
 
 	const char* GetCaptivePhaseName()
 	{
-		switch (g_captivePhase) {
-		case CaptivePhaseValue::None:
-			return g_captiveState ? "Escape" : "None";
-		case CaptivePhaseValue::Captive:
-			return "Captive";
-		case CaptivePhaseValue::Escape:
-			return "Escape";
-		default:
-			return "Unknown";
-		}
+		return TFD::CaptiveRuntime::GetPhaseName(g_captiveState, g_captivePhase);
 	}
 
 	bool IsCaptiveFamily()
 	{
-		return g_captiveState || g_captivePhase != CaptivePhaseValue::None;
+		return TFD::CaptiveRuntime::IsFamily(g_captiveState, g_captivePhase);
 	}
 
 	bool IsPlayerBleedHoldTargetBlocked()
@@ -9742,16 +9701,6 @@ namespace TFD::DefeatMonitor
 	bool HasReleaseFollowGraceForActor(RE::Actor* actor)
 	{
 		return HasReleaseFollowGrace(actor);
-	}
-
-	void ApplyReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason)
-	{
-		ApplyReleaseFollowGraceToSpeakerAndCrowd(speaker, durationSeconds, reason ? reason : "external_apply");
-	}
-
-	void RemoveReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, const char* reason)
-	{
-		RemoveReleaseFollowGraceFromSpeakerAndCrowd(speaker, reason ? reason : "external_remove");
 	}
 
 	void NoteEnemyTargetingPlayer(RE::Actor* actor)

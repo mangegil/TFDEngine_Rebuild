@@ -3,11 +3,16 @@
 #include <atomic>
 #include <cmath>
 #include <mutex>
+#include <string>
+#include <string_view>
 
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
 #include "TFDForceGreet.h"
+#include "TFDPacify.h"
+#include "TFDDefeatMonitor.h"
+#include "SKSE/SKSE.h"
 #include "TFDInCombat.h"
 
 namespace TFD::InCombatGreet
@@ -23,6 +28,8 @@ namespace TFD::InCombatGreet
 			bool stickyReopenPending = false;
 			Clock::time_point nextRetry{};
 			int retryCount = 0;
+			RE::FormID pacifySessionId = 0;
+			bool assignSent = false;
 		};
 
 		std::atomic_bool g_installed{ false };
@@ -30,12 +37,111 @@ namespace TFD::InCombatGreet
 		std::atomic<std::uint32_t> g_speakerFormID{ 0 };
 		RuntimeState g_runtime{};
 
+		double NowSec()
+		{
+			return std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+		}
+
+		void SendBridgeEvent(const char* eventName, RE::TESForm* sender)
+		{
+			if (!eventName) {
+				return;
+			}
+
+			auto* task = SKSE::GetTaskInterface();
+			if (!task) {
+				return;
+			}
+
+			const std::string name{ eventName };
+			std::uint32_t handle = 0;
+			if (auto* actor = sender ? sender->As<RE::Actor>() : nullptr) {
+				handle = actor->GetHandle().native_handle();
+			}
+
+			task->AddTask([name, handle]() {
+				RE::TESForm* outSender = nullptr;
+				if (handle != 0) {
+					auto sp = RE::Actor::LookupByHandle(handle);
+					outSender = sp.get();
+					if (!outSender) {
+						return;
+					}
+				}
+
+				auto* src = SKSE::GetModCallbackEventSource();
+				if (!src) {
+					return;
+				}
+
+				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
+				src->SendEvent(&ev);
+			});
+		}
+
+		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return false;
+			}
+			if (actor->GetFormID() == player->GetFormID()) {
+				return false;
+			}
+			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+				return false;
+			}
+			return true;
+		}
+
+		TFD::Pacify::ReleaseReason ResolveReleaseReason(const char* reason)
+		{
+			const auto text = reason ? std::string_view(reason) : std::string_view{};
+			if (text.find("dialogue_closed") != std::string_view::npos) {
+				return TFD::Pacify::ReleaseReason::DialogueClosed;
+			}
+			if (text.find("handoff") != std::string_view::npos) {
+				return TFD::Pacify::ReleaseReason::FlowHandoff;
+			}
+			return TFD::Pacify::ReleaseReason::Generic;
+		}
+
 		void ResetRuntimeLocked()
 		{
 			g_runtime.sawDialogue = false;
 			g_runtime.stickyReopenPending = false;
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
+			g_runtime.pacifySessionId = 0;
+			g_runtime.assignSent = false;
+		}
+
+		void ReleaseTrackedSession(TFD::Pacify::ReleaseReason releaseReason)
+		{
+			RE::FormID sessionId = 0;
+			bool assignSent = false;
+			{
+				std::scoped_lock lk(g_runtime.lock);
+				sessionId = g_runtime.pacifySessionId;
+				assignSent = g_runtime.assignSent;
+				g_runtime.pacifySessionId = 0;
+				g_runtime.assignSent = false;
+			}
+
+			const auto speakerFormID = g_speakerFormID.load(std::memory_order_acquire);
+			auto* speaker = speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(speakerFormID) : nullptr;
+			if (assignSent) {
+				if (speaker) {
+					SendBridgeEvent("TFDInCombatClear", speaker);
+				} else {
+					SendBridgeEvent("TFDInCombatClearAll", nullptr);
+				}
+			}
+			if (sessionId != 0) {
+				TFD::Pacify::ReleaseSession(sessionId, releaseReason);
+			}
 		}
 
 		bool CompleteDialogueClosedInternal(const char* reason)
@@ -81,10 +187,80 @@ namespace TFD::InCombatGreet
 
 	void Reset()
 	{
+		ReleaseTrackedSession(TFD::Pacify::ReleaseReason::Generic);
 		g_state.store(State::Idle, std::memory_order_release);
 		g_speakerFormID.store(0, std::memory_order_release);
 		ResetRuntime("reset");
 		spdlog::info("[TFD][InCombatGreet] Reset");
+	}
+
+	bool BeginForActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::None;
+		}
+		if (!IsCandidate(speaker, player)) {
+			return false;
+		}
+
+		const auto now = NowSec();
+		const auto result = TFD::InteractionRouter::HandleHotkeyPress(player, speaker, false, now);
+		if (outAction) {
+			*outAction = result.action;
+		}
+
+		spdlog::info(
+			"[TFD][InCombatGreet] BeginForActor actor={:08X} action={} executed={} dialogueRequested={} fail={}",
+			speaker ? speaker->GetFormID() : 0u,
+			TFD::InteractionRouter::ToString(result.action),
+			result.executed ? 1 : 0,
+			result.dialogueRequested ? 1 : 0,
+			TFD::InteractionRouter::ToString(result.failReason));
+
+		if (!result.executed || result.sessionId == 0 || result.action != TFD::InteractionRouter::Action::TruceInCombat) {
+			if (result.sessionId != 0 && result.action != TFD::InteractionRouter::Action::TruceInCombat) {
+				TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+			}
+			return false;
+		}
+
+		if (result.dialogueRequested && !TFD::Pacify::CanOpenDialogue(speaker)) {
+			TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+			return false;
+		}
+
+		CancelAll("begin_replace");
+
+		if (!TFD::InCombat::BeginTruce(speaker->GetFormID(), result.dialogueRequested, "incombat_truce_begin")) {
+			TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+			return false;
+		}
+
+		if (result.dialogueRequested) {
+			if (player && player->IsInCombat()) {
+				player->StopCombat();
+			}
+			SendBridgeEvent("TFDInCombatAssign", speaker);
+			if (!Begin(speaker, "incombat_dialogue_begin")) {
+				SendBridgeEvent("TFDInCombatClear", speaker);
+				TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+				TFD::InCombat::Complete("incombat_greet_begin_failed");
+				return false;
+			}
+		}
+		else {
+			ResetRuntime("begin_no_dialogue");
+			g_speakerFormID.store(speaker->GetFormID(), std::memory_order_release);
+		}
+
+		{
+			std::scoped_lock lk(g_runtime.lock);
+			g_runtime.pacifySessionId = result.sessionId;
+			g_runtime.assignSent = result.dialogueRequested;
+		}
+
+		return true;
 	}
 
 	bool Begin(RE::Actor* speaker, const char* reason)
@@ -124,6 +300,7 @@ namespace TFD::InCombatGreet
 	void CancelAll(const char* reason)
 	{
 		const auto formID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
+		ReleaseTrackedSession(ResolveReleaseReason(reason));
 		ResetRuntime("cancel");
 		TFD::ForceGreet::Cancel();
 		g_state.store(State::Idle, std::memory_order_release);

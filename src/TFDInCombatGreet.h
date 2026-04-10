@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <functional>
 
+#include "TFDInteractionRouter.h"
+
 namespace RE
 {
 	class Actor;
@@ -46,6 +48,7 @@ namespace TFD::InCombatGreet
 
 	void Install();
 	void Reset();
+	bool BeginForActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction = nullptr);
 	void ResetRuntime(const char* reason = nullptr);
 	bool Begin(RE::Actor* speaker, const char* reason = nullptr);
 	bool BeginAfterPleasure(RE::Actor* speaker, const char* reason = nullptr);

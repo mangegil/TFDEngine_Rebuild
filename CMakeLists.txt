@@ -32,12 +32,14 @@ add_library(TFDEngine SHARED
     src/main.cpp
     src/TFDSettings.cpp
     src/TFDLocation.cpp
+    src/TFDCaptiveRuntime.cpp
+    src/TFDRescueRuntime.cpp
+    src/TFDVictoryRuntime.cpp
     src/TFDActorScan.cpp
     src/TFDAntiAggro.cpp
     src/TFDDefeatMonitor.cpp
     src/TFDFactionMask.cpp
     src/TFDAggressionClamp.cpp
-    src/TFDPreCombat.cpp
     src/TFDPreCombatGreet.cpp
     src/TFDInCombat.cpp
     src/TFDInCombatGreet.cpp

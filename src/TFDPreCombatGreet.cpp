@@ -23,7 +23,6 @@
 #include "TFDInteractionRouter.h"
 #include "TFDLocation.h"
 #include "TFDPacify.h"
-#include "TFDInCombat.h"
 #include "TFDFlowController.h"
 #include "TFDForceGreet.h"
 #include "TFDPleasureRuntime.h"
@@ -58,7 +57,6 @@ namespace TFD::PreCombatGreet
 			bool dialogueRequested{ false };
 			bool dialogSeen{ false };
 			bool assignSent{ false };
-			double nextDebugLogSec{ 0.0 };
 
 			bool stickyReopenPending{ false };
 			bool terminalChoiceCommitted{ false };
@@ -191,7 +189,8 @@ namespace TFD::PreCombatGreet
 				gRecentActorCellFormID = cell->GetFormID();
 				auto* ws = GetCellWorldspace(cell);
 				gRecentActorWorldspaceFormID = ws ? ws->GetFormID() : 0u;
-			} else {
+			}
+			else {
 				gRecentActorInterior = false;
 				gRecentActorCellFormID = 0;
 				gRecentActorWorldspaceFormID = 0;
@@ -269,7 +268,7 @@ namespace TFD::PreCombatGreet
 
 				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
 				src->SendEvent(&ev);
-			});
+				});
 		}
 
 		struct BridgeEventNames
@@ -284,8 +283,6 @@ namespace TFD::PreCombatGreet
 			switch (action) {
 			case TFD::InteractionRouter::Action::TrucePreCombat:
 				return { "TFDPreCombatAssign", "TFDPreCombatClear", "TFDPreCombatClearAll" };
-			case TFD::InteractionRouter::Action::TruceInCombat:
-				return { "TFDInCombatAssign", "TFDInCombatClear", "TFDInCombatClearAll" };
 			default:
 				return {};
 			}
@@ -294,7 +291,6 @@ namespace TFD::PreCombatGreet
 		void ClearAllBridgeAliases()
 		{
 			SendBridgeEvent("TFDPreCombatClearAll", nullptr);
-			SendBridgeEvent("TFDInCombatClearAll", nullptr);
 		}
 
 		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -396,7 +392,7 @@ namespace TFD::PreCombatGreet
 			}
 		}
 
-		
+
 		std::uint32_t ResolveSinglePendingActorFormIDLocked()
 		{
 			if (gPending.size() != 1) {
@@ -491,7 +487,7 @@ namespace TFD::PreCombatGreet
 		{
 			(void)pending;
 			// Final policy: only BleedOut stays sticky.
-			// PreCombat and InCombat must abort back to aggression when dialogue closes without a committed choice.
+			// PreCombat must abort back to aggression when dialogue closes without a committed choice.
 			return false;
 		}
 
@@ -499,12 +495,7 @@ namespace TFD::PreCombatGreet
 		{
 			auto snapshot = TFD::Flow::Controller::GetSingleton().GetSnapshot();
 
-			if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat ||
-				pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-				if (snapshot.root == TFD::Flow::RootFlow::InCombat && !snapshot.terminalResolved && snapshot.gate == TFD::Flow::DecisionGate::None) {
-					return TFD::Pacify::ReleaseReason::DialogueClosed;
-				}
-
+			if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
 				if (snapshot.root == TFD::Flow::RootFlow::Captive ||
 					snapshot.root == TFD::Flow::RootFlow::Victory ||
 					snapshot.terminalResolved ||
@@ -527,20 +518,12 @@ namespace TFD::PreCombatGreet
 			pending.stickyReopenPending = true;
 			pending.terminalChoiceCommitted = false;
 			pending.expiresSec = now + kManualWindowSec;
-			pending.nextDebugLogSec = now;
 			pending.nextStickyRetrySec = now + kStickyReopenRetrySec;
 			pending.stickySuppressTerminalUntilSec = now + kStickyTerminalSuppressSec;
 			CacheRecentActor(actor, 0.0, reason ? reason : "sticky_reopen");
 
-			switch (pending.action) {
-			case TFD::InteractionRouter::Action::TrucePreCombat:
+			if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
 				TFD::ForceGreet::BeginPreCombatTruce(actor);
-				break;
-			case TFD::InteractionRouter::Action::TruceInCombat:
-				TFD::ForceGreet::BeginInCombatTruce(actor);
-				break;
-			default:
-				break;
 			}
 
 			spdlog::info(
@@ -573,7 +556,7 @@ namespace TFD::PreCombatGreet
 		}
 
 
-bool HasProtectedPleasurePendingLocked()
+		bool HasProtectedPleasurePendingLocked()
 		{
 			for (auto& [handle, pending] : gPending) {
 				if (!pending.dialogueRequested) {
@@ -591,32 +574,6 @@ bool HasProtectedPleasurePendingLocked()
 			return false;
 		}
 
-		void LogInCombatDialogueState(const char* tag, RE::Actor* actor, bool dialogueOpen)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!actor || !player) {
-				return;
-			}
-
-			auto* actorCell = actor->GetParentCell();
-			auto* playerCell = player->GetParentCell();
-			const bool sameCell = actorCell && playerCell && actorCell == playerCell;
-			const float dist = actor->GetPosition().GetDistance(player->GetPosition());
-			const bool hostile = actor->IsHostileToActor(player);
-
-			spdlog::info(
-				"[TFD][InCombatDebug] {} actor={:08X} inCombat={} weaponDrawn={} hostile={} loaded={} sameCell={} pacified={} dialogueOpen={} dist={:.1f}",
-				tag ? tag : "state",
-				actor->GetFormID(),
-				actor->IsInCombat() ? 1 : 0,
-				actor->IsWeaponDrawn() ? 1 : 0,
-				hostile ? 1 : 0,
-				actor->Is3DLoaded() ? 1 : 0,
-				sameCell ? 1 : 0,
-				TFD::Pacify::IsPacified(actor) ? 1 : 0,
-				dialogueOpen ? 1 : 0,
-				dist);
-		}
 
 		void CleanupOne(
 			RE::Actor* actor,
@@ -759,19 +716,6 @@ bool HasProtectedPleasurePendingLocked()
 
 				auto* actor = ResolvePleasureEventActor(ev);
 
-				if (HandleModCallbackEvent(
-						ev,
-						GraceEventHandlers{
-							[&](RE::Actor* graceActor, double seconds, const char* graceReason) {
-								TFD::DefeatMonitor::ApplyReleaseFollowGraceForSpeakerAndCrowd(graceActor, seconds, graceReason);
-							},
-							[&](RE::Actor* graceActor, const char* graceReason) {
-								TFD::DefeatMonitor::RemoveReleaseFollowGraceForSpeakerAndCrowd(graceActor, graceReason);
-							}
-						})) {
-					return RE::BSEventNotifyControl::kContinue;
-				}
-
 				if (name == kPreCombatOutcomePayEvent ||
 					name == kPreCombatOutcomeFightEvent ||
 					name == kPreCombatOutcomeCaptiveEvent ||
@@ -794,27 +738,32 @@ bool HasProtectedPleasurePendingLocked()
 							ArmPreCombatPayFollowupLocked(actor, *matchedPending, "mod_event_precombat_pay");
 						}
 						spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> waiting for followup branch", actorFormID);
-					} else if (name == kPreCombatOutcomeFightEvent) {
+					}
+					else if (name == kPreCombatOutcomeFightEvent) {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight");
-					} else if (name == kPreCombatOutcomeCaptiveEvent) {
+					}
+					else if (name == kPreCombatOutcomeCaptiveEvent) {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive");
-					} else if (name == kPreCombatOutcomeJoinEnemyEvent) {
+					}
+					else if (name == kPreCombatOutcomeJoinEnemyEvent) {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy");
-					} else if (name == kPreCombatOutcomeReleaseEvent) {
+					}
+					else if (name == kPreCombatOutcomeReleaseEvent) {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_release");
-					} else {
+					}
+					else {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
@@ -876,7 +825,7 @@ bool HasProtectedPleasurePendingLocked()
 				const bool preserveProtectedHandoff =
 					preserveAfterPleasureHandoff ||
 					(TFD::DefeatMonitor::IsPassiveHoldProtectedHandoff() &&
-					HasProtectedPleasurePendingLocked());
+						HasProtectedPleasurePendingLocked());
 
 				if (!preserveProtectedHandoff) {
 					spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} -> clear pending",
@@ -911,15 +860,8 @@ bool HasProtectedPleasurePendingLocked()
 					continue;
 				}
 
-				if (pending.action == TFD::InteractionRouter::Action::TruceInCombat && now >= pending.nextDebugLogSec) {
-					LogInCombatDialogueState("tick", actor, dialogueOpen);
-					pending.nextDebugLogSec = now + 0.75;
-				}
 
 				if (!TFD::Pacify::IsPacified(actor)) {
-					if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-						LogInCombatDialogueState("pacify_lost", actor, dialogueOpen);
-					}
 					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::Pacify::ReleaseReason::Generic);
 					it = gPending.erase(it);
 					continue;
@@ -943,9 +885,6 @@ bool HasProtectedPleasurePendingLocked()
 					}
 
 					if (pending.stickyReopenPending && !pending.terminalChoiceCommitted && now >= pending.nextStickyRetrySec) {
-						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-							LogInCombatDialogueState("sticky_watchdog", actor, dialogueOpen);
-						}
 						BeginStickyReopenLocked(actor, pending, "sticky_watchdog");
 						++it;
 						continue;
@@ -958,9 +897,6 @@ bool HasProtectedPleasurePendingLocked()
 							continue;
 						}
 
-						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-							LogInCombatDialogueState("dialogue_closed", actor, dialogueOpen);
-						}
 						if (ShouldStickyReopenLocked(pending)) {
 							BeginStickyReopenLocked(actor, pending, "dialogue_closed_no_choice");
 							++it;
@@ -976,9 +912,6 @@ bool HasProtectedPleasurePendingLocked()
 				}
 				else {
 					if (actor->IsInCombat()) {
-						if (pending.action == TFD::InteractionRouter::Action::TruceInCombat) {
-							LogInCombatDialogueState("tame_broken", actor, dialogueOpen);
-						}
 						CleanupOne(actor, pending, kCooldownAfterFailSec, "tame_broken", TFD::Pacify::ReleaseReason::TameBroken);
 						it = gPending.erase(it);
 						continue;
@@ -1143,6 +1076,15 @@ bool HasProtectedPleasurePendingLocked()
 			return false;
 		}
 
+		if (result.action != TFD::InteractionRouter::Action::TrucePreCombat) {
+			TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+			spdlog::warn(
+				"[TFD][PreCombatGreet] rejected non-precombat action actor={:08X} action={}",
+				actor->GetFormID(),
+				TFD::InteractionRouter::ToString(result.action));
+			return false;
+		}
+
 		if (!gPending.empty()) {
 			ClearAllPendingLocked();
 		}
@@ -1154,20 +1096,11 @@ bool HasProtectedPleasurePendingLocked()
 		pending.dialogueRequested = result.dialogueRequested;
 		pending.dialogSeen = false;
 		pending.assignSent = false;
-		pending.nextDebugLogSec = now;
 		pending.stickyReopenPending = false;
 		pending.terminalChoiceCommitted = false;
 		pending.nextStickyRetrySec = 0.0;
 		pending.stickySuppressTerminalUntilSec = 0.0;
 
-		if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
-			LogInCombatDialogueState("begin_after_router", actor, IsDialogueOpen());
-			spdlog::info(
-				"[TFD][InCombatDebug] begin session actor={:08X} sessionId={} canOpenDialogue={}",
-				actor->GetFormID(),
-				result.sessionId,
-				TFD::Pacify::CanOpenDialogue(actor) ? 1 : 0);
-		}
 
 		if (result.dialogueRequested) {
 			if (!TFD::Pacify::CanOpenDialogue(actor)) {
@@ -1177,18 +1110,8 @@ bool HasProtectedPleasurePendingLocked()
 
 			const auto bridge = GetBridgeEventNames(result.action);
 			if (bridge.assign) {
-				if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
-					if (player->IsInCombat()) {
-						player->StopCombat();
-					}
-				}
-
 				SendBridgeEvent(bridge.assign, actor);
 				pending.assignSent = true;
-
-				if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
-					LogInCombatDialogueState("assign_sent", actor, IsDialogueOpen());
-				}
 			}
 		}
 
@@ -1202,8 +1125,6 @@ bool HasProtectedPleasurePendingLocked()
 			if (result.dialogueRequested) {
 				(void)flow.BeginTruceDecision(actor->GetFormID(), "precombat_dialogue_begin");
 			}
-		} else if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
-			(void)TFD::InCombat::BeginTruce(actor->GetFormID(), result.dialogueRequested, "incombat_truce_begin");
 		}
 
 		gPending.emplace(handle, pending);

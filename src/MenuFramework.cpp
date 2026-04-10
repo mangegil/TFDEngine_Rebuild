@@ -28,6 +28,7 @@
 #include "TFDAntiAggro.h"
 #include "TFDForceGreet.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDInCombatGreet.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDTargetClassifier.h"
 #include "TFDInteractionRouter.h"
@@ -2633,7 +2634,10 @@ namespace TFDMenu
 
 					TFD::InteractionRouter::Action truceAction = TFD::InteractionRouter::Action::None;
 					SetInteractionStateValue(InteractionStateForPickMode(pickMode));
-					const bool truceStarted = TFD::PreCombatGreet::BeginForActor(target, &truceAction);
+					const bool truceStarted =
+						pickMode == HotkeyPickMode::TruceInCombat ?
+						TFD::InCombatGreet::BeginForActor(target, &truceAction) :
+						TFD::PreCombatGreet::BeginForActor(target, &truceAction);
 					if (!truceStarted) {
 						RE::DebugNotification("TFD: Truce Failed");
 						ClearInteractionStateValue();
