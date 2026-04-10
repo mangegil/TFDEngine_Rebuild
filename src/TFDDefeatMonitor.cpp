@@ -74,9 +74,6 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kBleedoutOutcomeCaptiveEvent = "TFDBleedoutOutcomeCaptive";
 		constexpr const char* kBleedoutOutcomeReleaseEvent = "TFDBleedoutOutcomeRelease";
 		constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
-		constexpr const char* kPreCombatOutcomeReleaseEvent = "TFDPreCombatOutcomeRelease";
-		constexpr const char* kPreCombatOutcomeReleaseEndEvent = "TFDPreCombatOutcomeReleaseEnd";
-		constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
 		constexpr const char* kInCombatOutcomeReleaseEvent = "TFDInCombatOutcomeRelease";
 		constexpr const char* kInCombatOutcomeFollowEvent = "TFDInCombatOutcomeFollow";
 		constexpr const char* kInCombatOutcomePayEvent = "TFDInCombatOutcomePay";
@@ -1674,7 +1671,6 @@ namespace TFD::DefeatMonitor
 		static RE::Actor* FindBestBleedoutSpeaker(float radius, float maxDist, RE::Actor* preferred = nullptr);
 		static RE::Actor* ChooseBleedoutCaptorStrict(float radius, float maxDist, RE::Actor* preferred = nullptr);
 		static bool IsReasonableBleedoutSpeaker(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance = nullptr);
-		static RE::Actor* ResolveRecentPreCombatAggressor(float radius);
 		static void SetGraceSeconds(int seconds);
 		static void RecoverPlayerForTransition();
 		static void MaintainTransitionCalmWindow();
@@ -7099,26 +7095,6 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
-		static RE::Actor* ResolveRecentPreCombatAggressor(float radius)
-		{
-			auto* player = Player();
-			if (!player) {
-				return nullptr;
-			}
-
-			auto* actor = TFD::PreCombatGreet::GetRecentActor(12.0);
-			if (!actor) {
-				return nullptr;
-			}
-
-			float dist = -1.0f;
-			if (!IsReasonableCombatAggressor(actor, player, radius, &dist)) {
-				return nullptr;
-			}
-
-			spdlog::info("[TFD][Defeat] using recent precombat actor {:08X} as defeat aggressor dist={:.1f}", actor->GetFormID(), dist);
-			return actor;
-		}
 
 		static void ClearLastEnemyTargetingPlayerInternal()
 		{
@@ -7210,8 +7186,7 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			if (auto* recent = ResolveRecentPreCombatAggressor(maxAggressorDist)) {
-				g_lastAggressor = recent->GetHandle();
+			if (auto* recent = TFD::PreCombatGreet::ResolveRecentAggressorAndCache(maxAggressorDist, g_lastAggressor)) {
 				return recent;
 			}
 
@@ -8856,25 +8831,6 @@ namespace TFD::DefeatMonitor
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
-				if (name == kPreCombatOutcomeReleaseEvent ||
-					name == kPreCombatOutcomeFollowEvent ||
-					name == kPreCombatOutcomeReleaseEndEvent) {
-					auto* actor = ResolveActorFromEventArg(ev->strArg.c_str() ? std::string_view(ev->strArg.c_str()) : std::string_view{});
-					const double durationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 20.0;
-					(void)TFD::PreCombatGreet::HandleGraceModEvent(
-						rawName,
-						actor,
-						durationSec,
-						TFD::PreCombatGreet::GraceEventHandlers{
-							[&](RE::Actor* graceActor, double seconds, const char* graceReason) {
-								ApplyReleaseFollowGraceToSpeakerAndCrowd(graceActor, seconds, graceReason);
-							},
-							[&](RE::Actor* graceActor, const char* graceReason) {
-								RemoveReleaseFollowGraceFromSpeakerAndCrowd(graceActor, graceReason);
-							}
-						});
-					return RE::BSEventNotifyControl::kContinue;
-				}
 
 				if (name == kBleedoutOutcomeReleaseEvent ||
 					name == kPleasureOutcomeReleaseEvent) {
@@ -9786,6 +9742,16 @@ namespace TFD::DefeatMonitor
 	bool HasReleaseFollowGraceForActor(RE::Actor* actor)
 	{
 		return HasReleaseFollowGrace(actor);
+	}
+
+	void ApplyReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason)
+	{
+		ApplyReleaseFollowGraceToSpeakerAndCrowd(speaker, durationSeconds, reason ? reason : "external_apply");
+	}
+
+	void RemoveReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, const char* reason)
+	{
+		RemoveReleaseFollowGraceFromSpeakerAndCrowd(speaker, reason ? reason : "external_remove");
 	}
 
 	void NoteEnemyTargetingPlayer(RE::Actor* actor)

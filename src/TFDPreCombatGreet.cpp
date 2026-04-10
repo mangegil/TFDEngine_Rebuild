@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -85,6 +87,29 @@ namespace TFD::PreCombatGreet
 
 		void ResolvePreCombatTerminalOutcomeLocked(TFD::Flow::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
 		void MarkTerminalChoiceCommittedLocked(Pending& pending, const char* reason);
+
+		bool IsGraceEventName(std::string_view eventName)
+		{
+			return eventName == std::string_view("TFDPreCombatOutcomeRelease") ||
+				eventName == std::string_view("TFDPreCombatOutcomeFollow") ||
+				eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd");
+		}
+
+		RE::Actor* ResolveActorFromEventArgRaw(const char* eventArg)
+		{
+			if (!eventArg || !*eventArg) {
+				return nullptr;
+			}
+
+			char* end = nullptr;
+			const auto raw = std::strtoul(eventArg, &end, 0);
+			if (end == nullptr || end == eventArg) {
+				return nullptr;
+			}
+
+			return RE::TESForm::LookupByID<RE::Actor>(static_cast<RE::FormID>(raw));
+		}
+
 
 		double NowSec()
 		{
@@ -734,6 +759,19 @@ bool HasProtectedPleasurePendingLocked()
 
 				auto* actor = ResolvePleasureEventActor(ev);
 
+				if (HandleModCallbackEvent(
+						ev,
+						GraceEventHandlers{
+							[&](RE::Actor* graceActor, double seconds, const char* graceReason) {
+								TFD::DefeatMonitor::ApplyReleaseFollowGraceForSpeakerAndCrowd(graceActor, seconds, graceReason);
+							},
+							[&](RE::Actor* graceActor, const char* graceReason) {
+								TFD::DefeatMonitor::RemoveReleaseFollowGraceForSpeakerAndCrowd(graceActor, graceReason);
+							}
+						})) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
 				if (name == kPreCombatOutcomePayEvent ||
 					name == kPreCombatOutcomeFightEvent ||
 					name == kPreCombatOutcomeCaptiveEvent ||
@@ -1173,16 +1211,30 @@ bool HasProtectedPleasurePendingLocked()
 	}
 
 
-	bool HandleReleaseFollowEvent(const GraceEventContext& context, const GraceEventHandlers& handlers)
+	bool HandleGraceModEvent(const GraceEventContext& context, const GraceEventHandlers& handlers)
 	{
 		auto* actor = context.actor;
 		if (!actor) {
 			return false;
 		}
 
-		const char* eventName = context.eventName ? context.eventName : "";
+		const std::string_view eventName = context.eventName ? std::string_view(context.eventName) : std::string_view{};
+		if (!IsGraceEventName(eventName)) {
+			return false;
+		}
+		if (eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd")) {
+			if (handlers.removeGrace) {
+				handlers.removeGrace(actor, "precombat_release_end");
+			}
+
+			spdlog::info(
+				"[TFD][PreCombatGreet] grace handled actor={:08X} reason=precombat_release_end",
+				actor->GetFormID());
+			return true;
+		}
+
 		const char* graceReason =
-			std::string_view(eventName) == std::string_view("TFDPreCombatOutcomeFollow") ?
+			eventName == std::string_view("TFDPreCombatOutcomeFollow") ?
 			"precombat_follow" :
 			"precombat_release";
 
@@ -1192,50 +1244,103 @@ bool HasProtectedPleasurePendingLocked()
 		}
 
 		spdlog::info(
-			"[TFD][PreCombatGreet] release/follow handled actor={:08X} reason={} duration={}",
+			"[TFD][PreCombatGreet] grace handled actor={:08X} reason={} duration={}",
 			actor->GetFormID(),
 			graceReason,
 			durationSec);
 		return true;
 	}
 
-	bool HandleReleaseEndEvent(RE::Actor* actor, const GraceEventHandlers& handlers)
+	bool HandleGraceModEventRaw(const char* eventName, const char* eventArg, double durationSec, const GraceEventHandlers& handlers)
 	{
-		if (!actor) {
-			return false;
-		}
-
-		if (handlers.removeGrace) {
-			handlers.removeGrace(actor, "precombat_release_end");
-		}
-
-		spdlog::info(
-			"[TFD][PreCombatGreet] release end handled actor={:08X}",
-			actor->GetFormID());
-		return true;
+		GraceEventContext context{};
+		context.eventName = eventName;
+		context.actor = ResolveActorFromEventArgRaw(eventArg);
+		context.durationSec = durationSec > 0.0 ? durationSec : 20.0;
+		return HandleGraceModEvent(context, handlers);
 	}
 
-	bool HandleGraceModEvent(const char* rawEventName, RE::Actor* actor, double durationSec, const GraceEventHandlers& handlers)
+	bool HandleModEventRaw(const char* eventName, const char* eventArg, double durationSec, const GraceEventHandlers& handlers)
 	{
-		const std::string_view name = rawEventName ? std::string_view(rawEventName) : std::string_view{};
-		if (name.empty()) {
+		const std::string_view name = eventName ? std::string_view(eventName) : std::string_view{};
+		if (!IsGraceEventName(name)) {
+			return false;
+		}
+		return HandleGraceModEventRaw(eventName, eventArg, durationSec, handlers);
+	}
+
+	bool HandleModCallbackEvent(const SKSE::ModCallbackEvent* ev, const GraceEventHandlers& handlers)
+	{
+		if (!ev) {
 			return false;
 		}
 
-		if (name == std::string_view("TFDPreCombatOutcomeRelease") ||
-			name == std::string_view("TFDPreCombatOutcomeFollow")) {
-			GraceEventContext context{};
-			context.eventName = rawEventName;
-			context.actor = actor;
-			context.durationSec = durationSec;
-			return HandleReleaseFollowEvent(context, handlers);
+		const char* eventName = ev->eventName.c_str();
+		const char* eventArg = ev->strArg.c_str();
+		const double durationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 20.0;
+		return HandleModEventRaw(eventName, eventArg, durationSec, handlers);
+	}
+
+	RE::Actor* ResolveRecentAggressor(float radius, double maxAgeSec)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player) {
+			return nullptr;
 		}
 
-		if (name == std::string_view("TFDPreCombatOutcomeReleaseEnd")) {
-			return HandleReleaseEndEvent(actor, handlers);
+		auto* actor = GetRecentActor(maxAgeSec);
+		if (!actor || actor == player) {
+			return nullptr;
+		}
+		if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			return nullptr;
+		}
+		if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+			return nullptr;
 		}
 
-		return false;
+		auto* playerCell = player->GetParentCell();
+		auto* actorCell = actor->GetParentCell();
+		if (playerCell && actorCell != playerCell) {
+			return nullptr;
+		}
+		auto* playerWs = player->GetWorldspace();
+		if (playerWs && actor->GetWorldspace() != playerWs) {
+			return nullptr;
+		}
+
+		const auto pp = player->GetPosition();
+		const auto ap = actor->GetPosition();
+		const float dx = ap.x - pp.x;
+		const float dy = ap.y - pp.y;
+		const float dz = ap.z - pp.z;
+		const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+		if (radius > 0.0f && dist > radius) {
+			return nullptr;
+		}
+
+		if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
+			spdlog::info("[TFD][PreCombatGreet] using recent aggressor actor={:08X} dist={:.1f}", actor->GetFormID(), dist);
+			return actor;
+		}
+
+		auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+		auto* currentTarget = targetSp.get();
+		if (currentTarget == player || (currentTarget && currentTarget->IsPlayerTeammate())) {
+			spdlog::info("[TFD][PreCombatGreet] using recent aggressor actor={:08X} dist={:.1f} reason=current_target", actor->GetFormID(), dist);
+			return actor;
+		}
+
+		return nullptr;
+	}
+
+	RE::Actor* ResolveRecentAggressorAndCache(float radius, RE::ActorHandle& cacheHandle, double maxAgeSec)
+	{
+		auto* actor = ResolveRecentAggressor(radius, maxAgeSec);
+		if (actor) {
+			cacheHandle = actor->GetHandle();
+		}
+		return actor;
 	}
 
 	RE::Actor* GetRecentActor(double maxAgeSec)

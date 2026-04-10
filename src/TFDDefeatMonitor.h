@@ -71,6 +71,8 @@ namespace TFD::DefeatMonitor
 	bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct = 55.0f);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
 	bool HasReleaseFollowGraceForActor(RE::Actor* actor);
+	void ApplyReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason = nullptr);
+	void RemoveReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, const char* reason = nullptr);
 	void NoteEnemyTargetingPlayer(RE::Actor* actor);
 	RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
 	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);

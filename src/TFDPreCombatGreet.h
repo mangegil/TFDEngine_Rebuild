@@ -6,6 +6,11 @@
 
 #include "TFDInteractionRouter.h"
 
+namespace SKSE
+{
+	struct ModCallbackEvent;
+}
+
 namespace TFD::PreCombatGreet
 {
 
@@ -35,9 +40,12 @@ namespace TFD::PreCombatGreet
 	void OnLoadingScreenClosed();
 	void OnCaptiveHandoffArrived();
 
-	bool HandleReleaseFollowEvent(const GraceEventContext& context, const GraceEventHandlers& handlers);
-	bool HandleReleaseEndEvent(RE::Actor* actor, const GraceEventHandlers& handlers);
-	bool HandleGraceModEvent(const char* rawEventName, RE::Actor* actor, double durationSec, const GraceEventHandlers& handlers);
+	bool HandleGraceModEvent(const GraceEventContext& context, const GraceEventHandlers& handlers);
+	bool HandleGraceModEventRaw(const char* eventName, const char* eventArg, double durationSec, const GraceEventHandlers& handlers);
+bool HandleModEventRaw(const char* eventName, const char* eventArg, double durationSec, const GraceEventHandlers& handlers);
+	bool HandleModCallbackEvent(const SKSE::ModCallbackEvent* ev, const GraceEventHandlers& handlers);
 
 	RE::Actor* GetRecentActor(double maxAgeSec = 0.0);
+	RE::Actor* ResolveRecentAggressor(float radius, double maxAgeSec = 12.0);
+	RE::Actor* ResolveRecentAggressorAndCache(float radius, RE::ActorHandle& cacheHandle, double maxAgeSec = 12.0);
 }
