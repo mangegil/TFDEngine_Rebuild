@@ -57,5 +57,7 @@ namespace TFD::CaptiveRuntime
 bool IsEscapeActive();
 bool IsStandardCaptiveActive();
 
+bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
+
 void ResetForLoad();
 }

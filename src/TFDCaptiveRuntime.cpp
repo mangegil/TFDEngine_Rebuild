@@ -1,9 +1,188 @@
 #include "TFDCaptiveRuntime.h"
 
+#include "TFDActorScan.h"
+#include "TFDAntiAggro.h"
+#include "TFDPacify.h"
+#include "TFDSettings.h"
+
+#include <SKSE/SKSE.h>
+
+#include <algorithm>
+
 namespace TFD::CaptiveRuntime
 {
 	namespace
 	{
+		static bool IsActorSameSpace(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+
+			auto* actorCell = actor->GetParentCell();
+			auto* playerCell = player->GetParentCell();
+			if (!actorCell || !playerCell) {
+				return false;
+			}
+
+			const bool actorInterior = actorCell->IsInteriorCell();
+			const bool playerInterior = playerCell->IsInteriorCell();
+			if (actorInterior != playerInterior) {
+				return false;
+			}
+
+			if (playerInterior) {
+				return actorCell == playerCell;
+			}
+
+			auto* actorWs = actor->GetWorldspace();
+			auto* playerWs = player->GetWorldspace();
+			return actorWs && playerWs && actorWs == playerWs;
+		}
+
+		static bool ActorHasLOS(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+			bool hasLOSData = false;
+			return actor->HasLineOfSight(player, hasLOSData);
+		}
+
+		static bool IsCaptorSupportedActor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player || actor == player) {
+				return false;
+			}
+			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return false;
+			}
+			if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+				return false;
+			}
+			const bool isNPC = actor->HasKeywordString("ActorTypeNPC");
+			const bool isCreature = actor->HasKeywordString("ActorTypeCreature");
+			return isNPC || isCreature;
+		}
+
+		static RE::Actor* PickCaptorSameCellLoaded(RE::Actor* player, float radius)
+		{
+			if (!player) {
+				return nullptr;
+			}
+
+			const float searchRadius = (std::max)(radius, 12288.0f);
+			TFD::ActorScan::Rescan(searchRadius, false);
+
+			RE::Actor* best = nullptr;
+			float bestScore = 1.0e30f;
+
+			const auto n = TFD::ActorScan::GetCount();
+			for (int i = 0; i < n; ++i) {
+				auto e = TFD::ActorScan::GetEntry(i);
+				auto* a = TFD::ActorScan::GetActor(i);
+				if (!a) continue;
+				if (!IsCaptorSupportedActor(a)) continue;
+				if (!IsActorSameSpace(a, player)) continue;
+				if (e.dist > searchRadius) continue;
+				if (!ActorHasLOS(a, player)) continue;
+
+				float score = e.dist;
+				if (e.hostile || a->IsHostileToActor(player)) score -= 140.0f;
+				if (e.inCombat || a->IsInCombat()) score -= 100.0f;
+				if (score < bestScore) {
+					bestScore = score;
+					best = a;
+				}
+			}
+
+			return best;
+		}
+
+		static void SendBridgeEvent(const char* eventName)
+		{
+			if (!eventName) {
+				return;
+			}
+
+			auto* src = SKSE::GetModCallbackEventSource();
+			if (!src) {
+				return;
+			}
+
+			SKSE::ModCallbackEvent e(eventName, "", 0.0f, nullptr);
+			src->SendEvent(&e);
+		}
+
+		static void SendBridgeAssignActor(const char* eventName, RE::Actor* actor)
+		{
+			if (!eventName || !actor) {
+				return;
+			}
+
+			auto* src = SKSE::GetModCallbackEventSource();
+			if (!src) {
+				return;
+			}
+
+			SKSE::ModCallbackEvent e(eventName, "", 0.0f, actor);
+			src->SendEvent(&e);
+		}
+
+		static void ApplyCallCaptorCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
+		{
+			if (!player || !primaryTarget) {
+				return;
+			}
+
+			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
+			TFD::AntiAggro::SweepOnce(sweepRadius, true);
+			TFD::AntiAggro::ScheduleWaves(sweepRadius, true, 10, 120);
+			TFD::ActorScan::Rescan(sweepRadius, false);
+
+			auto* pCell = player->GetParentCell();
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto* actor = TFD::ActorScan::GetActor(i);
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (!actor->Is3DLoaded()) {
+					continue;
+				}
+				if (actor->GetFormID() == player->GetFormID()) {
+					continue;
+				}
+				if (pCell && actor->GetParentCell() != pCell) {
+					continue;
+				}
+				if (actor->GetFormID() != primaryTarget->GetFormID() && !entry.hostile && !entry.inCombat) {
+					continue;
+				}
+
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					const bool runDetection = process->runDetection;
+					process->runDetection = false;
+					process->ClearCachedFactionFightReactions();
+					process->StopCombatAndAlarmOnActor(actor, false);
+					process->runDetection = runDetection;
+				}
+				actor->StopCombat();
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(true, false);
+			}
+
+			SendBridgeEvent("TFDCaptiveClearAll");
+			SendBridgeAssignActor("TFDCaptiveAssign", primaryTarget);
+		}
+
 		bool g_state = false;
 		PhaseValue g_phase = PhaseValue::None;
 		bool g_confiscationApplied = false;
@@ -92,6 +271,27 @@ namespace TFD::CaptiveRuntime
 	bool IsStandardCaptiveActive()
 	{
 		return g_phase == PhaseValue::Captive;
+	}
+
+	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor)
+	{
+		if (outCaptor) {
+			*outCaptor = nullptr;
+		}
+		if (!player) {
+			return false;
+		}
+
+		auto* captor = PickCaptorSameCellLoaded(player, 12288.0f);
+		if (!captor) {
+			return false;
+		}
+
+		ApplyCallCaptorCalmBubble(player, captor, 12288.0f);
+		if (outCaptor) {
+			*outCaptor = captor;
+		}
+		return true;
 	}
 
 	void ResetForLoad()

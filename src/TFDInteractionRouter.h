@@ -77,8 +77,85 @@ namespace TFD::InteractionRouter
         bool isCaptivePhase,
         double nowSec);
 
+    enum class FlowOwnedPrimaryKind : std::uint8_t
+    {
+        None = 0,
+        Busy,
+        Escape,
+        Bleedout,
+        Captive
+    };
+
+    struct FlowOwnedPrimaryResult
+    {
+        FlowOwnedPrimaryKind kind{ FlowOwnedPrimaryKind::None };
+        int interactionState{ 0 };
+        bool handled{ false };
+        bool success{ false };
+        const char* notification{ nullptr };
+    };
+
+    struct PrimaryHotkeyPickResult
+    {
+        RE::Actor* target{ nullptr };
+        Action action{ Action::None };
+        int interactionState{ 0 };
+        bool valid{ false };
+    };
+
     Action ResolvePreferredTruceAction(const TFD::Flow::Snapshot& snapshot);
     bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction = nullptr);
+    FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::Flow::Snapshot& snapshot);
+
+    RE::Actor* PickExactDialogueDefeatedTarget(float radius);
+    RE::Actor* PickExactActiveTameTarget(float radius);
+    RE::Actor* PickExactDefeatedCreatureTarget(float radius);
+
+    PrimaryHotkeyPickResult PickPrimaryHotkeyTarget(
+        RE::PlayerCharacter* player,
+        const TFD::Flow::Snapshot& snapshot,
+        float radius,
+        bool allowTameFallback = false);
+
+    struct PrimaryHotkeyExecuteResult
+    {
+        Action requestedAction{ Action::None };
+        Action finalAction{ Action::None };
+        FailReason failReason{ FailReason::None };
+        int interactionState{ 0 };
+        bool handled{ false };
+        bool success{ false };
+        const char* notification{ nullptr };
+    };
+
+    PrimaryHotkeyExecuteResult ExecutePrimaryHotkey(
+        RE::Actor* player,
+        const TFD::Flow::Snapshot& snapshot,
+        double nowSec,
+        float radius,
+        bool allowTameFallback = false);
+
+    enum class ShiftHotkeyAction : std::uint8_t
+    {
+        None = 0,
+        RecruitDefeatedCreature,
+        OpenFeedPopup
+    };
+
+    struct ShiftHotkeyExecuteResult
+    {
+        ShiftHotkeyAction action{ ShiftHotkeyAction::None };
+        RE::Actor* target{ nullptr };
+        int interactionState{ 0 };
+        bool handled{ false };
+        bool success{ false };
+        const char* notification{ nullptr };
+    };
+
+    ShiftHotkeyExecuteResult ExecuteShiftHotkey(
+        RE::Actor* player,
+        double nowSec,
+        float radius);
 
     const char* ToString(Action value);
     const char* ToString(FailReason value);

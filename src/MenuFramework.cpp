@@ -38,8 +38,8 @@
 #include "TFDCompanionRestore.h"
 #include "TFDFlowController.h"
 #include "TFDCaptiveRuntime.h"
-#include "TFDPleasureRuntime.h"
 #include "TFDRescueRuntime.h"
+#include "TFDPleasureRuntime.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -934,36 +934,6 @@ namespace TFDMenu
 			return GetGlobalValue(gPreCombatState) >= 0.5f;
 		}
 
-		static void SendBridgeEvent(const char* eventName)
-		{
-			if (!eventName) {
-				return;
-			}
-
-			auto* src = SKSE::GetModCallbackEventSource();
-			if (!src) {
-				return;
-			}
-
-			SKSE::ModCallbackEvent e(eventName, "", 0.0f, nullptr);
-			src->SendEvent(&e);
-		}
-
-		static void SendBridgeAssignActor(const char* eventName, RE::Actor* actor)
-		{
-			if (!eventName || !actor) {
-				return;
-			}
-
-			auto* src = SKSE::GetModCallbackEventSource();
-			if (!src) {
-				return;
-			}
-
-			SKSE::ModCallbackEvent e(eventName, "", 0.0f, actor);
-			src->SendEvent(&e);
-		}
-
 		static const char* KeyNameFromScanCode(std::uint32_t code)
 		{
 			switch (code) {
@@ -1069,61 +1039,6 @@ namespace TFDMenu
 			TFD::Settings::SetHotkeyWave(uiHotkeyWave);
 		}
 
-		static bool IsMenuActorSameBleedSpace(RE::Actor* actor, RE::Actor* player)
-		{
-			if (!actor || !player) {
-				return false;
-			}
-
-			auto* actorCell = actor->GetParentCell();
-			auto* playerCell = player->GetParentCell();
-			if (!actorCell || !playerCell) {
-				return false;
-			}
-
-			const bool actorInterior = actorCell->IsInteriorCell();
-			const bool playerInterior = playerCell->IsInteriorCell();
-			if (actorInterior != playerInterior) {
-				return false;
-			}
-
-			if (playerInterior) {
-				return actorCell == playerCell;
-			}
-
-			auto* actorWs = actor->GetWorldspace();
-			auto* playerWs = player->GetWorldspace();
-			return actorWs && playerWs && actorWs == playerWs;
-		}
-
-		static bool MenuActorHasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player)
-		{
-			if (!actor || !player) {
-				return false;
-			}
-			bool hasLOSData = false;
-			return actor->HasLineOfSight(player, hasLOSData);
-		}
-
-		static bool IsCaptorPickerSupportedActor(RE::Actor* actor)
-		{
-			if (!actor) {
-				return false;
-			}
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player || actor == player) {
-				return false;
-			}
-			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-				return false;
-			}
-			if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
-				return false;
-			}
-			const bool isNPC = actor->HasKeywordString("ActorTypeNPC");
-			const bool isCreature = actor->HasKeywordString("ActorTypeCreature");
-			return isNPC || isCreature;
-		}
 
 		static RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
 		{
@@ -1152,137 +1067,6 @@ namespace TFDMenu
 			}
 			auto* currentTarget = ResolveCurrentCombatTarget(actor);
 			return IsPlayerSideActor(currentTarget, player);
-		}
-
-		static RE::Actor* PickCaptorSameCellLoaded(float radius)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player) {
-				return nullptr;
-			}
-
-			const float searchRadius = (std::max)(radius, 12288.0f);
-			TFD::ActorScan::Rescan(searchRadius, false);
-
-			RE::Actor* best = nullptr;
-			float bestScore = 1.0e30f;
-
-			const auto n = TFD::ActorScan::GetCount();
-			for (int i = 0; i < n; ++i) {
-				auto e = TFD::ActorScan::GetEntry(i);
-				auto* a = TFD::ActorScan::GetActor(i);
-				if (!a) continue;
-				if (!IsCaptorPickerSupportedActor(a)) continue;
-				if (!IsMenuActorSameBleedSpace(a, player)) continue;
-				if (e.dist > searchRadius) continue;
-				if (!MenuActorHasLineOfSightToPlayer(a, player)) continue;
-
-				float score = e.dist;
-				if (e.hostile || a->IsHostileToActor(player)) score -= 140.0f;
-				if (e.inCombat || a->IsInCombat()) score -= 100.0f;
-				if (score < bestScore) {
-					bestScore = score;
-					best = a;
-				}
-			}
-
-			return best;
-		}
-
-		static void ApplyCellHotkeyCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
-		{
-			if (!player || !primaryTarget) {
-				return;
-			}
-
-			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
-			TFD::AntiAggro::SweepOnce(sweepRadius, true);
-			TFD::AntiAggro::ScheduleWaves(sweepRadius, true, 10, 120);
-			TFD::ActorScan::Rescan(sweepRadius, false);
-
-			auto* pCell = player->GetParentCell();
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
-				if (!actor || actor->IsDead() || actor->IsDisabled()) {
-					continue;
-				}
-				if (!actor->Is3DLoaded()) {
-					continue;
-				}
-				if (actor->GetFormID() == player->GetFormID()) {
-					continue;
-				}
-				if (pCell && actor->GetParentCell() != pCell) {
-					continue;
-				}
-				if (actor->GetFormID() != primaryTarget->GetFormID() &&
-					!entry.hostile &&
-					!entry.inCombat) {
-					continue;
-				}
-
-				if (auto* process = RE::ProcessLists::GetSingleton()) {
-					const bool runDetection = process->runDetection;
-					process->runDetection = false;
-					process->ClearCachedFactionFightReactions();
-					process->StopCombatAndAlarmOnActor(actor, false);
-					process->runDetection = runDetection;
-				}
-				actor->StopCombat();
-				if (actor->IsWeaponDrawn()) {
-					actor->DrawWeaponMagicHands(false);
-				}
-				actor->EvaluatePackage(true, false);
-			}
-
-			spdlog::info("[TFD][Hotkey] cell calm bubble primary={:08X} radius={:.0f}", primaryTarget->GetFormID(), sweepRadius);
-		}
-
-
-		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player)
-		{
-			if (!a || !player) {
-				return -1.0f;
-			}
-
-			const auto pa = player->GetPosition();
-			const auto pb = a->GetPosition();
-
-			const float dx = pb.x - pa.x;
-			const float dy = pb.y - pa.y;
-			const float d2 = dx * dx + dy * dy;
-			if (d2 <= 1.0f) {
-				return 1.0f;
-			}
-
-			const float len = std::sqrt(d2);
-			const float ang = player->GetAngleZ();
-			const float fx = std::sin(ang);
-			const float fy = std::cos(ang);
-			const float nx = dx / len;
-			const float ny = dy / len;
-			return nx * fx + ny * fy;
-		}
-
-		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist)
-		{
-			if (!a || !player) {
-				return false;
-			}
-
-			const auto pa = player->GetPosition();
-			const auto pb = a->GetPosition();
-
-			const float dx = pb.x - pa.x;
-			const float dy = pb.y - pa.y;
-			const float d2 = dx * dx + dy * dy;
-			if (d2 > (maxDist * maxDist)) {
-				return false;
-			}
-
-			return GetActorFrontDot2D(a, player) >= 0.20f;
 		}
 
 		enum class HotkeyPickMode
@@ -1335,6 +1119,9 @@ namespace TFDMenu
 			const bool inCombat = actor->IsInCombat() || entry.inCombat;
 			return !entry.hostile && !inCombat;
 		}
+
+		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player);
+		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist);
 
 		static bool IsShiftDown()
 		{
@@ -1474,6 +1261,51 @@ namespace TFDMenu
 			}
 
 			return best;
+		}
+
+
+		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player)
+		{
+			if (!a || !player) {
+				return -1.0f;
+			}
+
+			const auto pa = player->GetPosition();
+			const auto pb = a->GetPosition();
+
+			const float dx = pb.x - pa.x;
+			const float dy = pb.y - pa.y;
+			const float d2 = dx * dx + dy * dy;
+			if (d2 <= 1.0f) {
+				return 1.0f;
+			}
+
+			const float len = std::sqrt(d2);
+			const float ang = player->GetAngleZ();
+			const float fx = std::sin(ang);
+			const float fy = std::cos(ang);
+			const float nx = dx / len;
+			const float ny = dy / len;
+			return nx * fx + ny * fy;
+		}
+
+		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist)
+		{
+			if (!a || !player) {
+				return false;
+			}
+
+			const auto pa = player->GetPosition();
+			const auto pb = a->GetPosition();
+
+			const float dx = pb.x - pa.x;
+			const float dy = pb.y - pa.y;
+			const float d2 = dx * dx + dy * dy;
+			if (d2 > (maxDist * maxDist)) {
+				return false;
+			}
+
+			return GetActorFrontDot2D(a, player) >= 0.20f;
 		}
 
 
@@ -2509,56 +2341,23 @@ namespace TFDMenu
 					}
 
 					const int dialogueStateRaw = GetGlobalValueInt(gDialogueState);
-					const int defeatStateRaw = GetGlobalValueInt(gDefeatState);
-					auto& flow = TFD::Flow::Controller::GetSingleton();
-					const auto flowSnapshot = flow.GetSnapshot();
-					const bool rescueActive = TFD::RescueRuntime::IsActive();
-					const bool pleasureActive = TFD::PleasureRuntime::IsActive();
-					const bool captiveEscapeActive = TFD::CaptiveRuntime::IsEscapeActive();
-					const bool captiveStandardActive = TFD::CaptiveRuntime::IsStandardCaptiveActive();
-
+					const auto flowSnapshot = TFD::Flow::Controller::GetSingleton().GetSnapshot();
 					if (dialogueStateRaw == 1) {
 						RE::DebugNotification("TFD: Dialogue Busy");
 						continue;
 					}
 
-					if (rescueActive || pleasureActive) {
-						RE::DebugNotification("TFD: Busy");
-						continue;
-					}
-
-					if (captiveEscapeActive) {
-						SetInteractionStateValue(6);
-						RE::DebugNotification("TFD: Escape");
-						continue;
-					}
-
-					if (defeatStateRaw == 2 || flow.IsBleedDecisionActive()) {
-						SetInteractionStateValue(5);
-						if (TFD::DefeatMonitor::HandleBleedoutHotkey()) {
-							RE::DebugNotification("TFD: BleedOut Truce");
+					const auto ownedFlowResult = TFD::InteractionRouter::HandleFlowOwnedPrimaryHotkey(player, flowSnapshot);
+					if (ownedFlowResult.handled) {
+						if (ownedFlowResult.interactionState != 0) {
+							SetInteractionStateValue(ownedFlowResult.interactionState);
 						}
-						else {
-							RE::DebugNotification("TFD: No Response");
+						if (ownedFlowResult.notification) {
+							RE::DebugNotification(ownedFlowResult.notification);
+						}
+						if (!ownedFlowResult.success && ownedFlowResult.interactionState != 6) {
 							ClearInteractionStateValue();
 						}
-						continue;
-					}
-
-					if (captiveStandardActive) {
-						auto* captor = PickCaptorSameCellLoaded(12288.0f);
-						if (!captor) {
-							RE::DebugNotification("TFD: No Response");
-							ClearInteractionStateValue();
-							continue;
-						}
-
-						SetInteractionStateValue(4);
-						ApplyCellHotkeyCalmBubble(player, captor, 12288.0f);
-						SendBridgeEvent("TFDCaptiveClearAll");
-						SendBridgeAssignActor("TFDCaptiveAssign", captor);
-
-						RE::DebugNotification("TFD: Calling Captor");
 						continue;
 					}
 
