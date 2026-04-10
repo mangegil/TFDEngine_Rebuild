@@ -39,6 +39,10 @@ add_library(TFDEngine SHARED
     src/TFDAggressionClamp.cpp
     src/TFDPreCombat.cpp
     src/TFDPreCombatGreet.cpp
+    src/TFDInCombat.cpp
+    src/TFDInCombatGreet.cpp
+    src/TFDBleedout.cpp
+    src/TFDBleedoutGreet.cpp
     src/TFDPacify.cpp
     src/TFDPacifyHooks.cpp
     src/TFDTargetClassifier.cpp

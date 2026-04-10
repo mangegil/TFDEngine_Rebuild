@@ -18,6 +18,10 @@
 #include "TFDLocation.h"
 #include "TFDFactionMask.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDInCombat.h"
+#include "TFDInCombatGreet.h"
+#include "TFDBleedout.h"
+#include "TFDBleedoutGreet.h"
 #include "TFDPacify.h"
 #include "TFDPacifyHooks.h"
 #include "TFDTeammateAliasSync.h"
@@ -78,6 +82,10 @@ static void QueueHud(const char* text)
 static void ResetTransientStateForLoad()
 {
     TFD::PreCombatGreet::CancelAll();
+    TFD::InCombat::ResetForLoad();
+    TFD::InCombatGreet::Reset();
+    TFD::Bleedout::ResetForLoad();
+    TFD::BleedoutGreet::Reset();
     TFD::Pacify::Reset();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
@@ -114,7 +122,11 @@ static void InitOnceAfterLoad()
     TFD::Location::Initialize();
     TFD::FactionMask::Initialize();
     TFD::DefeatMonitor::Install();
+    TFD::InCombat::Install();
+    TFD::InCombatGreet::Install();
     TFD::DefeatMonitor::ResetGrace();
+    TFD::Bleedout::Install();
+    TFD::BleedoutGreet::Install();
     TFD::PreCombatGreet::Install();
     TFD::TeammateAliasSync::Install();
 

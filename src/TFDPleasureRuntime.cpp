@@ -1,4 +1,5 @@
 #include "TFDPleasureRuntime.h"
+#include "TFDFlowController.h"
 
 #include <cmath>
 #include <mutex>
@@ -32,6 +33,7 @@ namespace TFD::PleasureRuntime
 			bool holdActive{ false };
 			bool afterPleasureCommitted{ false };
 			bool redoPending{ false };
+			AfterChoice pendingChoice{ AfterChoice::None };
 		};
 
 		std::mutex g_lock;
@@ -103,6 +105,32 @@ namespace TFD::PleasureRuntime
 			}
 		}
 
+		AfterChoice MapAfterPleasureChoice(std::string_view eventName)
+		{
+			if (eventName == kAfterPleasureChoicePleasureEvent) {
+				return AfterChoice::Redo;
+			}
+			if (eventName == kAfterPleasureChoiceFinishEvent) {
+				return AfterChoice::Finish;
+			}
+			if (eventName == kAfterPleasureChoiceRecruitEvent) {
+				return AfterChoice::Recruit;
+			}
+			if (eventName == kAfterPleasureChoiceJoinEnemyEvent) {
+				return AfterChoice::JoinEnemy;
+			}
+			if (eventName == kAfterPleasureChoiceReleaseEvent) {
+				return AfterChoice::Release;
+			}
+			if (eventName == kAfterPleasureChoiceWorkEvent) {
+				return AfterChoice::Work;
+			}
+			if (eventName == kAfterPleasureChoiceKidnapEvent) {
+				return AfterChoice::Captive;
+			}
+			return AfterChoice::None;
+		}
+
 		RE::Actor* LookupActor(std::uint32_t formID)
 		{
 			return formID ? RE::TESForm::LookupByID<RE::Actor>(formID) : nullptr;
@@ -138,6 +166,7 @@ namespace TFD::PleasureRuntime
 			g_state.active = false;
 			g_state.redoPending = false;
 			g_state.flowOwnerToken = 0;
+			g_state.pendingChoice = AfterChoice::None;
 
 			ClearSpeakerStateLocked();
 			ClearBridgeStateLocked();
@@ -157,7 +186,8 @@ namespace TFD::PleasureRuntime
 
 			if (next == Phase::Idle || next == Phase::Closed) {
 				g_state.active = false;
-			} else {
+			}
+			else {
 				g_state.active = true;
 			}
 
@@ -176,6 +206,7 @@ namespace TFD::PleasureRuntime
 			g_state.source = source;
 			g_state.flowOwnerToken = g_state.sessionCycleId;
 			g_state.redoPending = false;
+			g_state.pendingChoice = AfterChoice::None;
 			g_state.afterPleasureCommitted = false;
 			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
 			g_state.bridgeState = 0;
@@ -197,26 +228,26 @@ namespace TFD::PleasureRuntime
 		bool IsAfterPleasureChoiceEvent(std::string_view eventName)
 		{
 			return eventName == kAfterPleasureChoiceFinishEvent ||
-			       eventName == kAfterPleasureChoiceRecruitEvent ||
-			       eventName == kAfterPleasureChoiceJoinEnemyEvent ||
-			       eventName == kAfterPleasureChoicePleasureEvent ||
-			       eventName == kAfterPleasureChoiceReleaseEvent ||
-			       eventName == kAfterPleasureChoiceWorkEvent ||
-			       eventName == kAfterPleasureChoiceKidnapEvent;
+				eventName == kAfterPleasureChoiceRecruitEvent ||
+				eventName == kAfterPleasureChoiceJoinEnemyEvent ||
+				eventName == kAfterPleasureChoicePleasureEvent ||
+				eventName == kAfterPleasureChoiceReleaseEvent ||
+				eventName == kAfterPleasureChoiceWorkEvent ||
+				eventName == kAfterPleasureChoiceKidnapEvent;
 		}
 
 		bool IsRecognizedEvent(std::string_view eventName)
 		{
 			return eventName == kPleasureStartPendingEvent ||
-			       eventName == kPleasureStartedEvent ||
-			       eventName == kPleasureFailedEvent ||
-			       eventName == kPleasureEndedEvent ||
-			       eventName == kOStimSceneStartPendingEvent ||
-			       eventName == kOStimSceneStartedEvent ||
-			       eventName == kOStimSceneEndedEvent ||
-			       eventName == kAfterPleasureEnterEvent ||
-			       eventName == kAfterPleasureLoopEnterEvent ||
-			       IsAfterPleasureChoiceEvent(eventName);
+				eventName == kPleasureStartedEvent ||
+				eventName == kPleasureFailedEvent ||
+				eventName == kPleasureEndedEvent ||
+				eventName == kOStimSceneStartPendingEvent ||
+				eventName == kOStimSceneStartedEvent ||
+				eventName == kOStimSceneEndedEvent ||
+				eventName == kAfterPleasureEnterEvent ||
+				eventName == kAfterPleasureLoopEnterEvent ||
+				IsAfterPleasureChoiceEvent(eventName);
 		}
 
 
@@ -246,6 +277,7 @@ namespace TFD::PleasureRuntime
 			case Phase::AfterPleasureAwaitQuest:
 			case Phase::AfterPleasureDialogue:
 			case Phase::RedoPending:
+			case Phase::Finalizing:
 				return true;
 			default:
 				return false;
@@ -292,16 +324,19 @@ namespace TFD::PleasureRuntime
 						if (!c.empty()) {
 							info.threadID = std::stoi(c);
 						}
-					} else {
+					}
+					else {
 						const auto b = token.substr(first + 1);
 						if (!b.empty()) {
 							info.sourceFlow = std::stoi(b);
 						}
 					}
-				} else {
+				}
+				else {
 					info.actorFormID = static_cast<std::uint32_t>(std::stoul(token, nullptr, 16));
 				}
-			} catch (...) {
+			}
+			catch (...) {
 				// shell awal: gagal parse cukup diam
 			}
 
@@ -381,9 +416,17 @@ namespace TFD::PleasureRuntime
 
 			if (eventName == kPleasureEndedEvent || eventName == kOStimSceneEndedEvent) {
 				if (g_state.phase == Phase::PleasureActive) {
+					const auto afterSpeakerFormID = info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID;
+
 					AdvancePhaseLocked(Phase::PleasureEnding, eventName);
+
+					g_state.afterPleasureSpeakerFormID = afterSpeakerFormID;
+					g_state.afterPleasureCommitted = false;
+					g_state.pendingChoice = AfterChoice::None;
+					g_state.redoPending = false;
+					g_state.blocking = true;
+
 					AdvancePhaseLocked(Phase::AfterPleasureAwaitQuest, eventName);
-					g_state.afterPleasureSpeakerFormID = info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID;
 					LogEventAcceptedLocked(eventName, info, "await_after_dialogue");
 					return;
 				}
@@ -395,6 +438,7 @@ namespace TFD::PleasureRuntime
 				if (g_state.phase == Phase::AfterPleasureAwaitQuest) {
 					AdvancePhaseLocked(Phase::AfterPleasureDialogue, eventName);
 					g_state.afterPleasureCommitted = true;
+					g_state.pendingChoice = AfterChoice::None;
 					g_state.blocking = true;
 					LogEventAcceptedLocked(eventName, info, "dialogue_open");
 					return;
@@ -427,7 +471,10 @@ namespace TFD::PleasureRuntime
 					return;
 				}
 
-				if (eventName == kAfterPleasureChoicePleasureEvent) {
+				const auto choice = MapAfterPleasureChoice(eventName);
+				g_state.pendingChoice = choice;
+
+				if (choice == AfterChoice::Redo) {
 					g_state.redoPending = true;
 					AdvancePhaseLocked(Phase::RedoPending, eventName);
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
@@ -442,12 +489,13 @@ namespace TFD::PleasureRuntime
 				AdvancePhaseLocked(Phase::Closed, eventName);
 				ClearBridgeStateLocked();
 				ClearHoldStateLocked();
+				g_state.pendingChoice = AfterChoice::None;
 				LogEventAcceptedLocked(eventName, info, "finalize_close");
 				return;
 			}
 		}
 
-	}
+	}  // namespace
 
 	void Install()
 	{
@@ -536,25 +584,11 @@ namespace TFD::PleasureRuntime
 			return;
 		}
 
-		if (g_state.phase != Phase::AfterPleasureAwaitQuest && g_state.phase != Phase::AfterPleasureDialogue) {
-			spdlog::info(
-				"[TFD][PleasureRuntime] dialogue commit ignored phase={} cycle={} reason={}",
-				ToString(g_state.phase),
-				g_state.sessionCycleId,
-				reason.empty() ? std::string{ "-" } : std::string{ reason });
-			return;
-		}
-
-		g_state.afterPleasureCommitted = true;
-		if (g_state.phase == Phase::AfterPleasureAwaitQuest) {
-			AdvancePhaseLocked(Phase::AfterPleasureDialogue, reason);
-		}
-
 		spdlog::info(
-			"[TFD][PleasureRuntime] dialogue committed reason={} cycle={} phase={}",
-			reason.empty() ? std::string{ "-" } : std::string{ reason },
+			"[TFD][PleasureRuntime] deprecated dialogue commit caller ignored phase={} cycle={} reason={}",
+			ToString(g_state.phase),
 			g_state.sessionCycleId,
-			ToString(g_state.phase));
+			reason.empty() ? std::string{ "-" } : std::string{ reason });
 	}
 
 	void Break(std::string_view reason, bool clearHold, bool clearBridge, bool completeFlow)
@@ -569,6 +603,7 @@ namespace TFD::PleasureRuntime
 		}
 
 		g_state.redoPending = false;
+		g_state.pendingChoice = AfterChoice::None;
 		g_state.active = false;
 		g_state.blocking = false;
 		g_state.phase = Phase::Closed;
@@ -622,6 +657,12 @@ namespace TFD::PleasureRuntime
 	{
 		std::scoped_lock lk(g_lock);
 		return ToString(g_state.source);
+	}
+
+	AfterChoice GetPendingAfterChoice()
+	{
+		std::scoped_lock lk(g_lock);
+		return g_state.pendingChoice;
 	}
 
 	std::uint32_t GetSessionCycleId()

@@ -1,4 +1,5 @@
 #include "TFDFlowController.h"
+#include "TFDPleasureRuntime.h"
 
 #include <cmath>
 #include <RE/Skyrim.h>
@@ -75,7 +76,19 @@ namespace TFD::Flow
 
         const int preCombat = (_snapshot.root == RootFlow::PreCombat) ? 1 : 0;
         const int defeat = g_defeatState ? static_cast<int>(std::lround(g_defeatState->value)) : 0;
-        const int inCombat = (defeat == 2) ? 0 : (_combatActive ? 1 : 0);
+
+        const auto runtimePhase = TFD::PleasureRuntime::GetPhase();
+        const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
+        const bool bleedoutAfterPleasure =
+            runtimeSource == TFD::PleasureRuntime::SourceContext::Bleedout &&
+            (runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest ||
+             runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue ||
+             runtimePhase == TFD::PleasureRuntime::Phase::Finalizing);
+
+        int inCombat = (defeat == 2) ? 0 : (_combatActive ? 1 : 0);
+        if (_snapshot.sub == SubFlow::BleedoutAfterPleasure || bleedoutAfterPleasure) {
+            inCombat = 0;
+        }
 
         int captive = 0;
         if (_snapshot.root == RootFlow::Captive && _snapshot.captiveMode != CaptiveMode::JoinedEnemy) {
@@ -92,21 +105,41 @@ namespace TFD::Flow
         }
 
         int pleasure = 0;
-        switch (_snapshot.sub) {
-        case SubFlow::PreCombatPleasure:
-        case SubFlow::InCombatPleasure:
-        case SubFlow::CaptivePleasure:
-        case SubFlow::VictoryPleasure:
-            pleasure = 1;
-            break;
-        case SubFlow::PreCombatAfterPleasure:
-        case SubFlow::InCombatAfterPleasure:
-        case SubFlow::CaptiveAfterPleasure:
-        case SubFlow::VictoryAfterPleasure:
-            pleasure = 2;
-            break;
-        default:
-            break;
+        if (TFD::PleasureRuntime::IsActive()) {
+            switch (TFD::PleasureRuntime::GetPhase()) {
+            case TFD::PleasureRuntime::Phase::PleasureStartPending:
+            case TFD::PleasureRuntime::Phase::PleasureActive:
+            case TFD::PleasureRuntime::Phase::PleasureEnding:
+            case TFD::PleasureRuntime::Phase::RedoPending:
+                pleasure = 1;
+                break;
+            case TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest:
+            case TFD::PleasureRuntime::Phase::AfterPleasureDialogue:
+            case TFD::PleasureRuntime::Phase::Finalizing:
+                pleasure = 2;
+                break;
+            default:
+                break;
+            }
+        } else {
+            switch (_snapshot.sub) {
+            case SubFlow::PreCombatPleasure:
+            case SubFlow::InCombatPleasure:
+            case SubFlow::BleedoutPleasure:
+            case SubFlow::CaptivePleasure:
+            case SubFlow::VictoryPleasure:
+                pleasure = 1;
+                break;
+            case SubFlow::PreCombatAfterPleasure:
+            case SubFlow::InCombatAfterPleasure:
+            case SubFlow::BleedoutAfterPleasure:
+            case SubFlow::CaptiveAfterPleasure:
+            case SubFlow::VictoryAfterPleasure:
+                pleasure = 2;
+                break;
+            default:
+                break;
+            }
         }
 
         SetGlobalInt(g_preCombatState, preCombat);
@@ -218,8 +251,18 @@ namespace TFD::Flow
             return RejectLocked("BeginPlayerBleedoutDecision", reason);
         }
 
-        if (_snapshot.root != RootFlow::InCombat) {
+        if (_snapshot.root != RootFlow::None && _snapshot.root != RootFlow::InCombat && _snapshot.root != RootFlow::Bleedout) {
             return RejectLocked("BeginPlayerBleedoutDecision", reason);
+        }
+
+        if (_snapshot.root != RootFlow::Bleedout) {
+            ClearDecisionLocked();
+            ClearSubLocked();
+            ClearTerminalLocked();
+            _snapshot.root = RootFlow::Bleedout;
+            _snapshot.contextRoot = RootFlow::Bleedout;
+            _snapshot.captiveMode = CaptiveMode::None;
+            BumpTokenLocked();
         }
 
         _snapshot.gate = DecisionGate::PlayerBleedout;
@@ -284,24 +327,24 @@ namespace TFD::Flow
     bool Controller::ResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
     {
         std::scoped_lock lk(_lock);
-        if (_snapshot.root != RootFlow::InCombat || _snapshot.gate != DecisionGate::PlayerBleedout) {
+        if (_snapshot.root != RootFlow::Bleedout || _snapshot.gate != DecisionGate::PlayerBleedout) {
             return RejectLocked("ResolveBleedoutOutcome", reason);
         }
 
         bool handled = false;
         switch (outcome) {
         case BleedoutOutcome::Pay:
-            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::None, actorFormID, reason);
+            handled = EnterTerminalContextLocked(RootFlow::Bleedout, SubFlow::None, actorFormID, reason);
             break;
         case BleedoutOutcome::Pleasure:
-            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::InCombatPleasure, actorFormID, reason);
+            handled = EnterTerminalContextLocked(RootFlow::Bleedout, SubFlow::BleedoutPleasure, actorFormID, reason);
             break;
         case BleedoutOutcome::Captive:
             handled = BeginCaptiveLocked(actorFormID, CaptiveMode::Kidnapped, reason);
             break;
         case BleedoutOutcome::Cancel:
         case BleedoutOutcome::Failed:
-            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::None, actorFormID, reason);
+            handled = EnterTerminalContextLocked(RootFlow::Bleedout, SubFlow::None, actorFormID, reason);
             break;
         case BleedoutOutcome::None:
         default:
@@ -407,6 +450,10 @@ namespace TFD::Flow
         case SubFlow::InCombatPleasure:
             _snapshot.sub = SubFlow::InCombatAfterPleasure;
             break;
+        case SubFlow::BleedoutPleasure:
+            _snapshot.sub = SubFlow::BleedoutAfterPleasure;
+            _combatActive = false;
+            break;
         case SubFlow::CaptivePleasure:
             _snapshot.sub = SubFlow::CaptiveAfterPleasure;
             break;
@@ -415,6 +462,7 @@ namespace TFD::Flow
             break;
         case SubFlow::PreCombatAfterPleasure:
         case SubFlow::InCombatAfterPleasure:
+        case SubFlow::BleedoutAfterPleasure:
         case SubFlow::CaptiveAfterPleasure:
         case SubFlow::VictoryAfterPleasure:
             break;
@@ -431,10 +479,16 @@ namespace TFD::Flow
     {
         std::scoped_lock lk(_lock);
         switch (_snapshot.sub) {
+        case SubFlow::PreCombatPleasure:
         case SubFlow::PreCombatAfterPleasure:
+        case SubFlow::InCombatPleasure:
         case SubFlow::InCombatAfterPleasure:
+        case SubFlow::BleedoutPleasure:
+        case SubFlow::BleedoutAfterPleasure:
+        case SubFlow::VictoryPleasure:
         case SubFlow::VictoryAfterPleasure:
             return CompleteTerminalContextLocked(reason);
+        case SubFlow::CaptivePleasure:
         case SubFlow::CaptiveAfterPleasure:
             SetCaptiveIdleLocked();
             RefreshFlowGlobalsLocked();
@@ -466,6 +520,11 @@ namespace TFD::Flow
             return;
         }
         _combatActive = true;
+        if (_snapshot.root == RootFlow::Bleedout) {
+            SetPrimaryActorLocked(actorFormID);
+            RefreshFlowGlobalsLocked();
+            return;
+        }
         (void)BeginRootLocked(RootFlow::InCombat, actorFormID, reason);
         RefreshFlowGlobalsLocked();
     }
@@ -474,7 +533,7 @@ namespace TFD::Flow
     {
         std::scoped_lock lk(_lock);
         _combatActive = false;
-        if (_snapshot.root == RootFlow::InCombat && _snapshot.gate == DecisionGate::None && _snapshot.sub == SubFlow::None) {
+        if ((_snapshot.root == RootFlow::InCombat || _snapshot.root == RootFlow::Bleedout) && _snapshot.gate == DecisionGate::None && _snapshot.sub == SubFlow::None) {
             ClearAllLocked();
         }
         RefreshFlowGlobalsLocked();
@@ -530,7 +589,7 @@ namespace TFD::Flow
     bool Controller::IsBleedDecisionActive() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root == RootFlow::InCombat && _snapshot.gate == DecisionGate::PlayerBleedout;
+        return _snapshot.root == RootFlow::Bleedout && _snapshot.gate == DecisionGate::PlayerBleedout;
     }
 
     bool Controller::BeginRootLocked(RootFlow next, std::uint32_t actorFormID, std::string_view reason)
@@ -672,6 +731,7 @@ namespace TFD::Flow
         case RootFlow::None: return "None";
         case RootFlow::PreCombat: return "PreCombat";
         case RootFlow::InCombat: return "InCombat";
+        case RootFlow::Bleedout: return "Bleedout";
         case RootFlow::Captive: return "Captive";
         case RootFlow::Victory: return "Victory";
         default: return "UnknownRootFlow";
@@ -708,6 +768,8 @@ namespace TFD::Flow
         case SubFlow::PreCombatAfterPleasure: return "PreCombatAfterPleasure";
         case SubFlow::InCombatPleasure: return "InCombatPleasure";
         case SubFlow::InCombatAfterPleasure: return "InCombatAfterPleasure";
+        case SubFlow::BleedoutPleasure: return "BleedoutPleasure";
+        case SubFlow::BleedoutAfterPleasure: return "BleedoutAfterPleasure";
         case SubFlow::VictoryPleasure: return "VictoryPleasure";
         case SubFlow::VictoryAfterPleasure: return "VictoryAfterPleasure";
         case SubFlow::CaptiveIdle: return "CaptiveIdle";

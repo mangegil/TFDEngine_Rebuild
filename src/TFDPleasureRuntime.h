@@ -30,6 +30,18 @@ namespace TFD::PleasureRuntime
 		Teammate
 	};
 
+	enum class AfterChoice : std::uint8_t
+	{
+		None = 0,
+		Redo,
+		Finish,
+		Recruit,
+		JoinEnemy,
+		Release,
+		Work,
+		Captive
+	};
+
 	struct EventInfo
 	{
 		RE::Actor* actor = nullptr;
@@ -62,6 +74,7 @@ namespace TFD::PleasureRuntime
 	SourceContext GetSourceContext();
 	const char* GetSourceContextName();
 
+	AfterChoice GetPendingAfterChoice();
 	std::uint32_t GetSessionCycleId();
 
 	RE::Actor* GetPleasureSpeaker();

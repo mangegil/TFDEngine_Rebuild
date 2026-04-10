@@ -18,6 +18,7 @@ namespace TFD::ForceGreet
 		constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
 		constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
 		constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
+		constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
 		constexpr auto kCommitQuietWindow = std::chrono::milliseconds(900);
 
 		struct PendingState
@@ -174,7 +175,7 @@ namespace TFD::ForceGreet
 			}
 
 			const auto now = Clock::now();
-			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : (mode == Mode::AfterPleasure ? std::chrono::milliseconds(2500) : kDefaultTimeout);
+			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : (mode == Mode::AfterPleasure ? kAfterPleasureTimeout : kDefaultTimeout);
 			g_pending.speaker = speaker->GetHandle();
 			g_pending.mode = mode;
 			g_pending.active = true;

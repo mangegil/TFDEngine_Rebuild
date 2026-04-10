@@ -11,6 +11,7 @@ namespace TFD::Flow
         None = 0,
         PreCombat,
         InCombat,
+        Bleedout,
         Captive,
         Victory
     };
@@ -39,6 +40,8 @@ namespace TFD::Flow
         PreCombatAfterPleasure,
         InCombatPleasure,
         InCombatAfterPleasure,
+        BleedoutPleasure,
+        BleedoutAfterPleasure,
         VictoryPleasure,
         VictoryAfterPleasure,
 

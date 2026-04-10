@@ -59,6 +59,10 @@ namespace TFD::PacifyHooks
                 return false;
             }
 
+            static bool IsReleaseGraceActor(RE::Actor* actor)
+            {
+                return actor && TFD::DefeatMonitor::HasReleaseFollowGraceForActor(actor);
+            }
 
             static void ClearInvalidCombatTarget(RE::Character* actor)
             {
@@ -125,7 +129,7 @@ namespace TFD::PacifyHooks
 
             static void UpdateCombat(RE::Character* actor)
             {
-                if (actor && TFD::Pacify::IsPacified(actor)) {
+                if (actor && (TFD::Pacify::IsPacified(actor) || IsReleaseGraceActor(actor))) {
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         const bool runDetection = process->runDetection;
                         process->runDetection = false;
@@ -134,10 +138,14 @@ namespace TFD::PacifyHooks
                         process->runDetection = runDetection;
                     }
 
+                    actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+
                     if (actor->IsInCombat()) {
                         actor->StopCombat();
                     }
 
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
                     return;
                 }
 
@@ -164,8 +172,8 @@ namespace TFD::PacifyHooks
                 float& unk09,
                 float& unk10)
             {
-                if ((target && TFD::Pacify::IsPacified(target)) ||
-                    (viewer && TFD::Pacify::IsPacified(viewer))) {
+                if ((target && (TFD::Pacify::IsPacified(target) || IsReleaseGraceActor(target))) ||
+                    (viewer && (TFD::Pacify::IsPacified(viewer) || IsReleaseGraceActor(viewer)))) {
                     detectVal = -1000;
                     return nullptr;
                 }

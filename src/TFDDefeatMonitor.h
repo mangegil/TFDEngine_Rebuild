@@ -70,6 +70,7 @@ namespace TFD::DefeatMonitor
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct = 55.0f);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
+	bool HasReleaseFollowGraceForActor(RE::Actor* actor);
 	void NoteEnemyTargetingPlayer(RE::Actor* actor);
 	RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
 	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);

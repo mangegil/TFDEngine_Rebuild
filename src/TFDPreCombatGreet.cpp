@@ -21,6 +21,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDLocation.h"
 #include "TFDPacify.h"
+#include "TFDInCombat.h"
 #include "TFDFlowController.h"
 #include "TFDForceGreet.h"
 #include "TFDPleasureRuntime.h"
@@ -829,9 +830,15 @@ bool HasProtectedPleasurePendingLocked()
 
 			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
 				std::scoped_lock lk(gLock);
+				const auto ctxKind = TFD::DefeatMonitor::GetDialogueContextKind();
+				const auto holdKind = TFD::DefeatMonitor::GetPassiveHoldKind();
+				const bool preserveAfterPleasureHandoff =
+					ctxKind == TFD::DefeatMonitor::DialogueContextKind::AfterPleasure &&
+					holdKind == TFD::DefeatMonitor::PassiveHoldKind::Pleasure;
 				const bool preserveProtectedHandoff =
-					TFD::DefeatMonitor::IsPassiveHoldProtectedHandoff() &&
-					HasProtectedPleasurePendingLocked();
+					preserveAfterPleasureHandoff ||
+					(TFD::DefeatMonitor::IsPassiveHoldProtectedHandoff() &&
+					HasProtectedPleasurePendingLocked());
 
 				if (!preserveProtectedHandoff) {
 					spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} -> clear pending",
@@ -841,7 +848,7 @@ bool HasProtectedPleasurePendingLocked()
 					return;
 				}
 
-				spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} but preserve protected handoff",
+				spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} but preserve handoff",
 					TFD::DefeatMonitor::GetDialogueContextName(),
 					TFD::DefeatMonitor::GetPassiveHoldName());
 			}
@@ -1158,10 +1165,7 @@ bool HasProtectedPleasurePendingLocked()
 				(void)flow.BeginTruceDecision(actor->GetFormID(), "precombat_dialogue_begin");
 			}
 		} else if (result.action == TFD::InteractionRouter::Action::TruceInCombat) {
-			(void)flow.BeginInCombat(actor->GetFormID(), "incombat_truce_begin");
-			if (result.dialogueRequested) {
-				(void)flow.BeginTruceDecision(actor->GetFormID(), "incombat_truce_dialogue_begin");
-			}
+			(void)TFD::InCombat::BeginTruce(actor->GetFormID(), result.dialogueRequested, "incombat_truce_begin");
 		}
 
 		gPending.emplace(handle, pending);
