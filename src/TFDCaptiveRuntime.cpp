@@ -79,6 +79,21 @@ namespace TFD::CaptiveRuntime
 		return stateActive || phase != PhaseValue::None;
 	}
 
+	bool IsActive()
+	{
+		return IsFamily(g_state, g_phase);
+	}
+
+	bool IsEscapeActive()
+	{
+		return g_phase == PhaseValue::Escape;
+	}
+
+	bool IsStandardCaptiveActive()
+	{
+		return g_phase == PhaseValue::Captive;
+	}
+
 	void ResetForLoad()
 	{
 		g_state = false;

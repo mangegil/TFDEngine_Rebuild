@@ -1,5 +1,6 @@
 #include "TFDRescueRuntime.h"
 
+#include <cmath>
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
@@ -28,5 +29,16 @@ namespace TFD::RescueRuntime
 		if (g_stateGlobal) {
 			g_stateGlobal->value = static_cast<float>(value);
 		}
+	}
+
+	int GetStateValue()
+	{
+		ResolveGlobal();
+		return g_stateGlobal ? static_cast<int>(std::lround(g_stateGlobal->value)) : 0;
+	}
+
+	bool IsActive()
+	{
+		return GetStateValue() != 0;
 	}
 }

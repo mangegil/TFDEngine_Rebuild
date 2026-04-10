@@ -37,6 +37,9 @@
 #include "TFDFeedPopup.h"
 #include "TFDCompanionRestore.h"
 #include "TFDFlowController.h"
+#include "TFDCaptiveRuntime.h"
+#include "TFDPleasureRuntime.h"
+#include "TFDRescueRuntime.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -1304,6 +1307,17 @@ namespace TFDMenu
 			}
 		}
 
+		static HotkeyPickMode HotkeyPickModeFromTruceAction(TFD::InteractionRouter::Action action)
+		{
+			switch (action) {
+			case TFD::InteractionRouter::Action::TruceInCombat:
+				return HotkeyPickMode::TruceInCombat;
+			case TFD::InteractionRouter::Action::TrucePreCombat:
+			default:
+				return HotkeyPickMode::TrucePreCombat;
+			}
+		}
+
 		static bool IsNonHostileActiveTameFollower(RE::Actor* actor, const TFD::ActorScan::Entry& entry)
 		{
 			if (!actor) {
@@ -2495,30 +2509,31 @@ namespace TFDMenu
 					}
 
 					const int dialogueStateRaw = GetGlobalValueInt(gDialogueState);
-					const int captiveStateRaw = GetGlobalValueInt(gCaptiveState);
 					const int defeatStateRaw = GetGlobalValueInt(gDefeatState);
-					const int preCombatStateRaw = GetGlobalValueInt(gPreCombatState);
-					const int inCombatStateRaw = GetGlobalValueInt(gInCombatState);
-					const int rescueStateRaw = GetGlobalValueInt(gRescueState);
-					const int pleasureStateRaw = GetGlobalValueInt(gPleasureState);
+					auto& flow = TFD::Flow::Controller::GetSingleton();
+					const auto flowSnapshot = flow.GetSnapshot();
+					const bool rescueActive = TFD::RescueRuntime::IsActive();
+					const bool pleasureActive = TFD::PleasureRuntime::IsActive();
+					const bool captiveEscapeActive = TFD::CaptiveRuntime::IsEscapeActive();
+					const bool captiveStandardActive = TFD::CaptiveRuntime::IsStandardCaptiveActive();
 
 					if (dialogueStateRaw == 1) {
 						RE::DebugNotification("TFD: Dialogue Busy");
 						continue;
 					}
 
-					if (rescueStateRaw != 0 || pleasureStateRaw != 0) {
+					if (rescueActive || pleasureActive) {
 						RE::DebugNotification("TFD: Busy");
 						continue;
 					}
 
-					if (captiveStateRaw == 2) {
+					if (captiveEscapeActive) {
 						SetInteractionStateValue(6);
 						RE::DebugNotification("TFD: Escape");
 						continue;
 					}
 
-					if (defeatStateRaw == 2) {
+					if (defeatStateRaw == 2 || flow.IsBleedDecisionActive()) {
 						SetInteractionStateValue(5);
 						if (TFD::DefeatMonitor::HandleBleedoutHotkey()) {
 							RE::DebugNotification("TFD: BleedOut Truce");
@@ -2530,7 +2545,7 @@ namespace TFDMenu
 						continue;
 					}
 
-					if (captiveStateRaw == 1) {
+					if (captiveStandardActive) {
 						auto* captor = PickCaptorSameCellLoaded(12288.0f);
 						if (!captor) {
 							RE::DebugNotification("TFD: No Response");
@@ -2575,18 +2590,10 @@ namespace TFDMenu
 					HotkeyPickMode pickMode = HotkeyPickMode::None;
 					RE::Actor* target = nullptr;
 
-					if (preCombatStateRaw == 1) {
-						TFD::ActorScan::Rescan(3500.0f, false);
-						target = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &pickMode);
-					}
-					else if (inCombatStateRaw == 1) {
-						TFD::ActorScan::Rescan(3500.0f, false);
-						target = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TruceInCombat, &pickMode);
-					}
-					else {
-						TFD::ActorScan::Rescan(3500.0f, false);
-						target = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &pickMode);
-					}
+					const auto preferredTruceAction = TFD::InteractionRouter::ResolvePreferredTruceAction(flowSnapshot);
+					const auto preferredPickMode = HotkeyPickModeFromTruceAction(preferredTruceAction);
+					TFD::ActorScan::Rescan(3500.0f, false);
+					target = PickBestHotkeyCandidateForMode(player, preferredPickMode, &pickMode);
 
 					if (!target || pickMode == HotkeyPickMode::None) {
 						RE::DebugNotification("TFD: No Valid Target");
@@ -2634,10 +2641,10 @@ namespace TFDMenu
 
 					TFD::InteractionRouter::Action truceAction = TFD::InteractionRouter::Action::None;
 					SetInteractionStateValue(InteractionStateForPickMode(pickMode));
-					const bool truceStarted =
-						pickMode == HotkeyPickMode::TruceInCombat ?
-						TFD::InCombatGreet::BeginForActor(target, &truceAction) :
-						TFD::PreCombatGreet::BeginForActor(target, &truceAction);
+					const bool truceStarted = TFD::InteractionRouter::BeginTruceForAction(
+						target,
+						preferredTruceAction,
+						&truceAction);
 					if (!truceStarted) {
 						RE::DebugNotification("TFD: Truce Failed");
 						ClearInteractionStateValue();

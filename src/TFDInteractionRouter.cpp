@@ -1,5 +1,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDTameBait.h"
+#include "TFDInCombatGreet.h"
+#include "TFDPreCombatGreet.h"
 
 #include <spdlog/spdlog.h>
 
@@ -342,4 +344,27 @@ namespace TFD::InteractionRouter
             return "Unknown";
         }
     }
+
+    Action ResolvePreferredTruceAction(const TFD::Flow::Snapshot& snapshot)
+    {
+        return snapshot.root == TFD::Flow::RootFlow::InCombat ? Action::TruceInCombat : Action::TrucePreCombat;
+    }
+
+    bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction)
+    {
+        switch (preferredAction) {
+        case Action::TruceInCombat:
+            return TFD::InCombatGreet::BeginForActor(target, outAction);
+        case Action::TrucePreCombat:
+            return TFD::PreCombatGreet::BeginForActor(target, outAction);
+        case Action::None:
+        case Action::Tame:
+        default:
+            if (outAction) {
+                *outAction = Action::None;
+            }
+            return false;
+        }
+    }
+
 }

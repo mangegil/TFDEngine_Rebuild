@@ -53,5 +53,9 @@ namespace TFD::CaptiveRuntime
 	const char* GetPhaseName(bool stateActive, PhaseValue phase);
 	bool IsFamily(bool stateActive, PhaseValue phase);
 
-	void ResetForLoad();
+	bool IsActive();
+bool IsEscapeActive();
+bool IsStandardCaptiveActive();
+
+void ResetForLoad();
 }

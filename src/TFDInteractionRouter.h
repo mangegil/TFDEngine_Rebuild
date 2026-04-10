@@ -6,6 +6,7 @@
 
 #include "TFDPacify.h"
 #include "TFDTargetClassifier.h"
+#include "TFDFlowController.h"
 
 namespace TFD::InteractionRouter
 {
@@ -75,6 +76,9 @@ namespace TFD::InteractionRouter
         RE::Actor* target,
         bool isCaptivePhase,
         double nowSec);
+
+    Action ResolvePreferredTruceAction(const TFD::Flow::Snapshot& snapshot);
+    bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction = nullptr);
 
     const char* ToString(Action value);
     const char* ToString(FailReason value);
