@@ -1,4 +1,4 @@
-// src/MenuFramework.cpp
+﻿// src/MenuFramework.cpp
 #include "RE/Skyrim.h"
 #include "SKSE/SKSE.h"
 
@@ -1040,569 +1040,6 @@ namespace TFDMenu
 		}
 
 
-		static RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
-		{
-			if (!actor) {
-				return nullptr;
-			}
-			auto sp = actor->GetActorRuntimeData().currentCombatTarget.get();
-			return sp.get();
-		}
-
-		static bool IsPlayerSideActor(RE::Actor* actor, RE::PlayerCharacter* player)
-		{
-			if (!actor || !player) {
-				return false;
-			}
-			if (actor == player) {
-				return true;
-			}
-			return actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor);
-		}
-
-		static bool IsActorActivelyTargetingPlayerSide(RE::Actor* actor, RE::PlayerCharacter* player)
-		{
-			if (!actor || !player) {
-				return false;
-			}
-			auto* currentTarget = ResolveCurrentCombatTarget(actor);
-			return IsPlayerSideActor(currentTarget, player);
-		}
-
-		enum class HotkeyPickMode
-		{
-			None = 0,
-			TrucePreCombat,
-			Tame,
-			TruceInCombat
-		};
-
-		static int InteractionStateForPickMode(HotkeyPickMode mode)
-		{
-			switch (mode) {
-			case HotkeyPickMode::TrucePreCombat:
-				return 1;
-			case HotkeyPickMode::TruceInCombat:
-				return 2;
-			case HotkeyPickMode::Tame:
-				return 3;
-			default:
-				return 0;
-			}
-		}
-
-		static HotkeyPickMode HotkeyPickModeFromTruceAction(TFD::InteractionRouter::Action action)
-		{
-			switch (action) {
-			case TFD::InteractionRouter::Action::TruceInCombat:
-				return HotkeyPickMode::TruceInCombat;
-			case TFD::InteractionRouter::Action::TrucePreCombat:
-			default:
-				return HotkeyPickMode::TrucePreCombat;
-			}
-		}
-
-		static bool IsNonHostileActiveTameFollower(RE::Actor* actor, const TFD::ActorScan::Entry& entry)
-		{
-			if (!actor) {
-				return false;
-			}
-
-			if (!TFD::Pacify::IsPacified(actor)) {
-				return false;
-			}
-
-			if (TFD::Pacify::GetMode(actor) != TFD::Pacify::Mode::Tame) {
-				return false;
-			}
-
-			const bool inCombat = actor->IsInCombat() || entry.inCombat;
-			return !entry.hostile && !inCombat;
-		}
-
-		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player);
-		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist);
-
-		static bool IsShiftDown()
-		{
-			return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
-				(GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
-				(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
-		}
-
-		static RE::Actor* PickExactDialogueDefeatedTargetSameCellLoaded(float radius)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player) {
-				return nullptr;
-			}
-
-			TFD::ActorScan::Rescan(radius, false);
-
-			RE::Actor* best = nullptr;
-			float bestScore = -1.0e30f;
-
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
-				if (!actor) {
-					continue;
-				}
-				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-					continue;
-				}
-				if (entry.dist > radius) {
-					continue;
-				}
-				if (actor->GetParentCell() != player->GetParentCell()) {
-					continue;
-				}
-				if (!TFD::DefeatMonitor::IsDialogueCapableDefeatedEnemy(actor)) {
-					continue;
-				}
-
-				const float frontDot = GetActorFrontDot2D(actor, player);
-				if (frontDot < 0.75f) {
-					continue;
-				}
-
-				float score = (frontDot * 100000.0f) - entry.dist;
-				if (frontDot >= 0.96f) {
-					score += 4000.0f;
-				}
-				else if (frontDot >= 0.90f) {
-					score += 2000.0f;
-				}
-
-				if (score > bestScore) {
-					bestScore = score;
-					best = actor;
-				}
-			}
-
-			return best;
-		}
-
-		static RE::Actor* PickExactActiveTameTargetSameCellLoaded(float radius)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player) {
-				return nullptr;
-			}
-
-			auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
-				if (!actor) {
-					return -1.0e30f;
-				}
-				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-					return -1.0e30f;
-				}
-				if (!TFD::Pacify::HasActiveTameSession(actor)) {
-					return -1.0e30f;
-				}
-				if (entry.dist > radius) {
-					return -1.0e30f;
-				}
-
-				const float frontDot = GetActorFrontDot2D(actor, player);
-				if (frontDot < 0.80f) {
-					return -1.0e30f;
-				}
-
-				float score = (frontDot * 100000.0f) - entry.dist;
-				if (frontDot >= 0.98f) {
-					score += 6000.0f;
-				}
-				else if (frontDot >= 0.94f) {
-					score += 3500.0f;
-				}
-				else if (frontDot >= 0.90f) {
-					score += 1500.0f;
-				}
-				if (actor->IsInCombat() || entry.inCombat) {
-					score += 50.0f;
-				}
-				return score;
-				};
-
-			TFD::ActorScan::Rescan(radius, false);
-
-			RE::Actor* best = nullptr;
-			float bestScore = -1.0e30f;
-
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
-				const float score = scoreActor(actor, entry);
-				if (score > bestScore) {
-					bestScore = score;
-					best = actor;
-				}
-			}
-
-			if (!best) {
-				const auto restored = TFD::CompanionRestore::RestoreNow();
-				if (restored > 0) {
-					TFD::ActorScan::Rescan(radius, false);
-
-					const auto retryCount = TFD::ActorScan::GetCount();
-					for (int i = 0; i < retryCount; ++i) {
-						auto entry = TFD::ActorScan::GetEntry(i);
-						auto* actor = TFD::ActorScan::GetActor(i);
-						const float score = scoreActor(actor, entry);
-						if (score > bestScore) {
-							bestScore = score;
-							best = actor;
-						}
-					}
-				}
-			}
-
-			return best;
-		}
-
-
-		static float GetActorFrontDot2D(RE::Actor* a, RE::PlayerCharacter* player)
-		{
-			if (!a || !player) {
-				return -1.0f;
-			}
-
-			const auto pa = player->GetPosition();
-			const auto pb = a->GetPosition();
-
-			const float dx = pb.x - pa.x;
-			const float dy = pb.y - pa.y;
-			const float d2 = dx * dx + dy * dy;
-			if (d2 <= 1.0f) {
-				return 1.0f;
-			}
-
-			const float len = std::sqrt(d2);
-			const float ang = player->GetAngleZ();
-			const float fx = std::sin(ang);
-			const float fy = std::cos(ang);
-			const float nx = dx / len;
-			const float ny = dy / len;
-			return nx * fx + ny * fy;
-		}
-
-		static bool IsActorCloseAndFront(RE::Actor* a, RE::PlayerCharacter* player, float maxDist)
-		{
-			if (!a || !player) {
-				return false;
-			}
-
-			const auto pa = player->GetPosition();
-			const auto pb = a->GetPosition();
-
-			const float dx = pb.x - pa.x;
-			const float dy = pb.y - pa.y;
-			const float d2 = dx * dx + dy * dy;
-			if (d2 > (maxDist * maxDist)) {
-				return false;
-			}
-
-			return GetActorFrontDot2D(a, player) >= 0.20f;
-		}
-
-
-		static RE::Actor* PickExactDefeatedCreatureTargetSameCellLoaded(float radius)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (!player) {
-				return nullptr;
-			}
-
-			auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
-				if (!actor) {
-					return -1.0e30f;
-				}
-				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-					return -1.0e30f;
-				}
-				if (!TFD::DefeatMonitor::IsCreatureDefeatedEnemy(actor)) {
-					return -1.0e30f;
-				}
-				if (TFD::DefeatMonitor::GetDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
-					return -1.0e30f;
-				}
-				if (entry.dist > radius) {
-					return -1.0e30f;
-				}
-
-				const float frontDot = GetActorFrontDot2D(actor, player);
-				if (frontDot < 0.80f) {
-					return -1.0e30f;
-				}
-
-				float score = (frontDot * 100000.0f) - entry.dist;
-				if (frontDot >= 0.98f) {
-					score += 6000.0f;
-				}
-				else if (frontDot >= 0.94f) {
-					score += 3500.0f;
-				}
-				else if (frontDot >= 0.90f) {
-					score += 1500.0f;
-				}
-				return score;
-				};
-
-			TFD::ActorScan::Rescan(radius, false);
-
-			RE::Actor* best = nullptr;
-			float bestScore = -1.0e30f;
-
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
-				const float score = scoreActor(actor, entry);
-				if (score > bestScore) {
-					bestScore = score;
-					best = actor;
-				}
-			}
-
-			return best;
-		}
-
-		static float ScoreTruceCandidate(
-			RE::Actor* actor,
-			RE::PlayerCharacter* player,
-			const TFD::ActorScan::Entry& entry,
-			HotkeyPickMode* outMode)
-		{
-			if (outMode) {
-				*outMode = HotkeyPickMode::None;
-			}
-
-			if (!actor || !player) {
-				return -1.0e30f;
-			}
-			if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
-				return -1.0e30f;
-			}
-
-			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-			const bool inCombat = IsActorActivelyTargetingPlayerSide(actor, player);
-			const bool weaponDrawn = actor->IsWeaponDrawn();
-
-			const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
-				player,
-				actor,
-				false,
-				inCombat,
-				entry.dist);
-
-			if (!classify.valid ||
-				classify.intent != TFD::TargetClassifier::InteractionIntent::Truce) {
-				return -1.0e30f;
-			}
-
-			if (!inCombat &&
-				front &&
-				entry.dist <= 1150.0f) {
-				if (outMode) {
-					*outMode = HotkeyPickMode::TrucePreCombat;
-				}
-
-				float score = 50000.0f;
-				score -= entry.dist;
-				if (weaponDrawn) {
-					score += 900.0f;
-				}
-				if (entry.hostile) {
-					score += 350.0f;
-				}
-				if (classify.allowDialogue) {
-					score += 250.0f;
-				}
-				return score;
-			}
-
-			if (inCombat &&
-				entry.dist <= 1400.0f) {
-				if (outMode) {
-					*outMode = HotkeyPickMode::TruceInCombat;
-				}
-
-				float score = 20000.0f;
-				score -= entry.dist;
-				if (front) {
-					score += 500.0f;
-				}
-				if (entry.hostile) {
-					score += 150.0f;
-				}
-				if (classify.allowDialogue) {
-					score += 250.0f;
-				}
-				return score;
-			}
-
-			return -1.0e30f;
-		}
-
-		static float ScoreTameCandidate(
-			RE::Actor* actor,
-			RE::PlayerCharacter* player,
-			const TFD::ActorScan::Entry& entry,
-			HotkeyPickMode* outMode)
-		{
-			if (outMode) {
-				*outMode = HotkeyPickMode::None;
-			}
-
-			if (!actor || !player) {
-				return -1.0e30f;
-			}
-			if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
-				return -1.0e30f;
-			}
-
-			if (IsNonHostileActiveTameFollower(actor, entry)) {
-				return -1.0e30f;
-			}
-
-			const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-			const bool inCombat = actor->IsInCombat() || entry.inCombat;
-			const bool weaponDrawn = actor->IsWeaponDrawn();
-
-			const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
-				player,
-				actor,
-				false,
-				inCombat,
-				entry.dist);
-
-			if (!classify.valid ||
-				classify.intent != TFD::TargetClassifier::InteractionIntent::Tame) {
-				return -1.0e30f;
-			}
-
-			if (entry.dist > 768.0f) {
-				return -1.0e30f;
-			}
-
-			const bool combatRelevant = entry.hostile || inCombat;
-			if (!combatRelevant) {
-				return -1.0e30f;
-			}
-
-			if (outMode) {
-				*outMode = HotkeyPickMode::Tame;
-			}
-
-			float score = inCombat ? 32000.0f : 30000.0f;
-			score -= entry.dist;
-			if (front) {
-				score += 300.0f;
-			}
-			if (entry.hostile) {
-				score += 250.0f;
-			}
-			if (weaponDrawn) {
-				score += 350.0f;
-			}
-			return score;
-		}
-
-		static RE::Actor* PickBestHotkeyCandidateForMode(
-			RE::PlayerCharacter* player,
-			HotkeyPickMode desiredMode,
-			HotkeyPickMode* outMode)
-		{
-			if (outMode) {
-				*outMode = HotkeyPickMode::None;
-			}
-
-			if (!player) {
-				return nullptr;
-			}
-
-			RE::Actor* best = nullptr;
-			HotkeyPickMode bestMode = HotkeyPickMode::None;
-			float bestScore = -1.0e30f;
-
-			const auto count = TFD::ActorScan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
-				if (!actor) {
-					continue;
-				}
-				if (actor->IsDead() || actor->IsDisabled()) {
-					continue;
-				}
-				if (!actor->Is3DLoaded()) {
-					continue;
-				}
-
-				HotkeyPickMode mode = HotkeyPickMode::None;
-				float score = -1.0e30f;
-
-				if (desiredMode == HotkeyPickMode::Tame) {
-					score = ScoreTameCandidate(actor, player, entry, &mode);
-				}
-				else {
-					score = ScoreTruceCandidate(actor, player, entry, &mode);
-				}
-
-				if (desiredMode != HotkeyPickMode::None && mode != desiredMode) {
-					continue;
-				}
-
-				if (score > bestScore) {
-					bestScore = score;
-					best = actor;
-					bestMode = mode;
-				}
-			}
-
-			if (outMode) {
-				*outMode = bestMode;
-			}
-
-			return best;
-		}
-
-		static RE::Actor* PickPreCombatTargetSameCellLoaded(float radius, HotkeyPickMode* outMode)
-		{
-			auto* player = RE::PlayerCharacter::GetSingleton();
-			if (outMode) {
-				*outMode = HotkeyPickMode::None;
-			}
-			if (!player) {
-				return nullptr;
-			}
-
-			TFD::ActorScan::Rescan(radius, false);
-
-			HotkeyPickMode truceMode = HotkeyPickMode::None;
-			if (auto* truceTarget = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::TrucePreCombat, &truceMode)) {
-				if (truceMode == HotkeyPickMode::TrucePreCombat) {
-					if (outMode) {
-						*outMode = truceMode;
-					}
-					return truceTarget;
-				}
-			}
-
-			HotkeyPickMode tameMode = HotkeyPickMode::None;
-			if (auto* tameTarget = PickBestHotkeyCandidateForMode(player, HotkeyPickMode::Tame, &tameMode)) {
-				if (outMode) {
-					*outMode = tameMode;
-				}
-				return tameTarget;
-			}
-
-			return nullptr;
-		}
-
 		enum class CaptureResult
 		{
 			None,
@@ -1706,6 +1143,13 @@ namespace TFDMenu
 				SafeStr(baseName));
 			RenderCellBrief("  Cell", cell);
 			RenderLocationBrief("  Loc", loc);
+		}
+
+		static bool IsShiftDown()
+		{
+			return (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0 ||
+				(GetAsyncKeyState(VK_LSHIFT) & 0x8000) != 0 ||
+				(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
 		}
 
 		static void RenderInlineFeedChoices(RE::Actor* actor, const TFD::Pacify::ActiveTameSnapshot& snap)
@@ -2247,7 +1691,7 @@ namespace TFDMenu
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
 							if (player && !TFD::DefeatMonitor::IsCaptivePhase()) {
-								if (auto* defeatedTalkTarget = PickExactDialogueDefeatedTargetSameCellLoaded(220.0f)) {
+								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(220.0f)) {
 									spdlog::info("[TFD][Menu] activate intercepted for defeated dialogue target={:08X}", defeatedTalkTarget->GetFormID());
 									RE::DebugNotification("TFD: Defeated Dialogue");
 									return RE::BSEventNotifyControl::kStop;
@@ -2362,119 +1806,68 @@ namespace TFDMenu
 					}
 
 					if (shiftDown) {
-						if (auto* defeatedCreature = PickExactDefeatedCreatureTargetSameCellLoaded(1400.0f)) {
-							if (TFD::DefeatMonitor::RecruitDefeatedCreatureAsTeammate(defeatedCreature, NowSec())) {
-								RE::DebugNotification("TFD: Defeated Creature Recruited");
-							}
-							else {
-								RE::DebugNotification("TFD: Defeated Recruit Failed");
-							}
-							continue;
-						}
-
-						auto* tameTarget = PickExactActiveTameTargetSameCellLoaded(1400.0f);
-						if (!tameTarget) {
-							RE::DebugNotification("TFD: No Exact Tame Target");
-							continue;
-						}
-
-						SetInteractionStateValue(3);
-						if (!TFD::FeedPopup::Open(tameTarget)) {
-							RE::DebugNotification("TFD: No Available Tame Commands");
-							ClearInteractionStateValue();
-						}
-						continue;
-					}
-
-					HotkeyPickMode pickMode = HotkeyPickMode::None;
-					RE::Actor* target = nullptr;
-
-					const auto preferredTruceAction = TFD::InteractionRouter::ResolvePreferredTruceAction(flowSnapshot);
-					const auto preferredPickMode = HotkeyPickModeFromTruceAction(preferredTruceAction);
-					TFD::ActorScan::Rescan(3500.0f, false);
-					target = PickBestHotkeyCandidateForMode(player, preferredPickMode, &pickMode);
-
-					if (!target || pickMode == HotkeyPickMode::None) {
-						RE::DebugNotification("TFD: No Valid Target");
-						ClearInteractionStateValue();
-						continue;
-					}
-
-					if (pickMode == HotkeyPickMode::Tame) {
-						SetInteractionStateValue(3);
-						const auto exec = TFD::InteractionRouter::HandleHotkeyPress(
+						const auto shiftResult = TFD::InteractionRouter::ExecuteShiftHotkey(
 							player,
-							target,
-							false,
-							NowSec());
+							NowSec(),
+							1400.0f);
 
-						if (!exec.executed) {
-							if (exec.failReason == TFD::InteractionRouter::FailReason::TameAlreadyActive) {
-								RE::DebugNotification("TFD: Already Tamed. Use Shift+H to Feed");
-							}
-							else if (exec.failReason == TFD::InteractionRouter::FailReason::NoValidBait) {
-								RE::DebugNotification("TFD: No Valid Bait");
-							}
-							else if (exec.action == TFD::InteractionRouter::Action::Tame &&
-								exec.failReason == TFD::InteractionRouter::FailReason::SessionBeginFailed) {
-								RE::DebugNotification("TFD: Pack Tame Failed");
-							}
-							else {
-								RE::DebugNotification("TFD: Interaction Failed");
-							}
+						if (!shiftResult.handled) {
+							RE::DebugNotification("TFD: Interaction Failed");
 							ClearInteractionStateValue();
 							continue;
 						}
 
-						switch (exec.action) {
-						case TFD::InteractionRouter::Action::Tame:
-							RE::DebugNotification("TFD: Tame");
-							break;
-						case TFD::InteractionRouter::Action::None:
-						default:
-							RE::DebugNotification("TFD: Tame Started");
-							break;
+						if (shiftResult.interactionState != 0) {
+							SetInteractionStateValue(shiftResult.interactionState);
 						}
+
+						if (shiftResult.action == TFD::InteractionRouter::ShiftHotkeyAction::OpenFeedPopup &&
+							shiftResult.success &&
+							shiftResult.target) {
+							if (!TFD::FeedPopup::Open(shiftResult.target)) {
+								RE::DebugNotification("TFD: No Available Tame Commands");
+								ClearInteractionStateValue();
+							}
+							continue;
+						}
+
+						if (shiftResult.notification) {
+							RE::DebugNotification(shiftResult.notification);
+						}
+
+						if (!shiftResult.success) {
+							ClearInteractionStateValue();
+						}
+
 						continue;
 					}
 
-					TFD::InteractionRouter::Action truceAction = TFD::InteractionRouter::Action::None;
-					SetInteractionStateValue(InteractionStateForPickMode(pickMode));
-					const bool truceStarted = TFD::InteractionRouter::BeginTruceForAction(
-						target,
-						preferredTruceAction,
-						&truceAction);
-					if (!truceStarted) {
-						RE::DebugNotification("TFD: Truce Failed");
+					const auto primaryResult = TFD::InteractionRouter::ExecutePrimaryHotkey(
+						player,
+						flowSnapshot,
+						NowSec(),
+						3500.0f,
+						true);
+
+					if (!primaryResult.handled) {
+						RE::DebugNotification("TFD: Interaction Failed");
 						ClearInteractionStateValue();
 						continue;
 					}
 
-					switch (truceAction) {
-					case TFD::InteractionRouter::Action::TrucePreCombat:
-						SetInteractionStateValue(1);
-						RE::DebugNotification("TFD: PreCombat Truce");
-						break;
-					case TFD::InteractionRouter::Action::TruceInCombat:
-						SetInteractionStateValue(2);
-						RE::DebugNotification("TFD: InCombat Truce");
-						break;
-					case TFD::InteractionRouter::Action::Tame:
-						SetInteractionStateValue(3);
-						RE::DebugNotification("TFD: Tame");
-						break;
-					case TFD::InteractionRouter::Action::None:
-					default:
-						if (pickMode == HotkeyPickMode::TruceInCombat) {
-							SetInteractionStateValue(2);
-							RE::DebugNotification("TFD: InCombat Truce");
-						}
-						else {
-							SetInteractionStateValue(1);
-							RE::DebugNotification("TFD: PreCombat Truce");
-						}
-						break;
+					if (primaryResult.interactionState != 0) {
+						SetInteractionStateValue(primaryResult.interactionState);
 					}
+
+					if (primaryResult.notification) {
+						RE::DebugNotification(primaryResult.notification);
+					}
+
+					if (!primaryResult.success) {
+						ClearInteractionStateValue();
+					}
+
+					continue;
 				}
 
 				return RE::BSEventNotifyControl::kContinue;
