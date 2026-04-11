@@ -1,17 +1,30 @@
 #include "TFDBleedout.h"
 
 #include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cmath>
+#include <array>
+#include <limits>
 #include <atomic>
+#include <string>
+#include <unordered_set>
+#include <vector>
 #include <utility>
 #include <thread>
 
+#include "TFDActorScan.h"
+#include "TFDFactionMask.h"
 #include "TFDFlowController.h"
+#include "RE/B/BGSRefAlias.h"
+#include "RE/T/TESQuest.h"
 
 namespace TFD::Bleedout
 {
+	bool ActorHasAllowListFaction(RE::Actor* actor);
+
 	namespace
 	{
 		using Clock = std::chrono::steady_clock;
@@ -21,11 +34,742 @@ namespace TFD::Bleedout
 			return actor ? actor->GetFormID() : 0u;
 		}
 
+		constexpr const char* kPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
+
+
+		struct BleedoutQuestRegistryCache
+		{
+			RE::TESQuest* quest{ nullptr };
+			std::array<RE::BGSRefAlias*, 10> captorAliases{};
+			bool resolved{ false };
+		};
+
+		BleedoutQuestRegistryCache g_bleedoutQuestRegistry{};
+		std::uint32_t g_activeCaptorFormID = 0;
+		RE::ActorHandle g_captorFactionHandle{};
+		Clock::time_point g_captorBindLast{};
+
+		void WriteQuestRefAlias(RE::TESQuest* quest, RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
+		{
+			if (!quest || !alias) {
+				return;
+			}
+
+			RE::ObjectRefHandle handle{};
+			if (ref) {
+				handle = ref->CreateRefHandle();
+			}
+
+			RE::BSWriteLockGuard lock(quest->aliasAccessLock);
+			auto it = quest->refAliasMap.find(alias->aliasID);
+			if (ref) {
+				if (it != quest->refAliasMap.end()) {
+					it->second = handle;
+				}
+				else {
+					quest->refAliasMap.insert({ alias->aliasID, handle });
+				}
+			}
+			else if (it != quest->refAliasMap.end()) {
+				quest->refAliasMap.erase(it);
+			}
+		}
+
+		bool SendBridgeModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f)
+		{
+			if (!eventName || !eventName[0]) {
+				return false;
+			}
+
+			auto* task = SKSE::GetTaskInterface();
+			if (!task) {
+				spdlog::warn("[TFD][BleedBridge] SendBridgeModEvent failed: no task interface event={}", eventName);
+				return false;
+			}
+
+			const std::string name{ eventName };
+			const std::string sarg{ strArg ? strArg : "" };
+			const float narg = numArg;
+
+			std::uint32_t actorHandle = 0;
+			RE::FormID senderFormID = 0;
+
+			if (sender) {
+				senderFormID = sender->GetFormID();
+				if (auto* actor = sender->As<RE::Actor>()) {
+					actorHandle = actor->GetHandle().native_handle();
+				}
+			}
+
+			task->AddTask([name, sarg, narg, actorHandle, senderFormID]() {
+				RE::TESForm* outSender = nullptr;
+
+				if (actorHandle != 0) {
+					auto actorSp = RE::Actor::LookupByHandle(actorHandle);
+					outSender = actorSp.get();
+					if (!outSender && senderFormID != 0) {
+						outSender = RE::TESForm::LookupByID(senderFormID);
+					}
+				}
+				else if (senderFormID != 0) {
+					outSender = RE::TESForm::LookupByID(senderFormID);
+				}
+
+				auto* src = SKSE::GetModCallbackEventSource();
+				if (!src) {
+					spdlog::warn("[TFD][BleedBridge] Dispatch skipped: no callback source event={} sender={:08X}", name, senderFormID);
+					return;
+				}
+
+				SKSE::ModCallbackEvent ev{ name.c_str(), sarg.c_str(), narg, outSender };
+				src->SendEvent(&ev);
+
+				spdlog::info("[TFD][BleedBridge] Dispatch event={} sender={:08X} resolved={:08X}",
+					name,
+					senderFormID,
+					outSender ? outSender->GetFormID() : 0u);
+			});
+
+			return true;
+		}
+
+		RE::BGSListForm* ResolveBleedoutAllowList()
+		{
+			static RE::BGSListForm* s_allowList = nullptr;
+			static bool s_tried = false;
+			if (!s_allowList && !s_tried) {
+				s_tried = true;
+				s_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionMask::kAllowListEditorId);
+			}
+			return s_allowList;
+		}
+
+		void ResolveBleedoutQuestRegistry()
+		{
+			if (g_bleedoutQuestRegistry.resolved) {
+				return;
+			}
+			g_bleedoutQuestRegistry.resolved = true;
+			g_bleedoutQuestRegistry.quest = nullptr;
+			g_bleedoutQuestRegistry.captorAliases.fill(nullptr);
+
+			constexpr std::array<const char*, 2> kBleedoutQuestEditorIds{
+				"TFDBleedoutQuest",
+				"TFDBleedOutQuest"
+			};
+			const char* matchedEditorId = nullptr;
+			for (auto* editorId : kBleedoutQuestEditorIds) {
+				auto* quest = RE::TESForm::LookupByEditorID<RE::TESQuest>(editorId);
+				if (quest) {
+					g_bleedoutQuestRegistry.quest = quest;
+					matchedEditorId = editorId;
+					break;
+				}
+			}
+			if (!g_bleedoutQuestRegistry.quest) {
+				spdlog::warn("[TFD][BleedQuest] bleedout quest not found editorIds=TFDBleedoutQuest|TFDBleedOutQuest");
+				return;
+			}
+
+			for (auto* baseAlias : g_bleedoutQuestRegistry.quest->aliases) {
+				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
+				if (!refAlias) {
+					continue;
+				}
+				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName.rfind("Captor", 0) != 0 || aliasName.size() <= 6) {
+					continue;
+				}
+				try {
+					int slot = std::stoi(aliasName.substr(6));
+					if (slot >= 1 && slot <= static_cast<int>(g_bleedoutQuestRegistry.captorAliases.size())) {
+						g_bleedoutQuestRegistry.captorAliases[static_cast<std::size_t>(slot) - 1] = refAlias;
+					}
+				}
+				catch (...) {}
+			}
+
+			std::size_t found = 0;
+			for (auto* alias : g_bleedoutQuestRegistry.captorAliases) {
+				if (alias) {
+					++found;
+				}
+			}
+			spdlog::info("[TFD][BleedQuest] bleedout quest resolved editorId={} quest={:08X} captorAliases={}",
+				matchedEditorId ? matchedEditorId : "unknown",
+				g_bleedoutQuestRegistry.quest ? g_bleedoutQuestRegistry.quest->GetFormID() : 0u,
+				found);
+		}
+
+		RE::TESFaction* ResolveBleedoutCaptorFaction()
+		{
+			static RE::TESFaction* cached = nullptr;
+			static bool tried = false;
+			if (!tried) {
+				tried = true;
+				cached = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDBleedOutFaction");
+				if (!cached) {
+					cached = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDBleedoutFaction");
+				}
+				if (!cached) {
+					spdlog::warn("[TFD][BleedQuest] bleedout captor faction not found editorIds=TFDBleedOutFaction|TFDBleedoutFaction");
+				}
+			}
+			return cached;
+		}
+
+		void RemoveBleedoutCaptorFaction(RE::Actor* actor, const char* reason)
+		{
+			auto* faction = ResolveBleedoutCaptorFaction();
+			if (!actor || !faction) {
+				if (actor && g_captorFactionHandle) {
+					auto tracked = g_captorFactionHandle.get().get();
+					if (tracked == actor) {
+						g_captorFactionHandle.reset();
+					}
+				}
+				return;
+			}
+
+			if (actor->IsInFaction(faction)) {
+				actor->RemoveFromFaction(faction);
+				spdlog::info("[TFD][BleedQuest] captor faction removed actor={:08X} faction={:08X} reason={}",
+					actor->GetFormID(),
+					faction->GetFormID(),
+					reason ? reason : "unknown");
+			}
+
+			if (g_captorFactionHandle) {
+				auto tracked = g_captorFactionHandle.get().get();
+				if (tracked == actor) {
+					g_captorFactionHandle.reset();
+				}
+			}
+		}
+
+		void ApplyBleedoutCaptorFaction(RE::Actor* actor, const char* reason)
+		{
+			auto* faction = ResolveBleedoutCaptorFaction();
+			if (!actor || !faction) {
+				return;
+			}
+
+			if (g_captorFactionHandle) {
+				auto tracked = g_captorFactionHandle.get().get();
+				if (tracked && tracked != actor) {
+					RemoveBleedoutCaptorFaction(tracked, "rebind_stale");
+				}
+			}
+
+			if (!actor->IsInFaction(faction)) {
+				actor->AddToFaction(faction, 0);
+				spdlog::info("[TFD][BleedQuest] captor faction applied actor={:08X} faction={:08X} reason={}",
+					actor->GetFormID(),
+					faction->GetFormID(),
+					reason ? reason : "unknown");
+			}
+
+			g_captorFactionHandle = actor->GetHandle();
+		}
+
 		DialogueOutcome g_dialogueOutcome = DialogueOutcome::None;
 		std::atomic<std::uint8_t> g_terminalCommit{ static_cast<std::uint8_t>(TerminalCommit::None) };
 		bool g_awaitingSystemEventOutcome = false;
 		Clock::time_point g_systemEventUntil{};
 		Clock::time_point g_systemEventLastDeferredLog{};
+
+		constexpr std::size_t kBleedCrowdMaxActors = 10;
+
+		float Distance3D(RE::Actor* a, RE::Actor* b)
+		{
+			if (!a || !b) {
+				return 99999.0f;
+			}
+			const auto ap = a->GetPosition();
+			const auto bp = b->GetPosition();
+			const float dx = ap.x - bp.x;
+			const float dy = ap.y - bp.y;
+			const float dz = ap.z - bp.z;
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
+		bool IsReasonableSpeakerImpl(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance, const SpeakerLogicHandlers& handlers)
+		{
+			if (outDistance) {
+				*outDistance = 99999.0f;
+			}
+			if (!actor || !player) {
+				return false;
+			}
+			if (!handlers.isStandingEnemyThresholdActor || !handlers.isStandingEnemyThresholdActor(actor) || !actor->Is3DLoaded()) {
+				return false;
+			}
+			if (actor->GetFormID() == player->GetFormID()) {
+				return false;
+			}
+			if (!handlers.isCaptiveSupportedAggressor || !handlers.isCaptiveSupportedAggressor(actor)) {
+				return false;
+			}
+			if (!ActorHasAllowListFaction(actor)) {
+				return false;
+			}
+			if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) {
+				return false;
+			}
+			if (!handlers.hasLineOfSightToPlayer || !handlers.hasLineOfSightToPlayer(actor, player)) {
+				return false;
+			}
+			const float dist = Distance3D(actor, player);
+			if (outDistance) {
+				*outDistance = dist;
+			}
+			return dist <= maxDist;
+		}
+
+		bool IsReasonableHotkeySpeakerImpl(RE::Actor* actor, RE::Actor* player, float maxDist, const SpeakerLogicHandlers& handlers, float* outDistance)
+		{
+			if (outDistance) {
+				*outDistance = 99999.0f;
+			}
+			if (!actor || !player) {
+				return false;
+			}
+			if (actor == player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return false;
+			}
+			if (!handlers.isStandingEnemyThresholdActor || !handlers.isStandingEnemyThresholdActor(actor)) {
+				return false;
+			}
+			if (!handlers.isCaptiveSupportedAggressor || !handlers.isCaptiveSupportedAggressor(actor)) {
+				return false;
+			}
+			if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) {
+				return false;
+			}
+			const float dist = Distance3D(actor, player);
+			if (outDistance) {
+				*outDistance = dist;
+			}
+			if (dist > maxDist) {
+				return false;
+			}
+			auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
+			if (currentTarget == player) {
+				return true;
+			}
+			if (currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget)) {
+				return true;
+			}
+			if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
+				return true;
+			}
+			if (handlers.resolveLastAggressor) {
+				if (auto* last = handlers.resolveLastAggressor(); last && last == actor) {
+					return true;
+				}
+			}
+			return ActorHasAllowListFaction(actor);
+		}
+
+		RE::Actor* FindBestHotkeySpeakerImpl(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers)
+		{
+			auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+			if (!player) {
+				return nullptr;
+			}
+
+			float preferredDist = 99999.0f;
+			if (preferred && IsReasonableHotkeySpeakerImpl(preferred, player, maxDist, handlers, &preferredDist)) {
+				return preferred;
+			}
+
+			TFD::ActorScan::Rescan(radius, false);
+			RE::Actor* best = nullptr;
+			float bestScore = std::numeric_limits<float>::max();
+			auto* lastAggressor = handlers.resolveLastAggressor ? handlers.resolveLastAggressor() : nullptr;
+			const auto count = TFD::ActorScan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::ActorScan::GetEntry(i);
+				auto actorSp = entry.actor.get();
+				auto* actor = actorSp.get();
+				float dist = 99999.0f;
+				if (!IsReasonableHotkeySpeakerImpl(actor, player, maxDist, handlers, &dist)) {
+					continue;
+				}
+
+				auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
+				const bool targetsPlayer = currentTarget == player;
+				const bool targetsFollower = currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget);
+				const bool hostile = entry.hostile || actor->IsHostileToActor(player);
+				const bool inCombat = entry.inCombat || actor->IsInCombat();
+				const bool los = handlers.hasLineOfSightToPlayer && handlers.hasLineOfSightToPlayer(actor, player);
+				float score = dist;
+				if (targetsPlayer) score -= 900.0f;
+				if (targetsFollower) score -= 650.0f;
+				if (hostile) score -= 240.0f;
+				if (inCombat) score -= 180.0f;
+				if (los) score -= 90.0f;
+				if (actor == preferred) score -= 400.0f;
+				if (lastAggressor && lastAggressor == actor) score -= 300.0f;
+				if (score < bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+			return best;
+		}
+
+	}
+
+
+	std::vector<RE::Actor*> CollectCrowd(float radius, RE::Actor* preferred, bool preserveAssigned, const SpeakerLogicHandlers& handlers)
+	{
+		std::vector<std::pair<float, RE::Actor*>> scored;
+
+		auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+		if (!player) {
+			return {};
+		}
+
+		const float scanRadius = (std::max)(radius, 2000.0f);
+		TFD::ActorScan::Rescan(scanRadius, false);
+		const auto count = TFD::ActorScan::GetCount();
+		for (int i = 0; i < count; ++i) {
+			auto entry = TFD::ActorScan::GetEntry(i);
+			auto actorSp = entry.actor.get();
+			auto* actor = actorSp.get();
+			if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
+			if (!actor->Is3DLoaded()) continue;
+			if (actor->GetFormID() == player->GetFormID()) continue;
+			if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) continue;
+			if (!handlers.isBleedCrowdSupportedAggressor || !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
+			if (entry.dist > scanRadius) continue;
+
+			const bool targetingPlayer = entry.hostile || entry.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
+			const bool preserved = preserveAssigned && handlers.isPreservedAssigned && handlers.isPreservedAssigned(actor);
+			if (!targetingPlayer && !preserved && actor != preferred) continue;
+
+			float score = entry.dist;
+			if (actor == preferred) score -= 1000.0f;
+			if (targetingPlayer) score -= 140.0f;
+			if (entry.hostile) score -= 80.0f;
+			if (entry.inCombat || actor->IsInCombat()) score -= 60.0f;
+			if (preserved) score -= 90.0f;
+			if (handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
+			scored.emplace_back(score, actor);
+		}
+
+		std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
+			if (a.first != b.first) {
+				return a.first < b.first;
+			}
+			if (!a.second || !b.second) {
+				return a.second != nullptr;
+			}
+			return a.second->GetFormID() < b.second->GetFormID();
+		});
+
+		std::vector<RE::Actor*> result;
+		result.reserve((std::min)(scored.size(), kBleedCrowdMaxActors));
+		for (const auto& [score, actor] : scored) {
+			(void)score;
+			if (!actor) {
+				continue;
+			}
+			const auto id = actor->GetFormID();
+			bool seen = false;
+			for (auto* existing : result) {
+				if (existing && existing->GetFormID() == id) {
+					seen = true;
+					break;
+				}
+			}
+			if (seen) {
+				continue;
+			}
+			result.push_back(actor);
+			if (result.size() >= kBleedCrowdMaxActors) {
+				break;
+			}
+		}
+
+		if (preferred) {
+			const auto preferredId = preferred->GetFormID();
+			auto it = std::find_if(result.begin(), result.end(), [preferredId](RE::Actor* actor) {
+				return actor && actor->GetFormID() == preferredId;
+			});
+			if (it == result.end()) {
+				if (result.size() >= kBleedCrowdMaxActors) {
+					result.pop_back();
+				}
+				result.insert(result.begin(), preferred);
+			} else if (it != result.begin()) {
+				std::rotate(result.begin(), it, it + 1);
+			}
+		}
+
+		return result;
+	}
+
+	bool IsReasonableSpeaker(RE::Actor* actor, float maxDist, float* outDistance, const SpeakerLogicHandlers& handlers)
+	{
+		auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+		return IsReasonableSpeakerImpl(actor, player, maxDist, outDistance, handlers);
+	}
+
+	RE::Actor* ChooseStrictSpeaker(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers)
+	{
+		auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+		if (!player) {
+			return nullptr;
+		}
+
+		auto isStrongPreferred = [&](RE::Actor* actor, float& outDist) -> bool {
+			if (!IsReasonableSpeakerImpl(actor, player, maxDist, &outDist, handlers)) {
+				return false;
+			}
+			auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
+			if (currentTarget == player) {
+				return true;
+			}
+			if (currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget)) {
+				return true;
+			}
+			if (actor->IsInCombat() && actor->IsHostileToActor(player) && handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 384.0f)) {
+				return true;
+			}
+			return false;
+		};
+
+		float preferredDist = 99999.0f;
+		if (preferred && isStrongPreferred(preferred, preferredDist)) {
+			return preferred;
+		}
+
+		TFD::ActorScan::Rescan(radius, false);
+		RE::Actor* best = nullptr;
+		float bestScore = std::numeric_limits<float>::max();
+		const auto count = TFD::ActorScan::GetCount();
+		for (int i = 0; i < count; ++i) {
+			auto entry = TFD::ActorScan::GetEntry(i);
+			auto actorSp = entry.actor.get();
+			auto* actor = actorSp.get();
+			float dist = 99999.0f;
+			if (!IsReasonableSpeakerImpl(actor, player, maxDist, &dist, handlers)) {
+				continue;
+			}
+
+			auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
+			const bool targetsPlayer = currentTarget == player;
+			const bool targetsFollower = currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget);
+			const bool hostile = entry.hostile || actor->IsHostileToActor(player);
+			const bool inCombat = entry.inCombat || actor->IsInCombat();
+			const bool front = handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 448.0f);
+			if (!hostile && !inCombat && !targetsPlayer && !targetsFollower) {
+				continue;
+			}
+
+			float score = dist;
+			if (targetsPlayer) score -= 900.0f;
+			if (targetsFollower) score -= 650.0f;
+			if (hostile) score -= 260.0f;
+			if (inCombat) score -= 180.0f;
+			if (front) score -= 220.0f;
+			if (actor == preferred) score -= 120.0f;
+			if (score < bestScore) {
+				bestScore = score;
+				best = actor;
+			}
+		}
+
+		if (best) {
+			return best;
+		}
+
+		float anyPreferredDist = 99999.0f;
+		if (preferred && IsReasonableSpeakerImpl(preferred, player, maxDist, &anyPreferredDist, handlers)) {
+			return preferred;
+		}
+
+		return nullptr;
+	}
+
+	RE::Actor* FindBestSpeaker(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers)
+	{
+		if (auto* best = ChooseStrictSpeaker(radius, maxDist, preferred, handlers)) {
+			return best;
+		}
+		auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+		if (!player) {
+			return nullptr;
+		}
+		float preferredDist = 99999.0f;
+		if (preferred && IsReasonableSpeakerImpl(preferred, player, maxDist, &preferredDist, handlers)) {
+			return preferred;
+		}
+		return nullptr;
+	}
+
+	bool CanUseSpeakerForGreet(RE::Actor* aggressor, float maxDist, float& outDistance, const SpeakerLogicHandlers& handlers)
+	{
+		outDistance = 99999.0f;
+		auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+		if (!player || !aggressor) {
+			return false;
+		}
+		if (!handlers.isStandingEnemyThresholdActor || !handlers.isStandingEnemyThresholdActor(aggressor) || !aggressor->Is3DLoaded()) {
+			return false;
+		}
+		if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(aggressor, player)) {
+			return false;
+		}
+		outDistance = Distance3D(aggressor, player);
+		return outDistance <= maxDist;
+	}
+
+	bool BeginDialogueHotkey(float radius, float maxSpeakerDist, const DialogueHotkeyHandlers& handlers)
+	{
+		if (!handlers.isBleedoutActive || !handlers.isBleedoutActive()) {
+			return false;
+		}
+		if (handlers.isCaptiveEscapePhase && handlers.isCaptiveEscapePhase()) {
+			return false;
+		}
+		if (handlers.isDialogueOpen && handlers.isDialogueOpen()) {
+			return false;
+		}
+
+		auto* player = handlers.speaker.getPlayer ? handlers.speaker.getPlayer() : nullptr;
+		if (!player) {
+			return false;
+		}
+
+		RE::Actor* aggressor = handlers.resolveSpeakerFromRuntime ? handlers.resolveSpeakerFromRuntime() : nullptr;
+		if (!aggressor && handlers.speaker.resolveLastAggressor) {
+			aggressor = handlers.speaker.resolveLastAggressor();
+		}
+		if (!aggressor && handlers.resolveAggressor) {
+			aggressor = handlers.resolveAggressor();
+		}
+		if (!aggressor && handlers.findBestAggressor) {
+			aggressor = handlers.findBestAggressor(radius);
+		}
+		aggressor = FindBestHotkeySpeakerImpl(radius, maxSpeakerDist, aggressor, handlers.speaker);
+		if (!aggressor) {
+			spdlog::info("[TFD][Bleedout] bleed hotkey -> no valid speaker");
+			return false;
+		}
+
+		if (handlers.releaseNoSpeakerTameSession) {
+			handlers.releaseNoSpeakerTameSession("bleed_hotkey_begin");
+		}
+		if (handlers.releaseTruceSession) {
+			handlers.releaseTruceSession();
+			handlers.releaseTruceSession();
+		}
+		if (!handlers.startTruceSessionForSpeaker || !handlers.startTruceSessionForSpeaker(player, aggressor, "bleed_hotkey")) {
+			spdlog::warn("[TFD][Bleedout] bleed hotkey truce session failed speaker={:08X}", aggressor->GetFormID());
+			return false;
+		}
+		if (handlers.resetSpeakerKick) {
+			handlers.resetSpeakerKick();
+		}
+		if (handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime("bleed_hotkey");
+		}
+		if (handlers.beginGreet) {
+			handlers.beginGreet(aggressor, "bleed_hotkey");
+		}
+		return true;
+	}
+
+
+
+	void ResetRuntimeState(bool preserveCaptive, const char* reason, const RuntimeResetHandlers& handlers)
+	{
+		const char* why = reason ? reason : "reset_bleed_runtime";
+		if (handlers.releasePlayerBleedLock) {
+			handlers.releasePlayerBleedLock(why);
+		}
+		if (handlers.releaseBleedTruceSession) {
+			handlers.releaseBleedTruceSession();
+		}
+		if (handlers.releaseNoSpeakerTameSession) {
+			handlers.releaseNoSpeakerTameSession(why);
+		}
+		if (handlers.clearBridgeAliases) {
+			handlers.clearBridgeAliases(why);
+		}
+		if (handlers.setBleedActive) {
+			handlers.setBleedActive(false, why);
+		}
+		if (handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime("bleed_reset");
+		}
+		if (handlers.resetSystemEventState) {
+			handlers.resetSystemEventState(why);
+		}
+		if (handlers.clearCaptorAliases) {
+			handlers.clearCaptorAliases(why);
+		}
+		if (handlers.resetDialogueRuntimeState) {
+			handlers.resetDialogueRuntimeState();
+		}
+		if (handlers.resetBattleObserveState) {
+			handlers.resetBattleObserveState();
+		}
+		if (handlers.clearEscapeBreakState) {
+			handlers.clearEscapeBreakState();
+		}
+		if (handlers.clearLastEnemyTargetingPlayer) {
+			handlers.clearLastEnemyTargetingPlayer();
+		}
+		if (handlers.clearOutcomeWindow) {
+			handlers.clearOutcomeWindow(why);
+		}
+		if (!preserveCaptive && handlers.resetPleasureRuntime) {
+			handlers.resetPleasureRuntime(why);
+		}
+		spdlog::info("[TFD][Bleedout] runtime reset preserveCaptive={} reason={}",
+			preserveCaptive ? 1 : 0,
+			why);
+	}
+
+	void TransitionRuntimeToPleasureCommit(const char* reason, std::uint32_t speakerId, bool preserveSession, std::uint32_t captorId, const RuntimePleasureCommitHandlers& handlers)
+	{
+		const char* why = reason ? reason : "bleed_pleasure_commit";
+		if (handlers.releaseNoSpeakerTameSession) {
+			handlers.releaseNoSpeakerTameSession(why);
+		}
+		if (handlers.clearBridgeAliases) {
+			handlers.clearBridgeAliases(why);
+		}
+		if (handlers.setBleedActive) {
+			handlers.setBleedActive(false, why);
+		}
+		if (handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime("bleed_reset");
+		}
+		if (handlers.resetDialogueRuntimeState) {
+			handlers.resetDialogueRuntimeState();
+		}
+		if (handlers.resetBattleObserveState) {
+			handlers.resetBattleObserveState();
+		}
+		if (handlers.clearEscapeBreakState) {
+			handlers.clearEscapeBreakState();
+		}
+		if (handlers.clearLastEnemyTargetingPlayer) {
+			handlers.clearLastEnemyTargetingPlayer();
+		}
+		if (handlers.clearOutcomeWindow) {
+			handlers.clearOutcomeWindow(why);
+		}
+		spdlog::info("[TFD][Bleedout] runtime transitioned to pleasure commit reason={} preserveSpeaker={:08X} preserveSession={} preserveCaptor={:08X}",
+			why,
+			speakerId,
+			preserveSession ? 1 : 0,
+			captorId);
 	}
 
 	void Install()
@@ -36,9 +780,206 @@ namespace TFD::Bleedout
 	void ResetForLoad()
 	{
 		ClearTerminalCommit("reset_for_load");
+		g_bleedoutQuestRegistry.resolved = false;
+		g_bleedoutQuestRegistry.quest = nullptr;
+		g_bleedoutQuestRegistry.captorAliases.fill(nullptr);
+		g_activeCaptorFormID = 0;
+		g_captorFactionHandle.reset();
+		g_captorBindLast = {};
 		spdlog::info("[TFD][Bleedout] ResetForLoad");
 	}
 
+
+	void ClearBridgeAliases(RE::TESForm* sender, const char* reason)
+	{
+		const bool queued = SendBridgeModEvent("TFDBleedoutClearAll", sender);
+		spdlog::info("[TFD][BleedBridge] ClearAll reason={} queued={}", reason ? reason : "unknown", queued);
+	}
+
+	void AssignBridgeActor(RE::Actor* actor)
+	{
+		if (!actor) {
+			return;
+		}
+
+		const bool queued = SendBridgeModEvent("TFDBleedoutAssign", actor);
+		spdlog::info("[TFD][BleedBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
+	}
+
+	void PrimeBridgeActor(RE::Actor* actor, const char* reason)
+	{
+		if (!actor) {
+			return;
+		}
+		const bool queued = SendBridgeModEvent(kPrimeSpeakerEvent, actor);
+		spdlog::info("[TFD][BleedBridge] Prime speaker actor={:08X} queued={} reason={}",
+			actor->GetFormID(),
+			queued,
+			reason ? reason : "unknown");
+	}
+
+	bool ActorHasAllowListFaction(RE::Actor* actor)
+	{
+		if (!actor) {
+			return false;
+		}
+		auto* allowList = ResolveBleedoutAllowList();
+		if (!allowList) {
+			return false;
+		}
+		for (auto* form : allowList->forms) {
+			auto* faction = form ? form->As<RE::TESFaction>() : nullptr;
+			if (faction && actor->IsInFaction(faction)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void ClearCaptorAliases(const char* reason)
+	{
+		std::vector<RE::Actor*> staleActors{};
+		ResolveBleedoutQuestRegistry();
+		if (g_bleedoutQuestRegistry.quest) {
+			for (auto* alias : g_bleedoutQuestRegistry.captorAliases) {
+				if (!alias) {
+					continue;
+				}
+				if (auto* current = alias->GetActorReference()) {
+					const auto currentId = current->GetFormID();
+					bool seen = false;
+					for (auto* existing : staleActors) {
+						if (existing && existing->GetFormID() == currentId) {
+							seen = true;
+							break;
+						}
+					}
+					if (!seen) {
+						staleActors.push_back(current);
+					}
+				}
+				WriteQuestRefAlias(g_bleedoutQuestRegistry.quest, alias, nullptr);
+			}
+		}
+
+		if (g_captorFactionHandle) {
+			auto tracked = g_captorFactionHandle.get().get();
+			if (tracked) {
+				const auto trackedId = tracked->GetFormID();
+				bool seen = false;
+				for (auto* existing : staleActors) {
+					if (existing && existing->GetFormID() == trackedId) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen) {
+					staleActors.push_back(tracked);
+				}
+			}
+		}
+
+		for (auto* stale : staleActors) {
+			RemoveBleedoutCaptorFaction(stale, reason ? reason : "unknown");
+		}
+		g_captorFactionHandle.reset();
+		g_activeCaptorFormID = 0;
+		g_captorBindLast = {};
+		spdlog::info("[TFD][BleedQuest] captor aliases cleared reason={}", reason ? reason : "unknown");
+	}
+
+	bool IsCaptorAliasPrimary(RE::Actor* actor)
+	{
+		ResolveBleedoutQuestRegistry();
+		if (!actor || !g_bleedoutQuestRegistry.quest || g_bleedoutQuestRegistry.captorAliases.empty()) {
+			return false;
+		}
+		auto* primaryAlias = g_bleedoutQuestRegistry.captorAliases[0];
+		if (!primaryAlias) {
+			return false;
+		}
+		auto* primaryRef = primaryAlias->GetActorReference();
+		return primaryRef && primaryRef == actor;
+	}
+
+	bool BindCaptorAliases(RE::Actor* actor, const char* reason)
+	{
+		if (!actor || actor->IsDead() || actor->IsDisabled()) {
+			return false;
+		}
+		ResolveBleedoutQuestRegistry();
+		if (!g_bleedoutQuestRegistry.quest) {
+			return false;
+		}
+
+		std::vector<RE::Actor*> staleActors{};
+		std::size_t primarySlot = 0;
+		bool bound = false;
+		for (std::size_t i = 0; i < g_bleedoutQuestRegistry.captorAliases.size(); ++i) {
+			auto* alias = g_bleedoutQuestRegistry.captorAliases[i];
+			if (!alias) {
+				continue;
+			}
+
+			auto* current = alias->GetActorReference();
+			if (current && current != actor) {
+				const auto currentId = current->GetFormID();
+				bool seen = false;
+				for (auto* existing : staleActors) {
+					if (existing && existing->GetFormID() == currentId) {
+						seen = true;
+						break;
+					}
+				}
+				if (!seen) {
+					staleActors.push_back(current);
+				}
+			}
+
+			if (!bound) {
+				WriteQuestRefAlias(g_bleedoutQuestRegistry.quest, alias, actor);
+				auto* boundActor = alias->GetActorReference();
+				if (boundActor && boundActor == actor) {
+					bound = true;
+					primarySlot = i + 1;
+					continue;
+				}
+			}
+
+			WriteQuestRefAlias(g_bleedoutQuestRegistry.quest, alias, nullptr);
+		}
+
+		for (auto* stale : staleActors) {
+			RemoveBleedoutCaptorFaction(stale, "rebind_stale");
+		}
+
+		if (bound) {
+			ApplyBleedoutCaptorFaction(actor, reason ? reason : "unknown");
+			g_activeCaptorFormID = actor->GetFormID();
+		}
+		else {
+			RemoveBleedoutCaptorFaction(actor, "bind_failed");
+			g_activeCaptorFormID = 0;
+		}
+		g_captorBindLast = Clock::now();
+		spdlog::info("[TFD][BleedQuest] captor bind actor={:08X} primarySlot={} bound={} reason={}",
+			actor->GetFormID(),
+			primarySlot,
+			bound ? 1 : 0,
+			reason ? reason : "unknown");
+		return bound;
+	}
+
+	std::uint32_t GetActiveCaptorFormID()
+	{
+		return g_activeCaptorFormID;
+	}
+
+	bool WasCaptorRecentlyBound(std::chrono::steady_clock::time_point now, std::chrono::milliseconds window)
+	{
+		return g_captorBindLast.time_since_epoch().count() != 0 &&
+			(now - g_captorBindLast) < window;
+	}
 
 
 	const char* GetTerminalCommitName(TerminalCommit kind)

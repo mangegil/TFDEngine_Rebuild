@@ -3,10 +3,12 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <vector>
 
 namespace RE
 {
 	class Actor;
+	class TESForm;
 }
 
 namespace TFD::Bleedout
@@ -30,6 +32,89 @@ namespace TFD::Bleedout
 
 	void Install();
 	void ResetForLoad();
+
+	struct SpeakerLogicHandlers
+	{
+		std::function<RE::Actor*()> getPlayer;
+		std::function<bool(RE::Actor*)> isStandingEnemyThresholdActor;
+		std::function<bool(RE::Actor*)> isCaptiveSupportedAggressor;
+		std::function<bool(RE::Actor*)> isBleedCrowdSupportedAggressor;
+		std::function<bool(RE::Actor*, RE::Actor*)> isBleedSpaceCompatible;
+		std::function<bool(RE::Actor*, RE::Actor*)> hasLineOfSightToPlayer;
+		std::function<bool(RE::Actor*, RE::Actor*, float)> isActorCloseAndFront;
+		std::function<RE::Actor*(RE::Actor*)> resolveCurrentCombatTarget;
+		std::function<bool(RE::Actor*)> isActiveFollowerActor;
+		std::function<RE::Actor*()> resolveLastAggressor;
+		std::function<bool(RE::Actor*)> isPreservedAssigned;
+	};
+
+	struct DialogueHotkeyHandlers
+	{
+		SpeakerLogicHandlers speaker;
+		std::function<bool()> isBleedoutActive;
+		std::function<bool()> isCaptiveEscapePhase;
+		std::function<bool()> isDialogueOpen;
+		std::function<RE::Actor*()> resolveSpeakerFromRuntime;
+		std::function<RE::Actor*()> resolveAggressor;
+		std::function<RE::Actor*(float)> findBestAggressor;
+		std::function<void(const char*)> releaseNoSpeakerTameSession;
+		std::function<void()> releaseTruceSession;
+		std::function<bool(RE::Actor*, RE::Actor*, const char*)> startTruceSessionForSpeaker;
+		std::function<void()> resetSpeakerKick;
+		std::function<void(const char*)> resetGreetRuntime;
+		std::function<void(RE::Actor*, const char*)> beginGreet;
+	};
+
+	std::vector<RE::Actor*> CollectCrowd(float radius, RE::Actor* preferred, bool preserveAssigned, const SpeakerLogicHandlers& handlers);
+	bool IsReasonableSpeaker(RE::Actor* actor, float maxDist, float* outDistance, const SpeakerLogicHandlers& handlers);
+	RE::Actor* ChooseStrictSpeaker(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers);
+	RE::Actor* FindBestSpeaker(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers);
+	bool CanUseSpeakerForGreet(RE::Actor* aggressor, float maxDist, float& outDistance, const SpeakerLogicHandlers& handlers);
+	bool BeginDialogueHotkey(float radius, float maxSpeakerDist, const DialogueHotkeyHandlers& handlers);
+
+
+	struct RuntimeResetHandlers
+	{
+		std::function<void(const char*)> releasePlayerBleedLock;
+		std::function<void()> releaseBleedTruceSession;
+		std::function<void(const char*)> releaseNoSpeakerTameSession;
+		std::function<void(const char*)> clearBridgeAliases;
+		std::function<void(bool, const char*)> setBleedActive;
+		std::function<void(const char*)> resetGreetRuntime;
+		std::function<void(const char*)> resetSystemEventState;
+		std::function<void(const char*)> clearCaptorAliases;
+		std::function<void()> resetDialogueRuntimeState;
+		std::function<void()> resetBattleObserveState;
+		std::function<void()> clearEscapeBreakState;
+		std::function<void()> clearLastEnemyTargetingPlayer;
+		std::function<void(const char*)> clearOutcomeWindow;
+		std::function<void(const char*)> resetPleasureRuntime;
+	};
+
+	struct RuntimePleasureCommitHandlers
+	{
+		std::function<void(const char*)> releaseNoSpeakerTameSession;
+		std::function<void(const char*)> clearBridgeAliases;
+		std::function<void(bool, const char*)> setBleedActive;
+		std::function<void(const char*)> resetGreetRuntime;
+		std::function<void()> resetDialogueRuntimeState;
+		std::function<void()> resetBattleObserveState;
+		std::function<void()> clearEscapeBreakState;
+		std::function<void()> clearLastEnemyTargetingPlayer;
+		std::function<void(const char*)> clearOutcomeWindow;
+	};
+
+	void ResetRuntimeState(bool preserveCaptive, const char* reason, const RuntimeResetHandlers& handlers);
+	void TransitionRuntimeToPleasureCommit(const char* reason, std::uint32_t speakerId, bool preserveSession, std::uint32_t captorId, const RuntimePleasureCommitHandlers& handlers);
+
+	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
+	void AssignBridgeActor(RE::Actor* actor);
+	void PrimeBridgeActor(RE::Actor* actor, const char* reason);
+	void ClearCaptorAliases(const char* reason);
+	bool IsCaptorAliasPrimary(RE::Actor* actor);
+	bool BindCaptorAliases(RE::Actor* actor, const char* reason);
+	std::uint32_t GetActiveCaptorFormID();
+	bool WasCaptorRecentlyBound(std::chrono::steady_clock::time_point now, std::chrono::milliseconds window);
 
 	bool BeginWindow(RE::Actor* speaker, const char* reason = nullptr);
 	bool ResolvePay(RE::Actor* actor, const char* reason = nullptr);
