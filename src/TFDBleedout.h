@@ -133,7 +133,8 @@ namespace TFD::Bleedout
 		std::chrono::steady_clock::time_point* bleedSpeakerKickLast = nullptr;
 		int* bleedSpeakerKickCount = nullptr;
 		int* bleedDialogueRetryCount = nullptr;
-		bool* escapeBreakBleedPending = nullptr;
+		std::function<bool()> isEscapeBreakBleedPending;
+		std::function<void(bool)> setEscapeBreakBleedPending;
 		bool* bleedPendingCaptiveOutcome = nullptr;
 		bool* bleedPendingNonCaptiveOutcome = nullptr;
 		bool* bleedBattleObservePending = nullptr;
@@ -215,7 +216,6 @@ namespace TFD::Bleedout
 	int& BleedSpeakerKickCountRef();
 	int& BleedDialogueRetryCountRef();
 	std::unordered_set<std::uint32_t>& BleedRejectedSpeakerIdsRef();
-	bool& EscapeBreakBleedPendingRef();
 	bool& BleedPendingCaptiveOutcomeRef();
 	bool& BleedPendingNonCaptiveOutcomeRef();
 	bool& BleedBattleObservePendingRef();

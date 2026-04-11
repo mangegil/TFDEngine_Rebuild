@@ -5,6 +5,9 @@
 #include "TFDPacify.h"
 #include "TFDSettings.h"
 #include "TFDLocation.h"
+#include "TFDFactionMask.h"
+#include "TFDAggressionClamp.h"
+#include "TFDFlowController.h"
 
 #include <SKSE/SKSE.h>
 
@@ -241,6 +244,8 @@ namespace TFD::CaptiveRuntime
 		RE::FormID g_locationFormID = 0;
 		bool g_queuedState = false;
 		PhaseValue g_queuedPhase = PhaseValue::None;
+		bool g_escapeBreakBleedPending = false;
+		RE::ActorHandle g_escapeBreakPreferredAggressor{};
 		bool g_prevLockpickOpen = false;
 		bool g_escapeRadiusActive = false;
 		std::chrono::steady_clock::time_point g_escapeRadiusSince{};
@@ -307,9 +312,34 @@ namespace TFD::CaptiveRuntime
 		return stateActive || phase != PhaseValue::None;
 	}
 
-	bool IsActive()
+	bool GetStateFlag()
+	{
+		return g_state;
+	}
+
+	PhaseValue GetPhase()
+	{
+		return g_phase;
+	}
+
+	std::uint32_t GetPhaseRaw()
+	{
+		return GetPhaseRaw(g_state, g_phase);
+	}
+
+	const char* GetPhaseName()
+	{
+		return GetPhaseName(g_state, g_phase);
+	}
+
+	bool IsFamily()
 	{
 		return IsFamily(g_state, g_phase);
+	}
+
+	bool IsActive()
+	{
+		return IsFamily();
 	}
 
 	bool IsEscapeActive()
@@ -320,6 +350,71 @@ namespace TFD::CaptiveRuntime
 	bool IsStandardCaptiveActive()
 	{
 		return g_phase == PhaseValue::Captive;
+	}
+
+	bool HasEscapeBreakRebleedPending()
+	{
+		return g_escapeBreakBleedPending;
+	}
+
+	void SetEscapeBreakRebleedPending(bool pending)
+	{
+		g_escapeBreakBleedPending = pending;
+		if (!pending) {
+			g_escapeBreakPreferredAggressor.reset();
+		}
+	}
+
+	void QueueEscapeBreakRebleed(RE::Actor* preferredAggressor)
+	{
+		g_escapeBreakPreferredAggressor = preferredAggressor ? preferredAggressor->GetHandle() : RE::ActorHandle{};
+		g_escapeBreakBleedPending = true;
+	}
+
+	void ClearEscapeBreakRebleed()
+	{
+		SetEscapeBreakRebleedPending(false);
+	}
+
+	RE::Actor* ResolveEscapeBreakPreferredAggressor(float radius, const std::function<RE::Actor*(float)>& fallbackResolver)
+	{
+		if (g_escapeBreakPreferredAggressor) {
+			auto sp = RE::Actor::LookupByHandle(g_escapeBreakPreferredAggressor.native_handle());
+			if (sp) {
+				return sp.get();
+			}
+			g_escapeBreakPreferredAggressor.reset();
+		}
+		return fallbackResolver ? fallbackResolver(radius) : nullptr;
+	}
+
+	void QueueLoadedState(bool stateActive, PhaseValue phase)
+	{
+		g_queuedState = stateActive;
+		g_queuedPhase = phase;
+	}
+
+	void ClearQueuedLoadedState()
+	{
+		g_queuedState = false;
+		g_queuedPhase = PhaseValue::None;
+	}
+
+	bool GetQueuedStateFlag()
+	{
+		return g_queuedState;
+	}
+
+	PhaseValue GetQueuedPhase()
+	{
+		return g_queuedPhase;
+	}
+
+	void SealDoorIfPresent()
+	{
+		if (g_door.HasDoor()) {
+			g_door.SealToInitial(true);
+		}
 	}
 
 	void ResolveQuestRegistry()
@@ -1005,6 +1100,148 @@ namespace TFD::CaptiveRuntime
 		return g_locationFormID != 0 && curLoc != 0 && curLoc != g_locationFormID;
 	}
 
+
+	bool NormalizeInvalidCaptivePair()
+	{
+		if (!g_state || g_phase != PhaseValue::None) {
+			return false;
+		}
+		SetRuntimeState(true, PhaseValue::Escape);
+		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, 0u, "normalize_invalid_captive_pair");
+		spdlog::info("[TFD][Captive] Normalized invalid captive pair -> Escape");
+		return true;
+	}
+
+	static bool EnterEscapeCommit(RE::Actor* player, const char* reason, RE::TESObjectREFR* door, const EscapeTickHandlers& handlers)
+	{
+		if (!g_state || g_phase != PhaseValue::Captive) {
+			return false;
+		}
+
+		TFD::FactionMask::Clear();
+		TFD::AggressionClamp::Clear();
+		if (handlers.setGraceActive) {
+			handlers.setGraceActive(false);
+		}
+		SetRuntimeState(true, PhaseValue::Escape);
+		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, 0u, reason ? reason : "escape_started");
+		if (handlers.updatePreCombatState) {
+			handlers.updatePreCombatState();
+		}
+		ResetLockpickWatch();
+		if (handlers.setPrevDialogueOpen) {
+			handlers.setPrevDialogueOpen(false);
+		}
+		if (door) {
+			BindDoor(door);
+		} else {
+			door = ResolveBoundEscapeDoor();
+		}
+		if (player) {
+			player->EvaluatePackage(true, false);
+		}
+
+		RE::Actor* aggressor = handlers.resolveAggressor ? handlers.resolveAggressor() : nullptr;
+		if (!aggressor && handlers.findBestAggressor) {
+			const float radius = (std::max)(1800.0f, TFD::Settings::GetSweepRadius());
+			aggressor = handlers.findBestAggressor(radius);
+			if (aggressor && handlers.setLastAggressor) {
+				handlers.setLastAggressor(aggressor);
+			}
+		}
+		if (aggressor) {
+			aggressor->EvaluatePackage(true, false);
+			spdlog::info("[TFD][Captive] Escape aggro nudge actor={:08X}", aggressor->GetFormID());
+		} else {
+			spdlog::info("[TFD][Captive] Escape aggro nudge skipped (no aggressor)");
+		}
+
+		spdlog::info("[TFD][Captive] EscapeCommit reason={} door={:08X}", reason ? reason : "unknown", door ? door->GetFormID() : 0);
+		return true;
+	}
+
+	bool TickCaptiveEscapePhase(RE::Actor* player, const EscapeTickHandlers& handlers)
+	{
+		if (!g_state || g_phase != PhaseValue::Captive) {
+			return false;
+		}
+
+		if (UpdateLockpickEscapeWatch(
+				[&](const char* reason, RE::TESObjectREFR* door) {
+					(void)EnterEscapeCommit(player, reason, door, handlers);
+				})) {
+			return true;
+		}
+
+		if (TryCommitEscapeByRadius(player)) {
+			(void)EnterEscapeCommit(player, "marker_radius", nullptr, handlers);
+			return true;
+		}
+
+		return false;
+	}
+
+	bool TickEscapeActivePhase(RE::Actor* player, const EscapeTickHandlers& handlers)
+	{
+		if (!g_state || g_phase != PhaseValue::Escape) {
+			return true;
+		}
+		if (!player) {
+			return false;
+		}
+
+		RE::FormID oldLoc = 0;
+		RE::FormID newLoc = 0;
+		if (DidEscapeByLocation(player, &oldLoc, &newLoc)) {
+			SetRuntimeState(false, PhaseValue::None);
+			(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeSucceeded, 0u, "escape_resolved_location");
+			(void)TFD::Flow::Controller::GetSingleton().CompleteTerminalContext("escape_resolved_location");
+			ClearEscapeContext();
+			if (handlers.updatePreCombatState) {
+				handlers.updatePreCombatState();
+			}
+			spdlog::info("[TFD][Captive] EscapeResolved by location old={:08X} new={:08X}", oldLoc, newLoc);
+			return true;
+		}
+
+		const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
+		const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
+		const float pct = (hpNow / hpMax) * 100.0f;
+		const float thresh = TFD::Settings::GetDefeatThresholdPct();
+		if (pct > thresh) {
+			return false;
+		}
+
+		RE::Actor* preferred = handlers.resolveAggressor ? handlers.resolveAggressor() : nullptr;
+		if (!preferred && handlers.findBestAggressor) {
+			const float reacquireRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+			preferred = handlers.findBestAggressor(reacquireRadius);
+		}
+
+		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, "escape_broken_threshold");
+		QueueEscapeBreakRebleed(preferred);
+		if (handlers.clearLastAggressor) {
+			handlers.clearLastAggressor();
+		}
+		SetRuntimeState(true, PhaseValue::Captive);
+		ClearEscapeContext();
+		if (handlers.updatePreCombatState) {
+			handlers.updatePreCombatState();
+		}
+		spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> revert to captive and schedule rebleed preferred={:08X}", pct, thresh, preferred ? preferred->GetFormID() : 0);
+		return true;
+	}
+
+	bool TriggerPlayerAggressionEscape(RE::Actor* actor, const char* reason)
+	{
+		if (!g_state) {
+			return false;
+		}
+		SetRuntimeState(true, PhaseValue::Escape);
+		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, actor ? actor->GetFormID() : 0u, reason ? reason : "player_aggression_captive");
+		return true;
+	}
+
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor)
 	{
 		if (outCaptor) {
@@ -1043,6 +1280,8 @@ namespace TFD::CaptiveRuntime
 		g_locationFormID = 0;
 		g_queuedState = false;
 		g_queuedPhase = PhaseValue::None;
+		g_escapeBreakBleedPending = false;
+		g_escapeBreakPreferredAggressor.reset();
 		g_prevLockpickOpen = false;
 		g_escapeRadiusActive = false;
 		g_escapeRadiusSince = {};

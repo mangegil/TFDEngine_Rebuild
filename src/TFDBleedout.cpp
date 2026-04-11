@@ -68,7 +68,6 @@ namespace TFD::Bleedout
 		int g_bleedSpeakerKickCount = 0;
 		std::unordered_set<std::uint32_t> g_bleedRejectedSpeakerIds{};
 		int g_bleedDialogueRetryCount = 0;
-		bool g_escapeBreakBleedPending = false;
 		bool g_bleedPendingCaptiveOutcome = false;
 		bool g_bleedPendingNonCaptiveOutcome = false;
 		bool g_bleedBattleObservePending = false;
@@ -872,7 +871,6 @@ namespace TFD::Bleedout
 	int& BleedSpeakerKickCountRef() { return g_bleedSpeakerKickCount; }
 	int& BleedDialogueRetryCountRef() { return g_bleedDialogueRetryCount; }
 	std::unordered_set<std::uint32_t>& BleedRejectedSpeakerIdsRef() { return g_bleedRejectedSpeakerIds; }
-	bool& EscapeBreakBleedPendingRef() { return g_escapeBreakBleedPending; }
 	bool& BleedPendingCaptiveOutcomeRef() { return g_bleedPendingCaptiveOutcome; }
 	bool& BleedPendingNonCaptiveOutcomeRef() { return g_bleedPendingNonCaptiveOutcome; }
 	bool& BleedBattleObservePendingRef() { return g_bleedBattleObservePending; }
@@ -2414,9 +2412,18 @@ namespace TFD::Bleedout
 
 	bool HandleRuntimePendingEscapeBreak(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers)
 	{
-		if (!state.escapeBreakBleedPending || !*state.escapeBreakBleedPending) return false;
+		auto isPending = [&]() -> bool {
+			return state.isEscapeBreakBleedPending ? state.isEscapeBreakBleedPending() : false;
+		};
+		auto setPending = [&](bool pending) {
+			if (state.setEscapeBreakBleedPending) {
+				state.setEscapeBreakBleedPending(pending);
+			}
+		};
+
+		if (!isPending()) return false;
 		if (!player || player->IsDead() || player->IsDisabled()) {
-			*state.escapeBreakBleedPending = false;
+			setPending(false);
 			return false;
 		}
 		const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
@@ -2424,7 +2431,7 @@ namespace TFD::Bleedout
 		const float pct = (hpNow / hpMax) * 100.0f;
 		const float thresh = TFD::Settings::GetDefeatThresholdPct();
 		if (pct > thresh) {
-			*state.escapeBreakBleedPending = false;
+			setPending(false);
 			spdlog::info("[TFD][Bleedout] pending escape-break rebleed canceled pct={:.1f} thresh={:.1f}", pct, thresh);
 			return false;
 		}
@@ -2437,14 +2444,14 @@ namespace TFD::Bleedout
 				handlers.setLastAggressor(aggressor);
 			}
 			if (StartRuntimeBattleObservePending(state, player, handlers)) {
-				*state.escapeBreakBleedPending = false;
+				setPending(false);
 				return true;
 			}
 		}
 		if (aggressor && handlers.isObserverAlly && handlers.isObserverAlly(aggressor)) aggressor = nullptr;
 		aggressor = handlers.findBestSpeaker ? handlers.findBestSpeaker(scanRadius, 768.0f, aggressor) : aggressor;
 		if (aggressor && handlers.setLastAggressor) handlers.setLastAggressor(aggressor);
-		*state.escapeBreakBleedPending = false;
+		setPending(false);
 		StartRuntimeWindow(state, player, aggressor, handlers);
 		return true;
 	}

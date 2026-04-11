@@ -49,14 +49,40 @@ namespace TFD::CaptiveRuntime
 	bool& QueuedStateRef();
 	PhaseValue& QueuedPhaseRef();
 
+	struct EscapeTickHandlers
+	{
+		std::function<void()> updatePreCombatState;
+		std::function<void(bool)> setPrevDialogueOpen;
+		std::function<void()> clearLastAggressor;
+		std::function<void(RE::Actor*)> setLastAggressor;
+		std::function<RE::Actor*()> resolveAggressor;
+		std::function<RE::Actor*(float)> findBestAggressor;
+		std::function<void(bool)> setGraceActive;
+	};
+
 	PhaseValue PhaseFromRaw(std::uint32_t raw);
 	std::uint32_t GetPhaseRaw(bool stateActive, PhaseValue phase);
 	const char* GetPhaseName(bool stateActive, PhaseValue phase);
 	bool IsFamily(bool stateActive, PhaseValue phase);
 
+	bool GetStateFlag();
+	PhaseValue GetPhase();
+	std::uint32_t GetPhaseRaw();
+	const char* GetPhaseName();
+	bool IsFamily();
 	bool IsActive();
 	bool IsEscapeActive();
 	bool IsStandardCaptiveActive();
+	bool HasEscapeBreakRebleedPending();
+	void SetEscapeBreakRebleedPending(bool pending);
+	void QueueEscapeBreakRebleed(RE::Actor* preferredAggressor);
+	void ClearEscapeBreakRebleed();
+	RE::Actor* ResolveEscapeBreakPreferredAggressor(float radius, const std::function<RE::Actor*(float)>& fallbackResolver = {});
+	void QueueLoadedState(bool stateActive, PhaseValue phase);
+	void ClearQueuedLoadedState();
+	bool GetQueuedStateFlag();
+	PhaseValue GetQueuedPhase();
+	void SealDoorIfPresent();
 
 	void ResolveQuestRegistry();
 	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref);
@@ -82,6 +108,10 @@ namespace TFD::CaptiveRuntime
 	bool UpdateLockpickEscapeWatch(const std::function<void(const char*, RE::TESObjectREFR*)>& onEscapeCommit);
 	bool TryCommitEscapeByRadius(RE::Actor* player);
 	bool DidEscapeByLocation(RE::Actor* player, RE::FormID* oldLocationOut = nullptr, RE::FormID* newLocationOut = nullptr);
+	bool NormalizeInvalidCaptivePair();
+	bool TickCaptiveEscapePhase(RE::Actor* player, const EscapeTickHandlers& handlers);
+	bool TickEscapeActivePhase(RE::Actor* player, const EscapeTickHandlers& handlers);
+	bool TriggerPlayerAggressionEscape(RE::Actor* actor, const char* reason);
 
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
 
