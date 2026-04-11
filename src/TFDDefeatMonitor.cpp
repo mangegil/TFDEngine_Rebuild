@@ -80,6 +80,7 @@ namespace TFD::DefeatMonitor
 		static std::uint32_t ResolveBleedFlowActorFormID();
 		static void ResolveTruceQuestRegistry();
 		static bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason);
+		static TFD::Bleedout::SupportBridgeHandlers BuildBleedSupportBridgeHandlers();
 		static TFD::Bleedout::RuntimeHostStateRefs BuildBleedRuntimeHostStateRefs();
 		static TFD::Bleedout::RuntimeHostHandlers BuildBleedRuntimeHostHandlers();
 		static void ApplyBleedForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet);
@@ -145,26 +146,58 @@ namespace TFD::DefeatMonitor
 		bool g_bleedPaused = false;
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
 		std::chrono::steady_clock::time_point g_bleedLastCalmPulse{};
-		std::chrono::steady_clock::time_point g_bleedLastCrowdAssign{};
 
-		std::vector<RE::FormID> g_bleedCrowdAssigned{};
-		RE::FormID g_bleedTruceSessionId = 0;
-		RE::FormID g_bleedNoSpeakerTameSessionId = 0;
-		RE::FormID g_bleedNoSpeakerTamePrimaryId = 0;
-		std::chrono::steady_clock::time_point g_bleedNoSpeakerTameLastAttempt{};
-		RE::FormID g_bleedSpeakerId = 0;
-		std::chrono::steady_clock::time_point g_bleedSpeakerKickLast{};
-		int g_bleedSpeakerKickCount = 0;
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
 
 		RE::ActorHandle g_lastAggressor{};
 
+		static std::uint32_t CurrentBleedSpeakerID()
+		{
+			return TFD::Bleedout::GetBleedSpeakerID();
+		}
+
+		static RE::Actor* CurrentBleedSpeaker()
+		{
+			return TFD::Bleedout::GetBleedSpeakerActor();
+		}
+
+		static void ResetBleedSpeakerKickState()
+		{
+			TFD::Bleedout::ResetBleedSpeakerKick();
+		}
+
+		static int CurrentBleedDialogueRetryCount()
+		{
+			return TFD::Bleedout::GetBleedDialogueRetryCount();
+		}
+
+		static void SetCurrentBleedDialogueRetryCount(int count)
+		{
+			TFD::Bleedout::SetBleedDialogueRetryCount(count);
+		}
+
+		static void ClearBleedRejectedSpeakerSet()
+		{
+			TFD::Bleedout::ClearBleedRejectedSpeakerIds();
+		}
+
+		static bool HasBleedRejectedSpeakerID(std::uint32_t actorID)
+		{
+			return TFD::Bleedout::HasBleedRejectedSpeakerID(actorID);
+		}
+
+		static void AddBleedRejectedSpeakerID(std::uint32_t actorID)
+		{
+			TFD::Bleedout::AddBleedRejectedSpeakerID(actorID);
+		}
+
 		static std::uint32_t ResolveBleedFlowActorFormID()
 		{
-			if (g_bleedSpeakerId != 0) {
-				return g_bleedSpeakerId;
+			const auto speakerId = CurrentBleedSpeakerID();
+			if (speakerId != 0) {
+				return speakerId;
 			}
 			return TFD::Flow::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
 		}
@@ -284,8 +317,6 @@ namespace TFD::DefeatMonitor
 		};
 
 		std::unordered_map<RE::FormID, ReleaseFollowGraceEntry> g_releaseFollowGraceEntries{};
-		std::unordered_set<RE::FormID> g_bleedRejectedSpeakerIds{};
-		int g_bleedDialogueRetryCount = 0;
 		static constexpr double kDefeatedEnemyKnockSeconds = 30.0;
 		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
@@ -689,43 +720,29 @@ namespace TFD::DefeatMonitor
 			return actorWs && playerWs && actorWs == playerWs;
 		}
 
+		static TFD::Bleedout::SupportBridgeHandlers BuildBleedSupportBridgeHandlers()
+		{
+			TFD::Bleedout::SupportBridgeHandlers handlers{};
+			handlers.queuePreCombatClearAll = []() { return SendBridgeModEvent("TFDPreCombatClearAll", nullptr); };
+			handlers.queueTruceClearAll = []() { return SendBridgeModEvent("TFDTruceClearAll", nullptr); };
+			handlers.queueInCombatClearAll = []() { return SendBridgeModEvent("TFDInCombatClearAll", nullptr); };
+			handlers.cancelAllPreCombat = []() { TFD::PreCombatGreet::CancelAll(); };
+			return handlers;
+		}
+
 		static void ClearBleedSupportBridgeAliases(const char* reason)
 		{
-			const bool preCombatQueued = SendBridgeModEvent("TFDPreCombatClearAll", nullptr);
-			const bool truceQueued = SendBridgeModEvent("TFDTruceClearAll", nullptr);
-			const bool inCombatQueued = SendBridgeModEvent("TFDInCombatClearAll", nullptr);
-			TFD::PreCombatGreet::CancelAll();
-			spdlog::info("[TFD][BleedBridge] ClearSupport reason={} preCombatQueued={} truceQueued={} inCombatQueued={}",
-				reason ? reason : "unknown",
-				preCombatQueued ? 1 : 0,
-				truceQueued ? 1 : 0,
-				inCombatQueued ? 1 : 0);
+			TFD::Bleedout::ClearSupportBridgeAliases(reason, BuildBleedSupportBridgeHandlers());
 		}
 
 		static void ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason reason)
 		{
-			if (g_bleedTruceSessionId != 0) {
-				TFD::Pacify::ReleaseSession(g_bleedTruceSessionId, reason);
-				spdlog::info("[TFD][Defeat] bleed truce session released id={} reason={}",
-					g_bleedTruceSessionId,
-					TFD::Pacify::ToString(reason));
-				g_bleedTruceSessionId = 0;
-			}
-			g_bleedSpeakerId = 0;
+			TFD::Bleedout::ReleaseTruceSession(reason);
 		}
 
 		static void ReleaseBleedNoSpeakerTameSession(const char* reason)
 		{
-			if (g_bleedNoSpeakerTameSessionId != 0) {
-				TFD::Pacify::ReleaseSession(g_bleedNoSpeakerTameSessionId, TFD::Pacify::ReleaseReason::Generic);
-				spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
-					g_bleedNoSpeakerTameSessionId,
-					g_bleedNoSpeakerTamePrimaryId,
-					reason ? reason : "unknown");
-				g_bleedNoSpeakerTameSessionId = 0;
-			}
-			g_bleedNoSpeakerTamePrimaryId = 0;
-			g_bleedNoSpeakerTameLastAttempt = {};
+			TFD::Bleedout::ReleaseNoSpeakerTameSession(reason);
 		}
 
 		static RE::Actor* ChooseBleedNoSpeakerTamePrimary(const std::vector<RE::Actor*>& actors)
@@ -769,53 +786,7 @@ namespace TFD::DefeatMonitor
 			if (!player) {
 				return false;
 			}
-
-			bool hasAny = false;
-			for (auto* actor : actors) {
-				if (!actor || actor->IsDead() || actor->IsDisabled()) {
-					continue;
-				}
-				hasAny = true;
-				if (IsCaptiveSupportedAggressor(actor)) {
-					return false;
-				}
-			}
-			if (!hasAny) {
-				return false;
-			}
-
-			auto* primary = ChooseBleedNoSpeakerTamePrimary(actors);
-			if (!primary) {
-				return false;
-			}
-
-			if (g_bleedNoSpeakerTamePrimaryId == primary->GetFormID() &&
-				TFD::Pacify::IsPacified(primary) &&
-				TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
-				return true;
-			}
-
-			if (g_bleedNoSpeakerTameSessionId != 0) {
-				ReleaseBleedNoSpeakerTameSession("restart");
-			}
-
-			player->DrawWeaponMagicHands(false);
-			auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
-			if (!sessionId.has_value()) {
-				spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
-					primary->GetFormID(),
-					reason ? reason : "unknown");
-				return false;
-			}
-
-			g_bleedNoSpeakerTameSessionId = *sessionId;
-			g_bleedNoSpeakerTamePrimaryId = primary->GetFormID();
-			spdlog::info("[TFD][Defeat] bleed no-speaker tame session id={} primary={:08X} crowdSize={} reason={}",
-				g_bleedNoSpeakerTameSessionId,
-				g_bleedNoSpeakerTamePrimaryId,
-				actors.size(),
-				reason ? reason : "unknown");
-			return true;
+			return TFD::Bleedout::TryEnsureNoSpeakerTameSession(actors, player, reason, BuildBleedRuntimeHostHandlers());
 		}
 
 		static TFD::Bleedout::SpeakerLogicHandlers BuildBleedoutSpeakerHandlers(bool preserveAssigned = false)
@@ -841,7 +812,7 @@ namespace TFD::DefeatMonitor
 				if (!preserveAssigned || !actor) {
 					return false;
 				}
-				return std::find(g_bleedCrowdAssigned.begin(), g_bleedCrowdAssigned.end(), actor->GetFormID()) != g_bleedCrowdAssigned.end();
+				return TFD::Bleedout::HasBleedCrowdAssignedID(actor->GetFormID());
 				};
 			return handlers;
 		}
@@ -853,50 +824,7 @@ namespace TFD::DefeatMonitor
 
 		static void ReleasePlayerBleedLock(const char* reason, bool playGetUp);
 
-		static const char* BleedTerminalCommitName(BleedTerminalCommit kind)
-		{
-			return TFD::Bleedout::GetTerminalCommitName(kind);
-		}
 
-		static BleedTerminalCommit GetBleedTerminalCommit()
-		{
-			return TFD::Bleedout::GetTerminalCommit();
-		}
-
-		static bool HasBleedTerminalCommit()
-		{
-			return TFD::Bleedout::HasTerminalCommit();
-		}
-
-		static bool TryBeginBleedTerminalCommit(BleedTerminalCommit kind, const char* reason)
-		{
-			return TFD::Bleedout::TryBeginTerminalCommit(kind, reason);
-		}
-
-		static void ClearBleedTerminalCommit(const char* reason)
-		{
-			TFD::Bleedout::ClearTerminalCommit(reason);
-		}
-
-		static void ArmBleedSystemEventOutcomeWindow(const char* reason, double seconds = 2.5);
-		static void ClearBleedSystemEventOutcomeWindow(const char* reason);
-		static bool IsBleedSystemEventPendingForFallback(const char** outReason = nullptr);
-		static bool ResolveBleedPendingSystemEventFallback(RE::Actor* player, const char* reason);
-
-		static void ArmBleedSystemEventOutcomeWindow(const char* reason, double seconds)
-		{
-			TFD::Bleedout::ArmSystemEventOutcomeWindow(reason, seconds);
-		}
-
-		static void ClearBleedSystemEventOutcomeWindow(const char* reason)
-		{
-			TFD::Bleedout::ClearSystemEventOutcomeWindow(reason);
-		}
-
-		static bool IsBleedSystemEventPendingForFallback(const char** outReason)
-		{
-			return TFD::Bleedout::IsSystemEventPendingForFallback(outReason);
-		}
 
 		static void ResetBleedRuntimeState(bool preserveCaptive = false)
 		{
@@ -924,13 +852,12 @@ namespace TFD::DefeatMonitor
 				g_bleedPendingNonCaptiveOutcome = false;
 				g_bleedPaused = false;
 				g_bleedPauseStarted = {};
-				g_bleedSpeakerKickLast = {};
-				g_bleedSpeakerKickCount = 0;
-				g_bleedDialogueRetryCount = 0;
+				ResetBleedSpeakerKickState();
+				SetCurrentBleedDialogueRetryCount(0);
 				g_bleedLastCalmPulse = {};
-				g_bleedLastCrowdAssign = {};
-				g_bleedCrowdAssigned.clear();
-				g_bleedRejectedSpeakerIds.clear();
+				TFD::Bleedout::BleedLastCrowdAssignRef() = {};
+				TFD::Bleedout::ClearBleedCrowdAssigned();
+				ClearBleedRejectedSpeakerSet();
 				g_bleedStart = Now();
 				g_bleedLastSeconds = -1;
 				};
@@ -946,7 +873,7 @@ namespace TFD::DefeatMonitor
 				};
 			handlers.clearEscapeBreakState = [&]() { TFD::CaptiveRuntime::ClearEscapeBreakRebleed(); };
 			handlers.clearLastEnemyTargetingPlayer = [&]() { ClearLastEnemyTargetingPlayerInternal(); };
-			handlers.clearOutcomeWindow = [&](const char* reason) { ClearBleedSystemEventOutcomeWindow(reason); };
+			handlers.clearOutcomeWindow = [&](const char* reason) { TFD::Bleedout::ClearSystemEventOutcomeWindow(reason); };
 			handlers.resetPleasureRuntime = [&](const char* reason) { TFD::PleasureRuntime::ResetRuntime(reason); };
 
 			TFD::Bleedout::ResetRuntimeState(preserveCaptive, "reset_bleed_runtime", handlers);
@@ -1025,8 +952,8 @@ namespace TFD::DefeatMonitor
 		{
 			TFD::Bleedout::TransitionRuntimeToPleasureCommit(
 				reason,
-				static_cast<std::uint32_t>(g_bleedSpeakerId),
-				g_bleedTruceSessionId != 0,
+				static_cast<std::uint32_t>(CurrentBleedSpeakerID()),
+				TFD::Bleedout::GetTruceSessionID() != 0,
 				static_cast<std::uint32_t>(TFD::Bleedout::GetActiveCaptorFormID()),
 				TFD::Bleedout::RuntimePleasureCommitHandlers{
 					[&](const char* why) { ReleaseBleedNoSpeakerTameSession(why); },
@@ -1043,13 +970,12 @@ namespace TFD::DefeatMonitor
 						g_bleedPendingNonCaptiveOutcome = false;
 						g_bleedPaused = false;
 						g_bleedPauseStarted = {};
-						g_bleedSpeakerKickLast = {};
-						g_bleedSpeakerKickCount = 0;
-						g_bleedDialogueRetryCount = 0;
+						ResetBleedSpeakerKickState();
+						SetCurrentBleedDialogueRetryCount(0);
 						g_bleedLastCalmPulse = {};
-						g_bleedLastCrowdAssign = {};
-						g_bleedCrowdAssigned.clear();
-						g_bleedRejectedSpeakerIds.clear();
+						TFD::Bleedout::BleedLastCrowdAssignRef() = {};
+						TFD::Bleedout::ClearBleedCrowdAssigned();
+						ClearBleedRejectedSpeakerSet();
 						g_bleedStart = Now();
 						g_bleedLastSeconds = -1;
 					},
@@ -1067,7 +993,7 @@ namespace TFD::DefeatMonitor
 					},
 					[&]() { TFD::CaptiveRuntime::ClearEscapeBreakRebleed(); },
 					[&]() { ClearLastEnemyTargetingPlayerInternal(); },
-					[&](const char* why) { ClearBleedSystemEventOutcomeWindow(why); }
+					[&](const char* why) { TFD::Bleedout::ClearSystemEventOutcomeWindow(why); }
 				});
 		}
 
@@ -1085,12 +1011,8 @@ namespace TFD::DefeatMonitor
 		static void UpdatePreCombatState();
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
-		static void DoBlackoutTeleport();
-		static void CompleteBleedPayRelease(const char* reason);
 		static void PreparePlayerForBleedoutPleasureScene(const char* reason);
 		static void PreparePlayerForCaptivePleasureScene(const char* reason);
-		static void CompleteCaptivePleasureHandoff(const char* reason);
-		static void CompleteBleedPleasureHandoff(const char* reason);
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor);
 		static bool BeginBleedoutDialogueHotkey();
 		static bool HandlePendingEscapeBreakBleed();
@@ -1098,7 +1020,6 @@ namespace TFD::DefeatMonitor
 		static void SetBleedDialogueOutcome(BleedDialogueOutcome outcome, const char* reason);
 		static void ClearBleedDialogueOutcome(const char* reason);
 		static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg);
-		static void EnterNonCaptiveChoice(const char* reason);
 		static bool BeginResolvedNoMarkerFallback(const char* reason);
 		static bool IsDialogueOpen();
 		static void ApplyCalmBubble(float radius);
@@ -1110,6 +1031,11 @@ namespace TFD::DefeatMonitor
 		static TFD::Bleedout::DialogueCloseHandlers BuildBleedDialogueCloseHandlers();
 		static TFD::Bleedout::TimeoutHandlers BuildBleedTimeoutHandlers();
 		static TFD::Bleedout::CompletionHandlers BuildBaseBleedCompletionHandlers();
+		static TFD::Bleedout::CompletionHandlers BuildCaptivePleasureCompletionHandlers();
+		static TFD::Bleedout::CompletionHandlers BuildPayReleaseCompletionHandlers();
+		static TFD::Bleedout::CompletionHandlers BuildBleedPleasureCompletionHandlers();
+		static TFD::Bleedout::NonCaptiveChoiceHandlers BuildBleedNonCaptiveChoiceHandlers();
+		static TFD::Bleedout::BlackoutHandlers BuildBleedBlackoutHandlers();
 
 		static bool IsActorBleedingOut(RE::Actor* actor)
 		{
@@ -1169,122 +1095,12 @@ namespace TFD::DefeatMonitor
 
 		static bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason)
 		{
-			if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
-				return false;
-			}
-			const auto speakerID = speaker->GetFormID();
-			const bool sameActiveCaptor = TFD::Bleedout::GetActiveCaptorFormID() != 0 && TFD::Bleedout::GetActiveCaptorFormID() == speakerID;
-			ClearBleedSupportBridgeAliases(reason ? reason : "bleed_retry");
-			g_bleedSpeakerId = speakerID;
-			g_lastAggressor = speaker->GetHandle();
-			if (!sameActiveCaptor) {
-				TFD::Bleedout::ClearBridgeAliases(speaker, reason ? reason : "bleed_retry");
-			}
-			else {
-				spdlog::info("[TFD][BleedBridge] ClearAll skipped reason={} actor={:08X} sameActiveCaptor=1",
-					reason ? reason : "bleed_retry",
-					speakerID);
-			}
-			TFD::Bleedout::AssignBridgeActor(speaker);
-			TFD::Bleedout::BindCaptorAliases(speaker, reason ? reason : "bleed_retry");
-			TFD::Bleedout::PrimeBridgeActor(speaker, reason ? reason : "bleed_retry");
-			if (!speaker->IsAIEnabled()) {
-				speaker->EnableAI(true);
-			}
-			speaker->AllowPCDialogue(true);
-			speaker->SetDialogueWithPlayer(false, false, nullptr);
-			if (speaker->IsInCombat()) {
-				speaker->StopCombat();
-			}
-			if (auto* process = RE::ProcessLists::GetSingleton()) {
-				process->StopCombatAndAlarmOnActor(speaker, false);
-			}
-			if (speaker->IsWeaponDrawn()) {
-				speaker->DrawWeaponMagicHands(false);
-			}
-			auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false, true);
-			if (!sessionId.has_value() && g_inBleedState.load(std::memory_order_relaxed)) {
-				spdlog::info("[TFD][Defeat] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
-					speaker->GetFormID(),
-					reason ? reason : "unknown");
-				sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true, true);
-			}
-			if (!sessionId.has_value()) {
-				spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
-					speaker->GetFormID(),
-					reason ? reason : "unknown");
-				return false;
-			}
-			g_bleedTruceSessionId = *sessionId;
-			ApplyBleedForceGreetOverdrive(player, speaker, reason ? reason : "bleed_retry", false);
-			speaker->EvaluatePackage(false, true);
-			speaker->EvaluatePackage(true, true);
-			spdlog::info("[TFD][Defeat] bleed speaker restart id={} actor={:08X} reason={}",
-				g_bleedTruceSessionId,
-				speaker->GetFormID(),
-				reason ? reason : "unknown");
-			return true;
+			return TFD::Bleedout::StartTruceSessionForSpeaker(player, speaker, reason, BuildBleedRuntimeHostStateRefs(), BuildBleedRuntimeHostHandlers());
 		}
 
 		static void ApplyBleedForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet)
 		{
-			if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
-				return;
-			}
-
-			if (!speaker->IsAIEnabled()) {
-				speaker->EnableAI(true);
-			}
-			speaker->AllowPCDialogue(true);
-			speaker->SetDialogueWithPlayer(false, false, nullptr);
-
-			if (speaker->IsInCombat()) {
-				speaker->StopCombat();
-			}
-			if (auto* process = RE::ProcessLists::GetSingleton()) {
-				process->StopCombatAndAlarmOnActor(speaker, false);
-			}
-			if (speaker->IsWeaponDrawn()) {
-				speaker->DrawWeaponMagicHands(false);
-			}
-
-			if (!TFD::Bleedout::IsCaptorAliasPrimary(speaker)) {
-				TFD::Bleedout::BindCaptorAliases(speaker, reason ? reason : "bleed_forcegreet_overdrive");
-			}
-			TFD::Bleedout::PrimeBridgeActor(speaker, reason ? reason : "bleed_forcegreet_overdrive");
-
-			// Bleedout forcegreet must stay speaker-only.
-			// Do not assign support crowd, do not broadcast truce/in-combat bridge events,
-			// and do not refresh bleed crowd aliases while the dialogue handshake is happening.
-			g_bleedCrowdAssigned.clear();
-			g_bleedLastCrowdAssign = Now();
-
-			std::optional<RE::FormID> burstId;
-			const bool preserveDialogueSession = g_inBleedState.load(std::memory_order_relaxed);
-			if (!preserveDialogueSession) {
-				burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
-			}
-			else {
-				spdlog::info("[TFD][Defeat] bleed forcegreet preserve dialogue session speaker={:08X} reason={}",
-					speaker->GetFormID(),
-					reason ? reason : "unknown");
-			}
-
-			player->DrawWeaponMagicHands(false);
-			player->EvaluatePackage(false, true);
-			player->EvaluatePackage(true, true);
-			speaker->EvaluatePackage(false, true);
-			speaker->EvaluatePackage(true, true);
-
-			if (restartForceGreet) {
-				TFD::BleedoutGreet::Begin(speaker, reason ? reason : "bleed_forcegreet_overdrive");
-			}
-
-			spdlog::info("[TFD][Defeat] bleed forcegreet overdrive speaker={:08X} crowdSize=1 burst={} restartFG={} reason={}",
-				speaker->GetFormID(),
-				burstId.has_value() ? 1 : 0,
-				restartForceGreet ? 1 : 0,
-				reason ? reason : "unknown");
+			TFD::Bleedout::ApplyForceGreetOverdrive(player, speaker, reason, restartForceGreet, BuildBleedRuntimeHostStateRefs(), BuildBleedRuntimeHostHandlers());
 		}
 
 		static bool PromoteNextBleedSpeakerFromTruceQueue(RE::Actor* player, const char* reason, bool rejectCurrent)
@@ -1297,8 +1113,8 @@ namespace TFD::DefeatMonitor
 				return false;
 			}
 
-			if (rejectCurrent && g_bleedSpeakerId != 0) {
-				g_bleedRejectedSpeakerIds.insert(g_bleedSpeakerId);
+			if (rejectCurrent && CurrentBleedSpeakerID() != 0) {
+				AddBleedRejectedSpeakerID(CurrentBleedSpeakerID());
 			}
 
 			for (auto* alias : g_truceQuestRegistry.truceAliases) {
@@ -1310,7 +1126,7 @@ namespace TFD::DefeatMonitor
 					continue;
 				}
 				const auto actorID = actor->GetFormID();
-				if (g_bleedRejectedSpeakerIds.find(actorID) != g_bleedRejectedSpeakerIds.end()) {
+				if (HasBleedRejectedSpeakerID(actorID)) {
 					continue;
 				}
 				if (!IsBleedCrowdSupportedAggressor(actor) || !IsBleedSpaceCompatible(actor, player)) {
@@ -1321,8 +1137,7 @@ namespace TFD::DefeatMonitor
 					g_prevDialogueOpen = false;
 					g_bleedPaused = false;
 					g_bleedPauseStarted = {};
-					g_bleedSpeakerKickLast = {};
-					g_bleedSpeakerKickCount = 0;
+					ResetBleedSpeakerKickState();
 					g_bleedLastSeconds = -1;
 					g_bleedStart = Now();
 					spdlog::info("[TFD][Defeat] promoted next bleed speaker actor={:08X} reason={}",
@@ -1330,7 +1145,7 @@ namespace TFD::DefeatMonitor
 						reason ? reason : "unknown");
 					return true;
 				}
-				g_bleedRejectedSpeakerIds.insert(actorID);
+				AddBleedRejectedSpeakerID(actorID);
 			}
 
 			return false;
@@ -1338,24 +1153,7 @@ namespace TFD::DefeatMonitor
 
 		static void MaintainBleedPrimaryCaptorBinding()
 		{
-			if (!g_inBleedState.load(std::memory_order_acquire) || g_bleedSpeakerId == 0 || g_bleedTruceSessionId == 0) {
-				return;
-			}
-			if (IsDialogueOpen()) {
-				return;
-			}
-			auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
-			if (!actor || actor->IsDead() || actor->IsDisabled()) {
-				return;
-			}
-			if (TFD::Bleedout::IsCaptorAliasPrimary(actor)) {
-				return;
-			}
-			const auto now = Now();
-			if (TFD::Bleedout::WasCaptorRecentlyBound(now, std::chrono::milliseconds(1500))) {
-				return;
-			}
-			TFD::Bleedout::BindCaptorAliases(actor, "maintain_primary_missing");
+			TFD::Bleedout::MaintainPrimaryCaptorBinding(IsDialogueOpen(), BuildBleedRuntimeHostStateRefs());
 		}
 
 		static void ResolveTruceQuestRegistry()
@@ -2625,7 +2423,7 @@ namespace TFD::DefeatMonitor
 
 		static void QueueNonCaptiveChoiceRequest(const char* reason)
 		{
-			EnterNonCaptiveChoice(reason ? reason : "queued_non_captive_choice");
+			(void)TFD::Bleedout::EnterNonCaptiveChoice(reason ? reason : "queued_non_captive_choice", BuildBleedNonCaptiveChoiceHandlers());
 		}
 
 		static bool ComputePlayerBleedOutState(RE::Actor* player)
@@ -3841,8 +3639,6 @@ namespace TFD::DefeatMonitor
 			return static_cast<int>(raw);
 		}
 
-		static bool ResolveBleedPostDialogueSystemEventOutcome(RE::Actor* player, const char* reason);
-		static bool ShouldDropBleedSystemEventBecauseFallback(const char* eventName);
 
 		static void ClearCaptiveOrchestrationResidue(bool clearPendingFadeIn)
 		{
@@ -3859,7 +3655,7 @@ namespace TFD::DefeatMonitor
 
 		static RE::Actor* ResolveBleedRuntimeSpeaker()
 		{
-			return g_bleedSpeakerId != 0 ? RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId) : nullptr;
+			return CurrentBleedSpeaker();
 		}
 
 		static void BeginBleedPleasureRuntime(RE::Actor* speaker, bool captive, const char* reason)
@@ -3882,15 +3678,22 @@ namespace TFD::DefeatMonitor
 		{
 			TFD::Bleedout::PendingSystemEventHandlers handlers{};
 			handlers.clearDialogueOutcome = [](const char* r) { ClearBleedDialogueOutcome(r); };
-			handlers.clearOutcomeWindow = [](const char* r) { ClearBleedSystemEventOutcomeWindow(r); };
-			handlers.completePayRelease = [](const char* r) { CompleteBleedPayRelease(r); };
+			handlers.clearOutcomeWindow = [](const char* r) { TFD::Bleedout::ClearSystemEventOutcomeWindow(r); };
+			handlers.completePayRelease = [](const char* r) {
+				auto completion = BuildPayReleaseCompletionHandlers();
+				(void)TFD::Bleedout::CompletePayRelease(r, completion);
+			};
 			handlers.releaseFlowHandoff = []() { ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::FlowHandoff); };
 			handlers.resolveCaptiveMarker = []() -> bool { return TFD::TransitionRuntime::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
-			handlers.doBlackoutTeleport = []() { DoBlackoutTeleport(); };
+			handlers.doBlackoutTeleport = []() {
+				(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
+			};
 			handlers.setGraceSeconds = [](int seconds) { SetGraceSeconds(seconds); };
 			handlers.releaseNoSpeakerTameSession = [](const char* r) { ReleaseBleedNoSpeakerTameSession(r); };
 			handlers.exitBleedState = []() { ExitBleedSystemEventRuntime(); };
-			handlers.enterNonCaptiveChoice = [](const char* r) { EnterNonCaptiveChoice(r); };
+			handlers.enterNonCaptiveChoice = [](const char* r) {
+				(void)TFD::Bleedout::EnterNonCaptiveChoice(r, BuildBleedNonCaptiveChoiceHandlers());
+			};
 			return handlers;
 		}
 
@@ -3898,7 +3701,10 @@ namespace TFD::DefeatMonitor
 		{
 			return TFD::Bleedout::DialogueCloseHandlers{
 				[](const char* r) { ClearBleedDialogueOutcome(r); },
-				[](const char* r) { CompleteBleedPayRelease(r); }
+				[](const char* r) {
+					auto completion = BuildPayReleaseCompletionHandlers();
+					(void)TFD::Bleedout::CompletePayRelease(r, completion);
+				}
 			};
 		}
 
@@ -3908,17 +3714,17 @@ namespace TFD::DefeatMonitor
 			handlers.releaseTruceGeneric = []() { ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::Generic); };
 			handlers.resolveCaptiveMarker = []() -> bool { return TFD::TransitionRuntime::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
 			handlers.resetBleedRuntimeState = []() { ResetBleedRuntimeState(); };
-			handlers.doBlackoutTeleport = []() { DoBlackoutTeleport(); };
+			handlers.doBlackoutTeleport = []() { (void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers()); };
 			handlers.setGraceSeconds = [](int seconds) { SetGraceSeconds(seconds); };
-			handlers.enterNonCaptiveChoice = [](const char* r) { EnterNonCaptiveChoice(r); };
+			handlers.enterNonCaptiveChoice = [](const char* r) { (void)TFD::Bleedout::EnterNonCaptiveChoice(r, BuildBleedNonCaptiveChoiceHandlers()); };
 			return handlers;
 		}
 
 		static TFD::Bleedout::CompletionHandlers BuildBaseBleedCompletionHandlers()
 		{
 			TFD::Bleedout::CompletionHandlers handlers{};
-			handlers.clearOutcomeWindow = [](const char* r) { ClearBleedSystemEventOutcomeWindow(r); };
-			handlers.tryBeginTerminalCommit = [](BleedTerminalCommit kind, const char* r) { return TryBeginBleedTerminalCommit(kind, r); };
+			handlers.clearOutcomeWindow = [](const char* r) { TFD::Bleedout::ClearSystemEventOutcomeWindow(r); };
+			handlers.tryBeginTerminalCommit = [](BleedTerminalCommit kind, const char* r) { return TFD::Bleedout::TryBeginTerminalCommit(kind, r); };
 			handlers.clearPendingCinematicFadeIn = []() { TFD::TransitionRuntime::ClearPendingFadeIn(); };
 			handlers.clearBridgeAliases = [](const char* r) { TFD::Bleedout::ClearBridgeAliases(nullptr, r); };
 			handlers.clearEscapeContext = []() { TFD::CaptiveRuntime::ClearEscapeContext(); };
@@ -3937,35 +3743,106 @@ namespace TFD::DefeatMonitor
 			return handlers;
 		}
 
-		static bool ResolveBleedPostDialogueSystemEventOutcome(RE::Actor* player, const char* reason)
+		static TFD::Bleedout::CompletionHandlers BuildCaptivePleasureCompletionHandlers()
 		{
-			(void)player;
-			auto handlers = BuildBaseBleedPendingSystemEventHandlers();
-			return TFD::Bleedout::TryResolvePostDialogueSystemEvent(reason, handlers);
+			auto handlers = BuildBaseBleedCompletionHandlers();
+			handlers.clearLastAggressor = []() { g_lastAggressor.reset(); };
+			handlers.resetBleedRuntimeState = [](bool preserve) { ResetBleedRuntimeState(preserve); };
+			handlers.syncPlayerCaptiveAlias = [](const char* r) { TFD::CaptiveRuntime::SyncPlayerAlias(Player(), r); };
+			return handlers;
 		}
 
-		static bool ShouldDropBleedSystemEventBecauseFallback(const char* eventName)
+		static TFD::Bleedout::CompletionHandlers BuildPayReleaseCompletionHandlers()
 		{
-			const auto commit = GetBleedTerminalCommit();
-			return TFD::Bleedout::ShouldDropSystemEventBecauseFallback(
-				eventName,
-				commit == BleedTerminalCommit::Captive || commit == BleedTerminalCommit::NonCaptiveFallback,
-				BleedTerminalCommitName(commit));
+			auto handlers = BuildBaseBleedCompletionHandlers();
+			handlers.clearFactionMask = []() { TFD::FactionMask::Clear(); };
+			handlers.clearLastAggressor = []() { g_lastAggressor.reset(); };
+			handlers.resetBleedRuntimeState = [](bool preserve) {
+				if (preserve) {
+					ResetBleedRuntimeState(true);
+				} else {
+					ResetBleedRuntimeState();
+				}
+			};
+			handlers.beginLeftForDeadCooldown = [](int secs) { TFD::TransitionRuntime::BeginLeftForDeadCooldown(secs); };
+			handlers.setGraceSeconds = [](int secs) { SetGraceSeconds(secs); };
+			return handlers;
 		}
 
-		static bool ResolveBleedPendingSystemEventFallback(RE::Actor* player, const char* reason)
+		static TFD::Bleedout::CompletionHandlers BuildBleedPleasureCompletionHandlers()
 		{
-			TFD::Bleedout::PendingSystemEventContext context{};
-			context.runtimePhaseName = TFD::PleasureRuntime::GetPhaseName();
-			context.runtimeActive = TFD::PleasureRuntime::IsActive();
-			context.runtimeBlocking = TFD::PleasureRuntime::IsBlocking();
-
-			auto handlers = BuildBaseBleedPendingSystemEventHandlers();
-			handlers.getRetryCount = []() -> int { return g_bleedDialogueRetryCount; };
-			handlers.setRetryCount = [](int count) { g_bleedDialogueRetryCount = count; };
-			handlers.promoteNextSpeaker = [player](const char* r) -> bool { return PromoteNextBleedSpeakerFromTruceQueue(player, r, false); };
-			return TFD::Bleedout::TryHandlePendingSystemEventFallback(context, reason, handlers);
+			auto handlers = BuildBaseBleedCompletionHandlers();
+			handlers.transitionBleedRuntimeToPleasureCommit = [](const char* r) { TransitionBleedRuntimeToPleasureCommit(r); g_lastRouterCombatContextActive = false; };
+			handlers.beginLeftForDeadCooldown = [](int secs) { TFD::TransitionRuntime::BeginLeftForDeadCooldown(secs); };
+			handlers.setGraceSeconds = [](int secs) { SetGraceSeconds(secs); };
+			handlers.refreshPostDefeatGlobals = []() { RefreshPostDefeatGlobals(); };
+			return handlers;
 		}
+
+		static TFD::Bleedout::NonCaptiveChoiceHandlers BuildBleedNonCaptiveChoiceHandlers()
+		{
+			return TFD::Bleedout::NonCaptiveChoiceHandlers{
+				[&]() {
+					const auto activeCommit = TFD::Bleedout::GetTerminalCommit();
+					return activeCommit != BleedTerminalCommit::None && activeCommit != BleedTerminalCommit::NonCaptiveFallback;
+				},
+				[&]() {
+					return TFD::Bleedout::GetTerminalCommitName(TFD::Bleedout::GetTerminalCommit());
+				},
+				[&](const char* r) { return BeginResolvedNoMarkerFallback(r); },
+				[&](const char* r) { TFD::Bleedout::ClearBridgeAliases(nullptr, r); },
+				[&]() { TFD::TransitionRuntime::ClearPendingFadeIn(); },
+				[&]() { TFD::FactionMask::Clear(); },
+				[&]() { TFD::CaptiveRuntime::ClearEscapeContext(); },
+				[&]() { TFD::CaptiveRuntime::ResetLockpickWatch(); },
+				[&](bool active) { g_grace.store(active, std::memory_order_release); },
+				[&]() { g_lastAggressor.reset(); },
+				[&]() { ResetBleedRuntimeState(); },
+				[&](bool v) { g_prevDialogueOpen = v; },
+				[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); },
+				[&](bool captive) { TFD::CaptiveRuntime::SetRuntimeState(captive, captive ? CaptivePhaseValue::Captive : CaptivePhaseValue::None); },
+				[&](bool immune) { SetPlayerBleedImmune(immune); },
+				[&](const char* r) { QueueNonCaptiveChoiceRequest(r); },
+				[&](const char* r) { TFD::Flow::Controller::GetSingleton().ResetRuntime(r ? r : "noncaptive_choice"); }
+			};
+		}
+
+		static TFD::Bleedout::BlackoutHandlers BuildBleedBlackoutHandlers()
+		{
+			TFD::Bleedout::BlackoutHandlers handlers{};
+			handlers.hasBlockingCommit = [&]() -> bool {
+				const auto activeCommit = TFD::Bleedout::GetTerminalCommit();
+				return activeCommit != BleedTerminalCommit::None && activeCommit != BleedTerminalCommit::Captive;
+			};
+			handlers.getBlockingCommitName = [&]() -> const char* {
+				return TFD::Bleedout::GetTerminalCommitName(TFD::Bleedout::GetTerminalCommit());
+			};
+			handlers.resolveCaptiveMarker = [&]() -> bool { return TFD::TransitionRuntime::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
+			handlers.enterNonCaptiveChoice = [&](const char* r) { (void)TFD::Bleedout::EnterNonCaptiveChoice(r, BuildBleedNonCaptiveChoiceHandlers()); };
+			handlers.tryBeginCaptiveCommit = [&](const char* r) -> bool {
+				const auto activeCommit = TFD::Bleedout::GetTerminalCommit();
+				if (activeCommit == BleedTerminalCommit::None) {
+					return TFD::Bleedout::TryBeginTerminalCommit(BleedTerminalCommit::Captive, r);
+				}
+				return true;
+			};
+			handlers.resetBleedRuntimeState = [&]() { ResetBleedRuntimeState(); };
+			handlers.clearBridgeAliases = [&](const char* r) { TFD::Bleedout::ClearBridgeAliases(nullptr, r); };
+			handlers.clearLastAggressor = [&]() { g_lastAggressor.reset(); };
+			handlers.beginCaptiveFlow = [&]() {
+				RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
+				(void)TFD::Flow::Controller::GetSingleton().BeginCaptive(ResolveBleedFlowActorFormID(), TFD::Flow::CaptiveMode::Kidnapped, "bleed_blackout_teleport");
+			};
+			handlers.clearPendingCinematicFadeIn = [&]() { TFD::TransitionRuntime::ClearPendingFadeIn(); };
+			handlers.queueCaptiveFadeTransition = [&]() -> bool { return TFD::TransitionRuntime::QueueRequest(TFD::TransitionRuntime::Kind::Captive, false, "captive_blackout"); };
+			handlers.showBlackoutFader = [&]() { TFD::TransitionRuntime::ShowBlackoutFader(); };
+			handlers.completeCaptiveTransitionNow = [&](const char* r) { if (!TFD::TransitionRuntime::CompleteCaptiveTransitionNow(r, BuildTransitionRuntimeHandlers(), BuildTransitionCaptiveHandlers())) { (void)TFD::Bleedout::EnterNonCaptiveChoice("teleport_failed", BuildBleedNonCaptiveChoiceHandlers()); } };
+			handlers.hideBlackoutFader = [&]() { TFD::TransitionRuntime::HideBlackoutFader(); };
+			return handlers;
+		}
+
+
+
 
 		static void SetGraceSeconds(int seconds)
 		{
@@ -4232,7 +4109,6 @@ namespace TFD::DefeatMonitor
 		}
 
 
-		static void EnterNonCaptiveChoice(const char* reason);
 		static bool BeginResolvedNoMarkerFallback(const char* reason);
 
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
@@ -4248,10 +4124,10 @@ namespace TFD::DefeatMonitor
 			handlers.isCaptiveEscapePhase = []() { return TFD::CaptiveRuntime::IsEscapeActive(); };
 			handlers.isDialogueOpen = []() { return IsDialogueOpen(); };
 			handlers.resolveSpeakerFromRuntime = []() -> RE::Actor* {
-				if (g_bleedSpeakerId == 0) {
+				if (CurrentBleedSpeakerID() == 0) {
 					return nullptr;
 				}
-				return RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
+				return CurrentBleedSpeaker();
 				};
 			handlers.resolveAggressor = []() -> RE::Actor* { return ResolveAggressor(); };
 			handlers.findBestAggressor = [](float radius) -> RE::Actor* { return FindBestAggressor(radius); };
@@ -4261,8 +4137,7 @@ namespace TFD::DefeatMonitor
 				return StartBleedTruceSessionForSpeaker(player, aggressor, reason);
 				};
 			handlers.resetSpeakerKick = []() {
-				g_bleedSpeakerKickLast = {};
-				g_bleedSpeakerKickCount = 0;
+				ResetBleedSpeakerKickState();
 				};
 			handlers.resetGreetRuntime = [](const char* reason) { TFD::BleedoutGreet::ResetRuntime(reason); };
 			handlers.beginGreet = [](RE::Actor* actor, const char* reason) { TFD::BleedoutGreet::Begin(actor, reason); };
@@ -4271,7 +4146,7 @@ namespace TFD::DefeatMonitor
 
 		static bool BeginResolvedNoMarkerFallback(const char* reason)
 		{
-			if (!TryBeginBleedTerminalCommit(BleedTerminalCommit::NonCaptiveFallback, reason ? reason : "noncaptive_fallback")) {
+			if (!TFD::Bleedout::TryBeginTerminalCommit(BleedTerminalCommit::NonCaptiveFallback, reason ? reason : "noncaptive_fallback")) {
 				return false;
 			}
 			ClearCaptiveOrchestrationResidue();
@@ -4311,69 +4186,7 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
-		static void EnterNonCaptiveChoice(const char* reason)
-		{
-			(void)TFD::Bleedout::EnterNonCaptiveChoice(
-				reason,
-				TFD::Bleedout::NonCaptiveChoiceHandlers{
-					[&]() {
-						const auto activeCommit = GetBleedTerminalCommit();
-						return activeCommit != BleedTerminalCommit::None && activeCommit != BleedTerminalCommit::NonCaptiveFallback;
-					},
-					[&]() {
-						return BleedTerminalCommitName(GetBleedTerminalCommit());
-					},
-					[&](const char* r) { return BeginResolvedNoMarkerFallback(r); },
-					[&](const char* r) { TFD::Bleedout::ClearBridgeAliases(nullptr, r); },
-					[&]() { TFD::TransitionRuntime::ClearPendingFadeIn(); },
-					[&]() { TFD::FactionMask::Clear(); },
-					[&]() { TFD::CaptiveRuntime::ClearEscapeContext(); },
-					[&]() { TFD::CaptiveRuntime::ResetLockpickWatch(); },
-					[&](bool active) { g_grace.store(active, std::memory_order_release); },
-					[&]() { g_lastAggressor.reset(); },
-					[&]() { ResetBleedRuntimeState(); },
-					[&](bool v) { g_prevDialogueOpen = v; },
-					[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); },
-					[&](bool captive) { TFD::CaptiveRuntime::SetRuntimeState(captive, captive ? CaptivePhaseValue::Captive : CaptivePhaseValue::None); },
-					[&](bool immune) { SetPlayerBleedImmune(immune); },
-					[&](const char* r) { QueueNonCaptiveChoiceRequest(r); },
-					[&](const char* r) { TFD::Flow::Controller::GetSingleton().ResetRuntime(r ? r : "noncaptive_choice"); }
-				});
-		}
 
-		static void DoBlackoutTeleport()
-		{
-			TFD::Bleedout::BlackoutHandlers handlers{};
-			handlers.hasBlockingCommit = [&]() -> bool {
-				const auto activeCommit = GetBleedTerminalCommit();
-				return activeCommit != BleedTerminalCommit::None && activeCommit != BleedTerminalCommit::Captive;
-				};
-			handlers.getBlockingCommitName = [&]() -> const char* {
-				return BleedTerminalCommitName(GetBleedTerminalCommit());
-				};
-			handlers.resolveCaptiveMarker = [&]() -> bool { return TFD::TransitionRuntime::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
-			handlers.enterNonCaptiveChoice = [&](const char* r) { EnterNonCaptiveChoice(r); };
-			handlers.tryBeginCaptiveCommit = [&](const char* r) -> bool {
-				const auto activeCommit = GetBleedTerminalCommit();
-				if (activeCommit == BleedTerminalCommit::None) {
-					return TryBeginBleedTerminalCommit(BleedTerminalCommit::Captive, r);
-				}
-				return true;
-				};
-			handlers.resetBleedRuntimeState = [&]() { ResetBleedRuntimeState(); };
-			handlers.clearBridgeAliases = [&](const char* r) { TFD::Bleedout::ClearBridgeAliases(nullptr, r); };
-			handlers.clearLastAggressor = [&]() { g_lastAggressor.reset(); };
-			handlers.beginCaptiveFlow = [&]() {
-				RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
-				(void)TFD::Flow::Controller::GetSingleton().BeginCaptive(ResolveBleedFlowActorFormID(), TFD::Flow::CaptiveMode::Kidnapped, "bleed_blackout_teleport");
-				};
-			handlers.clearPendingCinematicFadeIn = [&]() { TFD::TransitionRuntime::ClearPendingFadeIn(); };
-			handlers.queueCaptiveFadeTransition = [&]() -> bool { return TFD::TransitionRuntime::QueueRequest(TFD::TransitionRuntime::Kind::Captive, false, "captive_blackout"); };
-			handlers.showBlackoutFader = [&]() { TFD::TransitionRuntime::ShowBlackoutFader(); };
-			handlers.completeCaptiveTransitionNow = [&](const char* r) { if (!TFD::TransitionRuntime::CompleteCaptiveTransitionNow(r, BuildTransitionRuntimeHandlers(), BuildTransitionCaptiveHandlers())) { EnterNonCaptiveChoice("teleport_failed"); } };
-			handlers.hideBlackoutFader = [&]() { TFD::TransitionRuntime::HideBlackoutFader(); };
-			(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", handlers);
-		}
 
 		static void PreparePlayerForBleedoutPleasureScene(const char* reason)
 		{
@@ -4423,49 +4236,8 @@ namespace TFD::DefeatMonitor
 			TFD::CaptiveRuntime::SyncPlayerAlias(Player(), reason ? reason : "captive_pleasure_prepare");
 		}
 
-		static void CompleteCaptivePleasureHandoff(const char* reason)
-		{
-			auto handlers = BuildBaseBleedCompletionHandlers();
-			handlers.clearLastAggressor = []() { g_lastAggressor.reset(); };
-			handlers.resetBleedRuntimeState = [](bool preserve) { ResetBleedRuntimeState(preserve); };
-			handlers.syncPlayerCaptiveAlias = [](const char* r) { TFD::CaptiveRuntime::SyncPlayerAlias(Player(), r); };
-			(void)TFD::Bleedout::CompleteCaptivePleasureHandoff(reason, handlers);
-		}
 
-		static void CompleteBleedPayRelease(const char* reason)
-		{
-			auto handlers = BuildBaseBleedCompletionHandlers();
-			handlers.clearFactionMask = []() { TFD::FactionMask::Clear(); };
-			handlers.clearLastAggressor = []() { g_lastAggressor.reset(); };
-			handlers.resetBleedRuntimeState = [](bool preserve) {
-				if (preserve) {
-					ResetBleedRuntimeState(true);
-				} else {
-					ResetBleedRuntimeState();
-				}
-			};
-			handlers.beginLeftForDeadCooldown = [](int secs) { TFD::TransitionRuntime::BeginLeftForDeadCooldown(secs); };
-			handlers.setGraceSeconds = [](int secs) { SetGraceSeconds(secs); };
-			(void)TFD::Bleedout::CompletePayRelease(reason, handlers);
-		}
 
-		static void CompleteBleedPleasureHandoff(const char* reason)
-		{
-			const char* why = reason ? reason : "bleed_pleasure_handoff";
-			auto handlers = BuildBaseBleedCompletionHandlers();
-			handlers.transitionBleedRuntimeToPleasureCommit = [](const char* r) { TransitionBleedRuntimeToPleasureCommit(r); g_lastRouterCombatContextActive = false; };
-			handlers.beginLeftForDeadCooldown = [](int secs) { TFD::TransitionRuntime::BeginLeftForDeadCooldown(secs); };
-			handlers.setGraceSeconds = [](int secs) { SetGraceSeconds(secs); };
-			handlers.refreshPostDefeatGlobals = []() { RefreshPostDefeatGlobals(); };
-			const bool ok = TFD::Bleedout::CompleteBleedPleasureHandoff(why, handlers);
-			if (ok) {
-				spdlog::info("[TFD][Defeat] bleed pleasure handoff complete reason={} preserveStabilization=1 clearFlow=0 preserveFlowOwner=1 speaker={:08X} session={} captor={:08X}",
-					why,
-					g_bleedSpeakerId,
-					g_bleedTruceSessionId != 0 ? 1 : 0,
-					TFD::Bleedout::GetActiveCaptorFormID());
-			}
-		}
 
 		static TFD::Bleedout::RuntimeHostStateRefs BuildBleedRuntimeHostStateRefs()
 		{
@@ -4477,13 +4249,13 @@ namespace TFD::DefeatMonitor
 			state.bleedPaused = &g_bleedPaused;
 			state.bleedPauseStarted = &g_bleedPauseStarted;
 			state.bleedLastCalmPulse = &g_bleedLastCalmPulse;
-			state.bleedLastCrowdAssign = &g_bleedLastCrowdAssign;
-			state.bleedCrowdAssigned = reinterpret_cast<std::vector<std::uint32_t>*>(&g_bleedCrowdAssigned);
-			state.bleedRejectedSpeakerIds = reinterpret_cast<std::unordered_set<std::uint32_t>*>(&g_bleedRejectedSpeakerIds);
-			state.bleedSpeakerId = &g_bleedSpeakerId;
-			state.bleedSpeakerKickLast = &g_bleedSpeakerKickLast;
-			state.bleedSpeakerKickCount = &g_bleedSpeakerKickCount;
-			state.bleedDialogueRetryCount = &g_bleedDialogueRetryCount;
+			state.bleedLastCrowdAssign = &TFD::Bleedout::BleedLastCrowdAssignRef();
+			state.bleedCrowdAssigned = &TFD::Bleedout::BleedCrowdAssignedRef();
+			state.bleedRejectedSpeakerIds = &TFD::Bleedout::BleedRejectedSpeakerIdsRef();
+			state.bleedSpeakerId = &TFD::Bleedout::BleedSpeakerIDRef();
+			state.bleedSpeakerKickLast = &TFD::Bleedout::BleedSpeakerKickLastRef();
+			state.bleedSpeakerKickCount = &TFD::Bleedout::BleedSpeakerKickCountRef();
+			state.bleedDialogueRetryCount = &TFD::Bleedout::BleedDialogueRetryCountRef();
 			state.isEscapeBreakBleedPending = []() { return TFD::CaptiveRuntime::HasEscapeBreakRebleedPending(); };
 			state.setEscapeBreakBleedPending = [](bool pending) { TFD::CaptiveRuntime::SetEscapeBreakRebleedPending(pending); };
 			state.bleedPendingCaptiveOutcome = &g_bleedPendingCaptiveOutcome;
@@ -4510,7 +4282,15 @@ namespace TFD::DefeatMonitor
 			handlers.isStandingAllyThresholdActor = [](RE::Actor* actor) { return IsStandingAllyThresholdActor(actor); };
 			handlers.collectRegisteredTeammates = []() { return CollectRegisteredTeammates(); };
 			handlers.collectBleedoutCrowd = [](float radius, RE::Actor* preferred, bool preserveAssigned) { return CollectBleedoutCrowd(radius, preferred, preserveAssigned); };
-			handlers.getBleedCrowdAssigned = []() { return g_bleedCrowdAssigned; };
+			handlers.getBleedCrowdAssigned = []() {
+				std::vector<RE::FormID> ids{};
+				const auto assigned = TFD::Bleedout::GetBleedCrowdAssignedIDs();
+				ids.reserve(assigned.size());
+				for (auto id : assigned) {
+					ids.push_back(static_cast<RE::FormID>(id));
+				}
+				return ids;
+			};
 			handlers.tryAbortPleasureDueToHostileIntrusion = [](float radius) { return TryAbortPleasureDueToHostileIntrusion(radius); };
 			handlers.releasePlayerBleedLock = [](const char* reason, bool playGetUp) { ReleasePlayerBleedLock(reason, playGetUp); };
 			handlers.setGraceSeconds = [](int secs) { SetGraceSeconds(secs); };
@@ -4546,7 +4326,7 @@ namespace TFD::DefeatMonitor
 		static TFD::Bleedout::RuntimeHostHandlers BuildBleedRuntimeHostHandlers()
 		{
 			TFD::Bleedout::RuntimeHostHandlers handlers{};
-			handlers.clearTerminalCommit = [](const char* reason) { ClearBleedTerminalCommit(reason); };
+			handlers.clearTerminalCommit = [](const char* reason) { TFD::Bleedout::ClearTerminalCommit(reason); };
 			handlers.clearBridgeAliasesForActor = [](RE::Actor* actor, const char* reason) { TFD::Bleedout::ClearBridgeAliases(actor, reason); };
 			handlers.clearNoMarkerFallbackState = []() { TFD::TransitionRuntime::ClearNoMarkerFallbackState(); };
 			handlers.releaseNoSpeakerTameSession = [](const char* reason) { ReleaseBleedNoSpeakerTameSession(reason); };
@@ -4769,9 +4549,9 @@ namespace TFD::DefeatMonitor
 					if (dOpen) {
 						TFD::BleedoutGreet::NotifyDialogueOpened();
 					}
-					else if (TFD::BleedoutGreet::TryAfterPleasureWatchdog(g_prevDialogueOpen, dOpen, g_bleedSpeakerId, nowBleedHold,
+					else if (TFD::BleedoutGreet::TryAfterPleasureWatchdog(g_prevDialogueOpen, dOpen, CurrentBleedSpeakerID(), nowBleedHold,
 						[&](const char* reopenReason) -> bool {
-							auto* reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
+							auto* reopenSpeaker = CurrentBleedSpeaker();
 							float reopenDist = 99999.0f;
 							if (!(player && reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist))) {
 								return false;
@@ -4798,9 +4578,9 @@ namespace TFD::DefeatMonitor
 				}
 				if (g_bleedPaused && TFD::Bleedout::GetDialogueOutcome() == BleedDialogueOutcome::None) {
 					const auto nowBleed = Now();
-					if (TFD::BleedoutGreet::TryTimeoutRearm(g_prevDialogueOpen, HasBleedTerminalCommit(), TFD::PleasureRuntime::IsBlocking(), g_bleedSpeakerId, nowBleed,
+					if (TFD::BleedoutGreet::TryTimeoutRearm(g_prevDialogueOpen, TFD::Bleedout::HasTerminalCommit(), TFD::PleasureRuntime::IsBlocking(), CurrentBleedSpeakerID(), nowBleed,
 						[&](const char* reopenReason) -> bool {
-							auto* timeoutSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
+							auto* timeoutSpeaker = CurrentBleedSpeaker();
 							float timeoutDist = 99999.0f;
 							if (!(player && timeoutSpeaker && CanUseAggressorForBleedoutGreet(player, timeoutSpeaker, timeoutDist))) {
 								return false;
@@ -4808,8 +4588,7 @@ namespace TFD::DefeatMonitor
 							ApplyBleedForceGreetOverdrive(player, timeoutSpeaker, reopenReason, true);
 							g_bleedPauseStarted = nowBleed;
 							g_bleedLastSeconds = -1;
-							g_bleedSpeakerKickLast = {};
-							g_bleedSpeakerKickCount = 0;
+							ResetBleedSpeakerKickState();
 							spdlog::info("[TFD][Defeat] bleed forcegreet timeout rearm speaker={:08X} dist={:.1f}",
 								timeoutSpeaker->GetFormID(),
 								timeoutDist);
@@ -4828,9 +4607,9 @@ namespace TFD::DefeatMonitor
 
 				{
 					const auto nowBleed = Now();
-					if (TFD::BleedoutGreet::TryStickyWatchdog(HasBleedTerminalCommit(), IsDialogueOpen(), TFD::PleasureRuntime::IsBlocking(), g_bleedSpeakerId, nowBleed,
+					if (TFD::BleedoutGreet::TryStickyWatchdog(TFD::Bleedout::HasTerminalCommit(), IsDialogueOpen(), TFD::PleasureRuntime::IsBlocking(), CurrentBleedSpeakerID(), nowBleed,
 						[&](const char* reopenReason) -> bool {
-							auto* reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId);
+							auto* reopenSpeaker = CurrentBleedSpeaker();
 							float reopenDist = 99999.0f;
 							if (!(player && reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist))) {
 								return false;
@@ -4845,10 +4624,11 @@ namespace TFD::DefeatMonitor
 					}
 				}
 
-				if (g_bleedSpeakerId == 0) {
+				if (CurrentBleedSpeakerID() == 0) {
 					const auto nowBleed = Now();
-					if (g_bleedNoSpeakerTameLastAttempt.time_since_epoch().count() == 0 || (nowBleed - g_bleedNoSpeakerTameLastAttempt) >= std::chrono::milliseconds(900)) {
-						g_bleedNoSpeakerTameLastAttempt = nowBleed;
+					const auto lastNoSpeakerAttempt = TFD::Bleedout::GetNoSpeakerTameLastAttempt();
+					if (lastNoSpeakerAttempt.time_since_epoch().count() == 0 || (nowBleed - lastNoSpeakerAttempt) >= std::chrono::milliseconds(900)) {
+						TFD::Bleedout::SetNoSpeakerTameLastAttempt(nowBleed);
 						const float bleedRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 						auto crowd = CollectBleedoutCrowd(bleedRadius, nullptr, false);
 						const bool tameHeld = TryEnsureBleedNoSpeakerTameSession(crowd, "bleed_tick_no_speaker");
@@ -4868,18 +4648,18 @@ namespace TFD::DefeatMonitor
 					TFD::BleedoutGreet::DialogueClosedContext{
 						TFD::BleedoutGreet::HasSeenDialogue(),
 						g_prevDialogueOpen,
-						HasBleedTerminalCommit(),
+						TFD::Bleedout::HasTerminalCommit(),
 						TFD::PleasureRuntime::IsBlocking(),
 						TFD::Bleedout::GetDialogueOutcome() == BleedDialogueOutcome::Captive
 					},
 					player,
-					g_bleedSpeakerId,
+					CurrentBleedSpeakerID(),
 					TFD::BleedoutGreet::DialogueClosedHandlers{
 						[&]() {
 							g_prevDialogueOpen = false;
 							g_bleedLastSeconds = -1;
 							spdlog::info("[TFD][Defeat] bleed dialogue closed -> fallback suppressed activeTerminalCommit={}",
-								BleedTerminalCommitName(GetBleedTerminalCommit()));
+								TFD::Bleedout::GetTerminalCommitName(TFD::Bleedout::GetTerminalCommit()));
 						},
 						[&]() {
 							g_prevDialogueOpen = false;
@@ -4894,7 +4674,7 @@ namespace TFD::DefeatMonitor
 							ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::FlowHandoff);
 							if (TFD::TransitionRuntime::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers())) {
 								spdlog::info("[TFD][Defeat] bleedout dialogue closed after captive outcome -> captive marker found");
-								DoBlackoutTeleport();
+								(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
 								SetGraceSeconds(4);
 							}
  else {
@@ -4904,16 +4684,15 @@ namespace TFD::DefeatMonitor
   g_minHp = 0.0f;
   TFD::BleedoutGreet::ResetRuntime("bleed_reset");
   g_bleedLastSeconds = -1;
-  EnterNonCaptiveChoice("dialogue_closed_captive_no_marker");
+  (void)TFD::Bleedout::EnterNonCaptiveChoice("dialogue_closed_captive_no_marker", BuildBleedNonCaptiveChoiceHandlers());
 }
 },
 [&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
 	g_prevDialogueOpen = false;
 	TFD::BleedoutGreet::ResetRuntime("bleed_reset");
-	g_bleedSpeakerKickCount = 0;
-	g_bleedSpeakerKickLast = {};
+	ResetBleedSpeakerKickState();
 	g_bleedLastSeconds = -1;
-	ClearBleedSystemEventOutcomeWindow("dialogue_closed_sticky_reopen");
+	TFD::Bleedout::ClearSystemEventOutcomeWindow("dialogue_closed_sticky_reopen");
 	auto* reopenSpeaker = probe.speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(probe.speakerFormID) : nullptr;
 	if (player && reopenSpeaker) {
 		ApplyBleedForceGreetOverdrive(player, reopenSpeaker, "dialogue_closed_sticky_reopen", true);
@@ -4927,10 +4706,9 @@ namespace TFD::DefeatMonitor
 [&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
 	g_prevDialogueOpen = false;
 	TFD::BleedoutGreet::ResetRuntime("bleed_reset");
-	g_bleedSpeakerKickCount = 0;
-	g_bleedSpeakerKickLast = {};
+	ResetBleedSpeakerKickState();
 	g_bleedLastSeconds = -1;
-	ClearBleedSystemEventOutcomeWindow("dialogue_closed_sticky_reopen");
+	TFD::Bleedout::ClearSystemEventOutcomeWindow("dialogue_closed_sticky_reopen");
 	if (probe.speakerFormID != 0) {
 		spdlog::info("[TFD][Defeat] bleedout dialogue closed without committed outcome -> sticky reopen unavailable speaker={:08X} loaded={} dead={} dist={:.1f}",
 			probe.speakerFormID,
@@ -4947,15 +4725,25 @@ else {
 				}
 
 				if (TFD::Bleedout::IsAwaitingSystemEventOutcome() && !g_prevDialogueOpen) {
-					if (HasBleedTerminalCommit()) {
+					if (TFD::Bleedout::HasTerminalCommit()) {
 						TFD::BleedoutGreet::MarkStickyReopenPending(false, "terminal_commit_active");
-						ClearBleedSystemEventOutcomeWindow("terminal_commit_active");
+						TFD::Bleedout::ClearSystemEventOutcomeWindow("terminal_commit_active");
 						return;
 					}
-					if (ResolveBleedPostDialogueSystemEventOutcome(player, "post_dialogue_system_event")) {
+					if (TFD::Bleedout::TryResolvePostDialogueSystemEvent("post_dialogue_system_event", BuildBaseBleedPendingSystemEventHandlers())) {
 						return;
 					}
-					if (ResolveBleedPendingSystemEventFallback(player, "post_dialogue_system_event_window_expired")) {
+					if ([&]() {
+						TFD::Bleedout::PendingSystemEventContext context{};
+						context.runtimePhaseName = TFD::PleasureRuntime::GetPhaseName();
+						context.runtimeActive = TFD::PleasureRuntime::IsActive();
+						context.runtimeBlocking = TFD::PleasureRuntime::IsBlocking();
+						auto handlers = BuildBaseBleedPendingSystemEventHandlers();
+						handlers.getRetryCount = []() -> int { return CurrentBleedDialogueRetryCount(); };
+						handlers.setRetryCount = [](int count) { SetCurrentBleedDialogueRetryCount(count); };
+						handlers.promoteNextSpeaker = [player](const char* r) -> bool { return PromoteNextBleedSpeakerFromTruceQueue(player, r, false); };
+						return TFD::Bleedout::TryHandlePendingSystemEventFallback(context, "post_dialogue_system_event_window_expired", handlers);
+					}()) {
 						return;
 					}
 				}
@@ -4973,10 +4761,10 @@ else {
 				if (remain <= 0) {
 					g_bleedLastSeconds = -1;
 					const char* pendingSystemReason = nullptr;
-					(void)IsBleedSystemEventPendingForFallback(&pendingSystemReason);
+					(void)TFD::Bleedout::IsSystemEventPendingForFallback(&pendingSystemReason);
 					TFD::Bleedout::TimeoutContext timeoutContext{
-						HasBleedTerminalCommit(),
-						BleedTerminalCommitName(GetBleedTerminalCommit()),
+						TFD::Bleedout::HasTerminalCommit(),
+						TFD::Bleedout::GetTerminalCommitName(TFD::Bleedout::GetTerminalCommit()),
 						pendingSystemReason,
 						g_bleedPendingCaptiveOutcome
 					};
@@ -5148,7 +4936,7 @@ else {
 				}
 
 				const TFD::InCombat::OutcomeEventHandlers inCombatOutcomeEventHandlers{
-					[&](const char* reason, double seconds) { ArmBleedSystemEventOutcomeWindow(reason, seconds); },
+					[&](const char* reason, double seconds) { TFD::Bleedout::ArmSystemEventOutcomeWindow(reason, seconds); },
 					[&](TFD::InCombat::DialogueOutcome outcome, const char* reason) { TFD::InCombat::SetDialogueOutcome(outcome, reason); },
 					[&](const char* reason) { TFD::InCombat::ClearDialogueOutcome(reason); },
 					[&](std::uint32_t actorFormID, const char* reason) -> bool {
@@ -5168,9 +4956,9 @@ else {
 						return true;
 					},
 					[&](const char* reason) { PreparePlayerForCaptivePleasureScene(reason); },
-					[&](const char* reason) { CompleteCaptivePleasureHandoff(reason); },
+					[&](const char* reason) { auto completion = BuildCaptivePleasureCompletionHandlers(); (void)TFD::Bleedout::CompleteCaptivePleasureHandoff(reason, completion); },
 					[&](const char* reason) { PreparePlayerForBleedoutPleasureScene(reason); },
-					[&](const char* reason) { CompleteBleedPleasureHandoff(reason); }
+					[&](const char* reason) { auto completion = BuildBleedPleasureCompletionHandlers(); (void)TFD::Bleedout::CompleteBleedPleasureHandoff(reason ? reason : "bleed_pleasure_handoff", completion); }
 				};
 
 				if (name == kInCombatOutcomePayEvent) {
@@ -5231,11 +5019,11 @@ else {
 				}
 
 				const TFD::Bleedout::OutcomeEventHandlers bleedOutcomeEventHandlers{
-					[&](const char* eventName) { return ShouldDropBleedSystemEventBecauseFallback(eventName); },
-					[&](const char* reason, double seconds) { ArmBleedSystemEventOutcomeWindow(reason, seconds); },
+					[&](const char* eventName) { const auto commit = TFD::Bleedout::GetTerminalCommit(); return TFD::Bleedout::ShouldDropSystemEventBecauseFallback(eventName, commit == BleedTerminalCommit::Captive || commit == BleedTerminalCommit::NonCaptiveFallback, TFD::Bleedout::GetTerminalCommitName(commit)); },
+					[&](const char* reason, double seconds) { TFD::Bleedout::ArmSystemEventOutcomeWindow(reason, seconds); },
 					[&](TFD::Bleedout::DialogueOutcome outcome, const char* reason) { SetBleedDialogueOutcome(outcome, reason); },
 					[&](const char* reason) { ClearBleedDialogueOutcome(reason); },
-					[&](const char* reason) { ClearBleedSystemEventOutcomeWindow(reason); },
+					[&](const char* reason) { TFD::Bleedout::ClearSystemEventOutcomeWindow(reason); },
 					[&](std::uint32_t actorFormID, const char* reason) -> bool {
 							auto& flow = TFD::Flow::Controller::GetSingleton();
 							if (!flow.BeginCaptive(actorFormID, TFD::Flow::CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
@@ -5249,9 +5037,9 @@ else {
 						return true;
 					},
 					[&](const char* reason) { PreparePlayerForCaptivePleasureScene(reason); },
-					[&](const char* reason) { CompleteCaptivePleasureHandoff(reason); },
+					[&](const char* reason) { auto completion = BuildCaptivePleasureCompletionHandlers(); (void)TFD::Bleedout::CompleteCaptivePleasureHandoff(reason, completion); },
 					[&](const char* reason) { PreparePlayerForBleedoutPleasureScene(reason); },
-					[&](const char* reason) { CompleteBleedPleasureHandoff(reason); }
+					[&](const char* reason) { auto completion = BuildBleedPleasureCompletionHandlers(); (void)TFD::Bleedout::CompleteBleedPleasureHandoff(reason ? reason : "bleed_pleasure_handoff", completion); }
 				};
 
 				if (name == kBleedoutOutcomePayEvent) {
@@ -5685,8 +5473,8 @@ else {
 			return speaker;
 		}
 
-		if (g_bleedSpeakerId != 0) {
-			if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId)) {
+		if (CurrentBleedSpeakerID() != 0) {
+			if (auto* actor = CurrentBleedSpeaker()) {
 				return actor;
 			}
 		}
@@ -5764,7 +5552,7 @@ else {
 			changed |= TFD::Pacify::ReleaseActiveTruceSessionForActor(primary, TFD::Pacify::ReleaseReason::PlayerAggression, false);
 		}
 
-		if (g_inBleedState.load(std::memory_order_acquire) || g_bleedTruceSessionId != 0) {
+		if (g_inBleedState.load(std::memory_order_acquire) || TFD::Bleedout::GetTruceSessionID() != 0) {
 			ReleaseBleedTruceSession(TFD::Pacify::ReleaseReason::PlayerAggression);
 			ClearAllBleedLocks(reason ? reason : "passive_break");
 			TFD::Bleedout::ClearBridgeAliases(actor, reason ? reason : "passive_break");

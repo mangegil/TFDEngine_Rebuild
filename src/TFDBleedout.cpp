@@ -1075,6 +1075,21 @@ namespace TFD::Bleedout
 	}
 
 
+	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers)
+	{
+		const bool preCombatQueued = handlers.queuePreCombatClearAll ? handlers.queuePreCombatClearAll() : false;
+		const bool truceQueued = handlers.queueTruceClearAll ? handlers.queueTruceClearAll() : false;
+		const bool inCombatQueued = handlers.queueInCombatClearAll ? handlers.queueInCombatClearAll() : false;
+		if (handlers.cancelAllPreCombat) {
+			handlers.cancelAllPreCombat();
+		}
+		spdlog::info("[TFD][BleedBridge] ClearSupport reason={} preCombatQueued={} truceQueued={} inCombatQueued={}",
+			reason ? reason : "unknown",
+			preCombatQueued ? 1 : 0,
+			truceQueued ? 1 : 0,
+			inCombatQueued ? 1 : 0);
+	}
+
 
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
 	{
@@ -1203,7 +1218,7 @@ namespace TFD::Bleedout
 			reason ? reason : "unknown");
 	}
 
-	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason)
+	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason, std::uint32_t* bleedSpeakerId)
 	{
 		if (g_truceSessionId != 0) {
 			TFD::Pacify::ReleaseSession(g_truceSessionId, reason);
@@ -1211,6 +1226,11 @@ namespace TFD::Bleedout
 				g_truceSessionId,
 				TFD::Pacify::ToString(reason));
 			g_truceSessionId = 0;
+		}
+		g_bleedSpeakerId = 0;
+		ResetBleedSpeakerKick();
+		if (bleedSpeakerId) {
+			*bleedSpeakerId = 0;
 		}
 	}
 
@@ -1225,6 +1245,7 @@ namespace TFD::Bleedout
 			g_noSpeakerTameSessionId = 0;
 		}
 		g_noSpeakerTamePrimaryId = 0;
+		g_bleedNoSpeakerTameLastAttempt = {};
 	}
 
 	bool TryEnsureNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, RE::Actor* player, const char* reason, const RuntimeHostHandlers& handlers)
@@ -1345,6 +1366,73 @@ namespace TFD::Bleedout
 		return g_noSpeakerTamePrimaryId;
 	}
 
+	std::chrono::steady_clock::time_point GetNoSpeakerTameLastAttempt()
+	{
+		return g_bleedNoSpeakerTameLastAttempt;
+	}
+
+	void SetNoSpeakerTameLastAttempt(std::chrono::steady_clock::time_point when)
+	{
+		g_bleedNoSpeakerTameLastAttempt = when;
+	}
+
+	std::uint32_t GetBleedSpeakerID()
+	{
+		return g_bleedSpeakerId;
+	}
+
+	RE::Actor* GetBleedSpeakerActor()
+	{
+		return g_bleedSpeakerId != 0 ? RE::TESForm::LookupByID<RE::Actor>(g_bleedSpeakerId) : nullptr;
+	}
+
+	void ResetBleedSpeakerKick()
+	{
+		g_bleedSpeakerKickLast = {};
+		g_bleedSpeakerKickCount = 0;
+	}
+
+	int GetBleedDialogueRetryCount()
+	{
+		return g_bleedDialogueRetryCount;
+	}
+
+	void SetBleedDialogueRetryCount(int count)
+	{
+		g_bleedDialogueRetryCount = count;
+	}
+
+	std::vector<std::uint32_t> GetBleedCrowdAssignedIDs()
+	{
+		return g_bleedCrowdAssigned;
+	}
+
+	bool HasBleedCrowdAssignedID(std::uint32_t actorID)
+	{
+		return actorID != 0 && std::find(g_bleedCrowdAssigned.begin(), g_bleedCrowdAssigned.end(), actorID) != g_bleedCrowdAssigned.end();
+	}
+
+	void ClearBleedCrowdAssigned()
+	{
+		g_bleedCrowdAssigned.clear();
+	}
+
+	void ClearBleedRejectedSpeakerIds()
+	{
+		g_bleedRejectedSpeakerIds.clear();
+	}
+
+	bool HasBleedRejectedSpeakerID(std::uint32_t actorID)
+	{
+		return g_bleedRejectedSpeakerIds.find(actorID) != g_bleedRejectedSpeakerIds.end();
+	}
+
+	void AddBleedRejectedSpeakerID(std::uint32_t actorID)
+	{
+		if (actorID != 0) {
+			g_bleedRejectedSpeakerIds.insert(actorID);
+		}
+	}
 
 	const char* GetTerminalCommitName(TerminalCommit kind)
 	{

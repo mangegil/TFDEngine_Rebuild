@@ -117,6 +117,15 @@ namespace TFD::Bleedout
 	void TransitionRuntimeToPleasureCommit(const char* reason, std::uint32_t speakerId, bool preserveSession, std::uint32_t captorId, const RuntimePleasureCommitHandlers& handlers);
 
 
+
+	struct SupportBridgeHandlers
+	{
+		std::function<bool()> queuePreCombatClearAll;
+		std::function<bool()> queueTruceClearAll;
+		std::function<bool()> queueInCombatClearAll;
+		std::function<void()> cancelAllPreCombat;
+	};
+
 	struct RuntimeHostStateRefs
 	{
 		std::atomic_bool* inBleedState = nullptr;
@@ -228,16 +237,30 @@ namespace TFD::Bleedout
 	int& BleedBattleObserveActiveEmptyEnemyTicksRef();
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
+	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers);
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	bool PromoteNextSpeakerFromTruceQueue(RE::TESQuest* truceQuest, const std::array<RE::BGSRefAlias*, 10>& truceAliases, RE::Actor* player, const char* reason, bool rejectCurrent, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	void MaintainPrimaryCaptorBinding(bool dialogueOpen, RuntimeHostStateRefs state);
-	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason);
+	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason, std::uint32_t* bleedSpeakerId = nullptr);
 	void ReleaseNoSpeakerTameSession(const char* reason);
 	bool TryEnsureNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, RE::Actor* player, const char* reason, const RuntimeHostHandlers& handlers);
 	std::uint32_t GetTruceSessionID();
 	std::uint32_t GetNoSpeakerTameSessionID();
 	std::uint32_t GetNoSpeakerTamePrimaryFormID();
+	std::chrono::steady_clock::time_point GetNoSpeakerTameLastAttempt();
+	void SetNoSpeakerTameLastAttempt(std::chrono::steady_clock::time_point when);
+	std::uint32_t GetBleedSpeakerID();
+	RE::Actor* GetBleedSpeakerActor();
+	void ResetBleedSpeakerKick();
+	int GetBleedDialogueRetryCount();
+	void SetBleedDialogueRetryCount(int count);
+	std::vector<std::uint32_t> GetBleedCrowdAssignedIDs();
+	bool HasBleedCrowdAssignedID(std::uint32_t actorID);
+	void ClearBleedCrowdAssigned();
+	void ClearBleedRejectedSpeakerIds();
+	bool HasBleedRejectedSpeakerID(std::uint32_t actorID);
+	void AddBleedRejectedSpeakerID(std::uint32_t actorID);
 	void AssignBridgeActor(RE::Actor* actor);
 	void PrimeBridgeActor(RE::Actor* actor, const char* reason);
 	void ClearCaptorAliases(const char* reason);
