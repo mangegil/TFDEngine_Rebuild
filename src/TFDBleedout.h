@@ -1,6 +1,8 @@
 #pragma once
 
 #include <chrono>
+#include <unordered_set>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -83,6 +85,8 @@ namespace TFD::Bleedout
 		std::function<void(const char*)> resetGreetRuntime;
 		std::function<void(const char*)> resetSystemEventState;
 		std::function<void(const char*)> clearCaptorAliases;
+		std::function<void(const char*)> clearDialogueOutcome;
+		std::function<void()> resetBattleObserveTracking;
 		std::function<void()> resetDialogueRuntimeState;
 		std::function<void()> resetBattleObserveState;
 		std::function<void()> clearEscapeBreakState;
@@ -106,6 +110,87 @@ namespace TFD::Bleedout
 
 	void ResetRuntimeState(bool preserveCaptive, const char* reason, const RuntimeResetHandlers& handlers);
 	void TransitionRuntimeToPleasureCommit(const char* reason, std::uint32_t speakerId, bool preserveSession, std::uint32_t captorId, const RuntimePleasureCommitHandlers& handlers);
+
+
+	struct RuntimeHostStateRefs
+	{
+		std::atomic_bool* inBleedState = nullptr;
+		float* minHp = nullptr;
+		std::chrono::steady_clock::time_point* bleedStart = nullptr;
+		int* bleedLastSeconds = nullptr;
+		bool* bleedPaused = nullptr;
+		std::chrono::steady_clock::time_point* bleedPauseStarted = nullptr;
+		std::chrono::steady_clock::time_point* bleedLastCalmPulse = nullptr;
+		std::chrono::steady_clock::time_point* bleedLastCrowdAssign = nullptr;
+		std::vector<std::uint32_t>* bleedCrowdAssigned = nullptr;
+		std::unordered_set<std::uint32_t>* bleedRejectedSpeakerIds = nullptr;
+		std::uint32_t* bleedSpeakerId = nullptr;
+		std::chrono::steady_clock::time_point* bleedSpeakerKickLast = nullptr;
+		int* bleedSpeakerKickCount = nullptr;
+		int* bleedDialogueRetryCount = nullptr;
+		bool* escapeBreakBleedPending = nullptr;
+		bool* bleedPendingCaptiveOutcome = nullptr;
+		bool* bleedPendingNonCaptiveOutcome = nullptr;
+		bool* bleedBattleObservePending = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObservePendingUntil = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObservePendingLastRedirect = nullptr;
+		int* bleedBattleObservePendingEmptyEnemyTicks = nullptr;
+		bool* bleedBattleObserveActive = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObserveSince = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObserveLastRedirect = nullptr;
+		int* bleedBattleObserveActiveEmptyEnemyTicks = nullptr;
+	};
+
+	struct RuntimeHostHandlers
+	{
+		std::function<void(const char*)> clearTerminalCommit;
+		std::function<void(RE::Actor*, const char*)> clearBridgeAliasesForActor;
+		std::function<void()> clearNoMarkerFallbackState;
+		std::function<void(const char*)> releaseNoSpeakerTameSession;
+		std::function<void(const char*)> clearBleedSupportBridgeAliases;
+		std::function<void()> releaseTruceSession;
+		std::function<void(const char*)> resetGreetRuntime;
+		std::function<void(const char*)> clearCaptorAliases;
+		std::function<void(const char*)> clearDialogueOutcome;
+		std::function<void()> resetBattleObserveTracking;
+		std::function<void(bool)> setPlayerBleedImmune;
+		std::function<void(RE::Actor*, float)> clampHealth;
+		std::function<std::vector<RE::Actor*>(float)> collectBleedStandingFollowers;
+		std::function<float(RE::Actor*, const std::vector<RE::Actor*>&, float)> computeBleedBattleEnemyScanRadius;
+		std::function<RE::Actor*()> resolveAggressor;
+		std::function<RE::Actor*(float, double)> resolveLastEnemyTargetingPlayer;
+		std::function<RE::Actor*(float)> findBestAggressor;
+		std::function<bool(RE::Actor*)> isObserverAlly;
+		std::function<std::vector<RE::Actor*>(RE::Actor*, float, RE::Actor*, const std::vector<RE::Actor*>&)> collectCurrentObservedEnemies;
+		std::function<void(RE::Actor*, const std::vector<RE::Actor*>&, const std::vector<RE::Actor*>&, RE::Actor*)> updateObserverRoster;
+		std::function<std::vector<RE::Actor*>()> collectStandingFollowersFromSnapshot;
+		std::function<std::vector<RE::Actor*>()> collectStandingEnemiesFromSnapshot;
+		std::function<bool()> hadValidObservedEnemy;
+		std::function<void()> enterObservedBattleWin;
+		std::function<void(const char*)> enterObservedLeftForDead;
+		std::function<RE::Actor*(float, float, RE::Actor*)> findBestSpeaker;
+		std::function<bool(RE::Actor*, RE::Actor*, float, float*)> isReasonableSpeaker;
+		std::function<std::vector<RE::Actor*>(float, RE::Actor*, bool)> collectBleedoutCrowd;
+		std::function<bool(RE::Actor*)> isCaptiveSupportedAggressor;
+		std::function<bool(RE::Actor*)> applyFactionMaskFromAggressor;
+		std::function<bool()> resolveCaptiveMarkerForOutcome;
+		std::function<bool(RE::Actor*, RE::Actor*, bool, float*)> canUseCaptiveFallbackHeuristic;
+		std::function<bool(const std::vector<RE::Actor*>&, const char*)> tryEnsureNoSpeakerTameSession;
+		std::function<void(RE::Actor*)> setLastAggressor;
+		std::function<void(const char*)> debugNotification;
+		std::function<void(RE::Actor*, float, const char*)> clearEnemyTargetsToPlayerForDefeat;
+		std::function<RE::Actor*(float)> resolveEscapeBreakPreferredAggressor;
+		std::function<bool(RE::Actor*, RE::Actor*, const char*)> startTruceSessionForSpeaker;
+		std::function<bool(RE::Actor*, RE::Actor*, float*)> canUseAggressorForBleedoutGreet;
+		std::function<void(RE::Actor*, RE::Actor*, const char*, bool)> applyForceGreetOverdrive;
+	};
+
+	void StartRuntimeWindow(RuntimeHostStateRefs state, RE::Actor* player, RE::Actor* aggressor, const RuntimeHostHandlers& handlers);
+	bool StartRuntimeBattleObservePending(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
+	void TickRuntimeBattleObservePending(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
+	void TickRuntimeBattleObserve(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
+	bool HandleRuntimePendingEscapeBreak(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
+	void MaintainRuntimeSpeakerKick(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
 	void AssignBridgeActor(RE::Actor* actor);
