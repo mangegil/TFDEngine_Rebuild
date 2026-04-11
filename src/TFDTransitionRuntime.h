@@ -46,6 +46,24 @@ namespace TFD::TransitionRuntime
 		std::function<void()> updatePreCombatState;
 	};
 
+	struct CaptiveHandlers
+	{
+		std::function<void()> resetBleedRuntimeState;
+		std::function<void(const char*)> clearBridgeAliases;
+		std::function<void()> clearLastAggressor;
+		std::function<void(const char*)> beginCaptiveFlow;
+		std::function<void()> setCaptiveRuntimeCaptive;
+		std::function<bool()> isDialogueOpen;
+		std::function<void(bool)> setPrevDialogueOpen;
+		std::function<void()> captureCurrentLockpickMenuState;
+		std::function<void()> resetLockpickWatch;
+		std::function<void()> armEscapeContextFromCurrentState;
+		std::function<void()> sealCaptiveDoorIfPresent;
+		std::function<void(float)> applyCalmBubble;
+		std::function<void(const char*, bool)> queuePendingCaptiveConfiscation;
+		std::function<void(RE::Actor*, const char*)> syncPlayerCaptiveAlias;
+	};
+
 	const char* GetKindName(Kind kind);
 	const char* GetBranchName(FallbackBranch branch);
 	FallbackBranch GetCurrentFallbackBranch();
@@ -81,4 +99,8 @@ namespace TFD::TransitionRuntime
 	void ForceLeftForDeadSolo(const RuntimeHandlers& handlers);
 	bool BeginRescueTransition(const char* reason, const RuntimeHandlers& handlers);
 	void BeginRecoverTransition(const char* reason, const RuntimeHandlers& handlers);
+
+	bool ResolveCaptiveMarkerForOutcome(const RuntimeHandlers& handlers);
+	bool TeleportPlayerToCachedMarkerNow(const RuntimeHandlers& handlers);
+	bool CompleteCaptiveTransitionNow(const char* reason, const RuntimeHandlers& handlers, const CaptiveHandlers& captiveHandlers);
 }

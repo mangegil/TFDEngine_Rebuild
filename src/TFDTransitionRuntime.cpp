@@ -744,6 +744,29 @@ namespace TFD::TransitionRuntime
 			return nullptr;
 		}
 
+		static void AdvanceGameHoursSoft(float hours)
+		{
+			if (hours <= 0.0f) {
+				return;
+			}
+			auto* calendar = RE::Calendar::GetSingleton();
+			if (!calendar) {
+				return;
+			}
+			const float dayDelta = hours / 24.0f;
+			calendar->rawDaysPassed += dayDelta;
+			if (calendar->gameDaysPassed) {
+				calendar->gameDaysPassed->value = calendar->rawDaysPassed;
+			}
+			if (calendar->gameHour) {
+				float hour = std::fmod(calendar->gameHour->value + hours, 24.0f);
+				if (hour < 0.0f) {
+					hour += 24.0f;
+				}
+				calendar->gameHour->value = hour;
+			}
+		}
+
 		static void QueuePostRecoveryAggroKick(const char* reason, const RuntimeHandlers& handlers)
 		{
 			auto* player = ResolvePlayer(handlers);
@@ -1331,6 +1354,91 @@ namespace TFD::TransitionRuntime
 		g_fallback.follower.reset();
 		ResolveLeftForDeadDestination(handlers, g_fallback);
 	}
+
+	bool ResolveCaptiveMarkerForOutcome(const RuntimeHandlers& handlers)
+	{
+		auto* aggressor = handlers.resolveAggressor ? handlers.resolveAggressor() : nullptr;
+		bool resolved = false;
+		if (aggressor) {
+			resolved = TFD::Location::RescanCaptiveMarkerWithAggressor(aggressor, true);
+			if (!resolved) {
+				resolved = TFD::Location::RescanCaptiveMarkerWithAggressor(aggressor, false);
+			}
+		}
+		if (!resolved) {
+			resolved = TFD::Location::RescanCaptiveMarker();
+		}
+		return resolved && TFD::Location::GetCachedCaptiveMarker();
+	}
+
+	bool TeleportPlayerToCachedMarkerNow(const RuntimeHandlers& handlers)
+	{
+		auto* player = ResolvePlayer(handlers);
+		auto* marker = TFD::Location::GetCachedCaptiveMarker();
+		if (!player || !marker) {
+			return false;
+		}
+		player->MoveTo(marker);
+		spdlog::info("[TFD][Transition] direct MoveTo cached captive marker {:08X}", marker->GetFormID());
+		return true;
+	}
+
+	bool CompleteCaptiveTransitionNow(const char* reason, const RuntimeHandlers& handlers, const CaptiveHandlers& captiveHandlers)
+	{
+		ClearNoMarkerFallbackState();
+		if (captiveHandlers.resetBleedRuntimeState) {
+			captiveHandlers.resetBleedRuntimeState();
+		}
+		if (captiveHandlers.clearBridgeAliases) {
+			captiveHandlers.clearBridgeAliases("blackout_teleport");
+		}
+		if (captiveHandlers.clearLastAggressor) {
+			captiveHandlers.clearLastAggressor();
+		}
+		AdvanceGameHoursSoft(1.0f);
+		if (!TeleportPlayerToCachedMarkerNow(handlers)) {
+			return false;
+		}
+		std::this_thread::sleep_for(std::chrono::milliseconds(120));
+		RecoverPlayerAfterTeleport(handlers);
+		if (handlers.setGraceSeconds) {
+			handlers.setGraceSeconds(5);
+		}
+		if (captiveHandlers.beginCaptiveFlow) {
+			captiveHandlers.beginCaptiveFlow(reason ? reason : "captive_enter");
+		}
+		if (captiveHandlers.setCaptiveRuntimeCaptive) {
+			captiveHandlers.setCaptiveRuntimeCaptive();
+		}
+		if (captiveHandlers.setPrevDialogueOpen && captiveHandlers.isDialogueOpen) {
+			captiveHandlers.setPrevDialogueOpen(captiveHandlers.isDialogueOpen());
+		}
+		if (captiveHandlers.captureCurrentLockpickMenuState) {
+			captiveHandlers.captureCurrentLockpickMenuState();
+		}
+		if (captiveHandlers.resetLockpickWatch) {
+			captiveHandlers.resetLockpickWatch();
+		}
+		if (captiveHandlers.armEscapeContextFromCurrentState) {
+			captiveHandlers.armEscapeContextFromCurrentState();
+		}
+		if (captiveHandlers.sealCaptiveDoorIfPresent) {
+			captiveHandlers.sealCaptiveDoorIfPresent();
+		}
+		if (captiveHandlers.applyCalmBubble) {
+			captiveHandlers.applyCalmBubble((std::max)(2000.0f, TFD::Settings::GetSweepRadius()));
+		}
+		if (captiveHandlers.queuePendingCaptiveConfiscation) {
+			captiveHandlers.queuePendingCaptiveConfiscation(reason ? reason : "captive_enter", true);
+		}
+		if (captiveHandlers.syncPlayerCaptiveAlias) {
+			captiveHandlers.syncPlayerCaptiveAlias(ResolvePlayer(handlers), reason ? reason : "captive_enter");
+		}
+		spdlog::info("[TFD][Transition] captive transition complete reason={} confiscationQueued=1 starterKitPending=1",
+			reason ? reason : "unknown");
+		return true;
+	}
+
 
 	bool BeginRescueTransition(const char* reason, const RuntimeHandlers& handlers)
 	{
