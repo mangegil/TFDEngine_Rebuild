@@ -255,7 +255,6 @@ namespace TFD::DefeatMonitor
 		bool& g_captiveState = TFD::CaptiveRuntime::StateRef();
 		CaptivePhaseValue& g_captivePhase = TFD::CaptiveRuntime::PhaseRef();
 		bool g_prevDialogueOpen = false;
-		bool g_prevLockpickOpen = false;
 		bool& g_captiveConfiscationApplied = TFD::CaptiveRuntime::ConfiscationAppliedRef();
 		bool& g_captiveConfiscationPending = TFD::CaptiveRuntime::ConfiscationPendingRef();
 		bool& g_captiveStarterLockpickPending = TFD::CaptiveRuntime::StarterLockpickPendingRef();
@@ -287,8 +286,6 @@ namespace TFD::DefeatMonitor
 
 		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
 
-		using CaptiveQuestRegistryCache = TFD::CaptiveRuntime::QuestRegistryCache;
-		CaptiveQuestRegistryCache& g_captiveQuestRegistry = TFD::CaptiveRuntime::QuestRegistryRef();
 
 
 		struct TruceQuestRegistryCache
@@ -346,15 +343,10 @@ namespace TFD::DefeatMonitor
 		std::vector<RE::FormID> g_lockedFallbackCrowdIds{};
 		std::unordered_set<RE::FormID> g_bleedFollowerDownIds{};
 
-		RE::ObjectRefHandle g_lockpickDoorCandidate{};
-		bool g_lockpickDoorWasLocked = false;
 		TFD::CaptiveDoorController& g_captiveDoor = TFD::CaptiveRuntime::DoorControllerRef();
 		RE::ObjectRefHandle& g_captiveMarker = TFD::CaptiveRuntime::MarkerRef();
 		RE::FormID& g_captiveCellFormID = TFD::CaptiveRuntime::CellFormIDRef();
 		RE::FormID& g_captiveLocationFormID = TFD::CaptiveRuntime::LocationFormIDRef();
-		bool g_escapeRadiusActive = false;
-		std::chrono::steady_clock::time_point g_escapeRadiusSince{};
-		RE::ObjectRefHandle g_boundEscapeDoor{};
 
 		static constexpr double kCaptiveEscapeDoorRadius = 512.0;
 		static constexpr std::size_t kBleedBridgeMaxActors = 10;
@@ -1406,14 +1398,11 @@ namespace TFD::DefeatMonitor
 		static void CompleteCaptiveTransitionNow(const char* reason);
 		static bool CompleteRescueTransitionNow(const char* reason);
 		static void CompleteRecoverTransitionNow(const char* reason);
-		static bool TransferPlayerInventoryToCaptiveStorage(RE::TESObjectREFR* target, const char* reason);
-		static void SyncCaptiveStorageDebugAliases(const char* reason);
 		static void EnterNonCaptiveChoice(const char* reason);
 		static bool BeginResolvedNoMarkerFallback(const char* reason);
 		static void RecoverPlayerAfterTeleport();
 		static void SetCaptiveRuntime(bool stateActive, CaptivePhaseValue phase);
 		static bool IsDialogueOpen();
-		static bool IsLockpickingOpen();
 		static void ResetLockpickWatch();
 		static void ArmEscapeContextFromCurrentState();
 		static void ApplyCalmBubble(float radius);
@@ -1859,202 +1848,15 @@ namespace TFD::DefeatMonitor
 				found);
 		}
 
-		static void ResolveCaptiveQuestRegistry()
-		{
-			if (g_captiveQuestRegistry.resolved) {
-				return;
-			}
-			g_captiveQuestRegistry.resolved = true;
-			g_captiveQuestRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDCaptiveQuest");
-			if (!g_captiveQuestRegistry.quest) {
-				spdlog::warn("[TFD][Captive] captive quest not found");
-				return;
-			}
 
-			for (auto* baseAlias : g_captiveQuestRegistry.quest->aliases) {
-				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
-				if (!refAlias) {
-					continue;
-				}
-				const auto aliasName = std::string(refAlias->aliasName.c_str());
-				if (aliasName == "PlayerCaptive") {
-					g_captiveQuestRegistry.playerCaptiveAlias = refAlias;
-					continue;
-				}
-				if (aliasName == "LootTarget") {
-					g_captiveQuestRegistry.lootTargetAlias = refAlias;
-					continue;
-				}
-				if (aliasName.rfind("BossCaptor", 0) == 0 && aliasName.size() >= 11) {
-					try {
-						int slot = std::stoi(aliasName.substr(10));
-						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossCaptorAliases.size())) {
-							g_captiveQuestRegistry.bossCaptorAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
-						}
-					}
-					catch (...) {}
-					continue;
-				}
-				if (aliasName.rfind("BossContainer", 0) == 0 && aliasName.size() >= 14) {
-					try {
-						int slot = std::stoi(aliasName.substr(13));
-						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.bossContainerAliases.size())) {
-							g_captiveQuestRegistry.bossContainerAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
-						}
-					}
-					catch (...) {}
-					continue;
-				}
-				if (aliasName.rfind("Container", 0) == 0 && aliasName.size() >= 10) {
-					try {
-						int slot = std::stoi(aliasName.substr(9));
-						if (slot >= 1 && slot <= static_cast<int>(g_captiveQuestRegistry.containerAliases.size())) {
-							g_captiveQuestRegistry.containerAliases[static_cast<std::array<RE::BGSRefAlias*, 3Ui64>::size_type>(slot) - 1] = refAlias;
-						}
-					}
-					catch (...) {}
-					continue;
-				}
-			}
 
-			std::size_t bossCaptorCount = 0;
-			std::size_t bossContainerCount = 0;
-			std::size_t containerCount = 0;
-			for (auto* alias : g_captiveQuestRegistry.bossCaptorAliases) {
-				if (alias) {
-					++bossCaptorCount;
-				}
-			}
-			for (auto* alias : g_captiveQuestRegistry.bossContainerAliases) {
-				if (alias) {
-					++bossContainerCount;
-				}
-			}
-			for (auto* alias : g_captiveQuestRegistry.containerAliases) {
-				if (alias) {
-					++containerCount;
-				}
-			}
-
-			spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
-				g_captiveQuestRegistry.quest ? g_captiveQuestRegistry.quest->GetFormID() : 0u,
-				g_captiveQuestRegistry.playerCaptiveAlias ? g_captiveQuestRegistry.playerCaptiveAlias->aliasID : static_cast<std::uint32_t>(0),
-				bossCaptorCount,
-				bossContainerCount,
-				containerCount,
-				g_captiveQuestRegistry.lootTargetAlias ? 1 : 0);
-		}
-
-		static void WriteCaptiveQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
-		{
-			ResolveCaptiveQuestRegistry();
-			if (!g_captiveQuestRegistry.quest || !alias) {
-				return;
-			}
-
-			RE::ObjectRefHandle handle{};
-			if (ref) {
-				handle = ref->CreateRefHandle();
-			}
-
-			RE::BSWriteLockGuard lock(g_captiveQuestRegistry.quest->aliasAccessLock);
-			auto it = g_captiveQuestRegistry.quest->refAliasMap.find(alias->aliasID);
-			if (ref) {
-				if (it != g_captiveQuestRegistry.quest->refAliasMap.end()) {
-					it->second = handle;
-				}
-				else {
-					g_captiveQuestRegistry.quest->refAliasMap.insert({ alias->aliasID, handle });
-				}
-			}
-			else {
-				if (it != g_captiveQuestRegistry.quest->refAliasMap.end()) {
-					g_captiveQuestRegistry.quest->refAliasMap.erase(it);
-				}
-			}
-		}
-
-		static void WritePlayerCaptiveAlias(RE::Actor* actor)
-		{
-			ResolveCaptiveQuestRegistry();
-			WriteCaptiveQuestAlias(g_captiveQuestRegistry.playerCaptiveAlias, actor);
-		}
 
 		static void SyncPlayerCaptiveAlias(RE::Actor* actor, const char* reason)
 		{
-			ResolveCaptiveQuestRegistry();
-			if (!g_captiveQuestRegistry.quest || !g_captiveQuestRegistry.playerCaptiveAlias) {
-				spdlog::warn("[TFD][Captive] player captive alias unavailable reason={}", reason ? reason : "unknown");
-				return;
-			}
-
-			WritePlayerCaptiveAlias(actor);
-			spdlog::info("[TFD][Captive] PlayerCaptive alias {} actor={:08X} reason={}",
-				actor ? "assigned" : "cleared",
-				actor ? actor->GetFormID() : 0u,
-				reason ? reason : "unknown");
+			TFD::CaptiveRuntime::SyncPlayerAlias(actor, reason);
 		}
 
-		static void SyncCaptiveStorageDebugAliases(const char* reason)
-		{
-			ResolveCaptiveQuestRegistry();
-			if (!g_captiveQuestRegistry.quest) {
-				return;
-			}
 
-			TFD::Location::CaptiveStorageDebugSnapshot snapshot{};
-			const bool hasSnapshot = TFD::Location::GetLastCaptiveStorageDebugSnapshot(snapshot);
-
-			auto assignByFormID = [&](RE::BGSRefAlias* alias, std::uint32_t formID) {
-				RE::TESObjectREFR* ref = nullptr;
-				if (formID != 0) {
-					ref = LookupRefByFormID(formID);
-				}
-				WriteCaptiveQuestAlias(alias, ref);
-				};
-
-			for (std::size_t i = 0; i < g_captiveQuestRegistry.bossCaptorAliases.size(); ++i) {
-				assignByFormID(g_captiveQuestRegistry.bossCaptorAliases[i], hasSnapshot ? snapshot.bossActorFormIDs[i] : 0u);
-			}
-			for (std::size_t i = 0; i < g_captiveQuestRegistry.bossContainerAliases.size(); ++i) {
-				assignByFormID(g_captiveQuestRegistry.bossContainerAliases[i], hasSnapshot ? snapshot.bossContainerFormIDs[i] : 0u);
-			}
-			for (std::size_t i = 0; i < g_captiveQuestRegistry.containerAliases.size(); ++i) {
-				assignByFormID(g_captiveQuestRegistry.containerAliases[i], hasSnapshot ? snapshot.containerFormIDs[i] : 0u);
-			}
-			assignByFormID(g_captiveQuestRegistry.lootTargetAlias, hasSnapshot ? snapshot.finalTargetFormID : 0u);
-
-			spdlog::info("[TFD][Captive] debug aliases synced reason={} hasSnapshot={} boss1={:08X} bossContainer1={:08X} container1={:08X} lootTarget={:08X} targetKind={}",
-				reason ? reason : "unknown",
-				hasSnapshot ? 1 : 0,
-				hasSnapshot ? snapshot.bossActorFormIDs[0] : 0u,
-				hasSnapshot ? snapshot.bossContainerFormIDs[0] : 0u,
-				hasSnapshot ? snapshot.containerFormIDs[0] : 0u,
-				hasSnapshot ? snapshot.finalTargetFormID : 0u,
-				hasSnapshot ? snapshot.finalTargetKind : 0u);
-		}
-
-		static void ClearCaptiveStorageDebugAliases(const char* reason)
-		{
-			ResolveCaptiveQuestRegistry();
-			if (!g_captiveQuestRegistry.quest) {
-				return;
-			}
-
-			for (auto* alias : g_captiveQuestRegistry.bossCaptorAliases) {
-				WriteCaptiveQuestAlias(alias, nullptr);
-			}
-			for (auto* alias : g_captiveQuestRegistry.bossContainerAliases) {
-				WriteCaptiveQuestAlias(alias, nullptr);
-			}
-			for (auto* alias : g_captiveQuestRegistry.containerAliases) {
-				WriteCaptiveQuestAlias(alias, nullptr);
-			}
-			WriteCaptiveQuestAlias(g_captiveQuestRegistry.lootTargetAlias, nullptr);
-
-			spdlog::info("[TFD][Captive] debug aliases cleared reason={}",
-				reason ? reason : "unknown");
-		}
 
 		static void WriteDefeatedEnemyAlias(RE::BGSRefAlias* alias, RE::Actor* actor)
 		{
@@ -3207,7 +3009,7 @@ namespace TFD::DefeatMonitor
 			RecoverVictoryTeammates();
 			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
-			g_prevLockpickOpen = false;
+			TFD::CaptiveRuntime::SetPrevLockpickOpen(false);
 			ClearPendingDefeatedDialogueTargetInternal();
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 			SetPlayerBleedImmune(false);
@@ -3238,7 +3040,7 @@ namespace TFD::DefeatMonitor
 			g_lastAggressor.reset();
 			ResetBleedRuntimeState();
 			g_prevDialogueOpen = false;
-			g_prevLockpickOpen = false;
+			TFD::CaptiveRuntime::SetPrevLockpickOpen(false);
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 			SetPlayerBleedImmune(false);
 			BeginRecoverTransition(reason ? reason : "battle_observe_loss");
@@ -3787,6 +3589,11 @@ namespace TFD::DefeatMonitor
 			return RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
 		}
 
+		static RE::BGSLocation* GetLocationFromRef(RE::TESObjectREFR* ref)
+		{
+			return TFD::Location::GetLocationFromRef(ref);
+		}
+
 		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc)
 		{
 			if (!safeLoc) {
@@ -3996,332 +3803,16 @@ namespace TFD::DefeatMonitor
 				[&](const char* r) { CompleteRecoverTransitionNow(r); });
 		}
 
-		static RE::TESBoundObject* ResolveLockpickItem()
-		{
-			static RE::TESBoundObject* cached = nullptr;
-			static bool resolved = false;
-			if (!resolved) {
-				resolved = true;
-				cached = RE::TESForm::LookupByEditorID<RE::TESBoundObject>("Lockpick");
-				if (!cached) {
-					spdlog::warn("[TFD][Captive] Lockpick form not found by EditorID");
-				}
-			}
-			return cached;
-		}
 
-		static std::int32_t GetReferenceItemCount(RE::TESObjectREFR* ref, RE::TESBoundObject* item)
-		{
-			if (!ref || !item) {
-				return 0;
-			}
-
-			const auto inv = ref->GetInventory([item](RE::TESBoundObject& obj) {
-				return &obj == item;
-				}, true);
-
-			auto it = inv.find(item);
-			if (it == inv.end()) {
-				return 0;
-			}
-
-			return (std::max)(0, it->second.first);
-		}
-
-		static std::int32_t GetReferenceTotalInventoryCount(RE::TESObjectREFR* ref)
-		{
-			if (!ref) {
-				return 0;
-			}
-
-			const auto inv = ref->GetInventory([](RE::TESBoundObject&) {
-				return true;
-				}, true);
-
-			std::int32_t totalUnits = 0;
-			for (const auto& [item, invData] : inv) {
-				const auto& [count, entry] = invData;
-				(void)entry;
-				if (!item || count <= 0) {
-					continue;
-				}
-
-				totalUnits += count;
-			}
-
-			return totalUnits;
-		}
-
-		static bool IsContainerStorageTarget(RE::TESObjectREFR* target)
-		{
-			if (!target) {
-				return false;
-			}
-			auto* base = target->GetBaseObject();
-			return base && base->As<RE::TESObjectCONT>();
-		}
-
-		static void EnsureCaptiveStarterLockpicks(std::int32_t targetCount, const char* reason)
-		{
-			auto* player = Player();
-			auto* lockpick = ResolveLockpickItem();
-			if (!player || !lockpick || targetCount <= 0) {
-				return;
-			}
-
-			const auto currentCount = GetReferenceItemCount(player, lockpick);
-			if (currentCount >= targetCount) {
-				spdlog::info("[TFD][Captive] starter lockpick skipped current={} target={} reason={}",
-					currentCount,
-					targetCount,
-					reason ? reason : "unknown");
-				return;
-			}
-
-			const auto addCount = targetCount - currentCount;
-			player->AddObjectToContainer(lockpick, nullptr, addCount, nullptr);
-			spdlog::info("[TFD][Captive] starter lockpick granted add={} finalTarget={} reason={}",
-				addCount,
-				targetCount,
-				reason ? reason : "unknown");
-		}
-
-		static bool TransferPlayerInventoryToCaptiveStorage(RE::TESObjectREFR* target, const char* reason)
-		{
-			struct PendingMove
-			{
-				RE::TESBoundObject* item{ nullptr };
-				std::int32_t count{ 0 };
-			};
-
-			auto* player = Player();
-			if (!player || !target || target == player) {
-				spdlog::info("[TFD][Captive] confiscation skipped player={:08X} target={:08X} reason={}",
-					player ? player->GetFormID() : 0u,
-					target ? target->GetFormID() : 0u,
-					reason ? reason : "unknown");
-				return false;
-			}
-
-			if (!IsContainerStorageTarget(target)) {
-				spdlog::warn("[TFD][Captive] confiscation rejected non-container target={:08X} base={:08X} reason={}",
-					target->GetFormID(),
-					target->GetBaseObject() ? target->GetBaseObject()->GetFormID() : 0u,
-					reason ? reason : "unknown");
-				return false;
-			}
-
-			const auto inv = player->GetInventory([](RE::TESBoundObject&) {
-				return true;
-				}, true);
-
-			std::vector<PendingMove> pending{};
-			pending.reserve(inv.size());
-
-			std::int32_t totalStacks = 0;
-			std::int32_t totalUnits = 0;
-			for (const auto& [item, invData] : inv) {
-				const auto& [count, entry] = invData;
-				(void)entry;
-				if (!item || count <= 0) {
-					continue;
-				}
-
-				pending.push_back(PendingMove{ item, count });
-				++totalStacks;
-				totalUnits += count;
-			}
-
-			if (pending.empty() || totalUnits <= 0) {
-				spdlog::info("[TFD][Captive] confiscation skipped empty_inventory target={:08X} reason={}",
-					target->GetFormID(),
-					reason ? reason : "unknown");
-				return false;
-			}
-
-			std::int32_t removedUnits = 0;
-			std::int32_t addedUnits = 0;
-			std::int32_t movedStacks = 0;
-			std::int32_t partialStacks = 0;
-			std::int32_t failedStacks = 0;
-
-			for (const auto& move : pending) {
-				auto* item = move.item;
-				if (!item || move.count <= 0) {
-					continue;
-				}
-
-				const auto beforePlayer = GetReferenceItemCount(player, item);
-				if (beforePlayer <= 0) {
-					continue;
-				}
-
-				const auto requestCount = (std::min)(move.count, beforePlayer);
-				const auto beforeTarget = GetReferenceItemCount(target, item);
-
-				player->RemoveItem(
-					item,
-					requestCount,
-					RE::ITEM_REMOVE_REASON::kStoreInContainer,
-					nullptr,
-					target);
-
-				const auto afterPlayer = GetReferenceItemCount(player, item);
-				const auto afterTarget = GetReferenceItemCount(target, item);
-
-				const auto removedNow = (std::max)(0, beforePlayer - afterPlayer);
-				const auto addedNow = (std::max)(0, afterTarget - beforeTarget);
-
-				removedUnits += removedNow;
-				addedUnits += addedNow;
-
-				if (removedNow == requestCount && addedNow == requestCount) {
-					++movedStacks;
-					continue;
-				}
-
-				if (removedNow > 0 || addedNow > 0) {
-					++partialStacks;
-				}
-				else {
-					++failedStacks;
-				}
-
-				spdlog::warn(
-					"[TFD][Captive] confiscation stack mismatch item={:08X} requested={} removed={} added={} beforePlayer={} afterPlayer={} beforeTarget={} afterTarget={} reason={}",
-					item->GetFormID(),
-					requestCount,
-					removedNow,
-					addedNow,
-					beforePlayer,
-					afterPlayer,
-					beforeTarget,
-					afterTarget,
-					reason ? reason : "unknown");
-			}
-
-			const auto playerUnitsAfter = GetReferenceTotalInventoryCount(player);
-
-			spdlog::info(
-				"[TFD][Captive] confiscation moved_manual target={:08X} stacks={} units={} movedStacks={} partialStacks={} failedStacks={} removedUnits={} addedUnits={} playerUnitsAfter={} reason={}",
-				target->GetFormID(),
-				totalStacks,
-				totalUnits,
-				movedStacks,
-				partialStacks,
-				failedStacks,
-				removedUnits,
-				addedUnits,
-				playerUnitsAfter,
-				reason ? reason : "unknown");
-
-			return removedUnits > 0 || addedUnits > 0;
-		}
-
-		static void ClearPendingCaptiveConfiscation(const char* reason)
-		{
-			const bool hadPending = g_captiveConfiscationPending || g_captiveStarterLockpickPending || !g_captivePendingConfiscationReason.empty();
-			g_captiveConfiscationPending = false;
-			g_captiveStarterLockpickPending = false;
-			g_captivePendingConfiscationReason.clear();
-			g_captiveConfiscationAttemptCount = 0;
-			g_captiveConfiscationNextAttempt = {};
-			if (hadPending) {
-				spdlog::info("[TFD][Captive] confiscation pending cleared reason={}", reason ? reason : "unknown");
-			}
-		}
 
 		static void QueuePendingCaptiveConfiscation(const char* reason, bool starterKitWanted)
 		{
-			g_captiveConfiscationPending = true;
-			g_captiveStarterLockpickPending = starterKitWanted;
-			g_captivePendingConfiscationReason = reason ? reason : "unknown";
-			g_captiveConfiscationAttemptCount = 0;
-			g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationInitialDelayMs);
-			spdlog::info("[TFD][Captive] confiscation pending queued starterKitWanted={} delayMs={} reason={}",
-				starterKitWanted ? 1 : 0,
-				kCaptiveConfiscationInitialDelayMs,
-				g_captivePendingConfiscationReason.c_str());
+			TFD::CaptiveRuntime::QueuePendingConfiscation(reason, starterKitWanted);
 		}
 
 		static void ProcessPendingCaptiveConfiscation()
 		{
-			if (!g_captiveConfiscationPending) {
-				return;
-			}
-
-			if (g_captiveConfiscationApplied) {
-				ClearPendingCaptiveConfiscation("already_applied");
-				return;
-			}
-
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) {
-				ClearPendingCaptiveConfiscation("not_in_captive_phase");
-				return;
-			}
-
-			if (Now() < g_captiveConfiscationNextAttempt) {
-				return;
-			}
-
-			auto* ui = RE::UI::GetSingleton();
-			if (ui && ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) {
-				g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
-				return;
-			}
-
-			auto* player = Player();
-			auto* marker = TFD::Location::GetCachedCaptiveMarker();
-			auto* playerCell = player ? player->GetParentCell() : nullptr;
-			auto* markerCell = marker ? marker->GetParentCell() : nullptr;
-			if (!player || !playerCell || !marker || !markerCell || playerCell != markerCell) {
-				g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
-				return;
-			}
-
-			const char* reason = g_captivePendingConfiscationReason.empty() ? "unknown" : g_captivePendingConfiscationReason.c_str();
-			++g_captiveConfiscationAttemptCount;
-			spdlog::info("[TFD][Captive] confiscation pending attempt={} cell={:08X} marker={:08X} reason={}",
-				g_captiveConfiscationAttemptCount,
-				playerCell->GetFormID(),
-				marker->GetFormID(),
-				reason);
-
-			auto* storage = TFD::Location::ResolveNearestCaptiveStorageTarget(nullptr);
-			SyncCaptiveStorageDebugAliases(reason);
-			if (!storage) {
-				if (g_captiveConfiscationAttemptCount >= kCaptiveConfiscationMaxAttempts) {
-					spdlog::warn("[TFD][Captive] confiscation aborted no_container_target attempts={} reason={}",
-						g_captiveConfiscationAttemptCount,
-						reason);
-					ClearPendingCaptiveConfiscation("no_container_target");
-				}
-				else {
-					g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
-				}
-				return;
-			}
-
-			if (!IsContainerStorageTarget(storage)) {
-				if (g_captiveConfiscationAttemptCount >= kCaptiveConfiscationMaxAttempts) {
-					spdlog::warn("[TFD][Captive] confiscation aborted non_container_target target={:08X} attempts={} reason={}",
-						storage->GetFormID(),
-						g_captiveConfiscationAttemptCount,
-						reason);
-					ClearPendingCaptiveConfiscation("non_container_target");
-				}
-				else {
-					g_captiveConfiscationNextAttempt = Now() + std::chrono::milliseconds(kCaptiveConfiscationRetryDelayMs);
-				}
-				return;
-			}
-
-			const bool moved = TransferPlayerInventoryToCaptiveStorage(storage, reason);
-			g_captiveConfiscationApplied = true;
-			if (moved && g_captiveStarterLockpickPending) {
-				EnsureCaptiveStarterLockpicks(3, reason);
-			}
-			ClearPendingCaptiveConfiscation(moved ? "completed" : "completed_no_items");
+			TFD::CaptiveRuntime::ProcessPendingConfiscation();
 		}
 
 		static void CompleteCaptiveTransitionNow(const char* reason)
@@ -4341,7 +3832,7 @@ namespace TFD::DefeatMonitor
 			(void)TFD::Flow::Controller::GetSingleton().BeginCaptive(ResolveBleedFlowActorFormID(), TFD::Flow::CaptiveMode::Kidnapped, reason ? reason : "captive_enter");
 			SetCaptiveRuntime(true, CaptivePhaseValue::Captive);
 			g_prevDialogueOpen = IsDialogueOpen();
-			g_prevLockpickOpen = IsLockpickingOpen();
+			TFD::CaptiveRuntime::CaptureCurrentLockpickMenuState();
 			ResetLockpickWatch();
 			ArmEscapeContextFromCurrentState();
 			if (g_captiveDoor.HasDoor()) {
@@ -4626,16 +4117,7 @@ namespace TFD::DefeatMonitor
 
 		static void SetCaptiveRuntimeOnly(bool stateActive, CaptivePhaseValue phase)
 		{
-			g_captiveState = stateActive;
-			g_captivePhase = phase;
-			if (!stateActive) {
-				SyncPlayerCaptiveAlias(nullptr, "captive_exit");
-				ClearCaptiveStorageDebugAliases("captive_exit");
-			}
-			if (!stateActive || phase != CaptivePhaseValue::Captive) {
-				g_captiveConfiscationApplied = false;
-				ClearPendingCaptiveConfiscation("captive_state_reset");
-			}
+			TFD::CaptiveRuntime::SetRuntimeState(stateActive, phase);
 		}
 
 		static void SetCaptiveRuntime(bool stateActive, CaptivePhaseValue phase)
@@ -4654,149 +4136,35 @@ namespace TFD::DefeatMonitor
 			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
 		}
 
-		static bool IsLockpickingOpen()
-		{
-			auto* ui = RE::UI::GetSingleton();
-			return ui && ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME);
-		}
-
 		static void ResetLockpickWatch()
 		{
-			g_lockpickDoorCandidate.reset();
-			g_lockpickDoorWasLocked = false;
-			g_prevLockpickOpen = false;
-		}
-
-		static bool IsDoorRef(RE::TESObjectREFR* ref)
-		{
-			if (!ref) return false;
-			auto* base = ref->GetBaseObject();
-			if (!base) return false;
-			return base->GetFormType() == RE::FormType::Door;
-		}
-
-		static bool IsRefLocked(RE::TESObjectREFR* ref)
-		{
-			if (!ref) return false;
-			auto* lock = ref->GetLock();
-			return lock && lock->IsLocked();
+			TFD::CaptiveRuntime::ResetLockpickWatch();
 		}
 
 		static RE::TESObjectREFR* ResolveBoundEscapeDoor()
 		{
-			if (!g_boundEscapeDoor) return nullptr;
-			auto ptr = g_boundEscapeDoor.get();
-			return ptr.get();
+			return TFD::CaptiveRuntime::ResolveBoundEscapeDoor();
 		}
 
 		static void BindCaptiveDoor(RE::TESObjectREFR* door)
 		{
-			if (!door) return;
-			g_captiveDoor.Bind(door);
-			g_boundEscapeDoor = door->GetHandle();
-		}
-
-		static RE::BGSLocation* GetLocationFromRef(RE::TESObjectREFR* ref)
-		{
-			return TFD::Location::GetLocationFromRef(ref);
-		}
-
-		static RE::TESObjectREFR* FindNearestDoorNearCaptiveMarker()
-		{
-			RE::TESObjectREFR* marker = nullptr;
-			if (g_captiveMarker) {
-				auto ptr = g_captiveMarker.get();
-				marker = ptr.get();
-			}
-			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
-			if (!marker) return nullptr;
-			auto* cell = marker->GetParentCell();
-			if (!cell) return nullptr;
-			const auto mp = marker->GetPosition();
-			RE::TESObjectREFR* best = nullptr;
-			double bestDistSq = kCaptiveEscapeDoorRadius * kCaptiveEscapeDoorRadius;
-			cell->ForEachReferenceInRange(mp, static_cast<float>(kCaptiveEscapeDoorRadius), [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
-				if (!candidate || candidate == marker) return RE::BSContainer::ForEachResult::kContinue;
-				if (!IsDoorRef(candidate)) return RE::BSContainer::ForEachResult::kContinue;
-				const auto rp = candidate->GetPosition();
-				const double dx = static_cast<double>(rp.x - mp.x);
-				const double dy = static_cast<double>(rp.y - mp.y);
-				const double dz = static_cast<double>(rp.z - mp.z);
-				const double distSq = dx * dx + dy * dy + dz * dz;
-				if (distSq <= bestDistSq) {
-					bestDistSq = distSq;
-					best = candidate;
-				}
-				return RE::BSContainer::ForEachResult::kContinue;
-				});
-			return best;
+			TFD::CaptiveRuntime::BindDoor(door);
 		}
 
 		static void ClearEscapeContext()
 		{
-			g_captiveMarker.reset();
-			g_captiveCellFormID = 0;
-			g_captiveLocationFormID = 0;
-			g_escapeRadiusActive = false;
-			g_escapeRadiusSince = {};
-			g_boundEscapeDoor.reset();
-			g_captiveDoor.Reset();
+			TFD::CaptiveRuntime::ClearEscapeContext();
 		}
 
 		static void ArmEscapeContextFromCurrentState()
 		{
-			auto* player = Player();
-			if (!player) return;
-			auto* marker = TFD::Location::GetCachedCaptiveMarker();
-			if (!marker) {
-				TFD::Location::RescanCaptiveMarker();
-				marker = TFD::Location::GetCachedCaptiveMarker();
-			}
-			g_captiveMarker = marker ? marker->GetHandle() : RE::ObjectRefHandle{};
-			auto* cell = player->GetParentCell();
-			g_captiveCellFormID = cell ? cell->GetFormID() : 0;
-			auto* loc = cell ? cell->GetLocation() : nullptr;
-			g_captiveLocationFormID = loc ? loc->GetFormID() : 0;
-			g_escapeRadiusActive = false;
-			g_escapeRadiusSince = {};
-			if (!g_captiveDoor.HasDoor()) {
-				if (auto* door = FindNearestDoorNearCaptiveMarker()) {
-					BindCaptiveDoor(door);
-					spdlog::info("[TFD][Captive] Bound nearest captive door {:08X} on captive enter", door->GetFormID());
-				}
-			}
-			spdlog::info("[TFD][Captive] Escape context armed marker={:08X} cell={:08X} loc={:08X}", marker ? marker->GetFormID() : 0, g_captiveCellFormID, g_captiveLocationFormID);
+			TFD::CaptiveRuntime::ArmEscapeContextFromCurrentState(Player());
 		}
 
-		static bool IsDoorNearCaptiveMarker(RE::TESObjectREFR* door)
-		{
-			if (!door || !IsDoorRef(door)) return false;
-			RE::TESObjectREFR* marker = nullptr;
-			if (g_captiveMarker) {
-				auto ptr = g_captiveMarker.get();
-				marker = ptr.get();
-			}
-			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
-			if (!marker) return true;
-			const auto dp = door->GetPosition();
-			const auto mp = marker->GetPosition();
-			const double dx = static_cast<double>(dp.x - mp.x);
-			const double dy = static_cast<double>(dp.y - mp.y);
-			const double dz = static_cast<double>(dp.z - mp.z);
-			const double distSq = dx * dx + dy * dy + dz * dz;
-			return distSq <= (kCaptiveEscapeDoorRadius * kCaptiveEscapeDoorRadius);
-		}
 
 		static RE::Actor* ResolveAggressor();
 		static RE::Actor* FindBestAggressor(float radius);
 
-		static RE::TESObjectREFR* ResolveLockpickDoorCandidate(RE::TESObjectREFR* target)
-		{
-			if (target && IsDoorRef(target) && IsDoorNearCaptiveMarker(target)) return target;
-			auto* boundDoor = ResolveBoundEscapeDoor();
-			if (boundDoor && IsDoorRef(boundDoor) && IsDoorNearCaptiveMarker(boundDoor)) return boundDoor;
-			return nullptr;
-		}
 
 		static void EnterEscapeCommit(const char* reason, RE::TESObjectREFR* door)
 		{
@@ -4830,57 +4198,24 @@ namespace TFD::DefeatMonitor
 
 		static void TryCommitEscapeByRadius()
 		{
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) {
-				g_escapeRadiusActive = false;
-				return;
-			}
-			auto* player = Player();
-			if (!player) return;
-			RE::TESObjectREFR* marker = nullptr;
-			if (g_captiveMarker) {
-				auto ptr = g_captiveMarker.get();
-				marker = ptr.get();
-			}
-			if (!marker) marker = TFD::Location::GetCachedCaptiveMarker();
-			if (!marker) return;
-			const auto pp = player->GetPosition();
-			const auto mp = marker->GetPosition();
-			const double dx = static_cast<double>(pp.x - mp.x);
-			const double dy = static_cast<double>(pp.y - mp.y);
-			const double dz = static_cast<double>(pp.z - mp.z);
-			const double distSq = dx * dx + dy * dy + dz * dz;
-			const bool outside = distSq > (512.0 * 512.0);
-			if (!outside) {
-				g_escapeRadiusActive = false;
-				return;
-			}
-			if (!g_escapeRadiusActive) {
-				g_escapeRadiusActive = true;
-				g_escapeRadiusSince = Now();
-				return;
-			}
-			const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(Now() - g_escapeRadiusSince).count();
-			if (held >= 2000) {
+			if (TFD::CaptiveRuntime::TryCommitEscapeByRadius(Player())) {
 				EnterEscapeCommit("marker_radius", nullptr);
-				g_escapeRadiusActive = false;
 			}
 		}
 
 		static void TryResolveEscapeByLocation()
 		{
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Escape) return;
-			auto* player = Player();
-			if (!player) return;
-			auto* loc = GetLocationFromRef(player);
-			const auto curLoc = loc ? loc->GetFormID() : 0;
-			if (g_captiveLocationFormID != 0 && curLoc != 0 && curLoc != g_captiveLocationFormID) {
-				SetCaptiveRuntime(false, CaptivePhaseValue::None);
-				(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeSucceeded, 0u, "escape_resolved_location");
-				(void)TFD::Flow::Controller::GetSingleton().CompleteTerminalContext("escape_resolved_location");
-				ClearEscapeContext();
-				UpdatePreCombatState();
-				spdlog::info("[TFD][Captive] EscapeResolved by location old={:08X} new={:08X}", g_captiveLocationFormID, curLoc);
+			RE::FormID oldLoc = 0;
+			RE::FormID newLoc = 0;
+			if (!TFD::CaptiveRuntime::DidEscapeByLocation(Player(), &oldLoc, &newLoc)) {
+				return;
 			}
+			SetCaptiveRuntime(false, CaptivePhaseValue::None);
+			(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeSucceeded, 0u, "escape_resolved_location");
+			(void)TFD::Flow::Controller::GetSingleton().CompleteTerminalContext("escape_resolved_location");
+			ClearEscapeContext();
+			UpdatePreCombatState();
+			spdlog::info("[TFD][Captive] EscapeResolved by location old={:08X} new={:08X}", oldLoc, newLoc);
 		}
 
 		static bool BreakEscapeOnDefeatThreshold(RE::Actor* player)
@@ -4909,11 +4244,7 @@ namespace TFD::DefeatMonitor
 			SetCaptiveRuntime(true, CaptivePhaseValue::Captive);
 			ClearEscapeContext();
 			UpdatePreCombatState();
-			spdlog::info(
-				"[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> revert to captive and schedule rebleed preferred={:08X}",
-				pct,
-				thresh,
-				preferred ? preferred->GetFormID() : 0);
+			spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> revert to captive and schedule rebleed preferred={:08X}", pct, thresh, preferred ? preferred->GetFormID() : 0);
 			return true;
 		}
 
@@ -6269,10 +5600,6 @@ namespace TFD::DefeatMonitor
 			return TFD::Bleedout::BeginDialogueHotkey((std::max)(2400.0f, TFD::Settings::GetSweepRadius()), 1800.0f, handlers);
 		}
 
-		static void EnterEscapeFromLockpick(RE::TESObjectREFR* door)
-		{
-			EnterEscapeCommit("lockpick", door);
-		}
 
 		static bool BeginResolvedNoMarkerFallback(const char* reason)
 		{
@@ -6284,7 +5611,7 @@ namespace TFD::DefeatMonitor
 			ResetLockpickWatch();
 			g_grace.store(false, std::memory_order_release);
 			g_prevDialogueOpen = false;
-			g_prevLockpickOpen = false;
+			TFD::CaptiveRuntime::SetPrevLockpickOpen(false);
 			SetCaptiveRuntime(false, CaptivePhaseValue::None);
 
 			auto* player = Player();
@@ -6347,7 +5674,7 @@ namespace TFD::DefeatMonitor
 					[&]() { g_lastAggressor.reset(); },
 					[&]() { ResetBleedRuntimeState(); },
 					[&](bool v) { g_prevDialogueOpen = v; },
-					[&](bool v) { g_prevLockpickOpen = v; },
+					[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); },
 					[&](bool captive) { SetCaptiveRuntime(captive, captive ? CaptivePhaseValue::Captive : CaptivePhaseValue::None); },
 					[&](bool immune) { SetPlayerBleedImmune(immune); },
 					[&](const char* r) { QueueNonCaptiveChoiceRequest(r); },
@@ -6470,7 +5797,7 @@ namespace TFD::DefeatMonitor
 							why);
 					},
 					[&](bool v) { g_prevDialogueOpen = v; },
-					[&](bool v) { g_prevLockpickOpen = v; }
+					[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); }
 				});
 		}
 
@@ -6503,7 +5830,7 @@ namespace TFD::DefeatMonitor
 					{},
 					{},
 					[&](bool v) { g_prevDialogueOpen = v; },
-					[&](bool v) { g_prevLockpickOpen = v; }
+					[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); }
 				});
 		}
 
@@ -6541,7 +5868,7 @@ namespace TFD::DefeatMonitor
 							why2);
 					},
 					[&](bool v) { g_prevDialogueOpen = v; },
-					[&](bool v) { g_prevLockpickOpen = v; }
+					[&](bool v) { TFD::CaptiveRuntime::SetPrevLockpickOpen(v); }
 				});
 			if (ok) {
 				spdlog::info("[TFD][Defeat] bleed pleasure handoff complete reason={} preserveStabilization=1 clearFlow=0 preserveFlowOwner=1 speaker={:08X} session={} captor={:08X}",
@@ -6554,50 +5881,10 @@ namespace TFD::DefeatMonitor
 
 		static void UpdateLockpickEscapeWatch()
 		{
-			if (!g_captiveState || g_captivePhase != CaptivePhaseValue::Captive) {
-				ResetLockpickWatch();
-				return;
-			}
-			const bool lockOpen = IsLockpickingOpen();
-			if (lockOpen && !g_prevLockpickOpen) {
-				auto* rawTarget = RE::LockpickingMenu::GetTargetReference();
-				auto* target = ResolveLockpickDoorCandidate(rawTarget);
-				if (target) {
-					g_lockpickDoorCandidate = target->GetHandle();
-					g_lockpickDoorWasLocked = IsRefLocked(target);
-					if (g_lockpickDoorWasLocked) BindCaptiveDoor(target);
-					spdlog::info("[TFD][Captive] lockpick opened on door {:08X} wasLocked={} nearMarker=1 rawTarget={:08X}", target->GetFormID(), g_lockpickDoorWasLocked ? 1 : 0, rawTarget ? rawTarget->GetFormID() : 0);
-				}
-				else {
-					g_lockpickDoorCandidate.reset();
-					g_lockpickDoorWasLocked = false;
-					auto* boundDoor = ResolveBoundEscapeDoor();
-					if (rawTarget) {
-						spdlog::info("[TFD][Captive] lockpick target {:08X} ignored (door={} nearMarker={} fallbackBoundDoor={:08X})", rawTarget->GetFormID(), IsDoorRef(rawTarget) ? 1 : 0, IsDoorNearCaptiveMarker(rawTarget) ? 1 : 0, boundDoor ? boundDoor->GetFormID() : 0);
-					}
-					else {
-						spdlog::info("[TFD][Captive] lockpick target null (fallbackBoundDoor={:08X})", boundDoor ? boundDoor->GetFormID() : 0);
-					}
-				}
-			}
-			if (g_captiveDoor.HasDoor() && g_captiveDoor.UpdateWatcher()) {
-				EnterEscapeCommit("door_watch", nullptr);
-			}
-			if (!lockOpen && g_prevLockpickOpen) {
-				RE::TESObjectREFR* door = nullptr;
-				if (g_lockpickDoorCandidate) {
-					auto ptr = g_lockpickDoorCandidate.get();
-					door = ptr.get();
-				}
-				if (!door) door = ResolveBoundEscapeDoor();
-				if (door && IsDoorRef(door) && g_lockpickDoorWasLocked && !IsRefLocked(door)) {
-					EnterEscapeFromLockpick(door);
-				}
-				else {
-					ResetLockpickWatch();
-				}
-			}
-			g_prevLockpickOpen = lockOpen;
+			(void)TFD::CaptiveRuntime::UpdateLockpickEscapeWatch(
+				[&](const char* reason, RE::TESObjectREFR* door) {
+					EnterEscapeCommit(reason, door);
+				});
 		}
 
 		static RE::Actor* ResolveEscapeBreakPreferredAggressor(float radius)
@@ -7636,7 +6923,7 @@ else {
 		ClearLeftForDeadCooldown();
 		SetCaptiveRuntime(g_queuedCaptiveState, g_queuedCaptivePhase);
 		g_prevDialogueOpen = IsDialogueOpen();
-		g_prevLockpickOpen = IsLockpickingOpen();
+		TFD::CaptiveRuntime::CaptureCurrentLockpickMenuState();
 		if (g_queuedCaptiveState && g_queuedCaptivePhase == CaptivePhaseValue::Captive) {
 			TFD::Location::RescanCaptiveMarker();
 			ArmEscapeContextFromCurrentState();

@@ -3,6 +3,7 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include <RE/Skyrim.h>
@@ -54,10 +55,35 @@ namespace TFD::CaptiveRuntime
 	bool IsFamily(bool stateActive, PhaseValue phase);
 
 	bool IsActive();
-bool IsEscapeActive();
-bool IsStandardCaptiveActive();
+	bool IsEscapeActive();
+	bool IsStandardCaptiveActive();
 
-bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
+	void ResolveQuestRegistry();
+	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref);
+	void SyncPlayerAlias(RE::Actor* actor, const char* reason);
+	void SyncStorageDebugAliases(const char* reason);
+	void ClearStorageDebugAliases(const char* reason);
+	bool EnsureStarterLockpicks(std::int32_t targetCount, const char* reason);
+	bool TransferPlayerInventoryToStorage(RE::TESObjectREFR* target, const char* reason);
+	void ClearPendingConfiscation(const char* reason);
+	void QueuePendingConfiscation(const char* reason, bool starterKitWanted);
+	void ProcessPendingConfiscation();
+	void SetRuntimeState(bool stateActive, PhaseValue phase);
 
-void ResetForLoad();
+	void SetPrevLockpickOpen(bool open);
+	void CaptureCurrentLockpickMenuState();
+	void ResetLockpickWatch();
+	RE::TESObjectREFR* ResolveBoundEscapeDoor();
+	void BindDoor(RE::TESObjectREFR* door);
+	void ClearEscapeContext();
+	void ArmEscapeContextFromCurrentState(RE::Actor* player);
+	bool IsDoorNearMarker(RE::TESObjectREFR* door);
+	RE::TESObjectREFR* ResolveLockpickDoorCandidate(RE::TESObjectREFR* target);
+	bool UpdateLockpickEscapeWatch(const std::function<void(const char*, RE::TESObjectREFR*)>& onEscapeCommit);
+	bool TryCommitEscapeByRadius(RE::Actor* player);
+	bool DidEscapeByLocation(RE::Actor* player, RE::FormID* oldLocationOut = nullptr, RE::FormID* newLocationOut = nullptr);
+
+	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
+
+	void ResetForLoad();
 }

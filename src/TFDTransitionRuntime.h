@@ -1,7 +1,11 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <functional>
+#include <vector>
+
+#include <RE/Skyrim.h>
 
 namespace TFD::TransitionRuntime
 {
@@ -13,7 +17,39 @@ namespace TFD::TransitionRuntime
 		Recover = 3
 	};
 
+	enum class FallbackBranch : std::uint32_t
+	{
+		None = 0,
+		RecoveryFollower = 1,
+		RecoveryPotion = 2,
+		RescueCached = 3,
+		LeftForDeadSolo = 4,
+		LeftForDeadWithFollower = 5
+	};
+
+	struct RuntimeHandlers
+	{
+		std::function<RE::Actor*()> getPlayer;
+		std::function<RE::Actor*()> resolveAggressor;
+		std::function<RE::Actor*(float)> findBestAggressor;
+		std::function<bool(RE::Actor*)> isCombatSupportedAggressor;
+		std::function<bool(RE::Actor*)> isActiveFollowerActor;
+		std::function<bool(RE::Actor*)> isStandingAllyThresholdActor;
+		std::function<std::vector<RE::Actor*>()> collectRegisteredTeammates;
+		std::function<std::vector<RE::Actor*>(float, RE::Actor*, bool)> collectBleedoutCrowd;
+		std::function<std::vector<RE::FormID>()> getBleedCrowdAssigned;
+		std::function<bool(float)> tryAbortPleasureDueToHostileIntrusion;
+		std::function<void(const char*, bool)> releasePlayerBleedLock;
+		std::function<void(int)> setGraceSeconds;
+		std::function<void(int)> setRescueStateValue;
+		std::function<void()> refreshPostDefeatGlobals;
+		std::function<void()> updatePreCombatState;
+	};
+
 	const char* GetKindName(Kind kind);
+	const char* GetBranchName(FallbackBranch branch);
+	FallbackBranch GetCurrentFallbackBranch();
+	const char* GetCurrentFallbackBranchName();
 
 	bool QueueRequest(Kind kind, bool fadeIn, const char* reason = nullptr);
 
@@ -30,4 +66,19 @@ namespace TFD::TransitionRuntime
 
 	void ShowBlackoutFader();
 	void HideBlackoutFader();
+
+	void ClearNoMarkerFallbackState();
+	bool IsRecoveryActive();
+	void BeginLeftForDeadCooldown(int seconds);
+	bool IsLeftForDeadCooldownActive(const RuntimeHandlers& handlers);
+	void TickLeftForDeadCooldown(const RuntimeHandlers& handlers);
+	void ClearLeftForDeadCooldown(const RuntimeHandlers& handlers);
+	void MaintainCalmWindow(const RuntimeHandlers& handlers);
+	void RecoverPlayerForTransition(const RuntimeHandlers& handlers);
+	void RecoverPlayerAfterTeleport(const RuntimeHandlers& handlers);
+	FallbackBranch ResolveNoMarkerFallback(const char* reason, const RuntimeHandlers& handlers);
+	void ArmObservedLeftForDeadFallback(RE::Actor* follower, const RuntimeHandlers& handlers);
+	void ForceLeftForDeadSolo(const RuntimeHandlers& handlers);
+	bool BeginRescueTransition(const char* reason, const RuntimeHandlers& handlers);
+	void BeginRecoverTransition(const char* reason, const RuntimeHandlers& handlers);
 }
