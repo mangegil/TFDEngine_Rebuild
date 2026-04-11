@@ -59,6 +59,7 @@ add_library(TFDEngine SHARED
     src/TFDFlowController.cpp
     src/TFDForceGreet.cpp
     src/TFDPleasureRuntime.cpp
+    src/TFDTransitionRuntime.cpp
 )
 
 if(TFDEnableSmf)

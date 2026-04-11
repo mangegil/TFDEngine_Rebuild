@@ -20,6 +20,8 @@
 #include "TFDFactionMask.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
+#include "TFDPacify.h"
+#include "TFDBleedoutGreet.h"
 #include "RE/B/BGSRefAlias.h"
 #include "RE/T/TESQuest.h"
 
@@ -50,6 +52,36 @@ namespace TFD::Bleedout
 		std::uint32_t g_activeCaptorFormID = 0;
 		RE::ActorHandle g_captorFactionHandle{};
 		Clock::time_point g_captorBindLast{};
+
+		std::atomic_bool g_inBleedState{ false };
+		float g_minHp{ 0.0f };
+		Clock::time_point g_bleedStart{};
+		int g_bleedLastSeconds = -1;
+		bool g_bleedPaused = false;
+		Clock::time_point g_bleedPauseStarted{};
+		Clock::time_point g_bleedLastCalmPulse{};
+		Clock::time_point g_bleedLastCrowdAssign{};
+		std::vector<std::uint32_t> g_bleedCrowdAssigned{};
+		Clock::time_point g_bleedNoSpeakerTameLastAttempt{};
+		std::uint32_t g_bleedSpeakerId = 0;
+		Clock::time_point g_bleedSpeakerKickLast{};
+		int g_bleedSpeakerKickCount = 0;
+		std::unordered_set<std::uint32_t> g_bleedRejectedSpeakerIds{};
+		int g_bleedDialogueRetryCount = 0;
+		bool g_escapeBreakBleedPending = false;
+		bool g_bleedPendingCaptiveOutcome = false;
+		bool g_bleedPendingNonCaptiveOutcome = false;
+		bool g_bleedBattleObservePending = false;
+		Clock::time_point g_bleedBattleObservePendingUntil{};
+		Clock::time_point g_bleedBattleObservePendingLastRedirect{};
+		int g_bleedBattleObservePendingEmptyEnemyTicks = 0;
+		bool g_bleedBattleObserveActive = false;
+		Clock::time_point g_bleedBattleObserveSince{};
+		Clock::time_point g_bleedBattleObserveLastRedirect{};
+		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
+		std::uint32_t g_truceSessionId = 0;
+		std::uint32_t g_noSpeakerTameSessionId = 0;
+		std::uint32_t g_noSpeakerTamePrimaryId = 0;
 
 		void WriteQuestRefAlias(RE::TESQuest* quest, RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
 		{
@@ -134,6 +166,40 @@ namespace TFD::Bleedout
 
 			return true;
 		}
+
+		RE::Actor* ChooseNoSpeakerTamePrimary(const std::vector<RE::Actor*>& actors, RE::Actor* player, const RuntimeHostHandlers& handlers)
+		{
+			if (!player) {
+				return nullptr;
+			}
+
+			RE::Actor* best = nullptr;
+			float bestScore = std::numeric_limits<float>::max();
+			for (auto* actor : actors) {
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (handlers.isCaptiveSupportedAggressor && handlers.isCaptiveSupportedAggressor(actor)) {
+					continue;
+				}
+				const auto pp = player->GetPosition();
+				const auto ap = actor->GetPosition();
+				const float dx = ap.x - pp.x;
+				const float dy = ap.y - pp.y;
+				const float dz = ap.z - pp.z;
+				const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+				float score = dist;
+				if (actor->IsHostileToActor(player)) score -= 120.0f;
+				if (actor->IsInCombat()) score -= 80.0f;
+				if (score < bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			return best;
+		}
+
 
 		RE::BGSListForm* ResolveBleedoutAllowList()
 		{
@@ -791,6 +857,33 @@ namespace TFD::Bleedout
 		spdlog::info("[TFD][Bleedout] ResetForLoad");
 	}
 
+	std::atomic_bool& InBleedStateRef() { return g_inBleedState; }
+	float& MinHpRef() { return g_minHp; }
+	std::chrono::steady_clock::time_point& BleedStartRef() { return g_bleedStart; }
+	int& BleedLastSecondsRef() { return g_bleedLastSeconds; }
+	bool& BleedPausedRef() { return g_bleedPaused; }
+	std::chrono::steady_clock::time_point& BleedPauseStartedRef() { return g_bleedPauseStarted; }
+	std::chrono::steady_clock::time_point& BleedLastCalmPulseRef() { return g_bleedLastCalmPulse; }
+	std::chrono::steady_clock::time_point& BleedLastCrowdAssignRef() { return g_bleedLastCrowdAssign; }
+	std::vector<std::uint32_t>& BleedCrowdAssignedRef() { return g_bleedCrowdAssigned; }
+	std::chrono::steady_clock::time_point& BleedNoSpeakerTameLastAttemptRef() { return g_bleedNoSpeakerTameLastAttempt; }
+	std::uint32_t& BleedSpeakerIDRef() { return g_bleedSpeakerId; }
+	std::chrono::steady_clock::time_point& BleedSpeakerKickLastRef() { return g_bleedSpeakerKickLast; }
+	int& BleedSpeakerKickCountRef() { return g_bleedSpeakerKickCount; }
+	int& BleedDialogueRetryCountRef() { return g_bleedDialogueRetryCount; }
+	std::unordered_set<std::uint32_t>& BleedRejectedSpeakerIdsRef() { return g_bleedRejectedSpeakerIds; }
+	bool& EscapeBreakBleedPendingRef() { return g_escapeBreakBleedPending; }
+	bool& BleedPendingCaptiveOutcomeRef() { return g_bleedPendingCaptiveOutcome; }
+	bool& BleedPendingNonCaptiveOutcomeRef() { return g_bleedPendingNonCaptiveOutcome; }
+	bool& BleedBattleObservePendingRef() { return g_bleedBattleObservePending; }
+	std::chrono::steady_clock::time_point& BleedBattleObservePendingUntilRef() { return g_bleedBattleObservePendingUntil; }
+	std::chrono::steady_clock::time_point& BleedBattleObservePendingLastRedirectRef() { return g_bleedBattleObservePendingLastRedirect; }
+	int& BleedBattleObservePendingEmptyEnemyTicksRef() { return g_bleedBattleObservePendingEmptyEnemyTicks; }
+	bool& BleedBattleObserveActiveRef() { return g_bleedBattleObserveActive; }
+	std::chrono::steady_clock::time_point& BleedBattleObserveSinceRef() { return g_bleedBattleObserveSince; }
+	std::chrono::steady_clock::time_point& BleedBattleObserveLastRedirectRef() { return g_bleedBattleObserveLastRedirect; }
+	int& BleedBattleObserveActiveEmptyEnemyTicksRef() { return g_bleedBattleObserveActiveEmptyEnemyTicks; }
+
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason)
 	{
@@ -981,6 +1074,277 @@ namespace TFD::Bleedout
 	{
 		return g_captorBindLast.time_since_epoch().count() != 0 &&
 			(now - g_captorBindLast) < window;
+	}
+
+
+
+	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
+	{
+		if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
+			return false;
+		}
+		const auto speakerID = speaker->GetFormID();
+		const bool sameActiveCaptor = GetActiveCaptorFormID() != 0 && GetActiveCaptorFormID() == speakerID;
+		if (handlers.clearBleedSupportBridgeAliases) {
+			handlers.clearBleedSupportBridgeAliases(reason ? reason : "bleed_retry");
+		}
+		if (state.bleedSpeakerId) {
+			*state.bleedSpeakerId = speakerID;
+		}
+		if (handlers.setLastAggressor) {
+			handlers.setLastAggressor(speaker);
+		}
+		if (!sameActiveCaptor) {
+			ClearBridgeAliases(speaker, reason ? reason : "bleed_retry");
+		}
+		else {
+			spdlog::info("[TFD][BleedBridge] ClearAll skipped reason={} actor={:08X} sameActiveCaptor=1",
+				reason ? reason : "bleed_retry",
+				speakerID);
+		}
+		AssignBridgeActor(speaker);
+		BindCaptorAliases(speaker, reason ? reason : "bleed_retry");
+		PrimeBridgeActor(speaker, reason ? reason : "bleed_retry");
+		if (!speaker->IsAIEnabled()) {
+			speaker->EnableAI(true);
+		}
+		speaker->AllowPCDialogue(true);
+		speaker->SetDialogueWithPlayer(false, false, nullptr);
+		if (speaker->IsInCombat()) {
+			speaker->StopCombat();
+		}
+		if (auto* process = RE::ProcessLists::GetSingleton()) {
+			process->StopCombatAndAlarmOnActor(speaker, false);
+		}
+		if (speaker->IsWeaponDrawn()) {
+			speaker->DrawWeaponMagicHands(false);
+		}
+		auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false, true);
+		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
+		if (!sessionId.has_value() && preserveDialogueSession) {
+			spdlog::info("[TFD][Defeat] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
+				speaker->GetFormID(),
+				reason ? reason : "unknown");
+			sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true, true);
+		}
+		if (!sessionId.has_value()) {
+			spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
+				speaker->GetFormID(),
+				reason ? reason : "unknown");
+			return false;
+		}
+		g_truceSessionId = *sessionId;
+		ApplyForceGreetOverdrive(player, speaker, reason ? reason : "bleed_retry", false, state, handlers);
+		speaker->EvaluatePackage(false, true);
+		speaker->EvaluatePackage(true, true);
+		spdlog::info("[TFD][Defeat] bleed speaker restart id={} actor={:08X} reason={}",
+			g_truceSessionId,
+			speaker->GetFormID(),
+			reason ? reason : "unknown");
+		return true;
+	}
+
+	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
+	{
+		if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
+			return;
+		}
+
+		if (!speaker->IsAIEnabled()) {
+			speaker->EnableAI(true);
+		}
+		speaker->AllowPCDialogue(true);
+		speaker->SetDialogueWithPlayer(false, false, nullptr);
+
+		if (speaker->IsInCombat()) {
+			speaker->StopCombat();
+		}
+		if (auto* process = RE::ProcessLists::GetSingleton()) {
+			process->StopCombatAndAlarmOnActor(speaker, false);
+		}
+		if (speaker->IsWeaponDrawn()) {
+			speaker->DrawWeaponMagicHands(false);
+		}
+
+		if (!IsCaptorAliasPrimary(speaker)) {
+			BindCaptorAliases(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+		}
+		PrimeBridgeActor(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+
+		if (state.bleedCrowdAssigned) state.bleedCrowdAssigned->clear();
+		if (state.bleedLastCrowdAssign) *state.bleedLastCrowdAssign = Clock::now();
+
+		std::optional<RE::FormID> burstId;
+		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
+		if (!preserveDialogueSession) {
+			burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+		}
+		else {
+			spdlog::info("[TFD][Defeat] bleed forcegreet preserve dialogue session speaker={:08X} reason={}",
+				speaker->GetFormID(),
+				reason ? reason : "unknown");
+		}
+
+		player->DrawWeaponMagicHands(false);
+		player->EvaluatePackage(false, true);
+		player->EvaluatePackage(true, true);
+		speaker->EvaluatePackage(false, true);
+		speaker->EvaluatePackage(true, true);
+
+		if (restartForceGreet && handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime(reason ? reason : "bleed_forcegreet_overdrive");
+		}
+		if (restartForceGreet) {
+			TFD::BleedoutGreet::Begin(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+		}
+
+		spdlog::info("[TFD][Defeat] bleed forcegreet overdrive speaker={:08X} crowdSize=1 burst={} restartFG={} reason={}",
+			speaker->GetFormID(),
+			burstId.has_value() ? 1 : 0,
+			restartForceGreet ? 1 : 0,
+			reason ? reason : "unknown");
+	}
+
+	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason)
+	{
+		if (g_truceSessionId != 0) {
+			TFD::Pacify::ReleaseSession(g_truceSessionId, reason);
+			spdlog::info("[TFD][Defeat] bleed truce session released id={} reason={}",
+				g_truceSessionId,
+				TFD::Pacify::ToString(reason));
+			g_truceSessionId = 0;
+		}
+	}
+
+	void ReleaseNoSpeakerTameSession(const char* reason)
+	{
+		if (g_noSpeakerTameSessionId != 0) {
+			TFD::Pacify::ReleaseSession(g_noSpeakerTameSessionId, TFD::Pacify::ReleaseReason::Generic);
+			spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
+				g_noSpeakerTameSessionId,
+				g_noSpeakerTamePrimaryId,
+				reason ? reason : "unknown");
+			g_noSpeakerTameSessionId = 0;
+		}
+		g_noSpeakerTamePrimaryId = 0;
+	}
+
+	bool TryEnsureNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, RE::Actor* player, const char* reason, const RuntimeHostHandlers& handlers)
+	{
+		if (!player) {
+			return false;
+		}
+		bool hasAny = false;
+		for (auto* actor : actors) {
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				continue;
+			}
+			hasAny = true;
+			if (handlers.isCaptiveSupportedAggressor && handlers.isCaptiveSupportedAggressor(actor)) {
+				return false;
+			}
+		}
+		if (!hasAny) {
+			return false;
+		}
+		auto* primary = ChooseNoSpeakerTamePrimary(actors, player, handlers);
+		if (!primary) {
+			return false;
+		}
+		if (g_noSpeakerTamePrimaryId == primary->GetFormID() &&
+			TFD::Pacify::IsPacified(primary) &&
+			TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
+			return true;
+		}
+		if (g_noSpeakerTameSessionId != 0) {
+			ReleaseNoSpeakerTameSession("restart");
+		}
+		player->DrawWeaponMagicHands(false);
+		auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
+		if (!sessionId.has_value()) {
+			spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
+				primary->GetFormID(),
+				reason ? reason : "unknown");
+			return false;
+		}
+		g_noSpeakerTameSessionId = *sessionId;
+		g_noSpeakerTamePrimaryId = primary->GetFormID();
+		spdlog::info("[TFD][Defeat] bleed no-speaker tame session id={} primary={:08X} crowdSize={} reason={}",
+			g_noSpeakerTameSessionId,
+			g_noSpeakerTamePrimaryId,
+			actors.size(),
+			reason ? reason : "unknown");
+		return true;
+	}
+
+	bool PromoteNextSpeakerFromTruceQueue(RE::TESQuest* truceQuest, const std::array<RE::BGSRefAlias*, 10>& truceAliases, RE::Actor* player, const char* reason, bool rejectCurrent, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
+	{
+		if (!player || !truceQuest) {
+			return false;
+		}
+		if (rejectCurrent && state.bleedSpeakerId && *state.bleedSpeakerId != 0 && state.bleedRejectedSpeakerIds) {
+			state.bleedRejectedSpeakerIds->insert(*state.bleedSpeakerId);
+		}
+		for (auto* alias : truceAliases) {
+			if (!alias) continue;
+			auto* actor = alias->GetActorReference();
+			if (!actor || actor == player || actor->IsDead() || actor->IsDisabled()) continue;
+			const auto actorID = actor->GetFormID();
+			if (state.bleedRejectedSpeakerIds && state.bleedRejectedSpeakerIds->find(actorID) != state.bleedRejectedSpeakerIds->end()) continue;
+			if (handlers.isBleedCrowdSupportedAggressor && !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
+			if (handlers.isBleedSpaceCompatible && !handlers.isBleedSpaceCompatible(actor, player)) continue;
+			if (StartTruceSessionForSpeaker(player, actor, reason ? reason : "truce_queue_promote", state, handlers)) {
+				if (handlers.resetGreetRuntime) handlers.resetGreetRuntime("bleed_reset");
+				if (handlers.setPrevDialogueOpen) handlers.setPrevDialogueOpen(false);
+				if (state.bleedPaused) *state.bleedPaused = false;
+				if (state.bleedPauseStarted) *state.bleedPauseStarted = {};
+				if (state.bleedSpeakerKickLast) *state.bleedSpeakerKickLast = {};
+				if (state.bleedSpeakerKickCount) *state.bleedSpeakerKickCount = 0;
+				if (state.bleedLastSeconds) *state.bleedLastSeconds = -1;
+				if (state.bleedStart) *state.bleedStart = Clock::now();
+				spdlog::info("[TFD][Defeat] promoted next bleed speaker actor={:08X} reason={}", actorID, reason ? reason : "unknown");
+				return true;
+			}
+			if (state.bleedRejectedSpeakerIds) state.bleedRejectedSpeakerIds->insert(actorID);
+		}
+		return false;
+	}
+
+	void MaintainPrimaryCaptorBinding(bool dialogueOpen, RuntimeHostStateRefs state)
+	{
+		if (!state.inBleedState || !state.inBleedState->load(std::memory_order_acquire) || !state.bleedSpeakerId || *state.bleedSpeakerId == 0 || g_truceSessionId == 0) {
+			return;
+		}
+		if (dialogueOpen) {
+			return;
+		}
+		auto* actor = RE::TESForm::LookupByID<RE::Actor>(*state.bleedSpeakerId);
+		if (!actor || actor->IsDead() || actor->IsDisabled()) {
+			return;
+		}
+		if (IsCaptorAliasPrimary(actor)) {
+			return;
+		}
+		const auto now = Clock::now();
+		if (WasCaptorRecentlyBound(now, std::chrono::milliseconds(1500))) {
+			return;
+		}
+		BindCaptorAliases(actor, "maintain_primary_missing");
+	}
+
+	std::uint32_t GetTruceSessionID()
+	{
+		return g_truceSessionId;
+	}
+
+	std::uint32_t GetNoSpeakerTameSessionID()
+	{
+		return g_noSpeakerTameSessionId;
+	}
+
+	std::uint32_t GetNoSpeakerTamePrimaryFormID()
+	{
+		return g_noSpeakerTamePrimaryId;
 	}
 
 

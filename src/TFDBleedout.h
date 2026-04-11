@@ -6,11 +6,16 @@
 #include <cstdint>
 #include <functional>
 #include <vector>
+#include <array>
+
+#include "TFDPacify.h"
 
 namespace RE
 {
 	class Actor;
 	class TESForm;
+	class TESQuest;
+	class BGSRefAlias;
 }
 
 namespace TFD::Bleedout
@@ -177,6 +182,9 @@ namespace TFD::Bleedout
 		std::function<bool(RE::Actor*, RE::Actor*, bool, float*)> canUseCaptiveFallbackHeuristic;
 		std::function<bool(const std::vector<RE::Actor*>&, const char*)> tryEnsureNoSpeakerTameSession;
 		std::function<void(RE::Actor*)> setLastAggressor;
+		std::function<void(bool)> setPrevDialogueOpen;
+		std::function<bool(RE::Actor*)> isBleedCrowdSupportedAggressor;
+		std::function<bool(RE::Actor*, RE::Actor*)> isBleedSpaceCompatible;
 		std::function<void(const char*)> debugNotification;
 		std::function<void(RE::Actor*, float, const char*)> clearEnemyTargetsToPlayerForDefeat;
 		std::function<RE::Actor*(float)> resolveEscapeBreakPreferredAggressor;
@@ -192,7 +200,44 @@ namespace TFD::Bleedout
 	bool HandleRuntimePendingEscapeBreak(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
 	void MaintainRuntimeSpeakerKick(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers);
 
+	std::atomic_bool& InBleedStateRef();
+	float& MinHpRef();
+	std::chrono::steady_clock::time_point& BleedStartRef();
+	int& BleedLastSecondsRef();
+	bool& BleedPausedRef();
+	std::chrono::steady_clock::time_point& BleedPauseStartedRef();
+	std::chrono::steady_clock::time_point& BleedLastCalmPulseRef();
+	std::chrono::steady_clock::time_point& BleedLastCrowdAssignRef();
+	std::vector<std::uint32_t>& BleedCrowdAssignedRef();
+	std::chrono::steady_clock::time_point& BleedNoSpeakerTameLastAttemptRef();
+	std::uint32_t& BleedSpeakerIDRef();
+	std::chrono::steady_clock::time_point& BleedSpeakerKickLastRef();
+	int& BleedSpeakerKickCountRef();
+	int& BleedDialogueRetryCountRef();
+	std::unordered_set<std::uint32_t>& BleedRejectedSpeakerIdsRef();
+	bool& EscapeBreakBleedPendingRef();
+	bool& BleedPendingCaptiveOutcomeRef();
+	bool& BleedPendingNonCaptiveOutcomeRef();
+	bool& BleedBattleObservePendingRef();
+	std::chrono::steady_clock::time_point& BleedBattleObservePendingUntilRef();
+	std::chrono::steady_clock::time_point& BleedBattleObservePendingLastRedirectRef();
+	int& BleedBattleObservePendingEmptyEnemyTicksRef();
+	bool& BleedBattleObserveActiveRef();
+	std::chrono::steady_clock::time_point& BleedBattleObserveSinceRef();
+	std::chrono::steady_clock::time_point& BleedBattleObserveLastRedirectRef();
+	int& BleedBattleObserveActiveEmptyEnemyTicksRef();
+
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
+	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
+	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
+	bool PromoteNextSpeakerFromTruceQueue(RE::TESQuest* truceQuest, const std::array<RE::BGSRefAlias*, 10>& truceAliases, RE::Actor* player, const char* reason, bool rejectCurrent, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
+	void MaintainPrimaryCaptorBinding(bool dialogueOpen, RuntimeHostStateRefs state);
+	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason);
+	void ReleaseNoSpeakerTameSession(const char* reason);
+	bool TryEnsureNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, RE::Actor* player, const char* reason, const RuntimeHostHandlers& handlers);
+	std::uint32_t GetTruceSessionID();
+	std::uint32_t GetNoSpeakerTameSessionID();
+	std::uint32_t GetNoSpeakerTamePrimaryFormID();
 	void AssignBridgeActor(RE::Actor* actor);
 	void PrimeBridgeActor(RE::Actor* actor, const char* reason);
 	void ClearCaptorAliases(const char* reason);
