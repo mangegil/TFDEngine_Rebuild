@@ -17,10 +17,11 @@
 #include <thread>
 
 #include "TFDActorScan.h"
-#include "TFDFactionMask.h"
+#include "TFDFactionManager.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
+#include "TFDTame.h"
 #include "TFDBleedoutGreet.h"
 #include "RE/B/BGSRefAlias.h"
 #include "RE/T/TESQuest.h"
@@ -39,7 +40,6 @@ namespace TFD::Bleedout
 		}
 
 		constexpr const char* kPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
-
 
 		struct BleedoutQuestRegistryCache
 		{
@@ -199,14 +199,13 @@ namespace TFD::Bleedout
 			return best;
 		}
 
-
 		RE::BGSListForm* ResolveBleedoutAllowList()
 		{
 			static RE::BGSListForm* s_allowList = nullptr;
 			static bool s_tried = false;
 			if (!s_allowList && !s_tried) {
 				s_tried = true;
-				s_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionMask::kAllowListEditorId);
+				s_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionManager::kAllowListEditorId);
 			}
 			return s_allowList;
 		}
@@ -488,7 +487,6 @@ namespace TFD::Bleedout
 
 	}
 
-
 	std::vector<RE::Actor*> CollectCrowd(float radius, RE::Actor* preferred, bool preserveAssigned, const SpeakerLogicHandlers& handlers)
 	{
 		std::vector<std::pair<float, RE::Actor*>> scored;
@@ -750,8 +748,6 @@ namespace TFD::Bleedout
 		return true;
 	}
 
-
-
 	void ResetRuntimeState(bool preserveCaptive, const char* reason, const RuntimeResetHandlers& handlers)
 	{
 		const char* why = reason ? reason : "reset_bleed_runtime";
@@ -881,7 +877,6 @@ namespace TFD::Bleedout
 	std::chrono::steady_clock::time_point& BleedBattleObserveSinceRef() { return g_bleedBattleObserveSince; }
 	std::chrono::steady_clock::time_point& BleedBattleObserveLastRedirectRef() { return g_bleedBattleObserveLastRedirect; }
 	int& BleedBattleObserveActiveEmptyEnemyTicksRef() { return g_bleedBattleObserveActiveEmptyEnemyTicks; }
-
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason)
 	{
@@ -1074,7 +1069,6 @@ namespace TFD::Bleedout
 			(now - g_captorBindLast) < window;
 	}
 
-
 	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers)
 	{
 		const bool preCombatQueued = handlers.queuePreCombatClearAll ? handlers.queuePreCombatClearAll() : false;
@@ -1089,7 +1083,6 @@ namespace TFD::Bleedout
 			truceQueued ? 1 : 0,
 			inCombatQueued ? 1 : 0);
 	}
-
 
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
 	{
@@ -1132,13 +1125,13 @@ namespace TFD::Bleedout
 		if (speaker->IsWeaponDrawn()) {
 			speaker->DrawWeaponMagicHands(false);
 		}
-		auto sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, false, true);
+		auto sessionId = TFD::HostilityController::BeginTruceInCombatSession(player, speaker, 0.0, true, false, true);
 		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
 		if (!sessionId.has_value() && preserveDialogueSession) {
 			spdlog::info("[TFD][Defeat] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
 				speaker->GetFormID(),
 				reason ? reason : "unknown");
-			sessionId = TFD::Pacify::BeginTruceInCombatSession(player, speaker, 0.0, true, true, true);
+			sessionId = TFD::HostilityController::BeginTruceInCombatSession(player, speaker, 0.0, true, true, true);
 		}
 		if (!sessionId.has_value()) {
 			spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
@@ -1190,7 +1183,7 @@ namespace TFD::Bleedout
 		std::optional<RE::FormID> burstId;
 		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
 		if (!preserveDialogueSession) {
-			burstId = TFD::Pacify::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+			burstId = TFD::HostilityController::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
 		}
 		else {
 			spdlog::info("[TFD][Defeat] bleed forcegreet preserve dialogue session speaker={:08X} reason={}",
@@ -1218,13 +1211,13 @@ namespace TFD::Bleedout
 			reason ? reason : "unknown");
 	}
 
-	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason, std::uint32_t* bleedSpeakerId)
+	void ReleaseTruceSession(TFD::HostilityController::ReleaseReason reason, std::uint32_t* bleedSpeakerId)
 	{
 		if (g_truceSessionId != 0) {
-			TFD::Pacify::ReleaseSession(g_truceSessionId, reason);
+			TFD::HostilityController::ReleaseSession(g_truceSessionId, reason);
 			spdlog::info("[TFD][Defeat] bleed truce session released id={} reason={}",
 				g_truceSessionId,
-				TFD::Pacify::ToString(reason));
+				TFD::HostilityController::ToString(reason));
 			g_truceSessionId = 0;
 		}
 		g_bleedSpeakerId = 0;
@@ -1237,7 +1230,7 @@ namespace TFD::Bleedout
 	void ReleaseNoSpeakerTameSession(const char* reason)
 	{
 		if (g_noSpeakerTameSessionId != 0) {
-			TFD::Pacify::ReleaseSession(g_noSpeakerTameSessionId, TFD::Pacify::ReleaseReason::Generic);
+			TFD::HostilityController::ReleaseSession(g_noSpeakerTameSessionId, TFD::HostilityController::ReleaseReason::Generic);
 			spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
 				g_noSpeakerTameSessionId,
 				g_noSpeakerTamePrimaryId,
@@ -1271,15 +1264,15 @@ namespace TFD::Bleedout
 			return false;
 		}
 		if (g_noSpeakerTamePrimaryId == primary->GetFormID() &&
-			TFD::Pacify::IsPacified(primary) &&
-			TFD::Pacify::GetMode(primary) == TFD::Pacify::Mode::Tame) {
+			TFD::HostilityController::IsPacified(primary) &&
+			TFD::HostilityController::GetMode(primary) == TFD::HostilityController::Mode::Tame) {
 			return true;
 		}
 		if (g_noSpeakerTameSessionId != 0) {
 			ReleaseNoSpeakerTameSession("restart");
 		}
 		player->DrawWeaponMagicHands(false);
-		auto sessionId = TFD::Pacify::BeginTameSession(player, primary, 0.0, false);
+		auto sessionId = TFD::Tame::BeginSession(player, primary, 0.0, false);
 		if (!sessionId.has_value()) {
 			spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
 				primary->GetFormID(),
@@ -1900,7 +1893,6 @@ namespace TFD::Bleedout
 		return true;
 	}
 
-
 	bool TryHandlePayReleaseDialogueClosed(bool seenDialogue, bool prevDialogueOpen, const DialogueCloseHandlers& handlers)
 	{
 		if (!seenDialogue || !prevDialogueOpen || GetDialogueOutcome() != DialogueOutcome::PayRelease) {
@@ -2029,8 +2021,6 @@ namespace TFD::Bleedout
 		}
 		return true;
 	}
-
-
 
 	bool HandleBleedTimeout(const TimeoutContext& context, const char* reason, const TimeoutHandlers& handlers)
 	{
@@ -2176,10 +2166,9 @@ namespace TFD::Bleedout
 		return true;
 	}
 
-
 	bool BeginWindow(RE::Actor* speaker, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		const bool ok = flow.BeginPlayerBleedoutDecision(ActorFormID(speaker), reason ? reason : "bleed_window_start");
 		spdlog::info("[TFD][Bleedout] BeginWindow actor={:08X} ok={} reason={}", ActorFormID(speaker), ok ? 1 : 0, reason ? reason : "bleed_window_start");
 		return ok;
@@ -2187,9 +2176,9 @@ namespace TFD::Bleedout
 
 	bool ResolvePay(RE::Actor* actor, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		const auto actorFormID = ActorFormID(actor);
-		if (!flow.ResolveBleedoutOutcome(TFD::Flow::BleedoutOutcome::Pay, actorFormID, reason ? reason : "bleedout_pay")) {
+		if (!flow.ResolveBleedoutOutcome(TFD::FlowController::BleedoutOutcome::Pay, actorFormID, reason ? reason : "bleedout_pay")) {
 			return false;
 		}
 		return flow.CompleteTerminalContext(reason ? reason : "bleedout_pay");
@@ -2197,14 +2186,14 @@ namespace TFD::Bleedout
 
 	bool ResolvePleasure(RE::Actor* actor, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
-		return flow.ResolveBleedoutOutcome(TFD::Flow::BleedoutOutcome::Pleasure, ActorFormID(actor), reason ? reason : "bleedout_pleasure");
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		return flow.ResolveBleedoutOutcome(TFD::FlowController::BleedoutOutcome::Pleasure, ActorFormID(actor), reason ? reason : "bleedout_pleasure");
 	}
 
 	bool ResolveCaptive(RE::Actor* actor, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
-		return flow.ResolveBleedoutOutcome(TFD::Flow::BleedoutOutcome::Captive, ActorFormID(actor), reason ? reason : "bleedout_captive");
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		return flow.ResolveBleedoutOutcome(TFD::FlowController::BleedoutOutcome::Captive, ActorFormID(actor), reason ? reason : "bleedout_captive");
 	}
 
 	bool CommitDialogueOutcome(DialogueOutcome outcome, RE::Actor* actor, const char* reason)
@@ -2224,13 +2213,13 @@ namespace TFD::Bleedout
 
 	bool BeginAfterPleasure(RE::Actor* actor, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		return flow.BeginAfterPleasure(ActorFormID(actor), reason ? reason : "bleedout_after_pleasure");
 	}
 
 	bool CompleteAfterPleasure(const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		return flow.CompleteAfterPleasure(reason ? reason : "bleedout_after_pleasure_complete");
 	}
 
@@ -2238,7 +2227,6 @@ namespace TFD::Bleedout
 	{
 		return BeginAfterPleasure(actor, reason ? reason : "after_pleasure_enter");
 	}
-
 
 	void StartRuntimeWindow(RuntimeHostStateRefs state, RE::Actor* player, RE::Actor* aggressor, const RuntimeHostHandlers& handlers)
 	{
@@ -2568,16 +2556,16 @@ namespace TFD::Bleedout
 
 	bool IsActive()
 	{
-		return TFD::Flow::Controller::GetSingleton().IsBleedDecisionActive();
+		return TFD::FlowController::Controller::GetSingleton().IsBleedDecisionActive();
 	}
 
 	bool OwnsCurrentFlow()
 	{
-		const auto snapshot = TFD::Flow::Controller::GetSingleton().GetSnapshot();
-		return snapshot.root == TFD::Flow::RootFlow::Bleedout ||
-			snapshot.contextRoot == TFD::Flow::RootFlow::Bleedout ||
-			snapshot.sub == TFD::Flow::SubFlow::BleedoutPleasure ||
-			snapshot.sub == TFD::Flow::SubFlow::BleedoutAfterPleasure;
+		const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+		return snapshot.root == TFD::FlowController::RootFlow::Bleedout ||
+			snapshot.contextRoot == TFD::FlowController::RootFlow::Bleedout ||
+			snapshot.sub == TFD::FlowController::SubFlow::BleedoutPleasure ||
+			snapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure;
 	}
 
 	std::uint32_t ResolveActorFormID(RE::Actor* actor)

@@ -7,7 +7,7 @@
 
 #include <RE/Skyrim.h>
 
-namespace TFD::TransitionRuntime
+namespace TFD::Transition
 {
 	enum class Kind
 	{

@@ -1,25 +1,433 @@
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
+
+#include "TFDTame.h"
 
 #include "TFDActorScan.h"
 #include "TFDDefeatMonitor.h"
-#include "TFDFactionMask.h"
+#include "TFDFactionManager.h"
 #include "TFDSettings.h"
 #include "TFDTargetClassifier.h"
-#include "TFDTameBait.h"
+
+#include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include <spdlog/spdlog.h>
-#include <SKSE/SKSE.h>
-
-namespace TFD::Pacify
+namespace TFD::Tame::Internal
 {
+    std::vector<RE::FormID> BuildPackMemberIds(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        float splashRadius,
+        bool& outRejected);
+}
+
+
+namespace
+{
+    namespace AntiAggroInternal
+    {
+        inline std::atomic<std::uint32_t> g_waveGeneration{ 1 };
+
+        void SweepOnce(float radius, bool npcOnly)
+        {
+            if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                return;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return;
+            }
+
+            player->StopCombat();
+
+            TFD::ActorScan::Rescan(radius, npcOnly);
+            const auto count = TFD::ActorScan::GetCount();
+
+            for (std::int32_t i = 0; i < count; i++) {
+                auto* actor = TFD::ActorScan::GetActor(i);
+                if (!actor) {
+                    continue;
+                }
+                if (actor->IsDead() || actor->IsDisabled()) {
+                    continue;
+                }
+
+                actor->StopCombat();
+            }
+        }
+
+        void CancelPending()
+        {
+            const auto next = g_waveGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+            spdlog::info("[TFD][HostilityController] cancel pending waves generation={}", next);
+        }
+
+        void ScheduleWaves(float radius, bool npcOnly, int waves, int intervalMs)
+        {
+            if (waves <= 0) {
+                return;
+            }
+
+            const auto generation = g_waveGeneration.load(std::memory_order_acquire);
+
+            std::thread([radius, npcOnly, waves, intervalMs, generation]() {
+                for (int i = 0; i < waves; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+                    if (generation != g_waveGeneration.load(std::memory_order_acquire)) {
+                        return;
+                    }
+
+                    if (auto* tasks = SKSE::GetTaskInterface()) {
+                        tasks->AddUITask([radius, npcOnly, generation]() {
+                            if (generation != g_waveGeneration.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                            SweepOnce(radius, npcOnly);
+                        });
+                    }
+                }
+            }).detach();
+
+            spdlog::info("[TFD][HostilityController] scheduled {} waves ({}ms) generation={}", waves, intervalMs, generation);
+        }
+    }
+
+    namespace AggressionClampInternal
+    {
+        inline std::mutex g_lock{};
+        inline std::unordered_map<std::uint32_t, float> g_saved{};
+
+        void Apply(RE::Actor* actor)
+        {
+            if (!actor) {
+                return;
+            }
+
+            auto* avo = actor->AsActorValueOwner();
+            if (!avo) {
+                return;
+            }
+
+            const float current = avo->GetActorValue(RE::ActorValue::kAggression);
+            if (current <= 0.0f) {
+                return;
+            }
+
+            const std::uint32_t handle = actor->GetHandle().native_handle();
+
+            {
+                std::scoped_lock lock(g_lock);
+                if (g_saved.find(handle) != g_saved.end()) {
+                    return;
+                }
+                g_saved.emplace(handle, current);
+            }
+
+            avo->ModActorValue(RE::ActorValue::kAggression, -current);
+            spdlog::info("[TFD][HostilityController] aggression clamp applied actor={:08X} handle={} origAgg={}",
+                actor->GetFormID(),
+                handle,
+                current);
+        }
+
+        void Clear()
+        {
+            std::unordered_map<std::uint32_t, float> snapshot;
+            {
+                std::scoped_lock lock(g_lock);
+                snapshot.swap(g_saved);
+            }
+
+            for (auto& entry : snapshot) {
+                const auto handle = entry.first;
+                const auto original = entry.second;
+
+                auto actorRef = RE::Actor::LookupByHandle(handle);
+                auto* actor = actorRef.get();
+                if (!actor) {
+                    continue;
+                }
+
+                auto* avo = actor->AsActorValueOwner();
+                if (!avo) {
+                    continue;
+                }
+
+                avo->ModActorValue(RE::ActorValue::kAggression, original);
+                actor->EvaluatePackage(true, false);
+
+                spdlog::info("[TFD][HostilityController] aggression clamp restored actor={:08X} handle={} addBack={}",
+                    actor->GetFormID(),
+                    handle,
+                    original);
+            }
+        }
+    }
+
+    namespace CaptiveSuppressionInternal
+    {
+        using Clock = std::chrono::steady_clock;
+
+        inline std::mutex g_mutex{};
+        inline RE::BGSListForm* g_allowList = nullptr;
+        inline bool g_triedResolve = false;
+
+        struct Entry
+        {
+            float origAgg{ 0.0f };
+            bool hasOrig{ false };
+            bool didStopCombat{ false };
+        };
+
+        inline std::unordered_map<std::uint32_t, Entry> g_cache{};
+        inline Clock::time_point g_nextTick{};
+        constexpr auto k_interval = std::chrono::milliseconds(500);
+        constexpr float k_minAggToClamp = 0.0f;
+
+        void ResolveAllowList()
+        {
+            if (g_allowList || g_triedResolve) {
+                return;
+            }
+            g_triedResolve = true;
+
+            g_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionManager::kAllowListEditorId);
+            if (!g_allowList) {
+                spdlog::warn("[TFD][HostilityController] allowlist missing (EditorID='{}')", TFD::FactionManager::kAllowListEditorId);
+                return;
+            }
+
+            spdlog::info("[TFD][HostilityController] captive allowlist resolved -> {:08X} ({} entries)",
+                g_allowList->GetFormID(),
+                g_allowList->forms.size());
+        }
+
+        bool IsAllowlistedActor(RE::Actor* actor)
+        {
+            if (!actor || !g_allowList) {
+                return false;
+            }
+
+            for (auto* form : g_allowList->forms) {
+                auto* faction = form ? form->As<RE::TESFaction>() : nullptr;
+                if (!faction) {
+                    continue;
+                }
+                if (actor->IsInFaction(faction)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        void ApplyAggressionZero(RE::Actor* actor)
+        {
+            if (!actor) {
+                return;
+            }
+
+            auto* avo = actor->AsActorValueOwner();
+            if (!avo) {
+                return;
+            }
+
+            const std::uint32_t handle = actor->GetHandle().native_handle();
+            auto [it, inserted] = g_cache.emplace(handle, Entry{});
+            auto& entry = it->second;
+
+            if (!entry.hasOrig) {
+                entry.origAgg = avo->GetActorValue(RE::ActorValue::kAggression);
+                entry.hasOrig = true;
+            }
+
+            const float current = avo->GetActorValue(RE::ActorValue::kAggression);
+            if (current > k_minAggToClamp) {
+                avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+            }
+
+            if (!entry.didStopCombat && actor->IsInCombat()) {
+                actor->StopCombat();
+                actor->EvaluatePackage(true, false);
+                entry.didStopCombat = true;
+            }
+
+            if (inserted) {
+                spdlog::info("[TFD][HostilityController] captive clamp actor={:08X} handle={} origAgg={}",
+                    actor->GetFormID(),
+                    handle,
+                    entry.origAgg);
+            }
+        }
+
+        void RestoreAll()
+        {
+            if (g_cache.empty()) {
+                return;
+            }
+
+            std::int32_t restored = 0;
+
+            for (auto& entry : g_cache) {
+                const auto handle = entry.first;
+                const auto& saved = entry.second;
+
+                auto actorRef = RE::Actor::LookupByHandle(handle);
+                auto* actor = actorRef.get();
+                if (!actor) {
+                    continue;
+                }
+
+                auto* avo = actor->AsActorValueOwner();
+                if (!avo) {
+                    continue;
+                }
+
+                if (saved.hasOrig) {
+                    avo->SetActorValue(RE::ActorValue::kAggression, saved.origAgg);
+                    restored++;
+                }
+
+                actor->EvaluatePackage(true, false);
+            }
+
+            spdlog::info("[TFD][HostilityController] captive restored aggression for {} actor(s)", restored);
+            g_cache.clear();
+        }
+
+        void Tick()
+        {
+            std::scoped_lock lock(g_mutex);
+
+            if (!TFD::Settings::GetEnabled()) {
+                RestoreAll();
+                return;
+            }
+
+            if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+                RestoreAll();
+                return;
+            }
+
+            if (!TFD::DefeatMonitor::IsCaptivePhase()) {
+                RestoreAll();
+                return;
+            }
+
+            ResolveAllowList();
+            if (!g_allowList || g_allowList->forms.empty()) {
+                return;
+            }
+
+            const auto now = Clock::now();
+            if (now < g_nextTick) {
+                return;
+            }
+            g_nextTick = now + k_interval;
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return;
+            }
+
+            const float radius = TFD::Settings::GetSweepRadius();
+            TFD::ActorScan::Rescan(radius, true);
+
+            const auto count = TFD::ActorScan::GetCount();
+            for (std::int32_t i = 0; i < count; i++) {
+                auto scanEntry = TFD::ActorScan::GetEntry(i);
+                auto* actor = scanEntry.actor.get().get();
+                if (!actor || actor == player) {
+                    continue;
+                }
+                if (actor->IsDisabled() || actor->IsDead()) {
+                    continue;
+                }
+                if (!IsAllowlistedActor(actor)) {
+                    continue;
+                }
+                if (!scanEntry.hostile && !scanEntry.inCombat) {
+                    continue;
+                }
+
+                ApplyAggressionZero(actor);
+            }
+        }
+
+        void Reset()
+        {
+            std::scoped_lock lock(g_mutex);
+            RestoreAll();
+            g_allowList = nullptr;
+            g_triedResolve = false;
+            g_nextTick = {};
+        }
+    }
+}
+
+namespace TFD::HostilityController
+{
+    void StopCombatSweep(float radius, bool npcOnly)
+    {
+        AntiAggroInternal::SweepOnce(radius, npcOnly);
+    }
+
+    void CancelPendingWaves()
+    {
+        AntiAggroInternal::CancelPending();
+    }
+
+    void ScheduleStopCombatWaves(float radius, bool npcOnly, int waves, int intervalMs)
+    {
+        AntiAggroInternal::ScheduleWaves(radius, npcOnly, waves, intervalMs);
+    }
+
+    void ApplyAggressionClamp(RE::Actor* actor)
+    {
+        AggressionClampInternal::Apply(actor);
+    }
+
+    void ClearAggressionClamp()
+    {
+        AggressionClampInternal::Clear();
+    }
+
+    void TickCaptiveSuppression()
+    {
+        CaptiveSuppressionInternal::Tick();
+    }
+
+    void ResetCaptiveSuppression()
+    {
+        CaptiveSuppressionInternal::Reset();
+    }
+
+    void ClearAllTemporaryHostility()
+    {
+        ClearAggressionClamp();
+        ResetCaptiveSuppression();
+        CancelPendingWaves();
+    }
+}
+
+
+namespace TFD::HostilityController
+{
+    using TFD::Tame::TameDisposition;
     namespace
     {
         bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon);
@@ -200,7 +608,7 @@ namespace TFD::Pacify
 
             if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
                 spdlog::info(
-                    "TFDPacify: rehostile skipped actor={:08X} player={:08X} reason={} defeated_knock=1",
+                    "TFDHostilityController: rehostile skipped actor={:08X} player={:08X} reason={} defeated_knock=1",
                     actor->GetFormID(),
                     player->GetFormID(),
                     ToString(reason));
@@ -240,7 +648,7 @@ namespace TFD::Pacify
             const bool hostile = IsEnemyToPlayer(player, actor);
 
             spdlog::info(
-                "TFDPacify: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
+                "TFDHostilityController: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
                 actor->GetFormID(),
                 player->GetFormID(),
                 ToString(reason),
@@ -356,7 +764,7 @@ namespace TFD::Pacify
                 return false;
             }
 
-            if (TFD::FactionMask::SharesAllowedFactionExact(actor, primaryTarget)) {
+            if (TFD::FactionManager::SharesAllowedFactionExact(actor, primaryTarget)) {
                 return true;
             }
 
@@ -664,27 +1072,6 @@ namespace TFD::Pacify
             return std::clamp(settingsRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
         }
 
-        RE::TESRace* GetActorRace(RE::Actor* actor)
-        {
-            if (!actor) {
-                return nullptr;
-            }
-
-            auto* base = actor->GetActorBase();
-            return base ? base->GetRace() : nullptr;
-        }
-
-        bool IsSameTamePackSpecies(RE::Actor* actor, RE::Actor* primaryTarget)
-        {
-            auto* actorRace = GetActorRace(actor);
-            auto* primaryRace = GetActorRace(primaryTarget);
-            if (!actorRace || !primaryRace) {
-                return false;
-            }
-
-            return actorRace->GetFormID() == primaryRace->GetFormID();
-        }
-
         bool SharesPrimaryCombatAnchor(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
         {
             if (!actor || !player || !primaryTarget) {
@@ -754,71 +1141,6 @@ namespace TFD::Pacify
             const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
             const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
             return distToPrimary <= radius || distToPlayer <= radius;
-        }
-
-        std::vector<RE::FormID> BuildTamePackMemberIds(
-            RE::Actor* player,
-            RE::Actor* primaryTarget,
-            float splashRadius,
-            bool& outRejected)
-        {
-            outRejected = false;
-
-            std::vector<RE::FormID> result{};
-            if (!player || !primaryTarget) {
-                return result;
-            }
-
-            const auto primaryId = primaryTarget->GetFormID();
-            result.push_back(primaryId);
-
-            const float scanRadius = splashRadius + 256.0f;
-            TFD::ActorScan::Rescan(scanRadius, false);
-
-            const auto count = TFD::ActorScan::GetCount();
-            for (int i = 0; i < count; ++i) {
-                auto scanEntry = TFD::ActorScan::GetEntry(i);
-                auto* actor = TFD::ActorScan::GetActor(i);
-                if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, splashRadius)) {
-                    continue;
-                }
-                if (!IsSameTamePackSpecies(actor, primaryTarget)) {
-                    continue;
-                }
-                if (!SharesPrimaryCombatAnchor(actor, player, primaryTarget)) {
-                    continue;
-                }
-
-                const auto actorId = actor->GetFormID();
-                if (actorId == 0 || actorId == primaryId) {
-                    continue;
-                }
-                if (IsActorBoundToDifferentActiveTameSession(actorId, 0)) {
-                    outRejected = true;
-                    spdlog::info(
-                        "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=actor_bound_to_other_tame_session",
-                        primaryId,
-                        actorId);
-                    return {};
-                }
-
-                result.push_back(actorId);
-            }
-
-            std::sort(result.begin(), result.end());
-            result.erase(std::unique(result.begin(), result.end()), result.end());
-
-            if (result.size() > kTamePackMaxMembers) {
-                outRejected = true;
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} reason=pack_too_large size={} max={}",
-                    primaryId,
-                    static_cast<unsigned int>(result.size()),
-                    static_cast<unsigned int>(kTamePackMaxMembers));
-                return {};
-            }
-
-            return result;
         }
 
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
@@ -1009,52 +1331,6 @@ namespace TFD::Pacify
             return std::addressof(sessionIt->second);
         }
 
-        Session* FindCompatibleActiveTameSession(RE::Actor* player, RE::Actor* primaryTarget, bool allowDialogue)
-        {
-            if (!player || !primaryTarget) {
-                return nullptr;
-            }
-
-            Session* best = nullptr;
-            float bestDist = std::numeric_limits<float>::max();
-            const float splashRadius = GetLocalHostileSplashRadius() + 256.0f;
-
-            for (auto& [sessionId, session] : g_sessions) {
-                (void)sessionId;
-                if (session.finished || session.primaryMode != Mode::Tame) {
-                    continue;
-                }
-                if (session.dialogueRequested != allowDialogue) {
-                    continue;
-                }
-
-                auto* sessionPrimary = ResolveActor(session.primaryTargetId);
-                if (!IsActorStillValid(sessionPrimary)) {
-                    continue;
-                }
-                if (!sessionPrimary->Is3DLoaded()) {
-                    continue;
-                }
-                if (!IsSessionSpaceCompatible(sessionPrimary, player, primaryTarget)) {
-                    continue;
-                }
-
-                const float distToPlayer = sessionPrimary->GetPosition().GetDistance(player->GetPosition());
-                const float distToPrimary = sessionPrimary->GetPosition().GetDistance(primaryTarget->GetPosition());
-                if (distToPlayer > splashRadius && distToPrimary > splashRadius) {
-                    continue;
-                }
-
-                const float score = (std::min)(distToPlayer, distToPrimary);
-                if (score < bestDist) {
-                    bestDist = score;
-                    best = std::addressof(session);
-                }
-            }
-
-            return best;
-        }
-
         bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId)
         {
             auto entryIt = g_entries.find(actorId);
@@ -1112,7 +1388,7 @@ namespace TFD::Pacify
 
             if (session.primaryMode == Mode::Tame) {
                 spdlog::info(
-                    "TFDPacify: tame timer refresh session={} target={:08X} durationSec={:.2f} endTimeSec={:.2f}",
+                    "TFDHostilityController: tame timer refresh session={} target={:08X} durationSec={:.2f} endTimeSec={:.2f}",
                     session.sessionId,
                     session.primaryTargetId,
                     effectiveDurationSec,
@@ -1249,7 +1525,7 @@ namespace TFD::Pacify
             process->ClearCachedFactionFightReactions();
 
             spdlog::info(
-                "TFDPacify: detection pulse reason={} before={} after={}",
+                "TFDHostilityController: detection pulse reason={} before={} after={}",
                 reason ? reason : "<null>",
                 before ? 1 : 0,
                 process->runDetection ? 1 : 0);
@@ -1262,7 +1538,7 @@ namespace TFD::Pacify
             }
             if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
                 spdlog::info(
-                    "TFDPacify: skip queue rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
+                    "TFDHostilityController: skip queue rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
                     actor->GetFormID(),
                     player->GetFormID(),
                     sessionId,
@@ -1283,7 +1559,7 @@ namespace TFD::Pacify
             g_rehostileRequests[req.actorId] = req;
 
             spdlog::info(
-                "TFDPacify: queue rehostile actor={:08X} player={:08X} session={} reason={} attempts={}",
+                "TFDHostilityController: queue rehostile actor={:08X} player={:08X} session={} reason={} attempts={}",
                 req.actorId,
                 req.playerId,
                 sessionId,
@@ -1319,7 +1595,7 @@ namespace TFD::Pacify
 
                 if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
                     spdlog::info(
-                        "TFDPacify: cancel queued rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
+                        "TFDHostilityController: cancel queued rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
                         req.actorId,
                         req.playerId,
                         req.sessionId,
@@ -1521,7 +1797,7 @@ namespace TFD::Pacify
                 auto it = g_truceState.find(primaryTarget->GetFormID());
                 if (it != g_truceState.end() && it->second.spent) {
                     spdlog::info(
-                        "TFDPacify: reject session mode={} target={:08X} reason=truce_spent",
+                        "TFDHostilityController: reject session mode={} target={:08X} reason=truce_spent",
                         ToString(mode),
                         primaryTarget->GetFormID());
                     return std::nullopt;
@@ -1533,13 +1809,13 @@ namespace TFD::Pacify
                 if (allowForcedSheath) {
                     player->DrawWeaponMagicHands(false);
                     spdlog::info(
-                        "TFDPacify: forced sheath for session mode={} target={:08X} reason=player_armed",
+                        "TFDHostilityController: forced sheath for session mode={} target={:08X} reason=player_armed",
                         ToString(mode),
                         primaryTarget->GetFormID());
                 }
                 else {
                     spdlog::info(
-                        "TFDPacify: reject session mode={} target={:08X} reason=player_armed",
+                        "TFDHostilityController: reject session mode={} target={:08X} reason=player_armed",
                         ToString(mode),
                         primaryTarget->GetFormID());
                     return std::nullopt;
@@ -1556,7 +1832,7 @@ namespace TFD::Pacify
                     }
 
                     spdlog::info(
-                        "TFDPacify: truce handoff released tameSessions={} handoffActors={} newTarget={:08X}",
+                        "TFDHostilityController: truce handoff released tameSessions={} handoffActors={} newTarget={:08X}",
                         static_cast<unsigned int>(tameSessionsToRelease.size()),
                         static_cast<unsigned int>(truceHandoffIds.size()),
                         primaryTarget->GetFormID());
@@ -1568,7 +1844,7 @@ namespace TFD::Pacify
                     active->dialogueRequested == allowDialogue) {
                     RefreshSessionEntries(*active, nowSec, effectiveDurationSec);
                     spdlog::info(
-                        "TFDPacify: refresh session id={} mode={} target={:08X} reason=target_already_active",
+                        "TFDHostilityController: refresh session id={} mode={} target={:08X} reason=target_already_active",
                         active->sessionId,
                         ToString(mode),
                         primaryTarget->GetFormID());
@@ -1580,7 +1856,7 @@ namespace TFD::Pacify
                 const auto activeTarget = active->primaryTargetId;
 
                 spdlog::info(
-                    "TFDPacify: replace session oldId={} oldMode={} oldTarget={:08X} newMode={} newTarget={:08X}",
+                    "TFDHostilityController: replace session oldId={} oldMode={} oldTarget={:08X} newMode={} newTarget={:08X}",
                     activeSessionId,
                     ToString(activeMode),
                     activeTarget,
@@ -1593,7 +1869,7 @@ namespace TFD::Pacify
             std::vector<RE::FormID> curatedTameIds;
             bool tamePackRejected = false;
             if (mode == Mode::Tame && allowLocalSplash) {
-                curatedTameIds = BuildTamePackMemberIds(player, primaryTarget, GetLocalHostileSplashRadius(), tamePackRejected);
+                curatedTameIds = TFD::Tame::Internal::BuildPackMemberIds(player, primaryTarget, GetLocalHostileSplashRadius(), tamePackRejected);
                 if (tamePackRejected || curatedTameIds.empty()) {
                     return std::nullopt;
                 }
@@ -1602,7 +1878,7 @@ namespace TFD::Pacify
                     auto* actor = ResolveActor(actorId);
                     if (!IsActorStillValid(actor) || !actor->Is3DLoaded()) {
                         spdlog::info(
-                            "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_not_ready",
+                            "TFDHostilityController: reject tame pack primary={:08X} actor={:08X} reason=pack_member_not_ready",
                             primaryTarget->GetFormID(),
                             actorId);
                         return std::nullopt;
@@ -1781,7 +2057,7 @@ namespace TFD::Pacify
                             }
                         }
                         spdlog::info(
-                            "TFDPacify: reject tame pack session={} target={:08X} actor={:08X} reason=pack_member_lost_before_apply",
+                            "TFDHostilityController: reject tame pack session={} target={:08X} actor={:08X} reason=pack_member_lost_before_apply",
                             sessionId,
                             targetId,
                             actorId);
@@ -1811,7 +2087,7 @@ namespace TFD::Pacify
                             }
                         }
                         spdlog::info(
-                            "TFDPacify: reject tame pack session={} target={:08X} actor={:08X} reason=pack_add_failed",
+                            "TFDHostilityController: reject tame pack session={} target={:08X} actor={:08X} reason=pack_add_failed",
                             sessionId,
                             targetId,
                             actorId);
@@ -1853,7 +2129,7 @@ namespace TFD::Pacify
 
             const std::size_t packSize = applyIds.size();
             spdlog::info(
-                "TFDPacify: begin session id={} mode={} target={:08X} cellBubble={} localSplash={} packSize={} allowDialogue={} durationSec={:.2f} endTimeSec={:.2f}",
+                "TFDHostilityController: begin session id={} mode={} target={:08X} cellBubble={} localSplash={} packSize={} allowDialogue={} durationSec={:.2f} endTimeSec={:.2f}",
                 sessionId,
                 ToString(mode),
                 targetId,
@@ -1866,7 +2142,7 @@ namespace TFD::Pacify
 
             if (suppressBridgeEvents) {
                 spdlog::info(
-                    "TFDPacify: suppress assign events session={} mode={} primary={:08X}",
+                    "TFDHostilityController: suppress assign events session={} mode={} primary={:08X}",
                     sessionId,
                     ToString(mode),
                     targetId);
@@ -1875,7 +2151,7 @@ namespace TFD::Pacify
                 const auto primarySent = SendModEventToActors(GetPrimaryAssignEventName(mode), splitTargets.primaryIds);
                 const auto crowdSent = SendModEventToActors(GetCrowdAssignEventName(mode), splitTargets.crowdIds);
                 spdlog::info(
-                    "TFDPacify: assign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} crowdSize={}",
+                    "TFDHostilityController: assign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} crowdSize={}",
                     ToString(mode),
                     sessionId,
                     GetPrimaryAssignEventName(mode) ? GetPrimaryAssignEventName(mode) : "<none>",
@@ -1888,7 +2164,7 @@ namespace TFD::Pacify
                 const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
                 const auto sent = SendModEventToActors(GetPrimaryAssignEventName(mode), eventIds);
                 spdlog::info(
-                    "TFDPacify: assign events event={} session={} sent={} primary={:08X}",
+                    "TFDHostilityController: assign events event={} session={} sent={} primary={:08X}",
                     GetPrimaryAssignEventName(mode) ? GetPrimaryAssignEventName(mode) : "<none>",
                     sessionId,
                     static_cast<unsigned int>(sent),
@@ -1897,6 +2173,104 @@ namespace TFD::Pacify
             return sessionId;
         }
     }
+
+}  // namespace TFD::HostilityController
+
+namespace TFD::HostilityController::Runtime
+{
+    EntryMap& Entries()
+    {
+        return g_entries;
+    }
+
+    SessionMap& Sessions()
+    {
+        return g_sessions;
+    }
+
+    double NowSec()
+    {
+        return PacifyNowSec();
+    }
+
+    double GameDays()
+    {
+        return CurrentGameDays();
+    }
+
+    double ClampTameEndTime(double nowSec, double endTimeSec)
+    {
+        return (std::min)(endTimeSec, nowSec + kMaxTameTotalSec);
+    }
+
+    RE::Actor* ResolveActor(RE::FormID actorId)
+    {
+        if (actorId == 0) {
+            return nullptr;
+        }
+        return RE::TESForm::LookupByID<RE::Actor>(actorId);
+    }
+
+    void SyncSessionDisposition(Session& session)
+    {
+        for (auto& [actorId, entry] : g_entries) {
+            if (entry.sessionId != session.sessionId) {
+                continue;
+            }
+            entry.disposition = session.disposition;
+            entry.companionExpireGameDays = session.companionExpireGameDays;
+            entry.temporaryTeammateApplied = session.temporaryTeammateApplied;
+            if (session.disposition == TameDisposition::Companion) {
+                entry.endTimeSec = 0.0;
+            }
+        }
+    }
+
+    void SendModEvent(const char* eventName, RE::Actor* sender)
+    {
+        if (!eventName) {
+            return;
+        }
+
+        auto* src = SKSE::GetModCallbackEventSource();
+        if (!src) {
+            return;
+        }
+
+        SKSE::ModCallbackEvent e(eventName, "", 0.0f, sender);
+        src->SendEvent(&e);
+    }
+}
+
+namespace TFD::HostilityController::Internal
+{
+    bool ValidateActor(RE::Actor* actor)
+    {
+        return IsActorStillValid(actor);
+    }
+
+    std::optional<RE::FormID> BeginTameBaseSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        bool allowDialogue)
+    {
+        return BeginSessionCommon(
+            player,
+            primaryTarget,
+            Mode::Tame,
+            nowSec,
+            kTameDurationSec,
+            allowDialogue,
+            false,
+            false,
+            0.0f);
+    }
+}
+
+namespace TFD::HostilityController
+{
+    using TFD::Tame::TameDisposition;
 
     void Reset()
     {
@@ -1965,121 +2339,6 @@ namespace TFD::Pacify
         ProcessRehostileRetries(nowSec);
     }
 
-    std::optional<RE::FormID> BeginTameSession(
-        RE::Actor* player,
-        RE::Actor* primaryTarget,
-        double nowSec,
-        bool allowDialogue,
-        bool allowLocalSplash)
-    {
-        if (!CanStartTame(primaryTarget)) {
-            if (primaryTarget) {
-                spdlog::info(
-                    "TFDPacify: reject begin tame target={:08X} reason=active_tame_requires_feed",
-                    primaryTarget->GetFormID());
-            }
-            return std::nullopt;
-        }
-
-        if (!allowLocalSplash) {
-            return BeginSessionCommon(
-                player,
-                primaryTarget,
-                Mode::Tame,
-                nowSec,
-                kTameDurationSec,
-                allowDialogue,
-                false,
-                false,
-                0.0f);
-        }
-
-        bool tamePackRejected = false;
-        auto tamePackIds = BuildTamePackMemberIds(player, primaryTarget, GetLocalHostileSplashRadius(), tamePackRejected);
-        if (tamePackRejected || tamePackIds.empty()) {
-            return std::nullopt;
-        }
-
-        for (auto actorId : tamePackIds) {
-            auto* actor = ResolveActor(actorId);
-            if (!IsActorStillValid(actor) || !actor->Is3DLoaded()) {
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_not_ready_before_batch",
-                    primaryTarget ? primaryTarget->GetFormID() : 0,
-                    actorId);
-                return std::nullopt;
-            }
-
-            if (!CanStartTame(actor)) {
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=actor_already_has_active_tame",
-                    primaryTarget ? primaryTarget->GetFormID() : 0,
-                    actorId);
-                return std::nullopt;
-            }
-
-            if (TFD::TameBait::CollectValidBaits(player, actor).empty()) {
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=no_valid_bait_for_pack_member",
-                    primaryTarget ? primaryTarget->GetFormID() : 0,
-                    actorId);
-                return std::nullopt;
-            }
-        }
-
-        std::vector<RE::FormID> createdSessionIds;
-        createdSessionIds.reserve(tamePackIds.size());
-
-        std::optional<RE::FormID> primarySessionId;
-        for (auto actorId : tamePackIds) {
-            auto* actor = ResolveActor(actorId);
-            if (!actor) {
-                for (auto createdId : createdSessionIds) {
-                    ReleaseSession(createdId, ReleaseReason::Generic);
-                }
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=pack_member_lost_during_batch",
-                    primaryTarget ? primaryTarget->GetFormID() : 0,
-                    actorId);
-                return std::nullopt;
-            }
-
-            auto sessionId = BeginSessionCommon(
-                player,
-                actor,
-                Mode::Tame,
-                nowSec,
-                kTameDurationSec,
-                allowDialogue,
-                false,
-                false,
-                0.0f);
-            if (!sessionId.has_value()) {
-                for (auto createdId : createdSessionIds) {
-                    ReleaseSession(createdId, ReleaseReason::Generic);
-                }
-                spdlog::info(
-                    "TFDPacify: reject tame pack primary={:08X} actor={:08X} reason=batch_session_begin_failed",
-                    primaryTarget ? primaryTarget->GetFormID() : 0,
-                    actorId);
-                return std::nullopt;
-            }
-
-            createdSessionIds.push_back(*sessionId);
-            if (actorId == primaryTarget->GetFormID()) {
-                primarySessionId = *sessionId;
-            }
-        }
-
-        spdlog::info(
-            "TFDPacify: tame pack batch success primary={:08X} members={} primarySession={} separateSessions=1",
-            primaryTarget ? primaryTarget->GetFormID() : 0,
-            static_cast<unsigned int>(tamePackIds.size()),
-            primarySessionId.value_or(0));
-
-        return primarySessionId;
-    }
-
     std::optional<RE::FormID> BeginTrucePreCombatSession(
         RE::Actor* player,
         RE::Actor* primaryTarget,
@@ -2143,6 +2402,7 @@ namespace TFD::Pacify
             true);
     }
 
+
     bool IsPacified(RE::Actor* actor)
     {
         if (!actor) {
@@ -2184,487 +2444,6 @@ namespace TFD::Pacify
         }
 
         return TFD::DefeatMonitor::IsDialogueCapableDefeatedEnemy(actor);
-    }
-
-    bool CanStartTame(RE::Actor* actor)
-    {
-        return actor && !HasActiveTameSession(actor);
-    }
-
-    bool HasActiveTameSession(RE::Actor* actor)
-    {
-        if (!actor) {
-            return false;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return false;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return false;
-        }
-
-        return sessionIt->second.primaryMode == Mode::Tame;
-    }
-
-    std::vector<ActiveTameSnapshot> GetActiveTameSnapshots(double nowSec)
-    {
-        if (nowSec <= 0.0) {
-            nowSec = PacifyNowSec();
-        }
-
-        std::vector<ActiveTameSnapshot> result{};
-        result.reserve(g_sessions.size());
-
-        for (const auto& [sessionId, session] : g_sessions) {
-            if (session.finished || session.primaryMode != Mode::Tame || session.primaryTargetId == 0) {
-                continue;
-            }
-
-            ActiveTameSnapshot snap{};
-            snap.actorId = session.primaryTargetId;
-            snap.sessionId = sessionId;
-            snap.mode = session.primaryMode;
-            snap.disposition = session.disposition;
-            snap.remainingTameSec = session.disposition == TameDisposition::Companion || session.endTimeSec <= 0.0 ?
-                0.0 :
-                (std::max)(0.0, session.endTimeSec - nowSec);
-
-            if (session.disposition == TameDisposition::Companion && session.companionExpireGameDays > 0.0) {
-                const double remainingDays = session.companionExpireGameDays - CurrentGameDays();
-                snap.remainingCompanionHours = (std::max)(0.0, remainingDays * 24.0);
-            }
-
-            if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(snap.actorId)) {
-                snap.loaded = true;
-                if (const char* name = actor->GetName(); name && name[0]) {
-                    snap.actorName = name;
-                }
-            }
-
-            if (snap.actorName.empty()) {
-                char fallback[64];
-                std::snprintf(fallback, sizeof(fallback), "Creature 0x%08X", snap.actorId);
-                snap.actorName = fallback;
-            }
-
-            result.push_back(std::move(snap));
-        }
-
-        std::sort(result.begin(), result.end(), [](const ActiveTameSnapshot& a, const ActiveTameSnapshot& b) {
-            if (a.disposition != b.disposition) {
-                return static_cast<std::uint8_t>(a.disposition) > static_cast<std::uint8_t>(b.disposition);
-            }
-            if (a.actorName != b.actorName) {
-                return a.actorName < b.actorName;
-            }
-            return a.actorId < b.actorId;
-            });
-
-        return result;
-    }
-
-    std::vector<FeedOptionSnapshot> GetActiveTameFeedOptions(RE::Actor* actor, FeedAction action)
-    {
-        std::vector<FeedOptionSnapshot> result{};
-        if (!actor || !HasActiveTameSession(actor)) {
-            return result;
-        }
-
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            return result;
-        }
-
-        const bool downed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
-        const auto options = TFD::TameBait::CollectValidBaits(player, actor);
-        const std::int32_t cost = action == FeedAction::Teammate ? kCompanionFeedCost : kCalmFeedCost;
-        result.reserve(options.size());
-
-        for (const auto& opt : options) {
-            if (!opt.item || opt.count < cost) {
-                continue;
-            }
-
-            FeedOptionSnapshot bait{};
-            bait.itemId = opt.item->GetFormID();
-            bait.itemName = opt.name;
-            bait.count = opt.count;
-            bait.cost = cost;
-            bait.calmExtendSec = opt.extendSec;
-            bait.action = action;
-
-            char buffer[224];
-            if (action == FeedAction::Teammate) {
-                if (downed) {
-                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
-                }
-                else {
-                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fh)", opt.name.c_str(), opt.count, cost, kCompanionFeedHours);
-                }
-            }
-            else {
-                if (downed) {
-                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, revive + heal, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
-                }
-                else {
-                    std::snprintf(buffer, sizeof(buffer), "%s x%d (cost %d, +%.0fs)", opt.name.c_str(), opt.count, cost, opt.extendSec);
-                }
-            }
-            bait.label = buffer;
-            result.push_back(std::move(bait));
-        }
-
-        return result;
-    }
-
-    bool ApplyActiveTameFeed(RE::Actor* actor, RE::FormID itemId, FeedAction action)
-    {
-        if (!actor || itemId == 0 || !HasActiveTameSession(actor)) {
-            return false;
-        }
-
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            return false;
-        }
-
-        const bool reviveAfterFeed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
-        const auto options = GetActiveTameFeedOptions(actor, action);
-        const auto it = std::find_if(options.begin(), options.end(), [&](const FeedOptionSnapshot& opt) {
-            return opt.itemId == itemId;
-            });
-        if (it == options.end()) {
-            return false;
-        }
-
-        auto* item = RE::TESForm::LookupByID<RE::TESBoundObject>(itemId);
-        if (!item) {
-            return false;
-        }
-
-        bool ok = false;
-        if (action == FeedAction::Teammate) {
-            if (IsCompanion(actor)) {
-                ok = ExtendActiveCompanionHours(actor, kCompanionFeedHours);
-            }
-            else {
-                ok = PromoteActiveTameToCompanion(actor, kCompanionFeedHours);
-            }
-        }
-        else {
-            ok = ExtendActiveTameSession(actor, it->calmExtendSec, 0.0);
-        }
-
-        if (!ok) {
-            return false;
-        }
-
-        if (!TFD::TameBait::ConsumeBait(player, item, it->cost)) {
-            return false;
-        }
-
-        if (reviveAfterFeed) {
-            const float reviveHealPct = action == FeedAction::Teammate ? 60.0f : 45.0f;
-            if (!TFD::DefeatMonitor::ReviveDownedAlly(actor, reviveHealPct)) {
-                spdlog::warn("TFDPacify: feed revive failed actor={:08X} action={}", actor->GetFormID(), action == FeedAction::Teammate ? "teammate" : "calm");
-            }
-        }
-
-        return true;
-    }
-
-    bool ExtendActiveTameSession(RE::Actor* actor, double addSec, double nowSec)
-    {
-        if (!actor || addSec <= 0.0) {
-            return false;
-        }
-
-        if (nowSec <= 0.0) {
-            nowSec = PacifyNowSec();
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return false;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return false;
-        }
-
-        Session& session = sessionIt->second;
-        if (session.primaryMode != Mode::Tame || session.disposition == TameDisposition::Companion) {
-            return false;
-        }
-
-        const double baseEndTime = session.endTimeSec > nowSec ? session.endTimeSec : nowSec;
-        session.endTimeSec = ClampTameEndTime(nowSec, baseEndTime + addSec);
-        if (session.startTimeSec <= 0.0) {
-            session.startTimeSec = nowSec;
-        }
-        session.lastCalmRefreshSec = nowSec;
-        session.invalidSinceSec = 0.0;
-        session.armedSinceSec = 0.0;
-        session.tooFarSinceSec = 0.0;
-        session.tameStartleSinceSec = 0.0;
-        session.lastPlayerSampleSec = 0.0;
-        session.lastPlayerPos = {};
-        session.hasPlayerSample = false;
-
-        for (auto& [actorId, entry] : g_entries) {
-            if (entry.sessionId != session.sessionId) {
-                continue;
-            }
-            if (entry.startTimeSec <= 0.0) {
-                entry.startTimeSec = nowSec;
-            }
-            entry.endTimeSec = session.endTimeSec;
-            entry.disposition = session.disposition;
-            entry.companionExpireGameDays = session.companionExpireGameDays;
-            entry.temporaryTeammateApplied = session.temporaryTeammateApplied;
-        }
-
-        spdlog::info(
-            "TFDPacify: tame timer extend session={} target={:08X} addSec={:.2f} endTimeSec={:.2f} calmRefreshSec={:.2f}",
-            session.sessionId,
-            session.primaryTargetId,
-            addSec,
-            session.endTimeSec,
-            session.lastCalmRefreshSec);
-        return true;
-    }
-
-    double GetRemainingTameTime(RE::Actor* actor, double nowSec)
-    {
-        if (!actor) {
-            return 0.0;
-        }
-
-        if (nowSec <= 0.0) {
-            nowSec = PacifyNowSec();
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return 0.0;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return 0.0;
-        }
-
-        const Session& session = sessionIt->second;
-        if (session.primaryMode != Mode::Tame || session.disposition == TameDisposition::Companion || session.endTimeSec <= 0.0) {
-            return 0.0;
-        }
-
-        return (std::max)(0.0, session.endTimeSec - nowSec);
-    }
-
-    TameDisposition GetDisposition(RE::Actor* actor)
-    {
-        if (!actor) {
-            return TameDisposition::None;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return TameDisposition::None;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return entryIt->second.disposition;
-        }
-
-        return sessionIt->second.disposition;
-    }
-
-    bool IsCompanion(RE::Actor* actor)
-    {
-        return GetDisposition(actor) == TameDisposition::Companion;
-    }
-
-    bool PromoteActiveTameToCompanion(RE::Actor* actor, double addHoursGameTime)
-    {
-        if (!actor || addHoursGameTime <= 0.0) {
-            return false;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return false;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return false;
-        }
-
-        Session& session = sessionIt->second;
-        if (session.primaryMode != Mode::Tame || session.primaryTargetId != actor->GetFormID()) {
-            return false;
-        }
-
-        const double nowGameDays = CurrentGameDays();
-        const double addDays = addHoursGameTime / 24.0;
-        const double maxDays = nowGameDays + (kCompanionMaxHours / 24.0);
-        const bool wasCompanion = session.disposition == TameDisposition::Companion;
-        const double baseGameDays = session.companionExpireGameDays > nowGameDays ? session.companionExpireGameDays : nowGameDays;
-        const double oldExpireGameDays = session.companionExpireGameDays;
-        const double newExpireGameDays = (std::min)(maxDays, baseGameDays + addDays);
-        if (wasCompanion && newExpireGameDays <= oldExpireGameDays + 1e-6) {
-            spdlog::info(
-                "TFDPacify: reject promote companion session={} target={:08X} reason=companion_at_max expireGameDays={:.4f}",
-                session.sessionId,
-                session.primaryTargetId,
-                oldExpireGameDays);
-            return false;
-        }
-
-        if (!wasCompanion) {
-            SendModEvent("TFDTameUnassign", actor);
-            SendModEvent(kCreatureTeammateAssignEvent, actor);
-        }
-
-        session.disposition = TameDisposition::Companion;
-        session.temporaryTeammateApplied = true;
-        session.companionExpireGameDays = newExpireGameDays;
-        session.endTimeSec = 0.0;
-        session.lastCalmRefreshSec = 0.0;
-        session.invalidSinceSec = 0.0;
-        session.armedSinceSec = 0.0;
-        session.tooFarSinceSec = 0.0;
-        session.tameStartleSinceSec = 0.0;
-        session.lastPlayerSampleSec = 0.0;
-        session.lastPlayerPos = {};
-        session.hasPlayerSample = false;
-
-        SyncSessionDisposition(session);
-
-        if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-            if (auto* process = RE::ProcessLists::GetSingleton()) {
-                process->ClearCachedFactionFightReactions();
-            }
-
-            actor->EvaluatePackage(false, true);
-            actor->EvaluatePackage(true, true);
-            actor->UpdateCombat();
-            player->UpdateCombat();
-        }
-
-        spdlog::info(
-            "TFDPacify: promote companion session={} target={:08X} addHours={:.2f} expireGameDays={:.4f}",
-            session.sessionId,
-            session.primaryTargetId,
-            addHoursGameTime,
-            session.companionExpireGameDays);
-        return true;
-    }
-
-    bool ExtendActiveCompanionHours(RE::Actor* actor, double addHoursGameTime)
-    {
-        if (!actor || addHoursGameTime <= 0.0) {
-            return false;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return false;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return false;
-        }
-
-        Session& session = sessionIt->second;
-        if (session.primaryMode != Mode::Tame || session.disposition != TameDisposition::Companion) {
-            return false;
-        }
-
-        const double nowGameDays = CurrentGameDays();
-        const double addDays = addHoursGameTime / 24.0;
-        const double maxDays = nowGameDays + (kCompanionMaxHours / 24.0);
-        const double baseGameDays = session.companionExpireGameDays > nowGameDays ? session.companionExpireGameDays : nowGameDays;
-        const double oldExpireGameDays = session.companionExpireGameDays;
-        const double newExpireGameDays = (std::min)(maxDays, baseGameDays + addDays);
-        if (newExpireGameDays <= oldExpireGameDays + 1e-6) {
-            spdlog::info(
-                "TFDPacify: reject extend companion session={} target={:08X} reason=companion_at_max expireGameDays={:.4f}",
-                session.sessionId,
-                session.primaryTargetId,
-                oldExpireGameDays);
-            return false;
-        }
-        session.companionExpireGameDays = newExpireGameDays;
-        session.invalidSinceSec = 0.0;
-        session.armedSinceSec = 0.0;
-        session.tooFarSinceSec = 0.0;
-        session.tameStartleSinceSec = 0.0;
-        session.lastPlayerSampleSec = 0.0;
-        session.lastPlayerPos = {};
-        session.hasPlayerSample = false;
-        SyncSessionDisposition(session);
-
-        spdlog::info(
-            "TFDPacify: extend companion session={} target={:08X} addHours={:.2f} expireGameDays={:.4f}",
-            session.sessionId,
-            session.primaryTargetId,
-            addHoursGameTime,
-            session.companionExpireGameDays);
-        return true;
-    }
-
-    bool ReleaseActiveTameActor(RE::Actor* actor, ReleaseReason reason)
-    {
-        if (!actor) {
-            return false;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return false;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished || sessionIt->second.primaryMode != Mode::Tame) {
-            return false;
-        }
-
-        ReleaseSession(sessionIt->second.sessionId, reason);
-        return true;
-    }
-
-    double GetRemainingCompanionHours(RE::Actor* actor)
-    {
-        if (!actor) {
-            return 0.0;
-        }
-
-        auto entryIt = g_entries.find(actor->GetFormID());
-        if (entryIt == g_entries.end()) {
-            return 0.0;
-        }
-
-        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
-        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
-            return 0.0;
-        }
-
-        const Session& session = sessionIt->second;
-        if (session.primaryMode != Mode::Tame || session.disposition != TameDisposition::Companion || session.companionExpireGameDays <= 0.0) {
-            return 0.0;
-        }
-
-        const double remainingDays = session.companionExpireGameDays - CurrentGameDays();
-        return (std::max)(0.0, remainingDays * 24.0);
     }
 
     bool CanStartTruce(RE::Actor* actor)
@@ -2811,7 +2590,7 @@ namespace TFD::Pacify
 
         if (suppressUnassign) {
             spdlog::info(
-                "TFDPacify: suppress unassign/rehostile session={} reason={} mode={} primary={:08X}",
+                "TFDHostilityController: suppress unassign/rehostile session={} reason={} mode={} primary={:08X}",
                 sessionId,
                 ToString(reason),
                 ToString(primaryMode),
@@ -2821,7 +2600,7 @@ namespace TFD::Pacify
             const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), splitTargets.primaryIds);
             const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), splitTargets.crowdIds);
             spdlog::info(
-                "TFDPacify: unassign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} disposition={} crowdSize={}",
+                "TFDHostilityController: unassign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} disposition={} crowdSize={}",
                 ToString(primaryMode),
                 sessionId,
                 GetPrimaryUnassignEventName(primaryMode) ? GetPrimaryUnassignEventName(primaryMode) : "<none>",
@@ -2838,7 +2617,7 @@ namespace TFD::Pacify
                 GetPrimaryUnassignEventName(primaryMode);
             const auto sent = SendModEventToActors(unassignEvent, eventIds);
             spdlog::info(
-                "TFDPacify: unassign events event={} session={} sent={} primary={:08X} disposition={}",
+                "TFDHostilityController: unassign events event={} session={} sent={} primary={:08X} disposition={}",
                 unassignEvent ? unassignEvent : "<none>",
                 sessionId,
                 static_cast<unsigned int>(sent),
@@ -2846,7 +2625,7 @@ namespace TFD::Pacify
                 ToString(primaryDisposition));
         }
         spdlog::info(
-            "TFDPacify: release session id={} reason={} mode={} disposition={} target={:08X} packSize={}",
+            "TFDHostilityController: release session id={} reason={} mode={} disposition={} target={:08X} packSize={}",
             sessionId,
             ToString(reason),
             ToString(primaryMode),
@@ -2889,7 +2668,7 @@ namespace TFD::Pacify
         }
 
         spdlog::info(
-            "TFDPacify: release active truce actor={:08X} session={} reason={}",
+            "TFDHostilityController: release active truce actor={:08X} session={} reason={}",
             actor->GetFormID(),
             sessionId,
             ToString(reason));
@@ -2982,7 +2761,7 @@ namespace TFD::Pacify
         }
     }
 
-    const char* ToString(TameDisposition disposition)
+    const char* ToString(TFD::Tame::TameDisposition disposition)
     {
         switch (disposition) {
         case TameDisposition::None:
@@ -2996,3 +2775,4 @@ namespace TFD::Pacify
         }
     }
 }
+

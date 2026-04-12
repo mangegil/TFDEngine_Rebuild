@@ -3,13 +3,13 @@
   "spdxVersion": "SPDX-2.2",
   "dataLicense": "CC0-1.0",
   "SPDXID": "SPDXRef-DOCUMENT",
-  "documentNamespace": "https://spdx.org/spdxdocs/rapidcsv-x64-windows-static-8.64-d8e3925a-9718-4e50-b2b3-2a257bfe6737",
-  "name": "rapidcsv:x64-windows-static@8.64 47968abad8b01c0754ba50e66f26cc76af12172c20546c32bbe594e8d0837a93",
+  "documentNamespace": "https://spdx.org/spdxdocs/rapidcsv-x64-windows-static-8.64-97af5014-c601-4207-9082-900a4cdb9efe",
+  "name": "rapidcsv:x64-windows-static@8.64 d0cb6ac4e28a54cdba075e7728e941f6236e0f793dc000b3c4442bc7ae546ca4",
   "creationInfo": {
     "creators": [
       "Tool: vcpkg-2025-12-16-44bb3ce006467fc13ba37ca099f64077b8bbf84d"
     ],
-    "created": "2026-03-07T09:14:24Z"
+    "created": "2026-04-12T10:30:45Z"
   },
   "relationships": [
     {
@@ -64,7 +64,7 @@
     {
       "name": "rapidcsv:x64-windows-static",
       "SPDXID": "SPDXRef-binary",
-      "versionInfo": "47968abad8b01c0754ba50e66f26cc76af12172c20546c32bbe594e8d0837a93",
+      "versionInfo": "d0cb6ac4e28a54cdba075e7728e941f6236e0f793dc000b3c4442bc7ae546ca4",
       "downloadLocation": "NONE",
       "licenseConcluded": "BSD-3-Clause",
       "licenseDeclared": "NOASSERTION",

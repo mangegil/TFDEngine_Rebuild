@@ -1,4 +1,4 @@
-#include "TFDFactionMask.h"
+#include "TFDFactionManager.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
-namespace TFD::FactionMask
+namespace TFD::FactionManager
 {
 	namespace
 	{
@@ -98,7 +98,7 @@ namespace TFD::FactionMask
 
 			auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>(editorID);
 			if (!faction) {
-				spdlog::warn("[TFD][FactionMask] unresolved allowlist faction '{}'", editorID);
+				spdlog::warn("[TFD][FactionManager] unresolved allowlist faction '{}'", editorID);
 				return;
 			}
 
@@ -130,7 +130,7 @@ namespace TFD::FactionMask
 		}
 
 		spdlog::info(
-			"[TFD][FactionMask] initialized allowlist entries={}",
+			"[TFD][FactionManager] initialized allowlist entries={}",
 			g_allowedFactions.size());
 	}
 
@@ -141,7 +141,7 @@ namespace TFD::FactionMask
 
 		if (!aggressor) {
 			SetJoinEnemyState(0);
-			spdlog::info("[TFD][FactionMask] apply skipped: aggressor missing");
+			spdlog::info("[TFD][FactionManager] apply skipped: aggressor missing");
 			return false;
 		}
 
@@ -159,7 +159,7 @@ namespace TFD::FactionMask
 
 			++matchedCount;
 			spdlog::info(
-				"[TFD][FactionMask] classifier match actor={:08X} fac={:08X} editorID={}",
+				"[TFD][FactionManager] classifier match actor={:08X} fac={:08X} editorID={}",
 				aggressor->GetFormID(),
 				faction->GetFormID(),
 				entry.editorID ? entry.editorID : "unknown");
@@ -168,7 +168,7 @@ namespace TFD::FactionMask
 		if (matchedCount <= 0) {
 			SetJoinEnemyState(0);
 			spdlog::info(
-				"[TFD][FactionMask] aggressor {:08X} had no matching allowlist faction",
+				"[TFD][FactionManager] aggressor {:08X} had no matching allowlist faction",
 				aggressor->GetFormID());
 			return false;
 		}
@@ -179,7 +179,7 @@ namespace TFD::FactionMask
 		SetJoinEnemyState(matchedCount == 1 ? 1 : 2);
 
 		spdlog::info(
-			"[TFD][FactionMask] classified aggressor {:08X} matchedCount={} joinEnemyState={} (no faction copied to player)",
+			"[TFD][FactionManager] classified aggressor {:08X} matchedCount={} joinEnemyState={} (no faction copied to player)",
 			g_sourceActorFormID,
 			g_matchCount,
 			matchedCount == 1 ? 1 : 2);
@@ -196,7 +196,7 @@ namespace TFD::FactionMask
 		ResetState(true);
 
 		spdlog::info(
-			"[TFD][FactionMask] cleared classifier state source={:08X} matchedCount={} (player faction membership unchanged)",
+			"[TFD][FactionManager] cleared classifier state source={:08X} matchedCount={} (player faction membership unchanged)",
 			sourceActorFormID,
 			matchCount);
 	}

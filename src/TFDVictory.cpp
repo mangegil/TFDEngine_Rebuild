@@ -1,9 +1,9 @@
-#include "TFDVictoryRuntime.h"
+#include "TFDVictory.h"
 
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
-namespace TFD::VictoryRuntime
+namespace TFD::Victory
 {
 	namespace
 	{

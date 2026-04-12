@@ -11,7 +11,7 @@
 #include "RE/B/BGSRefAlias.h"
 #include "RE/T/TESQuest.h"
 
-namespace TFD::CaptiveRuntime
+namespace TFD::Captive
 {
 	enum class PhaseValue : int
 	{
@@ -42,7 +42,7 @@ namespace TFD::CaptiveRuntime
 	int& ConfiscationAttemptCountRef();
 	std::chrono::steady_clock::time_point& ConfiscationNextAttemptRef();
 	QuestRegistryCache& QuestRegistryRef();
-	TFD::CaptiveDoorController& DoorControllerRef();
+	DoorController& DoorControllerRef();
 	RE::ObjectRefHandle& MarkerRef();
 	RE::FormID& CellFormIDRef();
 	RE::FormID& LocationFormIDRef();

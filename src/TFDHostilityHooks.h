@@ -1,6 +1,6 @@
 #pragma once
 
-namespace TFD::PacifyHooks
+namespace TFD::HostilityHooks
 {
     void Install();
 }

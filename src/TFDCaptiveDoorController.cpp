@@ -4,9 +4,9 @@
 #include <RE/E/ExtraLock.h>
 #include <spdlog/spdlog.h>
 
-namespace TFD
+namespace TFD::Captive
 {
-	RE::TESObjectREFR* CaptiveDoorController::GetDoorPtr() const
+	RE::TESObjectREFR* DoorController::GetDoorPtr() const
 	{
 		if (!_door) {
 			return nullptr;
@@ -15,7 +15,7 @@ namespace TFD
 		return refPtr.get();
 	}
 
-	bool CaptiveDoorController::IsOpenOrOpening(RE::TESObjectREFR* a_ref)
+	bool DoorController::IsOpenOrOpening(RE::TESObjectREFR* a_ref)
 	{
 		if (!a_ref) {
 			return false;
@@ -25,7 +25,7 @@ namespace TFD
 			st == RE::BGSOpenCloseForm::OPEN_STATE::kOpening;
 	}
 
-	bool CaptiveDoorController::IsLocked(RE::TESObjectREFR* a_ref)
+	bool DoorController::IsLocked(RE::TESObjectREFR* a_ref)
 	{
 		if (!a_ref) {
 			return false;
@@ -36,7 +36,7 @@ namespace TFD
 		return false;
 	}
 
-	void CaptiveDoorController::SetOpen(RE::TESObjectREFR* a_ref, bool a_open, bool a_snap)
+	void DoorController::SetOpen(RE::TESObjectREFR* a_ref, bool a_open, bool a_snap)
 	{
 		if (!a_ref) {
 			return;
@@ -44,7 +44,7 @@ namespace TFD
 		RE::BGSOpenCloseForm::SetOpenState(a_ref, a_open, a_snap);
 	}
 
-	void CaptiveDoorController::CaptureSnapshot(RE::TESObjectREFR* a_ref, Snapshot& a_out)
+	void DoorController::CaptureSnapshot(RE::TESObjectREFR* a_ref, Snapshot& a_out)
 	{
 		if (!a_ref) {
 			return;
@@ -69,7 +69,7 @@ namespace TFD
 			a_out.keyFormID);
 	}
 
-	void CaptiveDoorController::RestoreLockFromSnapshot(RE::TESObjectREFR* a_ref, const Snapshot& a_snap)
+	void DoorController::RestoreLockFromSnapshot(RE::TESObjectREFR* a_ref, const Snapshot& a_snap)
 	{
 		if (!a_ref || !a_snap.captured) {
 			return;
@@ -111,7 +111,7 @@ namespace TFD
 			a_snap.keyFormID);
 	}
 
-	void CaptiveDoorController::Bind(RE::TESObjectREFR* a_doorRef)
+	void DoorController::Bind(RE::TESObjectREFR* a_doorRef)
 	{
 		if (!a_doorRef) {
 			return;
@@ -129,7 +129,7 @@ namespace TFD
 		spdlog::info("[TFD][CaptiveDoor] Bound door {:08X}", a_doorRef->GetFormID());
 	}
 
-	void CaptiveDoorController::SealToInitial(bool a_snapClose)
+	void DoorController::SealToInitial(bool a_snapClose)
 	{
 		auto* door = GetDoorPtr();
 		if (!door || !_snap.captured) {
@@ -155,7 +155,7 @@ namespace TFD
 		spdlog::info("[TFD][CaptiveDoor] Sealed captive door={:08X} forcedLocked=1 initialLocked={}", door->GetFormID(), _snap.locked ? 1 : 0);
 	}
 
-	void CaptiveDoorController::UnlockForRelease(double ignoreSeconds, bool a_openDoor, bool a_snapOpen)
+	void DoorController::UnlockForRelease(double ignoreSeconds, bool a_openDoor, bool a_snapOpen)
 	{
 		auto* door = GetDoorPtr();
 		if (!door) {
@@ -180,7 +180,7 @@ namespace TFD
 		spdlog::info("[TFD][CaptiveDoor] UnlockForRelease door={:08X} ignoreMs={}", door->GetFormID(), ms);
 	}
 
-	bool CaptiveDoorController::UpdateWatcher()
+	bool DoorController::UpdateWatcher()
 	{
 		auto* door = GetDoorPtr();
 		if (!door) {
@@ -216,7 +216,7 @@ namespace TFD
 		return false;
 	}
 
-	void CaptiveDoorController::Reset()
+	void DoorController::Reset()
 	{
 		_door.reset();
 		_snap = {};

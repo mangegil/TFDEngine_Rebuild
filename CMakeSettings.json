@@ -24,6 +24,11 @@
           "type": "STRING"
         },
         {
+          "name": "VCPKG_MANIFEST_MODE",
+          "value": "False",
+          "type": "BOOL"
+        },
+        {
           "name": "CMAKE_CXX_STANDARD",
           "value": "23",
           "type": "STRING"
@@ -97,6 +102,11 @@
           "name": "VCPKG_HOST_TRIPLET",
           "value": "x64-windows-static",
           "type": "STRING"
+        },
+        {
+          "name": "VCPKG_MANIFEST_MODE",
+          "value": "False",
+          "type": "BOOL"
         },
         {
           "name": "CMAKE_CXX_STANDARD",

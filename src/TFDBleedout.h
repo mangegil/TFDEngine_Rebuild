@@ -8,7 +8,7 @@
 #include <vector>
 #include <array>
 
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
 
 namespace RE
 {
@@ -242,7 +242,7 @@ namespace TFD::Bleedout
 	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	bool PromoteNextSpeakerFromTruceQueue(RE::TESQuest* truceQuest, const std::array<RE::BGSRefAlias*, 10>& truceAliases, RE::Actor* player, const char* reason, bool rejectCurrent, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	void MaintainPrimaryCaptorBinding(bool dialogueOpen, RuntimeHostStateRefs state);
-	void ReleaseTruceSession(TFD::Pacify::ReleaseReason reason, std::uint32_t* bleedSpeakerId = nullptr);
+	void ReleaseTruceSession(TFD::HostilityController::ReleaseReason reason, std::uint32_t* bleedSpeakerId = nullptr);
 	void ReleaseNoSpeakerTameSession(const char* reason);
 	bool TryEnsureNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, RE::Actor* player, const char* reason, const RuntimeHostHandlers& handlers);
 	std::uint32_t GetTruceSessionID();

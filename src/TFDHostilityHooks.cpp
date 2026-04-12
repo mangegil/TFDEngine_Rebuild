@@ -1,4 +1,4 @@
-#include "TFDPacifyHooks.h"
+#include "TFDHostilityHooks.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -6,7 +6,8 @@
 
 #include <atomic>
 
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
+#include "TFDTame.h"
 #include "TFDDefeatMonitor.h"
 
 #ifdef SKYRIM_SUPPORT_AE
@@ -17,7 +18,7 @@
 #define TFD_OFFSET(SE, AE) SE
 #endif
 
-namespace TFD::PacifyHooks
+namespace TFD::HostilityHooks
 {
     namespace
     {
@@ -39,7 +40,7 @@ namespace TFD::PacifyHooks
                 REL::Relocation<std::uintptr_t> characterVtbl{ RE::Character::VTABLE[0] };
                 _UpdateCombat = characterVtbl.write_vfunc(0xE4, UpdateCombat);
 
-                spdlog::info("[TFD][PacifyHooks] installed (DoDetect + UpdateCombat)");
+                spdlog::info("[TFD][HostilityHooks] installed (DoDetect + UpdateCombat)");
             }
 
         private:
@@ -48,7 +49,7 @@ namespace TFD::PacifyHooks
                 if (!actor) {
                     return true;
                 }
-                if (TFD::Pacify::IsPacified(actor)) {
+                if (TFD::HostilityController::IsPacified(actor)) {
                     return true;
                 }
                 return !TFD::DefeatMonitor::IsThresholdCombatTargetValid(actor);
@@ -82,7 +83,7 @@ namespace TFD::PacifyHooks
                 }
 
                 RE::Actor* replacement = nullptr;
-                if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+                if (actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) {
                     replacement = TFD::DefeatMonitor::ResolveBleedFollowerAggroTarget(actor);
                 }
                 if (!replacement) {
@@ -93,7 +94,7 @@ namespace TFD::PacifyHooks
                     if (!actor->IsAIEnabled()) {
                         actor->EnableAI(true);
                     }
-                    if ((actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) && !actor->IsWeaponDrawn()) {
+                    if ((actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) && !actor->IsWeaponDrawn()) {
                         actor->DrawWeaponMagicHands(true);
                     }
                     actor->SetBeenAttacked(true);
@@ -108,7 +109,7 @@ namespace TFD::PacifyHooks
                     replacement->EvaluatePackage(false, true);
                     replacement->EvaluatePackage(true, true);
 
-                    spdlog::info("[TFD][PacifyHooks] swapped invalid combat target actor={:08X} old={:08X} new={:08X}",
+                    spdlog::info("[TFD][HostilityHooks] swapped invalid combat target actor={:08X} old={:08X} new={:08X}",
                         actor->GetFormID(),
                         target ? target->GetFormID() : 0u,
                         replacement->GetFormID());
@@ -122,14 +123,14 @@ namespace TFD::PacifyHooks
                 actor->EvaluatePackage(false, true);
                 actor->EvaluatePackage(true, true);
 
-                spdlog::info("[TFD][PacifyHooks] cleared invalid combat target actor={:08X} target={:08X}",
+                spdlog::info("[TFD][HostilityHooks] cleared invalid combat target actor={:08X} target={:08X}",
                     actor->GetFormID(),
                     target ? target->GetFormID() : 0u);
             }
 
             static void UpdateCombat(RE::Character* actor)
             {
-                if (actor && (TFD::Pacify::IsPacified(actor) || IsReleaseGraceActor(actor))) {
+                if (actor && (TFD::HostilityController::IsPacified(actor) || IsReleaseGraceActor(actor))) {
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         const bool runDetection = process->runDetection;
                         process->runDetection = false;
@@ -172,8 +173,8 @@ namespace TFD::PacifyHooks
                 float& unk09,
                 float& unk10)
             {
-                if ((target && (TFD::Pacify::IsPacified(target) || IsReleaseGraceActor(target))) ||
-                    (viewer && (TFD::Pacify::IsPacified(viewer) || IsReleaseGraceActor(viewer)))) {
+                if ((target && (TFD::HostilityController::IsPacified(target) || IsReleaseGraceActor(target))) ||
+                    (viewer && (TFD::HostilityController::IsPacified(viewer) || IsReleaseGraceActor(viewer)))) {
                     detectVal = -1000;
                     return nullptr;
                 }

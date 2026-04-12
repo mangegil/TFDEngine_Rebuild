@@ -5,9 +5,10 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
-namespace TFD::Pacify
+namespace TFD::HostilityController
 {
     enum class Mode : std::uint8_t
     {
@@ -30,14 +31,12 @@ namespace TFD::Pacify
         TameBroken,
         TameExpired
     };
+}
 
-    enum class TameDisposition : std::uint8_t
-    {
-        None = 0,
-        Calm,
-        Companion
-    };
+#include "TFDTame.h"
 
+namespace TFD::HostilityController
+{
     struct Entry
     {
         RE::FormID actorId{ 0 };
@@ -53,7 +52,7 @@ namespace TFD::Pacify
         double lastPacifyApplySec{ 0.0 };
         double lastPackageEvalSec{ 0.0 };
 
-        TameDisposition disposition{ TameDisposition::None };
+        TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
         bool temporaryTeammateApplied{ false };
         bool allowDialogue{ false };
         bool isPrimaryTarget{ false };
@@ -80,7 +79,7 @@ namespace TFD::Pacify
         RE::NiPoint3 lastPlayerPos{};
         bool hasPlayerSample{ false };
 
-        TameDisposition disposition{ TameDisposition::None };
+        TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
         bool temporaryTeammateApplied{ false };
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
@@ -88,44 +87,8 @@ namespace TFD::Pacify
         bool finished{ false };
     };
 
-    struct ActiveTameSnapshot
-    {
-        RE::FormID actorId{ 0 };
-        RE::FormID sessionId{ 0 };
-        Mode mode{ Mode::None };
-        TameDisposition disposition{ TameDisposition::None };
-        double remainingTameSec{ 0.0 };
-        double remainingCompanionHours{ 0.0 };
-        bool loaded{ false };
-        std::string actorName{};
-    };
-
-    enum class FeedAction : std::uint8_t
-    {
-        Calm = 0,
-        Teammate
-    };
-
-    struct FeedOptionSnapshot
-    {
-        RE::FormID itemId{ 0 };
-        std::string label{};
-        std::string itemName{};
-        std::int32_t count{ 0 };
-        std::int32_t cost{ 0 };
-        double calmExtendSec{ 0.0 };
-        FeedAction action{ FeedAction::Calm };
-    };
-
     void Reset();
     void Update(double nowSec);
-
-    std::optional<RE::FormID> BeginTameSession(
-        RE::Actor* player,
-        RE::Actor* primaryTarget,
-        double nowSec,
-        bool allowDialogue = false,
-        bool allowLocalSplash = false);
 
     std::optional<RE::FormID> BeginTrucePreCombatSession(
         RE::Actor* player,
@@ -140,33 +103,20 @@ namespace TFD::Pacify
         bool ignoreSpent = false,
         bool suppressBridgeEvents = false);
 
-    bool IsPacified(RE::Actor* actor);
-    Mode GetMode(RE::Actor* actor);
-    bool CanOpenDialogue(RE::Actor* actor);
-    bool CanStartTame(RE::Actor* actor);
-    bool HasActiveTameSession(RE::Actor* actor);
-    std::vector<ActiveTameSnapshot> GetActiveTameSnapshots(double nowSec = 0.0);
-    std::vector<FeedOptionSnapshot> GetActiveTameFeedOptions(RE::Actor* actor, FeedAction action);
-    bool ApplyActiveTameFeed(RE::Actor* actor, RE::FormID itemId, FeedAction action);
-    bool ExtendActiveTameSession(RE::Actor* actor, double addSec, double nowSec);
-    double GetRemainingTameTime(RE::Actor* actor, double nowSec);
-    TameDisposition GetDisposition(RE::Actor* actor);
-    bool IsCompanion(RE::Actor* actor);
-    bool PromoteActiveTameToCompanion(RE::Actor* actor, double addHoursGameTime);
-    bool ExtendActiveCompanionHours(RE::Actor* actor, double addHoursGameTime);
-    bool ReleaseActiveTameActor(RE::Actor* actor, ReleaseReason reason = ReleaseReason::Generic);
-    double GetRemainingCompanionHours(RE::Actor* actor);
-
-    bool CanStartTruce(RE::Actor* actor);
-    bool HasSpentTruce(RE::Actor* actor);
-    bool WasTruceBetrayed(RE::Actor* actor);
-
     std::optional<RE::FormID> BeginCellTruceBurst(
         RE::Actor* player,
         RE::Actor* primaryTarget,
         double nowSec,
         double durationSec,
         float radius);
+
+    bool IsPacified(RE::Actor* actor);
+    Mode GetMode(RE::Actor* actor);
+    bool CanOpenDialogue(RE::Actor* actor);
+
+    bool CanStartTruce(RE::Actor* actor);
+    bool HasSpentTruce(RE::Actor* actor);
+    bool WasTruceBetrayed(RE::Actor* actor);
 
     void ReleaseSession(RE::FormID sessionId, ReleaseReason reason = ReleaseReason::Generic);
     bool ReleaseActiveTruceSessionForActor(
@@ -187,5 +137,44 @@ namespace TFD::Pacify
 
     const char* ToString(Mode mode);
     const char* ToString(ReleaseReason reason);
-    const char* ToString(TameDisposition disposition);
+    const char* ToString(TFD::Tame::TameDisposition disposition);
+
+    void StopCombatSweep(float radius, bool npcOnly);
+    void CancelPendingWaves();
+    void ScheduleStopCombatWaves(float radius, bool npcOnly, int waves, int intervalMs);
+
+    void ApplyAggressionClamp(RE::Actor* actor);
+    void ClearAggressionClamp();
+
+    void TickCaptiveSuppression();
+    void ResetCaptiveSuppression();
+
+    void ClearAllTemporaryHostility();
+}
+
+namespace TFD::HostilityController::Runtime
+{
+    using EntryMap = std::unordered_map<RE::FormID, Entry>;
+    using SessionMap = std::unordered_map<RE::FormID, Session>;
+
+    EntryMap& Entries();
+    SessionMap& Sessions();
+
+    double NowSec();
+    double GameDays();
+    double ClampTameEndTime(double nowSec, double endTimeSec);
+
+    RE::Actor* ResolveActor(RE::FormID actorId);
+    void SyncSessionDisposition(Session& session);
+    void SendModEvent(const char* eventName, RE::Actor* sender);
+}
+
+namespace TFD::HostilityController::Internal
+{
+    bool ValidateActor(RE::Actor* actor);
+    std::optional<RE::FormID> BeginTameBaseSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        bool allowDialogue);
 }

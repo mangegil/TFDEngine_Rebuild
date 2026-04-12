@@ -10,7 +10,7 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDForceGreet.h"
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
 #include "TFDDefeatMonitor.h"
 #include "SKSE/SKSE.h"
 #include "TFDInCombat.h"
@@ -28,7 +28,7 @@ namespace TFD::InCombatGreet
 			bool stickyReopenPending = false;
 			Clock::time_point nextRetry{};
 			int retryCount = 0;
-			RE::FormID pacifySessionId = 0;
+			RE::FormID truceSessionId = 0;
 			bool assignSent = false;
 		};
 
@@ -96,16 +96,16 @@ namespace TFD::InCombatGreet
 			return true;
 		}
 
-		TFD::Pacify::ReleaseReason ResolveReleaseReason(const char* reason)
+		TFD::HostilityController::ReleaseReason ResolveReleaseReason(const char* reason)
 		{
 			const auto text = reason ? std::string_view(reason) : std::string_view{};
 			if (text.find("dialogue_closed") != std::string_view::npos) {
-				return TFD::Pacify::ReleaseReason::DialogueClosed;
+				return TFD::HostilityController::ReleaseReason::DialogueClosed;
 			}
 			if (text.find("handoff") != std::string_view::npos) {
-				return TFD::Pacify::ReleaseReason::FlowHandoff;
+				return TFD::HostilityController::ReleaseReason::FlowHandoff;
 			}
-			return TFD::Pacify::ReleaseReason::Generic;
+			return TFD::HostilityController::ReleaseReason::Generic;
 		}
 
 		void ResetRuntimeLocked()
@@ -114,19 +114,19 @@ namespace TFD::InCombatGreet
 			g_runtime.stickyReopenPending = false;
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
-			g_runtime.pacifySessionId = 0;
+			g_runtime.truceSessionId = 0;
 			g_runtime.assignSent = false;
 		}
 
-		void ReleaseTrackedSession(TFD::Pacify::ReleaseReason releaseReason)
+		void ReleaseTrackedSession(TFD::HostilityController::ReleaseReason releaseReason)
 		{
 			RE::FormID sessionId = 0;
 			bool assignSent = false;
 			{
 				std::scoped_lock lk(g_runtime.lock);
-				sessionId = g_runtime.pacifySessionId;
+				sessionId = g_runtime.truceSessionId;
 				assignSent = g_runtime.assignSent;
-				g_runtime.pacifySessionId = 0;
+				g_runtime.truceSessionId = 0;
 				g_runtime.assignSent = false;
 			}
 
@@ -140,7 +140,7 @@ namespace TFD::InCombatGreet
 				}
 			}
 			if (sessionId != 0) {
-				TFD::Pacify::ReleaseSession(sessionId, releaseReason);
+				TFD::HostilityController::ReleaseSession(sessionId, releaseReason);
 			}
 		}
 
@@ -187,7 +187,7 @@ namespace TFD::InCombatGreet
 
 	void Reset()
 	{
-		ReleaseTrackedSession(TFD::Pacify::ReleaseReason::Generic);
+		ReleaseTrackedSession(TFD::HostilityController::ReleaseReason::Generic);
 		g_state.store(State::Idle, std::memory_order_release);
 		g_speakerFormID.store(0, std::memory_order_release);
 		ResetRuntime("reset");
@@ -220,20 +220,20 @@ namespace TFD::InCombatGreet
 
 		if (!result.executed || result.sessionId == 0 || result.action != TFD::InteractionRouter::Action::TruceInCombat) {
 			if (result.sessionId != 0 && result.action != TFD::InteractionRouter::Action::TruceInCombat) {
-				TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 			}
 			return false;
 		}
 
-		if (result.dialogueRequested && !TFD::Pacify::CanOpenDialogue(speaker)) {
-			TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+		if (result.dialogueRequested && !TFD::HostilityController::CanOpenDialogue(speaker)) {
+			TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 			return false;
 		}
 
 		CancelAll("begin_replace");
 
 		if (!TFD::InCombat::BeginTruce(speaker->GetFormID(), result.dialogueRequested, "incombat_truce_begin")) {
-			TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+			TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 			return false;
 		}
 
@@ -244,7 +244,7 @@ namespace TFD::InCombatGreet
 			SendBridgeEvent("TFDInCombatAssign", speaker);
 			if (!Begin(speaker, "incombat_dialogue_begin")) {
 				SendBridgeEvent("TFDInCombatClear", speaker);
-				TFD::Pacify::ReleaseSession(result.sessionId, TFD::Pacify::ReleaseReason::Generic);
+				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 				TFD::InCombat::Complete("incombat_greet_begin_failed");
 				return false;
 			}
@@ -256,7 +256,7 @@ namespace TFD::InCombatGreet
 
 		{
 			std::scoped_lock lk(g_runtime.lock);
-			g_runtime.pacifySessionId = result.sessionId;
+			g_runtime.truceSessionId = result.sessionId;
 			g_runtime.assignSent = result.dialogueRequested;
 		}
 

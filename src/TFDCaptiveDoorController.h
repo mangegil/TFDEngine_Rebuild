@@ -3,9 +3,9 @@
 #include <RE/Skyrim.h>
 #include <chrono>
 
-namespace TFD
+namespace TFD::Captive
 {
-	class CaptiveDoorController
+	class DoorController
 	{
 	public:
 		// Bind door for this captive session (call once when you know the door).
@@ -57,4 +57,9 @@ namespace TFD
 		static void RestoreLockFromSnapshot(RE::TESObjectREFR* a_ref, const Snapshot& a_snap);
 		static void CaptureSnapshot(RE::TESObjectREFR* a_ref, Snapshot& a_out);
 	};
+}
+
+namespace TFD
+{
+	using CaptiveDoorController = Captive::DoorController;
 }

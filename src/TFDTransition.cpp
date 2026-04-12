@@ -1,12 +1,12 @@
-#include "TFDTransitionRuntime.h"
+#include "TFDTransition.h"
 
 #include "EditorIdCache.h"
 #include "TFDActorScan.h"
-#include "TFDAggressionClamp.h"
-#include "TFDAntiAggro.h"
-#include "TFDFactionMask.h"
+#include "TFDHostilityController.h"
+
+#include "TFDFactionManager.h"
 #include "TFDLocation.h"
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDSettings.h"
 
@@ -22,7 +22,7 @@
 #include <thread>
 #include <unordered_set>
 
-namespace TFD::TransitionRuntime
+namespace TFD::Transition
 {
 	namespace
 	{
@@ -386,7 +386,6 @@ namespace TFD::TransitionRuntime
 			}
 			return best;
 		}
-
 
 		static RE::AlchemyItem* ResolveRecoveryPotionCandidate()
 		{
@@ -806,15 +805,15 @@ namespace TFD::TransitionRuntime
 					return;
 				}
 
-				const bool kickedNow = TFD::Pacify::ForceDetectionAndCombatRefresh(
+				const bool kickedNow = TFD::HostilityController::ForceDetectionAndCombatRefresh(
 					actor,
 					player,
-					TFD::Pacify::ReleaseReason::DialogueClosed,
+					TFD::HostilityController::ReleaseReason::DialogueClosed,
 					drawWeapon);
-				TFD::Pacify::QueueDetectionAndCombatRefresh(
+				TFD::HostilityController::QueueDetectionAndCombatRefresh(
 					actor,
 					player,
-					TFD::Pacify::ReleaseReason::DialogueClosed,
+					TFD::HostilityController::ReleaseReason::DialogueClosed,
 					drawWeapon);
 				++queued;
 
@@ -866,8 +865,8 @@ namespace TFD::TransitionRuntime
 				auto sp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
 				followerToRestore = sp.get();
 			}
-			TFD::AggressionClamp::Clear();
-			TFD::FactionMask::Clear();
+			TFD::HostilityController::ClearAggressionClamp();
+			TFD::FactionManager::Clear();
 			if (g_leftForDeadNeedsAggroKick) {
 				QueuePostRecoveryAggroKick("left_for_dead_recovery_finished", handlers);
 			}
@@ -1164,7 +1163,7 @@ namespace TFD::TransitionRuntime
 			player->StopCombat();
 		}
 		player->DrawWeaponMagicHands(false);
-		TFD::AntiAggro::SweepOnce(radius, false);
+		TFD::HostilityController::StopCombatSweep(radius, false);
 
 		std::size_t applied = 0;
 		if (!g_lockedFallbackCrowdIds.empty()) {
@@ -1174,7 +1173,7 @@ namespace TFD::TransitionRuntime
 				if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(handlers, actor)) {
 					continue;
 				}
-				TFD::AggressionClamp::Apply(actor);
+				TFD::HostilityController::ApplyAggressionClamp(actor);
 				actor->StopCombat();
 				actor->EvaluatePackage(false, true);
 				actor->EvaluatePackage(true, true);
@@ -1190,7 +1189,7 @@ namespace TFD::TransitionRuntime
 				if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(handlers, actor)) {
 					continue;
 				}
-				TFD::AggressionClamp::Apply(actor);
+				TFD::HostilityController::ApplyAggressionClamp(actor);
 				actor->StopCombat();
 				actor->EvaluatePackage(false, true);
 				actor->EvaluatePackage(true, true);
@@ -1438,7 +1437,6 @@ namespace TFD::TransitionRuntime
 			reason ? reason : "unknown");
 		return true;
 	}
-
 
 	bool BeginRescueTransition(const char* reason, const RuntimeHandlers& handlers)
 	{

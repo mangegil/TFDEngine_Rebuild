@@ -25,20 +25,20 @@
 #include "TFDSettings.h"
 #include "TFDLocation.h"
 #include "TFDActorScan.h"
-#include "TFDAntiAggro.h"
+#include "TFDHostilityController.h"
 #include "TFDForceGreet.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombatGreet.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDTargetClassifier.h"
 #include "TFDInteractionRouter.h"
-#include "TFDPacify.h"
-#include "TFDTameBait.h"
+#include "TFDHostilityController.h"
+#include "TFDTame.h"
 #include "TFDFeedPopup.h"
-#include "TFDCompanionRestore.h"
+#include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
-#include "TFDCaptiveRuntime.h"
-#include "TFDRescueRuntime.h"
+#include "TFDCaptive.h"
+#include "TFDRescue.h"
 #include "TFDPleasureRuntime.h"
 #include "EditorIdCache.h"
 
@@ -100,7 +100,7 @@ namespace TFDMenu
 		static bool gCaptureHotkey = false;
 		static Clock::time_point nextHotkey{};
 
-		static std::vector<TFD::Pacify::ActiveTameSnapshot> gCreatureTeammateMenuRows{};
+		static std::vector<TFD::Tame::ActiveSnapshot> gCreatureTeammateMenuRows{};
 		static double gCreatureTeammateMenuRefreshRealSec = 0.0;
 		static double gCreatureTeammateMenuRefreshGameDays = 0.0;
 		static double gCreatureTeammateMenuLastRenderSec = -1000.0;
@@ -525,8 +525,8 @@ namespace TFDMenu
 		static void RefreshCreatureTeammateMenuRows(bool resetInlineState)
 		{
 			const double now = NowSec();
-			TFD::Pacify::Update(now);
-			gCreatureTeammateMenuRows = TFD::Pacify::GetActiveTameSnapshots(now);
+			TFD::HostilityController::Update(now);
+			gCreatureTeammateMenuRows = TFD::Tame::GetActiveSnapshots(now);
 			gCreatureTeammateMenuRefreshRealSec = now;
 			gCreatureTeammateMenuRefreshGameDays = CurrentGameDays();
 			if (resetInlineState) {
@@ -539,7 +539,7 @@ namespace TFDMenu
 				return sessionId != 0 && std::any_of(
 					gCreatureTeammateMenuRows.begin(),
 					gCreatureTeammateMenuRows.end(),
-					[&](const TFD::Pacify::ActiveTameSnapshot& snap) { return snap.sessionId == sessionId; });
+					[&](const TFD::Tame::ActiveSnapshot& snap) { return snap.sessionId == sessionId; });
 				};
 			if (!keepSession(gCreatureTeammateFeedSessionId)) {
 				gCreatureTeammateFeedSessionId = 0;
@@ -549,13 +549,13 @@ namespace TFDMenu
 			}
 		}
 
-		static double GetDisplayRemainingTameSec(const TFD::Pacify::ActiveTameSnapshot& snap)
+		static double GetDisplayRemainingTameSec(const TFD::Tame::ActiveSnapshot& snap)
 		{
 			const double elapsed = NowSec() - gCreatureTeammateMenuRefreshRealSec;
 			return (std::max)(0.0, snap.remainingTameSec - elapsed);
 		}
 
-		static double GetDisplayRemainingCompanionHours(const TFD::Pacify::ActiveTameSnapshot& snap)
+		static double GetDisplayRemainingCompanionHours(const TFD::Tame::ActiveSnapshot& snap)
 		{
 			const double elapsedHours = (CurrentGameDays() - gCreatureTeammateMenuRefreshGameDays) * 24.0;
 			return (std::max)(0.0, snap.remainingCompanionHours - elapsedHours);
@@ -577,21 +577,21 @@ namespace TFDMenu
 			return buffer;
 		}
 
-		static std::string FormatCreatureTimer(const TFD::Pacify::ActiveTameSnapshot& snap)
+		static std::string FormatCreatureTimer(const TFD::Tame::ActiveSnapshot& snap)
 		{
-			if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
+			if (snap.disposition == TFD::Tame::TameDisposition::Companion) {
 				return FormatCountdownClock(GetDisplayRemainingCompanionHours(snap) * 3600.0);
 			}
 
 			return FormatCountdownClock(GetDisplayRemainingTameSec(snap));
 		}
 
-		static const char* CreatureStateLabel(const TFD::Pacify::ActiveTameSnapshot& snap)
+		static const char* CreatureStateLabel(const TFD::Tame::ActiveSnapshot& snap)
 		{
 			switch (snap.disposition) {
-			case TFD::Pacify::TameDisposition::Companion:
+			case TFD::Tame::TameDisposition::Companion:
 				return "Teammate";
-			case TFD::Pacify::TameDisposition::Calm:
+			case TFD::Tame::TameDisposition::Calm:
 				return "Tame";
 			default:
 				return "Unknown";
@@ -1039,7 +1039,6 @@ namespace TFDMenu
 			TFD::Settings::SetHotkeyWave(uiHotkeyWave);
 		}
 
-
 		enum class CaptureResult
 		{
 			None,
@@ -1081,7 +1080,6 @@ namespace TFDMenu
 
 			return CaptureResult::None;
 		}
-
 
 		static const char* YesNo(bool v)
 		{
@@ -1152,7 +1150,7 @@ namespace TFDMenu
 				(GetAsyncKeyState(VK_RSHIFT) & 0x8000) != 0;
 		}
 
-		static void RenderInlineFeedChoices(RE::Actor* actor, const TFD::Pacify::ActiveTameSnapshot& snap)
+		static void RenderInlineFeedChoices(RE::Actor* actor, const TFD::Tame::ActiveSnapshot& snap)
 		{
 			if (!actor) {
 				ImGuiMCP::Text("Feed unavailable: creature not loaded.");
@@ -1164,8 +1162,8 @@ namespace TFDMenu
 				ImGuiMCP::Text("This creature is downed. Feeding will revive and heal it.");
 			}
 
-			auto renderFeedGroup = [&](const char* title, TFD::Pacify::FeedAction action) {
-				auto options = TFD::Pacify::GetActiveTameFeedOptions(actor, action);
+			auto renderFeedGroup = [&](const char* title, TFD::Tame::FeedAction action) {
+				auto options = TFD::Tame::GetFeedOptions(actor, action);
 				ImGuiMCP::Text("%s", title);
 				if (options.empty()) {
 					ImGuiMCP::Text("  No valid bait.");
@@ -1175,8 +1173,8 @@ namespace TFDMenu
 					char buttonLabel[256];
 					std::snprintf(buttonLabel, sizeof(buttonLabel), "%s##feed_%08X_%u_%08X", opt.label.c_str(), snap.actorId, snap.sessionId, opt.itemId);
 					if (ImGuiMCP::Button(buttonLabel)) {
-						if (TFD::Pacify::ApplyActiveTameFeed(actor, opt.itemId, action)) {
-							if (action == TFD::Pacify::FeedAction::Teammate) {
+						if (TFD::Tame::ApplyFeed(actor, opt.itemId, action)) {
+							if (action == TFD::Tame::FeedAction::Teammate) {
 								RE::DebugNotification("TFD: Teammate fed.");
 							}
 							else {
@@ -1193,13 +1191,13 @@ namespace TFDMenu
 				};
 
 			ImGuiMCP::Indent();
-			if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
-				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
+			if (snap.disposition == TFD::Tame::TameDisposition::Companion) {
+				renderFeedGroup("Teammate Feed", TFD::Tame::FeedAction::Teammate);
 			}
 			else {
-				renderFeedGroup("Calm Feed", TFD::Pacify::FeedAction::Calm);
+				renderFeedGroup("Calm Feed", TFD::Tame::FeedAction::Calm);
 				ImGuiMCP::Separator();
-				renderFeedGroup("Teammate Feed", TFD::Pacify::FeedAction::Teammate);
+				renderFeedGroup("Teammate Feed", TFD::Tame::FeedAction::Teammate);
 			}
 			if (ImGuiMCP::Button((std::string("Close Feed##") + std::to_string(snap.sessionId)).c_str())) {
 				gCreatureTeammateFeedSessionId = 0;
@@ -1207,7 +1205,7 @@ namespace TFDMenu
 			ImGuiMCP::Unindent();
 		}
 
-		static void RenderInlineReleaseConfirm(RE::Actor* actor, const TFD::Pacify::ActiveTameSnapshot& snap)
+		static void RenderInlineReleaseConfirm(RE::Actor* actor, const TFD::Tame::ActiveSnapshot& snap)
 		{
 			ImGuiMCP::Indent();
 			ImGuiMCP::Text("Release this creature?");
@@ -1218,10 +1216,10 @@ namespace TFDMenu
 			if (ImGuiMCP::Button(confirmLabel)) {
 				bool released = false;
 				if (actor) {
-					released = TFD::Pacify::ReleaseActiveTameActor(actor, TFD::Pacify::ReleaseReason::Generic);
+					released = TFD::Tame::Release(actor, TFD::HostilityController::ReleaseReason::Generic);
 				}
 				else {
-					TFD::Pacify::ReleaseSession(snap.sessionId, TFD::Pacify::ReleaseReason::Generic);
+					TFD::HostilityController::ReleaseSession(snap.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 					released = true;
 				}
 				if (released) {
@@ -1379,12 +1377,12 @@ namespace TFDMenu
 
 		static void RenderFlowIndicatorSection()
 		{
-			const auto snap = TFD::Flow::Controller::GetSingleton().GetSnapshot();
-			ImGuiMCP::Text("Root: %s", TFD::Flow::Controller::ToString(snap.root));
-			ImGuiMCP::Text("Context Root: %s", TFD::Flow::Controller::ToString(snap.contextRoot));
-			ImGuiMCP::Text("Gate: %s", TFD::Flow::Controller::ToString(snap.gate));
-			ImGuiMCP::Text("SubFlow: %s", TFD::Flow::Controller::ToString(snap.sub));
-			ImGuiMCP::Text("Captive Mode: %s", TFD::Flow::Controller::ToString(snap.captiveMode));
+			const auto snap = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			ImGuiMCP::Text("Root: %s", TFD::FlowController::Controller::ToString(snap.root));
+			ImGuiMCP::Text("Context Root: %s", TFD::FlowController::Controller::ToString(snap.contextRoot));
+			ImGuiMCP::Text("Gate: %s", TFD::FlowController::Controller::ToString(snap.gate));
+			ImGuiMCP::Text("SubFlow: %s", TFD::FlowController::Controller::ToString(snap.sub));
+			ImGuiMCP::Text("Captive Mode: %s", TFD::FlowController::Controller::ToString(snap.captiveMode));
 			ImGuiMCP::Text("Token: %u", snap.token);
 			ImGuiMCP::Text("Primary Actor: %08X", snap.primaryActorFormID);
 			ImGuiMCP::Text("Terminal Resolved: %s", YesNo(snap.terminalResolved));
@@ -1437,7 +1435,7 @@ namespace TFDMenu
 			ImGuiMCP::SameLine();
 			if (ImGuiMCP::Button("Teleport -> Captive Marker")) {
 				TFD::Location::TeleportToCaptiveMarker();
-				TFD::AntiAggro::ScheduleWaves(TFD::Settings::GetSweepRadius(), true, 6, 180);
+				TFD::HostilityController::ScheduleStopCombatWaves(TFD::Settings::GetSweepRadius(), true, 6, 180);
 			}
 
 			ImGuiMCP::Separator();
@@ -1641,7 +1639,6 @@ namespace TFDMenu
 			RE::DebugNotification("TFD: SMF menu registered");
 		}
 
-
 		constexpr std::uint32_t kScanCodeActivate = 0x12;
 		constexpr std::uint32_t kScanCodeEscape = 0x01;
 		constexpr std::uint32_t kScanCodeEnter = 0x1C;
@@ -1785,7 +1782,7 @@ namespace TFDMenu
 					}
 
 					const int dialogueStateRaw = GetGlobalValueInt(gDialogueState);
-					const auto flowSnapshot = TFD::Flow::Controller::GetSingleton().GetSnapshot();
+					const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
 					if (dialogueStateRaw == 1) {
 						RE::DebugNotification("TFD: Dialogue Busy");
 						continue;

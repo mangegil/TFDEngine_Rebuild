@@ -13,8 +13,8 @@
 #pragma warning(disable: 4099 5054)
 #endif
 #include "SKSEMenuFramework.h"
-#include "TFDPacify.h"
-#include "TFDTameBait.h"
+#include "TFDHostilityController.h"
+#include "TFDTame.h"
 
 namespace TFD::FeedPopup
 {
@@ -62,7 +62,7 @@ namespace TFD::FeedPopup
             RE::FormID targetId{ 0 };
             std::string targetName{};
             PopupStage stage{ PopupStage::Actions };
-            TFD::Pacify::TameDisposition disposition{ TFD::Pacify::TameDisposition::None };
+            TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
             PopupAction pendingAction{ PopupAction::None };
             std::vector<ActionOption> actions{};
             std::vector<BaitOption> baits{};
@@ -78,7 +78,7 @@ namespace TFD::FeedPopup
             RE::FormID targetId{ 0 };
             std::string targetName{};
             PopupStage stage{ PopupStage::Actions };
-            TFD::Pacify::TameDisposition disposition{ TFD::Pacify::TameDisposition::None };
+            TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
             PopupAction pendingAction{ PopupAction::None };
             std::vector<ActionOption> actions{};
             std::vector<BaitOption> baits{};
@@ -137,7 +137,7 @@ namespace TFD::FeedPopup
             g_popup.targetId = 0;
             g_popup.targetName.clear();
             g_popup.stage = PopupStage::Actions;
-            g_popup.disposition = TFD::Pacify::TameDisposition::None;
+            g_popup.disposition = TFD::Tame::TameDisposition::None;
             g_popup.pendingAction = PopupAction::None;
             g_popup.actions.clear();
             g_popup.baits.clear();
@@ -151,9 +151,9 @@ namespace TFD::FeedPopup
         static void RefreshActionsLocked(RE::Actor* target)
         {
             g_popup.actions.clear();
-            g_popup.disposition = target ? TFD::Pacify::GetDisposition(target) : TFD::Pacify::TameDisposition::None;
+            g_popup.disposition = target ? TFD::Tame::GetDisposition(target) : TFD::Tame::TameDisposition::None;
 
-            if (g_popup.disposition == TFD::Pacify::TameDisposition::Companion) {
+            if (g_popup.disposition == TFD::Tame::TameDisposition::Companion) {
                 g_popup.actions.push_back({ PopupAction::CompanionFeed, "Teammate Feed (+3 in-game hours, cost 2 bait)" });
                 g_popup.actions.push_back({ PopupAction::Release, "Release" });
             } else {
@@ -175,7 +175,7 @@ namespace TFD::FeedPopup
                 return result;
             }
 
-            const auto options = TFD::TameBait::CollectValidBaits(player, target);
+            const auto options = TFD::Tame::CollectValidBaits(player, target);
             const std::int32_t cost = (action == PopupAction::CompanionFeed) ? kCompanionFeedCost : kCalmFeedCost;
             for (const auto& opt : options) {
                 if (!opt.item || opt.count < cost) {
@@ -235,7 +235,7 @@ namespace TFD::FeedPopup
                 return true;
             }
 
-            if (!TFD::Pacify::HasActiveTameSession(target)) {
+            if (!TFD::Tame::HasActiveSession(target)) {
                 RE::DebugNotification("TFD: Command Failed. No active tame session.");
                 return true;
             }
@@ -249,12 +249,12 @@ namespace TFD::FeedPopup
 
             bool ok = false;
             if (snap.pendingAction == PopupAction::CalmFeed) {
-                ok = TFD::Pacify::ExtendActiveTameSession(target, chosen.calmExtendSec, 0.0);
+                ok = TFD::Tame::ExtendSession(target, chosen.calmExtendSec, 0.0);
                 if (!ok) {
                     RE::DebugNotification("TFD: Calm Feed Failed.");
                     return true;
                 }
-                if (!TFD::TameBait::ConsumeBait(player, item, chosen.cost)) {
+                if (!TFD::Tame::ConsumeBait(player, item, chosen.cost)) {
                     RE::DebugNotification("TFD: Calm Feed Failed. Could not consume bait.");
                     return true;
                 }
@@ -265,17 +265,17 @@ namespace TFD::FeedPopup
             }
 
             if (snap.pendingAction == PopupAction::CompanionFeed) {
-                if (TFD::Pacify::IsCompanion(target)) {
-                    ok = TFD::Pacify::ExtendActiveCompanionHours(target, kCompanionFeedHours);
+                if (TFD::Tame::IsCompanion(target)) {
+                    ok = TFD::Tame::ExtendCompanionHours(target, kCompanionFeedHours);
                 } else {
-                    ok = TFD::Pacify::PromoteActiveTameToCompanion(target, kCompanionFeedHours);
+                    ok = TFD::Tame::PromoteToCompanion(target, kCompanionFeedHours);
                 }
 
                 if (!ok) {
                     RE::DebugNotification("TFD: Teammate Feed Failed.");
                     return true;
                 }
-                if (!TFD::TameBait::ConsumeBait(player, item, chosen.cost)) {
+                if (!TFD::Tame::ConsumeBait(player, item, chosen.cost)) {
                     RE::DebugNotification("TFD: Teammate Feed Failed. Could not consume bait.");
                     return true;
                 }
@@ -320,7 +320,7 @@ namespace TFD::FeedPopup
                 snap.targetId = target->GetFormID();
                 snap.targetName = (target->GetName() && target->GetName()[0]) ? target->GetName() : "Creature";
                 snap.stage = PopupStage::BaitSelect;
-                snap.disposition = TFD::Pacify::GetDisposition(target);
+                snap.disposition = TFD::Tame::GetDisposition(target);
                 snap.pendingAction = action;
                 snap.baits = baits;
                 Close();
@@ -353,7 +353,7 @@ namespace TFD::FeedPopup
                 target = ResolveTarget(g_popup.targetHandle);
             }
 
-            if (!target || !TFD::Pacify::HasActiveTameSession(target)) {
+            if (!target || !TFD::Tame::HasActiveSession(target)) {
                 Close();
                 RE::DebugNotification("TFD: Command Failed. No active tame session.");
                 return true;
@@ -362,7 +362,7 @@ namespace TFD::FeedPopup
             switch (action) {
             case PopupAction::Release:
                 Close();
-                if (!TFD::Pacify::ReleaseActiveTameActor(target, TFD::Pacify::ReleaseReason::Generic)) {
+                if (!TFD::Tame::Release(target, TFD::HostilityController::ReleaseReason::Generic)) {
                     RE::DebugNotification("TFD: Release Failed.");
                 } else {
                     RE::DebugNotification("TFD: Tame Released");
@@ -379,9 +379,9 @@ namespace TFD::FeedPopup
 
         static void RenderActionStage(const PopupSnapshot& snap)
         {
-            if (snap.disposition == TFD::Pacify::TameDisposition::Companion) {
+            if (snap.disposition == TFD::Tame::TameDisposition::Companion) {
                 ImGuiMCP::TextWrapped("Temporary teammate active. [Up/Down] choose command, [Enter] confirm, [Esc] close.");
-                ImGuiMCP::Text("Remaining teammate time: %.1f hours", TFD::Pacify::GetRemainingCompanionHours(ResolveTarget(snap.targetHandle)));
+                ImGuiMCP::Text("Remaining teammate time: %.1f hours", TFD::Tame::GetRemainingCompanionHours(ResolveTarget(snap.targetHandle)));
             } else {
                 ImGuiMCP::TextWrapped("Calm active. [Up/Down] choose command, [Enter] confirm, [Esc] close.");
             }
@@ -419,7 +419,7 @@ namespace TFD::FeedPopup
             }
 
             auto* target = ResolveTarget(snap.targetHandle);
-            if (!target || !TFD::Pacify::HasActiveTameSession(target)) {
+            if (!target || !TFD::Tame::HasActiveSession(target)) {
                 Close();
                 return;
             }

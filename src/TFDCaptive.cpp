@@ -1,12 +1,13 @@
-#include "TFDCaptiveRuntime.h"
+#include "TFDCaptive.h"
 
 #include "TFDActorScan.h"
-#include "TFDAntiAggro.h"
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
+#include "TFDHostilityController.h"
+#include "TFDTame.h"
 #include "TFDSettings.h"
 #include "TFDLocation.h"
-#include "TFDFactionMask.h"
-#include "TFDAggressionClamp.h"
+#include "TFDFactionManager.h"
+
 #include "TFDFlowController.h"
 
 #include <SKSE/SKSE.h>
@@ -17,7 +18,7 @@
 #include <algorithm>
 #include <vector>
 
-namespace TFD::CaptiveRuntime
+namespace TFD::Captive
 {
 	namespace
 	{
@@ -69,7 +70,7 @@ namespace TFD::CaptiveRuntime
 			if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
 				return false;
 			}
-			if (actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor)) {
+			if (actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) {
 				return false;
 			}
 			const bool isNPC = actor->HasKeywordString("ActorTypeNPC");
@@ -148,8 +149,8 @@ namespace TFD::CaptiveRuntime
 			}
 
 			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
-			TFD::AntiAggro::SweepOnce(sweepRadius, true);
-			TFD::AntiAggro::ScheduleWaves(sweepRadius, true, 10, 120);
+			TFD::HostilityController::StopCombatSweep(sweepRadius, true);
+			TFD::HostilityController::ScheduleStopCombatWaves(sweepRadius, true, 10, 120);
 			TFD::ActorScan::Rescan(sweepRadius, false);
 
 			auto* pCell = player->GetParentCell();
@@ -238,7 +239,7 @@ namespace TFD::CaptiveRuntime
 		int g_confiscationAttemptCount = 0;
 		std::chrono::steady_clock::time_point g_confiscationNextAttempt{};
 		QuestRegistryCache g_registry{};
-		TFD::CaptiveDoorController g_door{};
+		TFD::Captive::DoorController g_door{};
 		RE::ObjectRefHandle g_marker{};
 		RE::FormID g_cellFormID = 0;
 		RE::FormID g_locationFormID = 0;
@@ -263,7 +264,7 @@ namespace TFD::CaptiveRuntime
 	int& ConfiscationAttemptCountRef() { return g_confiscationAttemptCount; }
 	std::chrono::steady_clock::time_point& ConfiscationNextAttemptRef() { return g_confiscationNextAttempt; }
 	QuestRegistryCache& QuestRegistryRef() { return g_registry; }
-	TFD::CaptiveDoorController& DoorControllerRef() { return g_door; }
+	TFD::Captive::DoorController& DoorControllerRef() { return g_door; }
 	RE::ObjectRefHandle& MarkerRef() { return g_marker; }
 	RE::FormID& CellFormIDRef() { return g_cellFormID; }
 	RE::FormID& LocationFormIDRef() { return g_locationFormID; }
@@ -1100,14 +1101,13 @@ namespace TFD::CaptiveRuntime
 		return g_locationFormID != 0 && curLoc != 0 && curLoc != g_locationFormID;
 	}
 
-
 	bool NormalizeInvalidCaptivePair()
 	{
 		if (!g_state || g_phase != PhaseValue::None) {
 			return false;
 		}
 		SetRuntimeState(true, PhaseValue::Escape);
-		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, 0u, "normalize_invalid_captive_pair");
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeStarted, 0u, "normalize_invalid_captive_pair");
 		spdlog::info("[TFD][Captive] Normalized invalid captive pair -> Escape");
 		return true;
 	}
@@ -1118,13 +1118,13 @@ namespace TFD::CaptiveRuntime
 			return false;
 		}
 
-		TFD::FactionMask::Clear();
-		TFD::AggressionClamp::Clear();
+		TFD::FactionManager::Clear();
+		TFD::HostilityController::ClearAggressionClamp();
 		if (handlers.setGraceActive) {
 			handlers.setGraceActive(false);
 		}
 		SetRuntimeState(true, PhaseValue::Escape);
-		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, 0u, reason ? reason : "escape_started");
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeStarted, 0u, reason ? reason : "escape_started");
 		if (handlers.updatePreCombatState) {
 			handlers.updatePreCombatState();
 		}
@@ -1194,8 +1194,8 @@ namespace TFD::CaptiveRuntime
 		RE::FormID newLoc = 0;
 		if (DidEscapeByLocation(player, &oldLoc, &newLoc)) {
 			SetRuntimeState(false, PhaseValue::None);
-			(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeSucceeded, 0u, "escape_resolved_location");
-			(void)TFD::Flow::Controller::GetSingleton().CompleteTerminalContext("escape_resolved_location");
+			(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeSucceeded, 0u, "escape_resolved_location");
+			(void)TFD::FlowController::Controller::GetSingleton().CompleteTerminalContext("escape_resolved_location");
 			ClearEscapeContext();
 			if (handlers.updatePreCombatState) {
 				handlers.updatePreCombatState();
@@ -1218,7 +1218,7 @@ namespace TFD::CaptiveRuntime
 			preferred = handlers.findBestAggressor(reacquireRadius);
 		}
 
-		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, "escape_broken_threshold");
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, "escape_broken_threshold");
 		QueueEscapeBreakRebleed(preferred);
 		if (handlers.clearLastAggressor) {
 			handlers.clearLastAggressor();
@@ -1238,7 +1238,7 @@ namespace TFD::CaptiveRuntime
 			return false;
 		}
 		SetRuntimeState(true, PhaseValue::Escape);
-		(void)TFD::Flow::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::Flow::CaptiveOutcome::EscapeStarted, actor ? actor->GetFormID() : 0u, reason ? reason : "player_aggression_captive");
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeStarted, actor ? actor->GetFormID() : 0u, reason ? reason : "player_aggression_captive");
 		return true;
 	}
 

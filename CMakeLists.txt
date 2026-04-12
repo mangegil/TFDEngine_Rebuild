@@ -32,34 +32,30 @@ add_library(TFDEngine SHARED
     src/main.cpp
     src/TFDSettings.cpp
     src/TFDLocation.cpp
-    src/TFDCaptiveRuntime.cpp
-    src/TFDRescueRuntime.cpp
-    src/TFDVictoryRuntime.cpp
+    src/TFDCaptive.cpp
+    src/TFDRescue.cpp
+    src/TFDVictory.cpp
     src/TFDActorScan.cpp
-    src/TFDAntiAggro.cpp
     src/TFDDefeatMonitor.cpp
-    src/TFDFactionMask.cpp
-    src/TFDAggressionClamp.cpp
+    src/TFDFactionManager.cpp
     src/TFDPreCombatGreet.cpp
     src/TFDInCombat.cpp
     src/TFDInCombatGreet.cpp
     src/TFDBleedout.cpp
     src/TFDBleedoutGreet.cpp
-    src/TFDPacify.cpp
-    src/TFDPacifyHooks.cpp
+    src/TFDHostilityHooks.cpp
+    src/TFDHostilityController.cpp
     src/TFDTargetClassifier.cpp
     src/TFDInteractionRouter.cpp
     src/MenuFramework.cpp
-    src/TFDTameBait.cpp
+    src/TFDTame.cpp
     src/TFDFeedPopup.cpp
-    src/TFDCaptiveHostility.cpp
     src/TFDCaptiveDoorController.cpp
-    src/TFDTeammateAliasSync.cpp
-    src/TFDCompanionRestore.cpp
+    src/TFDTeammateManager.cpp
     src/TFDFlowController.cpp
     src/TFDForceGreet.cpp
     src/TFDPleasureRuntime.cpp
-    src/TFDTransitionRuntime.cpp
+    src/TFDTransition.cpp
 )
 
 if(TFDEnableSmf)

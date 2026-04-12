@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-#include "TFDPacify.h"
+#include "TFDHostilityController.h"
 #include "TFDTargetClassifier.h"
 #include "TFDFlowController.h"
 
@@ -103,9 +103,9 @@ namespace TFD::InteractionRouter
         bool valid{ false };
     };
 
-    Action ResolvePreferredTruceAction(const TFD::Flow::Snapshot& snapshot);
+    Action ResolvePreferredTruceAction(const TFD::FlowController::Snapshot& snapshot);
     bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction = nullptr);
-    FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::Flow::Snapshot& snapshot);
+    FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::FlowController::Snapshot& snapshot);
 
     RE::Actor* PickExactDialogueDefeatedTarget(float radius);
     RE::Actor* PickExactActiveTameTarget(float radius);
@@ -113,7 +113,7 @@ namespace TFD::InteractionRouter
 
     PrimaryHotkeyPickResult PickPrimaryHotkeyTarget(
         RE::PlayerCharacter* player,
-        const TFD::Flow::Snapshot& snapshot,
+        const TFD::FlowController::Snapshot& snapshot,
         float radius,
         bool allowTameFallback = false);
 
@@ -130,7 +130,7 @@ namespace TFD::InteractionRouter
 
     PrimaryHotkeyExecuteResult ExecutePrimaryHotkey(
         RE::Actor* player,
-        const TFD::Flow::Snapshot& snapshot,
+        const TFD::FlowController::Snapshot& snapshot,
         double nowSec,
         float radius,
         bool allowTameFallback = false);

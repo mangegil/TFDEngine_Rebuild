@@ -1,6 +1,6 @@
 #pragma once
 
-namespace TFD::VictoryRuntime
+namespace TFD::Victory
 {
 	void SetStateValue(int value);
 }

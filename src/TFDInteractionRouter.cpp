@@ -1,13 +1,13 @@
 #include "TFDInteractionRouter.h"
-#include "TFDTameBait.h"
+#include "TFDTame.h"
 #include "TFDInCombatGreet.h"
 #include "TFDPreCombatGreet.h"
-#include "TFDCaptiveRuntime.h"
-#include "TFDRescueRuntime.h"
+#include "TFDCaptive.h"
+#include "TFDRescue.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDActorScan.h"
-#include "TFDCompanionRestore.h"
+#include "TFDTeammateManager.h"
 
 #include <spdlog/spdlog.h>
 
@@ -62,7 +62,7 @@ namespace TFD::InteractionRouter
             if (actor == player) {
                 return true;
             }
-            return actor->IsPlayerTeammate() || TFD::Pacify::IsCompanion(actor);
+            return actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor);
         }
 
         bool IsActorActivelyTargetingPlayerSide(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -98,11 +98,11 @@ namespace TFD::InteractionRouter
                 return false;
             }
 
-            if (!TFD::Pacify::IsPacified(actor)) {
+            if (!TFD::HostilityController::IsPacified(actor)) {
                 return false;
             }
 
-            if (TFD::Pacify::GetMode(actor) != TFD::Pacify::Mode::Tame) {
+            if (TFD::HostilityController::GetMode(actor) != TFD::HostilityController::Mode::Tame) {
                 return false;
             }
 
@@ -402,7 +402,7 @@ namespace TFD::InteractionRouter
 
         switch (classify.intent) {
         case TFD::TargetClassifier::InteractionIntent::Tame:
-            if (!TFD::Pacify::CanStartTame(target)) {
+            if (!TFD::Tame::CanStart(target)) {
                 spdlog::info(
                     "[TFD][Router] reject tame target={:08X} reason=active_tame_requires_feed",
                     target->GetFormID());
@@ -411,7 +411,7 @@ namespace TFD::InteractionRouter
                 return result;
             }
 
-            if (TFD::TameBait::CollectValidBaits(player, target).empty()) {
+            if (TFD::Tame::CollectValidBaits(player, target).empty()) {
                 spdlog::info(
                     "[TFD][Router] reject tame target={:08X} reason=no_valid_bait",
                     target->GetFormID());
@@ -428,7 +428,7 @@ namespace TFD::InteractionRouter
             return result;
 
         case TFD::TargetClassifier::InteractionIntent::Truce:
-            if (!TFD::Pacify::CanStartTruce(target)) {
+            if (!TFD::HostilityController::CanStartTruce(target)) {
                 result.valid = false;
                 result.failReason = FailReason::TruceUnavailable;
                 return result;
@@ -474,7 +474,7 @@ namespace TFD::InteractionRouter
 
         switch (resolved.action) {
         case Action::Tame:
-            sessionId = TFD::Pacify::BeginTameSession(
+            sessionId = TFD::Tame::BeginSession(
                 player,
                 target,
                 nowSec,
@@ -483,11 +483,11 @@ namespace TFD::InteractionRouter
             break;
 
         case Action::TrucePreCombat:
-            sessionId = TFD::Pacify::BeginTrucePreCombatSession(player, target, nowSec);
+            sessionId = TFD::HostilityController::BeginTrucePreCombatSession(player, target, nowSec);
             break;
 
         case Action::TruceInCombat:
-            sessionId = TFD::Pacify::BeginTruceInCombatSession(
+            sessionId = TFD::HostilityController::BeginTruceInCombatSession(
                 player,
                 target,
                 nowSec,
@@ -533,11 +533,9 @@ namespace TFD::InteractionRouter
         return ExecuteResolvedAction(player, target, resolved, nowSec);
     }
 
-
-
-    Action ResolvePreferredTruceAction(const TFD::Flow::Snapshot& snapshot)
+    Action ResolvePreferredTruceAction(const TFD::FlowController::Snapshot& snapshot)
     {
-        return snapshot.root == TFD::Flow::RootFlow::InCombat ? Action::TruceInCombat : Action::TrucePreCombat;
+        return snapshot.root == TFD::FlowController::RootFlow::InCombat ? Action::TruceInCombat : Action::TrucePreCombat;
     }
 
     bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction)
@@ -557,14 +555,14 @@ namespace TFD::InteractionRouter
         }
     }
 
-    FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::Flow::Snapshot& snapshot)
+    FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::FlowController::Snapshot& snapshot)
     {
         FlowOwnedPrimaryResult result{};
         if (!player) {
             return result;
         }
 
-        if (TFD::RescueRuntime::IsActive() || TFD::PleasureRuntime::IsActive()) {
+        if (TFD::Rescue::IsActive() || TFD::PleasureRuntime::IsActive()) {
             result.kind = FlowOwnedPrimaryKind::Busy;
             result.handled = true;
             result.success = false;
@@ -572,7 +570,7 @@ namespace TFD::InteractionRouter
             return result;
         }
 
-        if (TFD::CaptiveRuntime::IsEscapeActive()) {
+        if (TFD::Captive::IsEscapeActive()) {
             result.kind = FlowOwnedPrimaryKind::Escape;
             result.interactionState = 6;
             result.handled = true;
@@ -581,7 +579,7 @@ namespace TFD::InteractionRouter
             return result;
         }
 
-        if (snapshot.root == TFD::Flow::RootFlow::Bleedout || TFD::Flow::Controller::GetSingleton().IsBleedDecisionActive()) {
+        if (snapshot.root == TFD::FlowController::RootFlow::Bleedout || TFD::FlowController::Controller::GetSingleton().IsBleedDecisionActive()) {
             result.kind = FlowOwnedPrimaryKind::Bleedout;
             result.interactionState = 5;
             result.handled = true;
@@ -590,11 +588,11 @@ namespace TFD::InteractionRouter
             return result;
         }
 
-        if (TFD::CaptiveRuntime::IsStandardCaptiveActive()) {
+        if (TFD::Captive::IsStandardCaptiveActive()) {
             result.kind = FlowOwnedPrimaryKind::Captive;
             result.interactionState = 4;
             result.handled = true;
-            result.success = TFD::CaptiveRuntime::BeginCaptorCallHotkey(player);
+            result.success = TFD::Captive::BeginCaptorCallHotkey(player);
             result.notification = result.success ? "TFD: Calling Captor" : "TFD: No Response";
             return result;
         }
@@ -604,7 +602,7 @@ namespace TFD::InteractionRouter
 
     PrimaryHotkeyPickResult PickPrimaryHotkeyTarget(
         RE::PlayerCharacter* player,
-        const TFD::Flow::Snapshot& snapshot,
+        const TFD::FlowController::Snapshot& snapshot,
         float radius,
         bool allowTameFallback)
     {
@@ -674,10 +672,9 @@ namespace TFD::InteractionRouter
         return result;
     }
 
-
     PrimaryHotkeyExecuteResult ExecutePrimaryHotkey(
         RE::Actor* player,
-        const TFD::Flow::Snapshot& snapshot,
+        const TFD::FlowController::Snapshot& snapshot,
         double nowSec,
         float radius,
         bool allowTameFallback)
@@ -759,7 +756,6 @@ namespace TFD::InteractionRouter
         return result;
     }
 
-
     ShiftHotkeyExecuteResult ExecuteShiftHotkey(
         RE::Actor* player,
         double nowSec,
@@ -801,7 +797,6 @@ namespace TFD::InteractionRouter
         result.notification = "TFD: No Exact Tame Target";
         return result;
     }
-
 
     RE::Actor* PickExactDialogueDefeatedTarget(float radius)
     {
@@ -870,7 +865,7 @@ namespace TFD::InteractionRouter
             if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 return -1.0e30f;
             }
-            if (!TFD::Pacify::HasActiveTameSession(actor)) {
+            if (!TFD::Tame::HasActiveSession(actor)) {
                 return -1.0e30f;
             }
             if (entry.dist > radius) {
@@ -913,7 +908,7 @@ namespace TFD::InteractionRouter
         }
 
         if (!best) {
-            const auto restored = TFD::CompanionRestore::RestoreNow();
+            const auto restored = TFD::TeammateManager::RestoreNow();
             if (restored > 0) {
                 TFD::ActorScan::Rescan(radius, false);
 
@@ -991,7 +986,6 @@ namespace TFD::InteractionRouter
 
         return best;
     }
-
 
     const char* ToString(Action value)
     {

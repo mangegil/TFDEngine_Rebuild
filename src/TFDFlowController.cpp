@@ -28,42 +28,42 @@ namespace
         }
     }
 
-    void LogFlowSnapshot(const char* op, std::string_view reason, const TFD::Flow::Snapshot& s, std::uint32_t actorFormID = 0, const char* detail = nullptr)
+    void LogFlowSnapshot(const char* op, std::string_view reason, const TFD::FlowController::Snapshot& s, std::uint32_t actorFormID = 0, const char* detail = nullptr)
     {
         spdlog::info(
             "[TFD][Flow] {} detail={} reason={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} terminal={} actor={:08X}",
             op ? op : "unknown",
             detail ? detail : "-",
             reason.empty() ? std::string{ "-" } : std::string{ reason },
-            TFD::Flow::Controller::ToString(s.root),
-            TFD::Flow::Controller::ToString(s.contextRoot),
-            TFD::Flow::Controller::ToString(s.gate),
-            TFD::Flow::Controller::ToString(s.sub),
-            TFD::Flow::Controller::ToString(s.captiveMode),
+            TFD::FlowController::Controller::ToString(s.root),
+            TFD::FlowController::Controller::ToString(s.contextRoot),
+            TFD::FlowController::Controller::ToString(s.gate),
+            TFD::FlowController::Controller::ToString(s.sub),
+            TFD::FlowController::Controller::ToString(s.captiveMode),
             s.token,
             s.primaryActorFormID,
             s.terminalResolved ? 1 : 0,
             actorFormID);
     }
 
-    void LogFlowReject(const char* op, std::string_view reason, const TFD::Flow::Snapshot& s)
+    void LogFlowReject(const char* op, std::string_view reason, const TFD::FlowController::Snapshot& s)
     {
         spdlog::warn(
             "[TFD][Flow] reject op={} reason={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} terminal={}",
             op ? op : "unknown",
             reason.empty() ? std::string{ "-" } : std::string{ reason },
-            TFD::Flow::Controller::ToString(s.root),
-            TFD::Flow::Controller::ToString(s.contextRoot),
-            TFD::Flow::Controller::ToString(s.gate),
-            TFD::Flow::Controller::ToString(s.sub),
-            TFD::Flow::Controller::ToString(s.captiveMode),
+            TFD::FlowController::Controller::ToString(s.root),
+            TFD::FlowController::Controller::ToString(s.contextRoot),
+            TFD::FlowController::Controller::ToString(s.gate),
+            TFD::FlowController::Controller::ToString(s.sub),
+            TFD::FlowController::Controller::ToString(s.captiveMode),
             s.token,
             s.primaryActorFormID,
             s.terminalResolved ? 1 : 0);
     }
 }
 
-namespace TFD::Flow
+namespace TFD::FlowController
 {
 
     void Controller::RefreshFlowGlobalsLocked()

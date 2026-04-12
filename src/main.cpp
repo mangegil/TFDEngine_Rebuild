@@ -16,15 +16,15 @@
 
 #include "TFDDefeatMonitor.h"
 #include "TFDLocation.h"
-#include "TFDFactionMask.h"
+#include "TFDFactionManager.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
-#include "TFDPacify.h"
-#include "TFDPacifyHooks.h"
-#include "TFDTeammateAliasSync.h"
+#include "TFDHostilityController.h"
+#include "TFDHostilityHooks.h"
+#include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 
 #if !defined(TFDEnableSmf)
@@ -86,10 +86,10 @@ static void ResetTransientStateForLoad()
     TFD::InCombatGreet::Reset();
     TFD::Bleedout::ResetForLoad();
     TFD::BleedoutGreet::Reset();
-    TFD::Pacify::Reset();
+    TFD::HostilityController::Reset();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
-    TFD::Flow::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
+    TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
 
     spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, pacify cleared)");
 }
@@ -120,7 +120,7 @@ static void InitOnceAfterLoad()
     spdlog::info("[TFD] InitOnceAfterLoad");
 
     TFD::Location::Initialize();
-    TFD::FactionMask::Initialize();
+    TFD::FactionManager::Initialize();
     TFD::DefeatMonitor::Install();
     TFD::InCombat::Install();
     TFD::InCombatGreet::Install();
@@ -128,7 +128,7 @@ static void InitOnceAfterLoad()
     TFD::Bleedout::Install();
     TFD::BleedoutGreet::Install();
     TFD::PreCombatGreet::Install();
-    TFD::TeammateAliasSync::Install();
+    TFD::TeammateManager::Install();
 
     QueueHud("TFDEngine: Init OK (after load)");
     QueueHud(BuildStamp().c_str());
@@ -342,7 +342,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     spdlog::info("[TFD] SKSEPlugin_Load");
     spdlog::info("[TFD] {}", BuildStamp());
 
-    TFD::PacifyHooks::Install();
+    TFD::HostilityHooks::Install();
 
 #if TFDEnableSmf
     TFDMenu::Init();

@@ -53,7 +53,7 @@ namespace TFD::InCombat
 
 	void ObserveCombat(std::uint32_t actorFormID, bool active, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		std::scoped_lock lk(g_lock);
 
 		if (active) {
@@ -71,7 +71,7 @@ namespace TFD::InCombat
 
 	bool BeginTruce(std::uint32_t actorFormID, bool dialogueRequested, const char* reason)
 	{
-		auto& flow = TFD::Flow::Controller::GetSingleton();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		std::scoped_lock lk(g_lock);
 
 		const auto why = reason ? reason : "incombat_truce_begin";

@@ -2,7 +2,7 @@
 
 #include <RE/Skyrim.h>
 
-namespace TFD::FactionMask
+namespace TFD::FactionManager
 {
 	inline constexpr const char* kAllowListEditorId = "TFDHostileFactionAllowList";
 

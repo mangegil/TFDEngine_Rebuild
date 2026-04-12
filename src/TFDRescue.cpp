@@ -1,10 +1,10 @@
-#include "TFDRescueRuntime.h"
+#include "TFDRescue.h"
 
 #include <cmath>
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
-namespace TFD::RescueRuntime
+namespace TFD::Rescue
 {
 	namespace
 	{

@@ -4,7 +4,7 @@
 #include <mutex>
 #include <string_view>
 
-namespace TFD::Flow
+namespace TFD::FlowController
 {
     enum class RootFlow : std::uint8_t
     {
@@ -186,4 +186,8 @@ namespace TFD::Flow
         Snapshot _snapshot{};
         bool _combatActive{ false };
     };
+}
+
+namespace TFD {
+    namespace Flow = FlowController;
 }
