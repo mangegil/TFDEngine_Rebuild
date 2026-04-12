@@ -25,7 +25,6 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDFlowController.h"
-#include "TFDForceGreet.h"
 #include "TFDPleasureRuntime.h"
 
 namespace TFD::PreCombatGreet
@@ -51,7 +50,7 @@ namespace TFD::PreCombatGreet
 
 		struct Pending
 		{
-			RE::FormID truceSessionId{ 0 };
+			RE::FormID pacifySessionId{ 0 };
 			TFD::InteractionRouter::Action action{ TFD::InteractionRouter::Action::None };
 
 			double expiresSec{ 0.0 };
@@ -488,7 +487,7 @@ namespace TFD::PreCombatGreet
 			return false;
 		}
 
-		TFD::HostilityController::ReleaseReason ResolveDialogueClosedReleaseReasonLocked(const Pending& pending)
+		TFD::Tame::ReleaseReason ResolveDialogueClosedReleaseReasonLocked(const Pending& pending)
 		{
 			auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
 
@@ -497,11 +496,11 @@ namespace TFD::PreCombatGreet
 					snapshot.root == TFD::FlowController::RootFlow::Victory ||
 					snapshot.terminalResolved ||
 					snapshot.root == TFD::FlowController::RootFlow::None) {
-					return TFD::HostilityController::ReleaseReason::FlowHandoff;
+					return TFD::Tame::ReleaseReason::FlowHandoff;
 				}
 			}
 
-			return TFD::HostilityController::ReleaseReason::DialogueClosed;
+			return TFD::Tame::ReleaseReason::DialogueClosed;
 		}
 
 		void BeginStickyReopenLocked(RE::Actor* actor, Pending& pending, const char* reason)
@@ -520,7 +519,7 @@ namespace TFD::PreCombatGreet
 			CacheRecentActor(actor, 0.0, reason ? reason : "sticky_reopen");
 
 			if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
-				TFD::ForceGreet::BeginPreCombatTruce(actor);
+				TFD::InteractionRouter::DialogueOpen::BeginPreCombatTruce(actor);
 			}
 
 			spdlog::info(
@@ -574,12 +573,12 @@ namespace TFD::PreCombatGreet
 			Pending& pending,
 			double cooldownSec,
 			const char* reason,
-			TFD::HostilityController::ReleaseReason releaseReason)
+			TFD::Tame::ReleaseReason pacifyReason)
 		{
 
-			if (pending.truceSessionId != 0) {
-				TFD::HostilityController::ReleaseSession(pending.truceSessionId, releaseReason);
-				pending.truceSessionId = 0;
+			if (pending.pacifySessionId != 0) {
+				TFD::HostilityController::ReleaseSession(pending.pacifySessionId, pacifyReason);
+				pending.pacifySessionId = 0;
 			}
 
 			if (pending.assignSent) {
@@ -616,9 +615,9 @@ namespace TFD::PreCombatGreet
 				auto sp = RE::Actor::LookupByHandle(handle);
 				auto* actor = sp.get();
 
-				if (pending.truceSessionId != 0) {
-					TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::HostilityController::ReleaseReason::Generic);
-					pending.truceSessionId = 0;
+				if (pending.pacifySessionId != 0) {
+					TFD::HostilityController::ReleaseSession(pending.pacifySessionId, TFD::Tame::ReleaseReason::Generic);
+					pending.pacifySessionId = 0;
 				}
 
 				if (pending.assignSent) {
@@ -675,7 +674,7 @@ namespace TFD::PreCombatGreet
 
 			ClearAllBridgeAliases();
 
-			CleanupOne(targetActor, it->second, kCooldownAfterPlayerAttackSec, "player_attack", TFD::HostilityController::ReleaseReason::PlayerAggression);
+			CleanupOne(targetActor, it->second, kCooldownAfterPlayerAttackSec, "player_attack", TFD::Tame::ReleaseReason::PlayerAggression);
 			gPending.erase(it);
 		}
 
@@ -845,15 +844,15 @@ namespace TFD::PreCombatGreet
 				auto& pending = it->second;
 
 				if (!IsActorStillValid(actor)) {
-					if (pending.truceSessionId != 0) {
-						TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::HostilityController::ReleaseReason::Generic);
+					if (pending.pacifySessionId != 0) {
+						TFD::HostilityController::ReleaseSession(pending.pacifySessionId, TFD::Tame::ReleaseReason::Generic);
 					}
 					it = gPending.erase(it);
 					continue;
 				}
 
 				if (!TFD::HostilityController::IsPacified(actor)) {
-					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::HostilityController::ReleaseReason::Generic);
+					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::Tame::ReleaseReason::Generic);
 					it = gPending.erase(it);
 					continue;
 				}
@@ -895,22 +894,22 @@ namespace TFD::PreCombatGreet
 						}
 
 						auto releaseReason = ResolveDialogueClosedReleaseReasonLocked(pending);
-						CacheRecentActor(actor, 0.0, releaseReason == TFD::HostilityController::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort");
-						CleanupOne(actor, pending, kCooldownAfterDoneSec, releaseReason == TFD::HostilityController::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort", releaseReason);
+						CacheRecentActor(actor, 0.0, releaseReason == TFD::Tame::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort");
+						CleanupOne(actor, pending, kCooldownAfterDoneSec, releaseReason == TFD::Tame::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort", releaseReason);
 						it = gPending.erase(it);
 						continue;
 					}
 				}
 				else {
 					if (actor->IsInCombat()) {
-						CleanupOne(actor, pending, kCooldownAfterFailSec, "tame_broken", TFD::HostilityController::ReleaseReason::TameBroken);
+						CleanupOne(actor, pending, kCooldownAfterFailSec, "tame_broken", TFD::Tame::ReleaseReason::TameBroken);
 						it = gPending.erase(it);
 						continue;
 					}
 				}
 
 				if (now >= pending.expiresSec) {
-					CleanupOne(actor, pending, kCooldownAfterFailSec, "hidden_failsafe_expired", TFD::HostilityController::ReleaseReason::HardFailsafeExpired);
+					CleanupOne(actor, pending, kCooldownAfterFailSec, "hidden_failsafe_expired", TFD::Tame::ReleaseReason::HardFailsafeExpired);
 					it = gPending.erase(it);
 					continue;
 				}
@@ -1068,7 +1067,7 @@ namespace TFD::PreCombatGreet
 		}
 
 		if (result.action != TFD::InteractionRouter::Action::TrucePreCombat) {
-			TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
+			TFD::HostilityController::ReleaseSession(result.sessionId, TFD::Tame::ReleaseReason::Generic);
 			spdlog::warn(
 				"[TFD][PreCombatGreet] rejected non-precombat action actor={:08X} action={}",
 				actor->GetFormID(),
@@ -1081,7 +1080,7 @@ namespace TFD::PreCombatGreet
 		}
 
 		Pending pending{};
-		pending.truceSessionId = result.sessionId;
+		pending.pacifySessionId = result.sessionId;
 		pending.action = result.action;
 		pending.expiresSec = now + kManualWindowSec;
 		pending.dialogueRequested = result.dialogueRequested;
@@ -1094,7 +1093,7 @@ namespace TFD::PreCombatGreet
 
 		if (result.dialogueRequested) {
 			if (!TFD::HostilityController::CanOpenDialogue(actor)) {
-				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
+				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::Tame::ReleaseReason::Generic);
 				return false;
 			}
 

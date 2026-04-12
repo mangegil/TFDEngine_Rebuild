@@ -27,6 +27,8 @@
 #include "TFDSettings.h"
 #include "TFDLocation.h"
 #include "TFDCaptive.h"
+#include "TFDCaptiveGreet.h"
+#include "TFDRescueGreet.h"
 #include "TFDRescue.h"
 #include "TFDVictory.h"
 #include "TFDCaptiveDoorController.h"
@@ -40,7 +42,7 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDFlowController.h"
-#include "TFDForceGreet.h"
+#include "TFDInteractionRouter.h"
 #include "TFDTransition.h"
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
@@ -688,7 +690,7 @@ namespace TFD::DefeatMonitor
 		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player);
 
 		static void ClearBleedSupportBridgeAliases(const char* reason);
-		static void ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason reason);
+		static void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason);
 		static void ReleaseBleedNoSpeakerTameSession(const char* reason);
 		static bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason);
 
@@ -734,7 +736,7 @@ namespace TFD::DefeatMonitor
 			TFD::Bleedout::ClearSupportBridgeAliases(reason, BuildBleedSupportBridgeHandlers());
 		}
 
-		static void ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason reason)
+		static void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason)
 		{
 			TFD::Bleedout::ReleaseTruceSession(reason);
 		}
@@ -793,7 +795,7 @@ namespace TFD::DefeatMonitor
 		{
 			TFD::Bleedout::RuntimeResetHandlers handlers{};
 			handlers.releasePlayerBleedLock = [&](const char* reason) { ReleasePlayerBleedLock(reason, false); };
-			handlers.releaseBleedTruceSession = [&]() { ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::Generic); };
+			handlers.releaseBleedTruceSession = [&]() { ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::Generic); };
 			handlers.releaseNoSpeakerTameSession = [&](const char* reason) { ReleaseBleedNoSpeakerTameSession(reason); };
 			handlers.clearBridgeAliases = [&](const char* reason) { ClearBleedSupportBridgeAliases(reason); };
 			handlers.setBleedActive = [&](bool active, const char*) {
@@ -3643,7 +3645,7 @@ namespace TFD::DefeatMonitor
 				auto completion = BuildPayReleaseCompletionHandlers();
 				(void)TFD::Bleedout::CompletePayRelease(r, completion);
 			};
-			handlers.releaseFlowHandoff = []() { ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::FlowHandoff); };
+			handlers.releaseFlowHandoff = []() { ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::FlowHandoff); };
 			handlers.resolveCaptiveMarker = []() -> bool { return TFD::Transition::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
 			handlers.doBlackoutTeleport = []() {
 				(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
@@ -3671,7 +3673,7 @@ namespace TFD::DefeatMonitor
 		static TFD::Bleedout::TimeoutHandlers BuildBleedTimeoutHandlers()
 		{
 			TFD::Bleedout::TimeoutHandlers handlers{};
-			handlers.releaseTruceGeneric = []() { ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::Generic); };
+			handlers.releaseTruceGeneric = []() { ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::Generic); };
 			handlers.resolveCaptiveMarker = []() -> bool { return TFD::Transition::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers()); };
 			handlers.resetBleedRuntimeState = []() { ResetBleedRuntimeState(); };
 			handlers.doBlackoutTeleport = []() { (void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers()); };
@@ -4088,7 +4090,7 @@ namespace TFD::DefeatMonitor
 			handlers.resolveAggressor = []() -> RE::Actor* { return ResolveAggressor(); };
 			handlers.findBestAggressor = [](float radius) -> RE::Actor* { return FindBestAggressor(radius); };
 			handlers.releaseNoSpeakerTameSession = [](const char* reason) { ReleaseBleedNoSpeakerTameSession(reason); };
-			handlers.releaseTruceSession = []() { ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::Generic); };
+			handlers.releaseTruceSession = []() { ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::Generic); };
 			handlers.startTruceSessionForSpeaker = [](RE::Actor* player, RE::Actor* aggressor, const char* reason) {
 				return StartBleedTruceSessionForSpeaker(player, aggressor, reason);
 				};
@@ -4282,7 +4284,7 @@ namespace TFD::DefeatMonitor
 			handlers.clearNoMarkerFallbackState = []() { TFD::Transition::ClearNoMarkerFallbackState(); };
 			handlers.releaseNoSpeakerTameSession = [](const char* reason) { ReleaseBleedNoSpeakerTameSession(reason); };
 			handlers.clearBleedSupportBridgeAliases = [](const char* reason) { ClearBleedSupportBridgeAliases(reason); };
-			handlers.releaseTruceSession = []() { ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::Generic); };
+			handlers.releaseTruceSession = []() { ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::Generic); };
 			handlers.resetGreetRuntime = [](const char* reason) { TFD::BleedoutGreet::ResetRuntime(reason); };
 			handlers.clearCaptorAliases = [](const char* reason) { TFD::Bleedout::ClearCaptorAliases(reason); };
 			handlers.clearDialogueOutcome = [](const char* reason) { ClearBleedDialogueOutcome(reason); };
@@ -4369,8 +4371,16 @@ namespace TFD::DefeatMonitor
 			if (!captiveBleedOverlay && TFD::InCombat::IsActive() && inCombatDialogueOpen) {
 				TFD::InCombatGreet::NotifyDialogueOpened();
 			}
+			if (!captiveBleedOverlay && TFD::Rescue::IsActive() && inCombatDialogueOpen) {
+				TFD::RescueGreet::NotifyDialogueOpened();
+			}
 			if (TFD::Captive::IsStandardCaptiveActive()) {
 				const bool dialogOpen = IsDialogueOpen();
+				if (dialogOpen) {
+					TFD::CaptiveGreet::NotifyDialogueOpened();
+				} else if (g_prevDialogueOpen && TFD::CaptiveGreet::IsActive()) {
+					TFD::CaptiveGreet::Cancel("dialogue_closed");
+				}
 				if (!dialogOpen && g_prevDialogueOpen) {
 					spdlog::info("[TFD][Captive] Dialogue closed -> no implicit action");
 				}
@@ -4395,7 +4405,7 @@ namespace TFD::DefeatMonitor
 				RefreshPostDefeatGlobals();
 				return;
 			}
-			TFD::ForceGreet::Tick();
+			TFD::InteractionRouter::DialogueOpen::Tick();
 			TFD::PleasureRuntime::Tick();
 			TFD::Location::UpdateAmbientKidnapAvailability(false);
 			MaintainReleaseFollowGrace();
@@ -4622,7 +4632,7 @@ namespace TFD::DefeatMonitor
 						[&]() {
 							g_prevDialogueOpen = false;
 							ClearBleedDialogueOutcome("dialogue_closed_captive_commit");
-							ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::FlowHandoff);
+							ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::FlowHandoff);
 							if (TFD::Transition::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers())) {
 								spdlog::info("[TFD][Defeat] bleedout dialogue closed after captive outcome -> captive marker found");
 								(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
@@ -4836,8 +4846,8 @@ else {
 						spdlog::info("[TFD][Defeat] incombat after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
 					}
 					else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
-						TFD::ForceGreet::BeginAfterPleasure(actor);
-						spdlog::info("[TFD][Defeat] after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
+						(void)TFD::CaptiveGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
+						spdlog::info("[TFD][Defeat] captive after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
 					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
@@ -5498,13 +5508,13 @@ else {
 		bool changed = false;
 		ClearAllReleaseFollowGrace(reason ? reason : "passive_break");
 
-		changed |= TFD::HostilityController::ReleaseActiveTruceSessionForActor(actor, TFD::HostilityController::ReleaseReason::PlayerAggression, false);
+		changed |= TFD::HostilityController::ReleaseActiveTruceSessionForActor(actor, TFD::Tame::ReleaseReason::PlayerAggression, false);
 		if (auto* primary = ResolveCurrentPassivePrimaryActor(); primary && primary != actor) {
-			changed |= TFD::HostilityController::ReleaseActiveTruceSessionForActor(primary, TFD::HostilityController::ReleaseReason::PlayerAggression, false);
+			changed |= TFD::HostilityController::ReleaseActiveTruceSessionForActor(primary, TFD::Tame::ReleaseReason::PlayerAggression, false);
 		}
 
 		if (g_inBleedState.load(std::memory_order_acquire) || TFD::Bleedout::GetTruceSessionID() != 0) {
-			ReleaseBleedTruceSession(TFD::HostilityController::ReleaseReason::PlayerAggression);
+			ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::PlayerAggression);
 			ClearAllBleedLocks(reason ? reason : "passive_break");
 			TFD::Bleedout::ClearBridgeAliases(actor, reason ? reason : "passive_break");
 			changed = true;
@@ -5850,7 +5860,7 @@ else {
 			return false;
 		}
 		if (!TFD::Tame::PromoteToCompanion(actor, 24.0)) {
-			TFD::Tame::Release(actor, TFD::HostilityController::ReleaseReason::Generic);
+			TFD::Tame::Release(actor, TFD::Tame::ReleaseReason::Generic);
 			spdlog::warn("[TFD][Defeat] defeated creature recruit failed actor={:08X} reason=promote_failed", actor->GetFormID());
 			return false;
 		}

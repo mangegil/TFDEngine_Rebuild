@@ -26,7 +26,6 @@
 #include "TFDLocation.h"
 #include "TFDActorScan.h"
 #include "TFDHostilityController.h"
-#include "TFDForceGreet.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombatGreet.h"
 #include "TFDDefeatMonitor.h"
@@ -1216,10 +1215,10 @@ namespace TFDMenu
 			if (ImGuiMCP::Button(confirmLabel)) {
 				bool released = false;
 				if (actor) {
-					released = TFD::Tame::Release(actor, TFD::HostilityController::ReleaseReason::Generic);
+					released = TFD::Tame::Release(actor, TFD::Tame::ReleaseReason::Generic);
 				}
 				else {
-					TFD::HostilityController::ReleaseSession(snap.sessionId, TFD::HostilityController::ReleaseReason::Generic);
+					TFD::HostilityController::ReleaseSession(snap.sessionId, TFD::Tame::ReleaseReason::Generic);
 					released = true;
 				}
 				if (released) {

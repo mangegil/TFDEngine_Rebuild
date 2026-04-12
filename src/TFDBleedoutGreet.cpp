@@ -8,7 +8,7 @@
 #include <utility>
 
 #include "TFDBleedout.h"
-#include "TFDForceGreet.h"
+#include "TFDInteractionRouter.h"
 #include "TFDPleasureRuntime.h"
 
 namespace TFD::BleedoutGreet
@@ -64,7 +64,7 @@ namespace TFD::BleedoutGreet
 			if (pleasureCommitted) {
 				return { true, HoldReason::PleasureCommit };
 			}
-			if (TFD::ForceGreet::IsActive() && TFD::ForceGreet::GetMode() == TFD::ForceGreet::Mode::Bleedout) {
+			if (TFD::InteractionRouter::DialogueOpen::IsActive() && TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout) {
 				return { true, HoldReason::DialogueReopen };
 			}
 			return { false, HoldReason::None };
@@ -79,8 +79,8 @@ namespace TFD::BleedoutGreet
 	void Reset()
 	{
 		ResetRuntime("reset");
-		if (TFD::ForceGreet::IsActive() && OwnsCurrentFlow()) {
-			TFD::ForceGreet::Cancel();
+		if (TFD::InteractionRouter::DialogueOpen::IsActive() && OwnsCurrentFlow()) {
+			TFD::InteractionRouter::DialogueOpen::Cancel();
 		}
 	}
 
@@ -97,7 +97,7 @@ namespace TFD::BleedoutGreet
 			spdlog::warn("[TFD][BleedoutGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", speaker ? speaker->GetFormID() : 0u, reason ? reason : "bleedout");
 			return false;
 		}
-		TFD::ForceGreet::BeginBleedout(speaker);
+		TFD::InteractionRouter::DialogueOpen::BeginBleedout(speaker);
 		spdlog::info("[TFD][BleedoutGreet] begin speaker={:08X} reason={}", speaker ? speaker->GetFormID() : 0u, reason ? reason : "bleedout");
 		return true;
 	}
@@ -109,16 +109,16 @@ namespace TFD::BleedoutGreet
 			return false;
 		}
 		MarkAfterPleasureArmed(reason ? reason : "after_pleasure");
-		TFD::ForceGreet::BeginAfterPleasure(speaker);
+		TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(speaker);
 		spdlog::info("[TFD][BleedoutGreet] after pleasure speaker={:08X} reason={}", speaker ? speaker->GetFormID() : 0u, reason ? reason : "after_pleasure");
 		return true;
 	}
 
 	void Cancel(const char* reason)
 	{
-		if (TFD::ForceGreet::IsActive()) {
+		if (TFD::InteractionRouter::DialogueOpen::IsActive()) {
 			spdlog::info("[TFD][BleedoutGreet] cancel reason={}", reason ? reason : "unknown");
-			TFD::ForceGreet::Cancel();
+			TFD::InteractionRouter::DialogueOpen::Cancel();
 		}
 	}
 
@@ -395,7 +395,7 @@ bool TryHandleDialogueClosed(const DialogueClosedContext& ctx,
 
 	bool IsActive()
 	{
-		return TFD::ForceGreet::IsActive() && OwnsCurrentFlow();
+		return TFD::InteractionRouter::DialogueOpen::IsActive() && OwnsCurrentFlow();
 	}
 
 	bool OwnsCurrentFlow()
@@ -403,7 +403,7 @@ bool TryHandleDialogueClosed(const DialogueClosedContext& ctx,
 		if (!HasBleedoutOwnership()) {
 			return false;
 		}
-		const auto mode = TFD::ForceGreet::GetMode();
-		return mode == TFD::ForceGreet::Mode::Bleedout || mode == TFD::ForceGreet::Mode::AfterPleasure;
+		const auto mode = TFD::InteractionRouter::DialogueOpen::GetMode();
+		return mode == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout || mode == TFD::InteractionRouter::DialogueOpen::Mode::AfterPleasure;
 	}
 }

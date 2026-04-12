@@ -1211,7 +1211,7 @@ namespace TFD::Bleedout
 			reason ? reason : "unknown");
 	}
 
-	void ReleaseTruceSession(TFD::HostilityController::ReleaseReason reason, std::uint32_t* bleedSpeakerId)
+	void ReleaseTruceSession(TFD::Tame::ReleaseReason reason, std::uint32_t* bleedSpeakerId)
 	{
 		if (g_truceSessionId != 0) {
 			TFD::HostilityController::ReleaseSession(g_truceSessionId, reason);
@@ -1230,7 +1230,7 @@ namespace TFD::Bleedout
 	void ReleaseNoSpeakerTameSession(const char* reason)
 	{
 		if (g_noSpeakerTameSessionId != 0) {
-			TFD::HostilityController::ReleaseSession(g_noSpeakerTameSessionId, TFD::HostilityController::ReleaseReason::Generic);
+			TFD::HostilityController::ReleaseSession(g_noSpeakerTameSessionId, TFD::Tame::ReleaseReason::Generic);
 			spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
 				g_noSpeakerTameSessionId,
 				g_noSpeakerTamePrimaryId,

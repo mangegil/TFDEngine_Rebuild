@@ -362,7 +362,7 @@ namespace TFD::FeedPopup
             switch (action) {
             case PopupAction::Release:
                 Close();
-                if (!TFD::Tame::Release(target, TFD::HostilityController::ReleaseReason::Generic)) {
+                if (!TFD::Tame::Release(target, TFD::Tame::ReleaseReason::Generic)) {
                     RE::DebugNotification("TFD: Release Failed.");
                 } else {
                     RE::DebugNotification("TFD: Tame Released");

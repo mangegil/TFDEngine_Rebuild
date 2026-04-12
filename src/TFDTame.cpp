@@ -249,7 +249,47 @@ namespace TFD::Tame
             return result;
         }
 
+        void RefreshSessionEntries(TFD::HostilityController::Session& session, double nowSec, double durationSec)
+        {
+            const double effectiveDurationSec = durationSec > 0.0 ? durationSec : kTameDurationSec;
+            const double endTimeSec = TFD::HostilityController::Runtime::ClampTameEndTime(nowSec, nowSec + effectiveDurationSec);
 
+            if (session.startTimeSec <= 0.0) {
+                session.startTimeSec = nowSec;
+            }
+            if (session.disposition == TameDisposition::Calm) {
+                session.lastCalmRefreshSec = nowSec;
+            }
+            session.endTimeSec = (session.disposition == TameDisposition::Companion) ? 0.0 : endTimeSec;
+            session.invalidSinceSec = 0.0;
+            session.armedSinceSec = 0.0;
+            session.tooFarSinceSec = 0.0;
+            session.tameStartleSinceSec = 0.0;
+            session.lastPlayerSampleSec = 0.0;
+            session.lastPlayerPos = {};
+            session.hasPlayerSample = false;
+
+            for (auto& [actorId, entry] : Entries()) {
+                (void)actorId;
+                if (entry.sessionId != session.sessionId) {
+                    continue;
+                }
+                if (entry.startTimeSec <= 0.0) {
+                    entry.startTimeSec = nowSec;
+                }
+                entry.endTimeSec = (session.disposition == TameDisposition::Companion) ? 0.0 : endTimeSec;
+                entry.disposition = session.disposition;
+                entry.companionExpireGameDays = session.companionExpireGameDays;
+                entry.temporaryTeammateApplied = session.temporaryTeammateApplied;
+            }
+
+            spdlog::info(
+                "TFDTame: timer refresh session={} target={:08X} durationSec={:.2f} endTimeSec={:.2f}",
+                session.sessionId,
+                session.primaryTargetId,
+                effectiveDurationSec,
+                session.endTimeSec);
+        }
     }
 
     namespace

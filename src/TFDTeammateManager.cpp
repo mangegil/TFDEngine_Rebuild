@@ -205,7 +205,7 @@ namespace
 
             const bool promoted = TFD::Tame::PromoteToCompanion(actor, kRestoreCompanionHours);
             if (!promoted) {
-                TFD::Tame::Release(actor, TFD::HostilityController::ReleaseReason::Generic);
+                TFD::Tame::Release(actor, TFD::Tame::ReleaseReason::Generic);
                 spdlog::warn("[TFD][TeammateManager] promote failed after restore begin actor={:08X}", actor->GetFormID());
                 return RestoreResult::kRetryLater;
             }
@@ -706,6 +706,6 @@ namespace TFD::TeammateManager
 
     bool ReleaseCreatureCompanion(RE::Actor* actor)
     {
-        return actor ? TFD::Tame::Release(actor, TFD::HostilityController::ReleaseReason::Generic) : false;
+        return actor ? TFD::Tame::Release(actor, TFD::Tame::ReleaseReason::Generic) : false;
     }
 }

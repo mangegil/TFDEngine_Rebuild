@@ -9,7 +9,7 @@
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
-#include "TFDForceGreet.h"
+#include "TFDInteractionRouter.h"
 #include "TFDHostilityController.h"
 #include "TFDDefeatMonitor.h"
 #include "SKSE/SKSE.h"
@@ -28,7 +28,7 @@ namespace TFD::InCombatGreet
 			bool stickyReopenPending = false;
 			Clock::time_point nextRetry{};
 			int retryCount = 0;
-			RE::FormID truceSessionId = 0;
+			RE::FormID pacifySessionId = 0;
 			bool assignSent = false;
 		};
 
@@ -114,7 +114,7 @@ namespace TFD::InCombatGreet
 			g_runtime.stickyReopenPending = false;
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
-			g_runtime.truceSessionId = 0;
+			g_runtime.pacifySessionId = 0;
 			g_runtime.assignSent = false;
 		}
 
@@ -124,9 +124,9 @@ namespace TFD::InCombatGreet
 			bool assignSent = false;
 			{
 				std::scoped_lock lk(g_runtime.lock);
-				sessionId = g_runtime.truceSessionId;
+				sessionId = g_runtime.pacifySessionId;
 				assignSent = g_runtime.assignSent;
-				g_runtime.truceSessionId = 0;
+				g_runtime.pacifySessionId = 0;
 				g_runtime.assignSent = false;
 			}
 
@@ -256,7 +256,7 @@ namespace TFD::InCombatGreet
 
 		{
 			std::scoped_lock lk(g_runtime.lock);
-			g_runtime.truceSessionId = result.sessionId;
+			g_runtime.pacifySessionId = result.sessionId;
 			g_runtime.assignSent = result.dialogueRequested;
 		}
 
@@ -274,7 +274,7 @@ namespace TFD::InCombatGreet
 		ResetRuntime("begin");
 		g_state.store(State::Armed, std::memory_order_release);
 		g_speakerFormID.store(formID, std::memory_order_release);
-		TFD::ForceGreet::BeginInCombatTruce(speaker);
+		TFD::InteractionRouter::DialogueOpen::BeginInCombatTruce(speaker);
 
 		spdlog::info("[TFD][InCombatGreet] Begin speaker={:08X} reason={}", formID, reason ? reason : "incombat");
 		return true;
@@ -291,7 +291,7 @@ namespace TFD::InCombatGreet
 		ResetRuntime("begin_after_pleasure");
 		g_state.store(State::AfterPleasure, std::memory_order_release);
 		g_speakerFormID.store(formID, std::memory_order_release);
-		TFD::ForceGreet::BeginAfterPleasure(speaker);
+		TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(speaker);
 
 		spdlog::info("[TFD][InCombatGreet] AfterPleasure speaker={:08X} reason={}", formID, reason ? reason : "after_pleasure");
 		return true;
@@ -302,7 +302,7 @@ namespace TFD::InCombatGreet
 		const auto formID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
 		ReleaseTrackedSession(ResolveReleaseReason(reason));
 		ResetRuntime("cancel");
-		TFD::ForceGreet::Cancel();
+		TFD::InteractionRouter::DialogueOpen::Cancel();
 		g_state.store(State::Idle, std::memory_order_release);
 
 		spdlog::info("[TFD][InCombatGreet] CancelAll speaker={:08X} reason={}", formID, reason ? reason : "-");

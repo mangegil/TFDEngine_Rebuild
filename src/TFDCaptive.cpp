@@ -1,7 +1,7 @@
 #include "TFDCaptive.h"
+#include "TFDCaptiveGreet.h"
 
 #include "TFDActorScan.h"
-#include "TFDHostilityController.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDSettings.h"
@@ -1257,6 +1257,10 @@ namespace TFD::Captive
 		}
 
 		ApplyCallCaptorCalmBubble(player, captor, 12288.0f);
+		if (!TFD::CaptiveGreet::Begin(captor, "call_captor_hotkey")) {
+			spdlog::warn("[TFD][Captive] Call Captor greet failed actor={:08X}", captor->GetFormID());
+			return false;
+		}
 		if (outCaptor) {
 			*outCaptor = captor;
 		}

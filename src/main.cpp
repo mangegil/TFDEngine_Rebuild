@@ -18,10 +18,12 @@
 #include "TFDLocation.h"
 #include "TFDFactionManager.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDCaptiveGreet.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
+#include "TFDRescueGreet.h"
 #include "TFDHostilityController.h"
 #include "TFDHostilityHooks.h"
 #include "TFDTeammateManager.h"
@@ -82,6 +84,8 @@ static void QueueHud(const char* text)
 static void ResetTransientStateForLoad()
 {
     TFD::PreCombatGreet::CancelAll();
+    TFD::CaptiveGreet::Reset();
+    TFD::RescueGreet::Reset();
     TFD::InCombat::ResetForLoad();
     TFD::InCombatGreet::Reset();
     TFD::Bleedout::ResetForLoad();
@@ -128,6 +132,8 @@ static void InitOnceAfterLoad()
     TFD::Bleedout::Install();
     TFD::BleedoutGreet::Install();
     TFD::PreCombatGreet::Install();
+    TFD::CaptiveGreet::Install();
+    TFD::RescueGreet::Install();
     TFD::TeammateManager::Install();
 
     QueueHud("TFDEngine: Init OK (after load)");
