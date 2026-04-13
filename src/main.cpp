@@ -95,7 +95,7 @@ static void ResetTransientStateForLoad()
     TFD::DefeatMonitor::ResetGrace();
     TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
 
-    spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, pacify cleared)");
+    spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, suppression cleared)");
 }
 
 static constexpr std::uint32_t kSerializationID = 'TFDE';

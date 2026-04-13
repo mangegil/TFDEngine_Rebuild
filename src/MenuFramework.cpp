@@ -906,11 +906,6 @@ namespace TFDMenu
 			RenderNearbyBedRefs(player);
 		}
 
-		// Source of truth captive = native defeat monitor
-		static bool IsCaptivePhase()
-		{
-			return TFD::DefeatMonitor::IsCaptivePhase();
-		}
 
 		static std::uint32_t GetCaptivePhaseRaw()
 		{
@@ -1686,7 +1681,7 @@ namespace TFDMenu
 								!ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
-							if (player && !TFD::DefeatMonitor::IsCaptivePhase()) {
+							if (player && !TFD::Captive::IsStandardCaptiveActive()) {
 								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(220.0f)) {
 									spdlog::info("[TFD][Menu] activate intercepted for defeated dialogue target={:08X}", defeatedTalkTarget->GetFormID());
 									RE::DebugNotification("TFD: Defeated Dialogue");

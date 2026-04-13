@@ -9,6 +9,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <string_view>
+#include <limits>
+#include <cmath>
 #include <cstdint>
 #include <exception>
 #include <future>
@@ -21,6 +24,8 @@
 
 #include "TFDActorScan.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDFlowController.h"
+#include "TFDSettings.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 
@@ -638,6 +643,82 @@ namespace
     }
 }
 
+
+namespace TFD::TeammateManager::BridgeInternal
+{
+        constexpr const char* kDefeatedHumanoidRecruitEvent = "TFDDefeatedHumanoidRecruit";
+        constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
+        constexpr double kDefeatedReentrySuppressSeconds = 6.0;
+
+        inline RuntimeProviders g_runtimeProviders{};
+
+        class DefeatedRecruitEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+        {
+        public:
+            RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
+            {
+                if (!ev) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                std::string_view name(ev->eventName);
+                if (name.empty() || name != kDefeatedHumanoidRecruitEvent) {
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                auto* actor = g_runtimeProviders.resolvePendingDefeatedDialogueTarget ? g_runtimeProviders.resolvePendingDefeatedDialogueTarget() : nullptr;
+                if (!actor) {
+                    spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit event ignored reason=no_pending_target");
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                const bool ok = TFD::TeammateManager::RecruitDefeatedHumanoidAsTeammate(actor);
+                spdlog::info("[TFD][TeammateManager] defeated humanoid recruit event actor={} ok={}", static_cast<std::uint32_t>(actor->GetFormID()), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+        };
+
+        inline DefeatedRecruitEventSink g_defeatedRecruitEventSink{};
+
+        bool HasFollowerAnchorFaction(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDisabled()) {
+                return false;
+            }
+            AliasInternal::ResolveRegistry();
+            if (AliasInternal::g_registry.currentFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.currentFollowerFaction)) {
+                return true;
+            }
+            if (AliasInternal::g_registry.playerFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.playerFollowerFaction)) {
+                return true;
+            }
+            return false;
+        }
+
+        std::vector<RE::Actor*> CollectRegisteredActors()
+        {
+            AliasInternal::ResolveRegistry();
+            std::vector<RE::Actor*> out;
+            out.reserve(AliasInternal::g_registry.teammateAliases.size());
+            for (auto* alias : AliasInternal::g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+                auto* actor = alias->GetActorReference();
+                if (!actor || actor->IsDisabled()) {
+                    continue;
+                }
+                out.push_back(actor);
+            }
+            return out;
+        }
+
+        float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b)
+        {
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float dz = a.z - b.z;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+    }
+
 namespace TFD::TeammateManager
 {
     void Install()
@@ -666,6 +747,10 @@ namespace TFD::TeammateManager
             spdlog::warn("[TFD][TeammateManager] MessagingInterface null");
         }
 
+        if (auto* src = SKSE::GetModCallbackEventSource()) {
+            src->AddEventSink(&BridgeInternal::g_defeatedRecruitEventSink);
+        }
+
         AliasInternal::g_running.store(true, std::memory_order_release);
         AliasInternal::g_tickPending.store(false, std::memory_order_release);
         AliasInternal::g_worker = std::thread([]() { AliasInternal::WorkerLoop(); });
@@ -682,6 +767,10 @@ namespace TFD::TeammateManager
             AliasInternal::g_worker.join();
         }
         AliasInternal::g_tickPending.store(false, std::memory_order_release);
+        if (auto* src = SKSE::GetModCallbackEventSource()) {
+            src->RemoveEventSink(&BridgeInternal::g_defeatedRecruitEventSink);
+        }
+        BridgeInternal::g_runtimeProviders = {};
         spdlog::info("[TFD][TeammateManager] shutdown");
     }
 
@@ -692,6 +781,201 @@ namespace TFD::TeammateManager
     std::size_t RestoreNow()
     {
         return RestoreInternal::RestorePass().restored;
+    }
+
+    void InstallRuntimeProviders(RuntimeProviders providers)
+    {
+        BridgeInternal::g_runtimeProviders = std::move(providers);
+    }
+
+    void ResetRuntimeProviders()
+    {
+        BridgeInternal::g_runtimeProviders = {};
+    }
+
+    bool IsActiveFollowerActor(RE::Actor* actor)
+    {
+        return AliasInternal::IsValidTeammate(actor);
+    }
+
+    std::vector<RE::Actor*> CollectRegisteredTeammates()
+    {
+        return BridgeInternal::CollectRegisteredActors();
+    }
+
+    std::vector<RE::Actor*> CollectKnownTeammates(float radius)
+    {
+        auto* player = AliasInternal::Player();
+        std::vector<RE::Actor*> out;
+        if (!player) {
+            return out;
+        }
+
+        std::unordered_set<RE::FormID> seen;
+        const float maxRadius = radius > 0.0f ? (std::max)(radius, 5000.0f) : 5000.0f;
+
+        for (auto* actor : CollectRegisteredTeammates()) {
+            if (!actor || actor == player || actor->IsDisabled()) {
+                continue;
+            }
+            if (radius > 0.0f) {
+                const float dist = BridgeInternal::Distance3D(actor->GetPosition(), player->GetPosition());
+                if (dist > maxRadius) {
+                    continue;
+                }
+            }
+            seen.insert(actor->GetFormID());
+            out.push_back(actor);
+        }
+
+        TFD::ActorScan::Rescan(maxRadius, false);
+        const auto count = TFD::ActorScan::GetCount();
+        auto* pCell = player->GetParentCell();
+        for (int i = 0; i < count; ++i) {
+            auto entry = TFD::ActorScan::GetEntry(i);
+            auto sp = entry.actor.get();
+            auto* actor = sp.get();
+            if (!actor || actor == player || actor->IsDisabled()) {
+                continue;
+            }
+            if (actor->GetParentCell() != pCell) {
+                continue;
+            }
+            if (entry.dist > maxRadius) {
+                continue;
+            }
+            if (!actor->IsPlayerTeammate() && !BridgeInternal::HasFollowerAnchorFaction(actor)) {
+                continue;
+            }
+            if (!seen.insert(actor->GetFormID()).second) {
+                continue;
+            }
+            out.push_back(actor);
+        }
+
+        return out;
+    }
+
+    FollowerResolution ResolveFollowerCandidates(float radius)
+    {
+        FollowerResolution result{};
+        auto* player = AliasInternal::Player();
+        if (!player) {
+            return result;
+        }
+
+        float bestStandingDist = std::numeric_limits<float>::max();
+        float bestDownedDist = std::numeric_limits<float>::max();
+        for (auto* actor : CollectRegisteredTeammates()) {
+            if (!actor || actor == player) {
+                continue;
+            }
+            const float dist = BridgeInternal::Distance3D(actor->GetPosition(), player->GetPosition());
+            if (radius > 0.0f && dist > (std::max)(radius, 5000.0f)) {
+                continue;
+            }
+            const bool downed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+            if (!downed) {
+                if (dist < bestStandingDist) {
+                    bestStandingDist = dist;
+                    result.standing = actor;
+                }
+            } else if (dist < bestDownedDist) {
+                bestDownedDist = dist;
+                result.downed = actor;
+            }
+        }
+        return result;
+    }
+
+    std::vector<RE::Actor*> CollectStandingFollowers(float radius)
+    {
+        std::vector<RE::Actor*> out;
+        for (auto* actor : CollectKnownTeammates(radius)) {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                continue;
+            }
+            if (TFD::DefeatMonitor::IsThresholdDownedActor(actor)) {
+                continue;
+            }
+            out.push_back(actor);
+        }
+        return out;
+    }
+
+    void RecoverVictoryTeammates()
+    {
+        for (auto* actor : CollectRegisteredTeammates()) {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                continue;
+            }
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+            }
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->StopCombatAndAlarmOnActor(actor, false);
+            }
+            if (actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(false);
+            }
+
+            const bool isLockedAlly = BridgeInternal::g_runtimeProviders.hasAllyBleedLock ? BridgeInternal::g_runtimeProviders.hasAllyBleedLock(actor) : false;
+            const bool isBleedingOut = BridgeInternal::g_runtimeProviders.isBleedingOutActor ? BridgeInternal::g_runtimeProviders.isBleedingOutActor(actor) : false;
+            const bool isDown = isLockedAlly || isBleedingOut || TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+            if (!isDown) {
+                continue;
+            }
+            if (BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct) {
+                BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct(actor,
+                    TFD::Settings::GetAllyDownedThresholdPct(),
+                    0.12f,
+                    0.58f,
+                    0.92f,
+                    45.0f,
+                    "victory_teammate_recover");
+            }
+        }
+    }
+
+    bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+        if (BridgeInternal::g_runtimeProviders.isDialogueCapableDefeatedEnemy && !BridgeInternal::g_runtimeProviders.isDialogueCapableDefeatedEnemy(actor)) {
+            return false;
+        }
+        if (BridgeInternal::g_runtimeProviders.getDefeatedEnemyRemainingSeconds && BridgeInternal::g_runtimeProviders.getDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
+            return false;
+        }
+        if (!TFD::FlowController::QueueBridgeModEvent(BridgeInternal::kHumanoidTeammateAssignEvent, actor)) {
+            spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=bridge_assign_failed", actor->GetFormID());
+            return false;
+        }
+        if (BridgeInternal::g_runtimeProviders.suppressDefeatedReentry) {
+            BridgeInternal::g_runtimeProviders.suppressDefeatedReentry(actor, BridgeInternal::kDefeatedReentrySuppressSeconds, "defeated_humanoid_recruit");
+        }
+        if (BridgeInternal::g_runtimeProviders.releaseBleedLock) {
+            BridgeInternal::g_runtimeProviders.releaseBleedLock(actor, "defeated_humanoid_recruit", true);
+        }
+        if (BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct) {
+            BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct(actor,
+                TFD::Settings::GetEnemyDownedThresholdPct(),
+                0.12f,
+                0.58f,
+                0.92f,
+                45.0f,
+                "defeated_humanoid_recruit");
+        }
+        if (actor->IsInCombat()) {
+            actor->StopCombat();
+        }
+        actor->DrawWeaponMagicHands(false);
+        if (BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget) {
+            BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget();
+        }
+        spdlog::info("[TFD][TeammateManager] defeated humanoid recruit actor={:08X}", actor->GetFormID());
+        return true;
     }
 
     bool IsCreatureCompanion(RE::Actor* actor)

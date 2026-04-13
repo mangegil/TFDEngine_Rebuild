@@ -3,6 +3,7 @@
 #include <RE/Skyrim.h>
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -49,7 +50,7 @@ namespace TFD::HostilityController
         double lastCalmRefreshSec{ 0.0 };
         double endTimeSec{ 0.0 };
         double companionExpireGameDays{ 0.0 };
-        double lastPacifyApplySec{ 0.0 };
+        double lastSuppressionApplySec{ 0.0 };
         double lastPackageEvalSec{ 0.0 };
 
         TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
@@ -110,7 +111,7 @@ namespace TFD::HostilityController
         double durationSec,
         float radius);
 
-    bool IsPacified(RE::Actor* actor);
+    bool IsSuppressed(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
 
@@ -150,6 +151,20 @@ namespace TFD::HostilityController
     void ResetCaptiveSuppression();
 
     void ClearAllTemporaryHostility();
+
+    struct BleedTruceRuntimeProviders
+    {
+        std::function<bool(RE::Actor*, RE::Actor*, const char*)> startSessionForSpeaker;
+        std::function<void(TFD::Tame::ReleaseReason)> releaseSession;
+    };
+
+    void InstallBleedTruceRuntimeProviders(BleedTruceRuntimeProviders providers);
+    void ResetBleedTruceRuntimeProviders();
+    bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason);
+    void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason);
+
+    bool HasActiveDialoguePhaseFaction(RE::Actor* actor);
+    bool IsActorTemporarilySuppressed(RE::Actor* actor);
 }
 
 namespace TFD::HostilityController::Runtime

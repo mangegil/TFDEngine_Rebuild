@@ -1,8 +1,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string_view>
+
+namespace RE
+{
+    class Actor;
+    class TESForm;
+}
 
 namespace TFD::FlowController
 {
@@ -114,6 +121,97 @@ namespace TFD::FlowController
         bool locked{ false };
     };
 
+
+    enum class DialogueContextKind : std::uint8_t
+    {
+        None = 0,
+        PreCombat,
+        InCombat,
+        Bleedout,
+        Captive,
+        AfterPleasure,
+        JoinedEnemy
+    };
+
+    enum class PassiveHoldKind : std::uint8_t
+    {
+        None = 0,
+        Dialogue,
+        Grace,
+        Pleasure,
+        Captive,
+        JoinedEnemy
+    };
+
+    struct PassiveRuntimeProviders
+    {
+        std::function<bool()> isBleedoutActive;
+        std::function<bool()> hasReleaseFollowGrace;
+        std::function<RE::Actor* ()> resolveFallbackPassivePrimaryActor;
+        std::function<bool(RE::Actor*)> isActorCoveredByPassiveContext;
+        std::function<void(RE::Actor*, const char*)> cancelReleaseFollowGraceForActor;
+        std::function<void(const char*)> clearAllReleaseFollowGrace;
+        std::function<void()> releaseBleedPlayerAggressionTruce;
+        std::function<void(const char*)> clearAllBleedLocks;
+        std::function<void(RE::Actor*, const char*)> clearBleedBridgeAliases;
+        std::function<void()> clearPendingDialogueTarget;
+    };
+
+    void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers);
+    void ResetPassiveRuntimeProviders();
+
+    struct OutcomeRuntimeProviders
+    {
+        std::function<void(RE::Actor*, double, const char*)> applyReleaseFollowGrace;
+        std::function<void(RE::Actor*, const char*)> removeReleaseFollowGrace;
+        std::function<std::uint32_t()> resolveBleedFlowActorFormID;
+        std::function<bool()> isBleedStateActive;
+        std::function<void(const char*)> preparePlayerForCaptivePleasureScene;
+        std::function<void(const char*)> completeCaptivePleasureHandoff;
+        std::function<void(const char*)> preparePlayerForBleedoutPleasureScene;
+        std::function<void(const char*)> completeBleedPleasureHandoff;
+    };
+
+    void InstallOutcomeRuntimeProviders(OutcomeRuntimeProviders providers);
+    void ResetOutcomeRuntimeProviders();
+    bool HandleOutcomeModEvent(const char* eventName, const char* strArg = nullptr, float numArg = 0.0f, RE::TESForm* sender = nullptr);
+    bool HandlePassiveBreakHitEvent(RE::Actor* causeActor, RE::Actor* targetActor);
+    bool HandlePassiveBreakModEvent(const char* eventName, const char* strArg = nullptr);
+
+    struct BattleObserverRuntimeProviders
+    {
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void()> clearCaptiveResidue;
+        std::function<void()> clearAllFactions;
+        std::function<void()> recoverVictoryTeammates;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void()> clearPendingDialogueTarget;
+        std::function<void(bool)> setPlayerBleedImmune;
+        std::function<void(const char*)> queueNonCaptiveChoice;
+        std::function<RE::Actor* ()> resolveObservedDownedFollower;
+        std::function<void(RE::Actor*)> armObservedLeftForDeadFallback;
+        std::function<void(const char*)> beginRecoverTransition;
+        std::function<const char* ()> getCurrentFallbackBranchName;
+    };
+
+    void InstallBattleObserverRuntimeProviders(BattleObserverRuntimeProviders providers);
+    void ResetBattleObserverRuntimeProviders();
+    void HandleObservedBattleWin(const char* reason = nullptr);
+    void HandleObservedLeftForDead(const char* reason = nullptr);
+
+    bool QueueBridgeModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f);
+
+    DialogueContextKind GetDialogueContextKind();
+    const char* GetDialogueContextName();
+    bool IsDialogueContextActive();
+    PassiveHoldKind GetPassiveHoldKind();
+    const char* GetPassiveHoldName();
+    bool IsPassiveHoldActive();
+    bool IsPassiveHoldProtectedHandoff();
+    bool IsPleasureLockActive();
+    bool IsPreCombatBlocked();
+    bool HandlePassiveInvalidationAgainstActor(RE::Actor* actor, const char* reason = nullptr, bool severeCrime = false);
+
     class Controller
     {
     public:
@@ -154,6 +252,14 @@ namespace TFD::FlowController
         bool IsCaptiveContext() const;
         bool IsJoinedEnemyMode() const;
         bool IsBleedDecisionActive() const;
+        bool IsCombatOrBleedRootActive() const;
+        bool IsCaptiveEscapeContextActive() const;
+        bool IsPleasureSubFlowActive() const;
+        bool IsAfterPleasureSubFlowActive() const;
+        bool IsInCombatAfterPleasureContextActive() const;
+        bool IsTerminalDialogueGateActive() const;
+        bool BeginCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason);
+        bool BeginCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason);
 
         static const char* ToString(RootFlow value);
         static const char* ToString(DecisionGate value);

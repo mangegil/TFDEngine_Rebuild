@@ -9,6 +9,7 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDFactionManager.h"
 
 #ifdef SKYRIM_SUPPORT_AE
 #define TFD_RELID(SE, AE) REL::ID(AE)
@@ -49,7 +50,7 @@ namespace TFD::HostilityHooks
                 if (!actor) {
                     return true;
                 }
-                if (TFD::HostilityController::IsPacified(actor)) {
+                if (TFD::HostilityController::IsSuppressed(actor)) {
                     return true;
                 }
                 return !TFD::DefeatMonitor::IsThresholdCombatTargetValid(actor);
@@ -62,7 +63,7 @@ namespace TFD::HostilityHooks
 
             static bool IsReleaseGraceActor(RE::Actor* actor)
             {
-                return actor && TFD::DefeatMonitor::HasReleaseFollowGraceForActor(actor);
+                return actor && TFD::FactionManager::HasReleaseFollowGrace(actor);
             }
 
             static void ClearInvalidCombatTarget(RE::Character* actor)
@@ -130,7 +131,7 @@ namespace TFD::HostilityHooks
 
             static void UpdateCombat(RE::Character* actor)
             {
-                if (actor && (TFD::HostilityController::IsPacified(actor) || IsReleaseGraceActor(actor))) {
+                if (actor && (TFD::HostilityController::IsSuppressed(actor) || IsReleaseGraceActor(actor))) {
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         const bool runDetection = process->runDetection;
                         process->runDetection = false;
@@ -173,8 +174,8 @@ namespace TFD::HostilityHooks
                 float& unk09,
                 float& unk10)
             {
-                if ((target && (TFD::HostilityController::IsPacified(target) || IsReleaseGraceActor(target))) ||
-                    (viewer && (TFD::HostilityController::IsPacified(viewer) || IsReleaseGraceActor(viewer)))) {
+                if ((target && (TFD::HostilityController::IsSuppressed(target) || IsReleaseGraceActor(target))) ||
+                    (viewer && (TFD::HostilityController::IsSuppressed(viewer) || IsReleaseGraceActor(viewer)))) {
                     detectVal = -1000;
                     return nullptr;
                 }

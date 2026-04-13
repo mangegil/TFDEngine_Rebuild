@@ -229,10 +229,10 @@ namespace TFD::BleedoutGreet
 		if (!CanTimeoutRearm() || prevDialogueOpen || hasTerminalCommit || pleasureBlocking || speakerFormID == 0 || !reopenFn) {
 			return false;
 		}
-		if (!reopenFn("forcegreet_timeout_rearm")) {
+		if (!reopenFn("dialogue_timeout_rearm")) {
 			return false;
 		}
-		NoteTimeoutRearm(now + std::chrono::milliseconds(650), "forcegreet_timeout_rearm");
+		NoteTimeoutRearm(now + std::chrono::milliseconds(650), "dialogue_timeout_rearm");
 		spdlog::info("[TFD][BleedoutGreet] timeout watchdog reopen speaker={:08X} retry={}",
 			speakerFormID,
 			GetRetryCount());

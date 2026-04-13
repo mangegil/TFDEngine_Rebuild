@@ -28,7 +28,7 @@ namespace TFD::InCombatGreet
 			bool stickyReopenPending = false;
 			Clock::time_point nextRetry{};
 			int retryCount = 0;
-			RE::FormID pacifySessionId = 0;
+			RE::FormID truceSessionId = 0;
 			bool assignSent = false;
 		};
 
@@ -114,7 +114,7 @@ namespace TFD::InCombatGreet
 			g_runtime.stickyReopenPending = false;
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
-			g_runtime.pacifySessionId = 0;
+			g_runtime.truceSessionId = 0;
 			g_runtime.assignSent = false;
 		}
 
@@ -124,9 +124,9 @@ namespace TFD::InCombatGreet
 			bool assignSent = false;
 			{
 				std::scoped_lock lk(g_runtime.lock);
-				sessionId = g_runtime.pacifySessionId;
+				sessionId = g_runtime.truceSessionId;
 				assignSent = g_runtime.assignSent;
-				g_runtime.pacifySessionId = 0;
+				g_runtime.truceSessionId = 0;
 				g_runtime.assignSent = false;
 			}
 
@@ -256,7 +256,7 @@ namespace TFD::InCombatGreet
 
 		{
 			std::scoped_lock lk(g_runtime.lock);
-			g_runtime.pacifySessionId = result.sessionId;
+			g_runtime.truceSessionId = result.sessionId;
 			g_runtime.assignSent = result.dialogueRequested;
 		}
 

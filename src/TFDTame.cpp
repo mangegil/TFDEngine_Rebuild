@@ -1,6 +1,7 @@
 #include "TFDTame.h"
 
 #include "TFDActorScan.h"
+#include "TFDBleedout.h"
 #include "TFDHostilityController.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
@@ -28,6 +29,8 @@ namespace TFD::Tame
         constexpr float kLocalHostileSplashRadiusMin = 1000.0f;
         constexpr float kLocalHostileSplashRadiusMax = 1800.0f;
         constexpr std::size_t kTamePackMaxMembers = 6;
+
+        inline RuntimeProviders g_runtimeProviders{};
 
         auto& Entries()
         {
@@ -817,6 +820,87 @@ namespace TFD::Tame
             primarySessionId.value_or(0));
 
         return primarySessionId;
+    }
+
+    void InstallRuntimeProviders(RuntimeProviders providers)
+    {
+        g_runtimeProviders = std::move(providers);
+    }
+
+    void ResetRuntimeProviders()
+    {
+        g_runtimeProviders = {};
+    }
+
+    void ReleaseBleedNoSpeakerTameSession(const char* reason)
+    {
+        if (g_runtimeProviders.releaseBleedNoSpeakerTameSession) {
+            g_runtimeProviders.releaseBleedNoSpeakerTameSession(reason);
+            return;
+        }
+        TFD::Bleedout::ReleaseNoSpeakerTameSession(reason);
+    }
+
+    bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason)
+    {
+        if (g_runtimeProviders.tryEnsureBleedNoSpeakerTameSession) {
+            return g_runtimeProviders.tryEnsureBleedNoSpeakerTameSession(actors, reason);
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return false;
+        }
+        return TFD::Bleedout::TryEnsureNoSpeakerTameSession(actors, player, reason, {});
+    }
+
+    std::chrono::steady_clock::time_point GetBleedNoSpeakerTameLastAttempt()
+    {
+        return TFD::Bleedout::GetNoSpeakerTameLastAttempt();
+    }
+
+    void SetBleedNoSpeakerTameLastAttempt(std::chrono::steady_clock::time_point when)
+    {
+        TFD::Bleedout::SetNoSpeakerTameLastAttempt(when);
+    }
+
+    bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || !actor) {
+            return false;
+        }
+        if (g_runtimeProviders.isCreatureDefeatedEnemy && !g_runtimeProviders.isCreatureDefeatedEnemy(actor)) {
+            return false;
+        }
+        if (g_runtimeProviders.getDefeatedEnemyRemainingSeconds && g_runtimeProviders.getDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
+            return false;
+        }
+
+        auto session = BeginSession(player, actor, nowSec, false, false);
+        if (!session.has_value()) {
+            spdlog::warn("[TFD][Tame] defeated creature recruit failed actor={:08X} reason=begin_tame_failed", actor->GetFormID());
+            return false;
+        }
+        if (!PromoteToCompanion(actor, 24.0)) {
+            Release(actor, ReleaseReason::Generic);
+            spdlog::warn("[TFD][Tame] defeated creature recruit failed actor={:08X} reason=promote_failed", actor->GetFormID());
+            return false;
+        }
+        if (g_runtimeProviders.suppressDefeatedReentry) {
+            g_runtimeProviders.suppressDefeatedReentry(actor, 6.0, "defeated_creature_recruit");
+        }
+        if (g_runtimeProviders.releaseBleedLock) {
+            g_runtimeProviders.releaseBleedLock(actor, "defeated_creature_recruit", true);
+        }
+        if (g_runtimeProviders.restoreActorHealthToSafePct) {
+            g_runtimeProviders.restoreActorHealthToSafePct(actor, TFD::Settings::GetEnemyDownedThresholdPct(), 0.12f, 0.58f, 0.92f, 45.0f, "defeated_creature_recruit");
+        }
+        if (actor->IsInCombat()) {
+            actor->StopCombat();
+        }
+        actor->DrawWeaponMagicHands(false);
+        spdlog::info("[TFD][Tame] defeated creature recruit actor={:08X}", actor->GetFormID());
+        return true;
     }
 
     std::vector<ActiveSnapshot> GetActiveSnapshots(double nowSec)

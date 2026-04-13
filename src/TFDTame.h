@@ -2,7 +2,9 @@
 
 #include <RE/Skyrim.h>
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -38,6 +40,17 @@ namespace TFD::Tame
     {
         Calm = 0,
         Teammate
+    };
+
+    struct RuntimeProviders
+    {
+        std::function<bool(RE::Actor*)> isCreatureDefeatedEnemy;
+        std::function<double(RE::Actor*)> getDefeatedEnemyRemainingSeconds;
+        std::function<void(RE::Actor*, double, const char*)> suppressDefeatedReentry;
+        std::function<void(RE::Actor*, const char*, bool)> releaseBleedLock;
+        std::function<void(RE::Actor*, float, float, float, float, float, const char*)> restoreActorHealthToSafePct;
+        std::function<void(const char*)> releaseBleedNoSpeakerTameSession;
+        std::function<bool(const std::vector<RE::Actor*>&, const char*)> tryEnsureBleedNoSpeakerTameSession;
     };
 
     struct FeedOptionSnapshot
@@ -89,6 +102,14 @@ namespace TFD::Tame
         double nowSec,
         bool allowDialogue = false,
         bool allowLocalSplash = false);
+
+    void InstallRuntimeProviders(RuntimeProviders providers);
+    void ResetRuntimeProviders();
+    void ReleaseBleedNoSpeakerTameSession(const char* reason);
+    bool TryEnsureBleedNoSpeakerTameSession(const std::vector<RE::Actor*>& actors, const char* reason);
+    std::chrono::steady_clock::time_point GetBleedNoSpeakerTameLastAttempt();
+    void SetBleedNoSpeakerTameLastAttempt(std::chrono::steady_clock::time_point when);
+    bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec);
 
     std::vector<ActiveSnapshot> GetActiveSnapshots(double nowSec = 0.0);
     std::vector<FeedOptionSnapshot> GetFeedOptions(RE::Actor* actor, FeedAction action);

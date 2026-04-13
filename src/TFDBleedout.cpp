@@ -1140,7 +1140,7 @@ namespace TFD::Bleedout
 			return false;
 		}
 		g_truceSessionId = *sessionId;
-		ApplyForceGreetOverdrive(player, speaker, reason ? reason : "bleed_retry", false, state, handlers);
+		ApplyDialogueOverdrive(player, speaker, reason ? reason : "bleed_retry", false, state, handlers);
 		speaker->EvaluatePackage(false, true);
 		speaker->EvaluatePackage(true, true);
 		spdlog::info("[TFD][Defeat] bleed speaker restart id={} actor={:08X} reason={}",
@@ -1150,7 +1150,7 @@ namespace TFD::Bleedout
 		return true;
 	}
 
-	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
+	void ApplyDialogueOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartDialogue, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
 	{
 		if (!player || !speaker || speaker->IsDead() || speaker->IsDisabled()) {
 			return;
@@ -1173,9 +1173,9 @@ namespace TFD::Bleedout
 		}
 
 		if (!IsCaptorAliasPrimary(speaker)) {
-			BindCaptorAliases(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+			BindCaptorAliases(speaker, reason ? reason : "bleed_dialogue_overdrive");
 		}
-		PrimeBridgeActor(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+		PrimeBridgeActor(speaker, reason ? reason : "bleed_dialogue_overdrive");
 
 		if (state.bleedCrowdAssigned) state.bleedCrowdAssigned->clear();
 		if (state.bleedLastCrowdAssign) *state.bleedLastCrowdAssign = Clock::now();
@@ -1186,7 +1186,7 @@ namespace TFD::Bleedout
 			burstId = TFD::HostilityController::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
 		}
 		else {
-			spdlog::info("[TFD][Defeat] bleed forcegreet preserve dialogue session speaker={:08X} reason={}",
+			spdlog::info("[TFD][Defeat] bleed dialogue overdrive preserve dialogue session speaker={:08X} reason={}",
 				speaker->GetFormID(),
 				reason ? reason : "unknown");
 		}
@@ -1197,17 +1197,17 @@ namespace TFD::Bleedout
 		speaker->EvaluatePackage(false, true);
 		speaker->EvaluatePackage(true, true);
 
-		if (restartForceGreet && handlers.resetGreetRuntime) {
-			handlers.resetGreetRuntime(reason ? reason : "bleed_forcegreet_overdrive");
+		if (restartDialogue && handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime(reason ? reason : "bleed_dialogue_overdrive");
 		}
-		if (restartForceGreet) {
-			TFD::BleedoutGreet::Begin(speaker, reason ? reason : "bleed_forcegreet_overdrive");
+		if (restartDialogue) {
+			TFD::BleedoutGreet::Begin(speaker, reason ? reason : "bleed_dialogue_overdrive");
 		}
 
-		spdlog::info("[TFD][Defeat] bleed forcegreet overdrive speaker={:08X} crowdSize=1 burst={} restartFG={} reason={}",
+		spdlog::info("[TFD][Defeat] bleed dialogue overdrive speaker={:08X} crowdSize=1 burst={} restartDialogue={} reason={}",
 			speaker->GetFormID(),
 			burstId.has_value() ? 1 : 0,
-			restartForceGreet ? 1 : 0,
+			restartDialogue ? 1 : 0,
 			reason ? reason : "unknown");
 	}
 
@@ -1264,7 +1264,7 @@ namespace TFD::Bleedout
 			return false;
 		}
 		if (g_noSpeakerTamePrimaryId == primary->GetFormID() &&
-			TFD::HostilityController::IsPacified(primary) &&
+			TFD::HostilityController::IsSuppressed(primary) &&
 			TFD::HostilityController::GetMode(primary) == TFD::HostilityController::Mode::Tame) {
 			return true;
 		}
@@ -1780,8 +1780,8 @@ namespace TFD::Bleedout
 		if (handlers.clearBridgeAliases) {
 			handlers.clearBridgeAliases(why);
 		}
-		if (handlers.clearFactionMask) {
-			handlers.clearFactionMask();
+		if (handlers.clearFactionState) {
+			handlers.clearFactionState();
 		}
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();
@@ -2080,8 +2080,8 @@ namespace TFD::Bleedout
 		if (handlers.clearPendingCinematicFadeIn) {
 			handlers.clearPendingCinematicFadeIn();
 		}
-		if (handlers.clearFactionMask) {
-			handlers.clearFactionMask();
+		if (handlers.clearFactionState) {
+			handlers.clearFactionState();
 		}
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();
@@ -2301,7 +2301,7 @@ namespace TFD::Bleedout
 				spdlog::info("[TFD][Bleedout] aggressor {:08X} not captive-supported -> pending=noncaptive", aggressor->GetFormID());
 			}
 			else {
-				const bool allowlistSupported = handlers.applyFactionMaskFromAggressor ? handlers.applyFactionMaskFromAggressor(aggressor) : false;
+				const bool allowlistSupported = handlers.applyAllowedFactionFromAggressor ? handlers.applyAllowedFactionFromAggressor(aggressor) : false;
 				const bool hasCaptiveOutcome = handlers.resolveCaptiveMarkerForOutcome ? handlers.resolveCaptiveMarkerForOutcome() : false;
 				float fallbackDistance = 99999.0f;
 				const bool fallbackSupported = !allowlistSupported && handlers.canUseCaptiveFallbackHeuristic &&
@@ -2549,7 +2549,7 @@ namespace TFD::Bleedout
 		auto* actor = RE::TESForm::LookupByID<RE::Actor>(*state.bleedSpeakerId);
 		float dist = 99999.0f;
 		if (!player || !handlers.isReasonableSpeaker || !handlers.isReasonableSpeaker(actor, player, 1400.0f, &dist)) return;
-		if (handlers.applyForceGreetOverdrive) handlers.applyForceGreetOverdrive(player, actor, "speaker_prime_retry", true);
+		if (handlers.applyDialogueOverdrive) handlers.applyDialogueOverdrive(player, actor, "speaker_prime_retry", true);
 		if (state.bleedSpeakerKickLast) *state.bleedSpeakerKickLast = now;
 		if (state.bleedSpeakerKickCount) ++(*state.bleedSpeakerKickCount);
 	}

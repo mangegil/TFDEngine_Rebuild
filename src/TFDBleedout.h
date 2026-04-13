@@ -187,7 +187,7 @@ namespace TFD::Bleedout
 		std::function<bool(RE::Actor*, RE::Actor*, float, float*)> isReasonableSpeaker;
 		std::function<std::vector<RE::Actor*>(float, RE::Actor*, bool)> collectBleedoutCrowd;
 		std::function<bool(RE::Actor*)> isCaptiveSupportedAggressor;
-		std::function<bool(RE::Actor*)> applyFactionMaskFromAggressor;
+		std::function<bool(RE::Actor*)> applyAllowedFactionFromAggressor;
 		std::function<bool()> resolveCaptiveMarkerForOutcome;
 		std::function<bool(RE::Actor*, RE::Actor*, bool, float*)> canUseCaptiveFallbackHeuristic;
 		std::function<bool(const std::vector<RE::Actor*>&, const char*)> tryEnsureNoSpeakerTameSession;
@@ -200,7 +200,7 @@ namespace TFD::Bleedout
 		std::function<RE::Actor*(float)> resolveEscapeBreakPreferredAggressor;
 		std::function<bool(RE::Actor*, RE::Actor*, const char*)> startTruceSessionForSpeaker;
 		std::function<bool(RE::Actor*, RE::Actor*, float*)> canUseAggressorForBleedoutGreet;
-		std::function<void(RE::Actor*, RE::Actor*, const char*, bool)> applyForceGreetOverdrive;
+		std::function<void(RE::Actor*, RE::Actor*, const char*, bool)> applyDialogueOverdrive;
 	};
 
 	void StartRuntimeWindow(RuntimeHostStateRefs state, RE::Actor* player, RE::Actor* aggressor, const RuntimeHostHandlers& handlers);
@@ -239,7 +239,7 @@ namespace TFD::Bleedout
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
 	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers);
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
-	void ApplyForceGreetOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartForceGreet, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
+	void ApplyDialogueOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartDialogue, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	bool PromoteNextSpeakerFromTruceQueue(RE::TESQuest* truceQuest, const std::array<RE::BGSRefAlias*, 10>& truceAliases, RE::Actor* player, const char* reason, bool rejectCurrent, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	void MaintainPrimaryCaptorBinding(bool dialogueOpen, RuntimeHostStateRefs state);
 	void ReleaseTruceSession(TFD::HostilityController::ReleaseReason reason, std::uint32_t* bleedSpeakerId = nullptr);
@@ -354,7 +354,7 @@ namespace TFD::Bleedout
 		std::function<bool(TerminalCommit, const char*)> tryBeginTerminalCommit;
 		std::function<void()> clearPendingCinematicFadeIn;
 		std::function<void(const char*)> clearBridgeAliases;
-		std::function<void()> clearFactionMask;
+		std::function<void()> clearFactionState;
 		std::function<void()> clearEscapeContext;
 		std::function<void()> resetLockpickWatch;
 		std::function<void(bool)> setGraceActive;
@@ -425,7 +425,7 @@ namespace TFD::Bleedout
 		std::function<bool(const char*)> beginResolvedNoMarkerFallback;
 		std::function<void(const char*)> clearBridgeAliases;
 		std::function<void()> clearPendingCinematicFadeIn;
-		std::function<void()> clearFactionMask;
+		std::function<void()> clearFactionState;
 		std::function<void()> clearEscapeContext;
 		std::function<void()> resetLockpickWatch;
 		std::function<void(bool)> setGraceActive;

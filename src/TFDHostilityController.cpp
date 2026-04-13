@@ -3,6 +3,7 @@
 #include "TFDTame.h"
 
 #include "TFDActorScan.h"
+#include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDFactionManager.h"
 #include "TFDSettings.h"
@@ -22,6 +23,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace TFD::Tame::Internal
@@ -178,6 +180,11 @@ namespace
         }
     }
 
+    namespace BleedTruceInternal
+    {
+        inline TFD::HostilityController::BleedTruceRuntimeProviders g_runtimeProviders{};
+    }
+
     namespace CaptiveSuppressionInternal
     {
         using Clock = std::chrono::steady_clock;
@@ -323,7 +330,7 @@ namespace
                 return;
             }
 
-            if (!TFD::DefeatMonitor::IsCaptivePhase()) {
+            if (!TFD::Captive::IsStandardCaptiveActive()) {
                 RestoreAll();
                 return;
             }
@@ -534,7 +541,7 @@ namespace TFD::HostilityController
         }
 
 
-        double PacifyNowSec()
+        double SuppressionNowSec()
         {
             static const auto t0 = Clock::now();
             return std::chrono::duration<double>(Clock::now() - t0).count();
@@ -550,7 +557,7 @@ namespace TFD::HostilityController
         constexpr double kMaxTameTotalSec = 180.0;
         constexpr double kTruceHiddenFailsafeSec = 120.0;
 
-        constexpr double kPacifyApplyIntervalSec = 0.25;
+        constexpr double kSuppressionApplyIntervalSec = 0.25;
         constexpr double kPackageEvalIntervalSec = 1.0;
 
         constexpr double kRehostileRetryDelaySec = 0.20;
@@ -1260,7 +1267,7 @@ namespace TFD::HostilityController
             return false;
         }
 
-        bool IsPlayerArmedForPacify(RE::Actor* player)
+        bool IsPlayerArmedForSuppression(RE::Actor* player)
         {
             if (!player) {
                 return true;
@@ -1467,13 +1474,13 @@ namespace TFD::HostilityController
             return actorIds;
         }
 
-        void ApplyPacify(RE::Actor* actor, Entry& entry, double nowSec)
+        void ApplySuppression(RE::Actor* actor, Entry& entry, double nowSec)
         {
             if (!IsActorStillValid(actor)) {
                 return;
             }
 
-            if (entry.disposition != TameDisposition::Companion && (nowSec - entry.lastPacifyApplySec) >= kPacifyApplyIntervalSec) {
+            if (entry.disposition != TameDisposition::Companion && (nowSec - entry.lastSuppressionApplySec) >= kSuppressionApplyIntervalSec) {
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     const bool runDetection = process->runDetection;
                     process->runDetection = false;
@@ -1488,7 +1495,7 @@ namespace TFD::HostilityController
                     actor->DrawWeaponMagicHands(false);
                 }
 
-                entry.lastPacifyApplySec = nowSec;
+                entry.lastSuppressionApplySec = nowSec;
             }
 
             if ((nowSec - entry.lastPackageEvalSec) >= kPackageEvalIntervalSec) {
@@ -1497,7 +1504,7 @@ namespace TFD::HostilityController
             }
         }
 
-        void RemovePacify(RE::Actor* actor, Entry& entry)
+        void RemoveSuppression(RE::Actor* actor, Entry& entry)
         {
             if (!actor) {
                 return;
@@ -1656,7 +1663,7 @@ namespace TFD::HostilityController
             entry.startTimeSec = startTimeSec;
             entry.endTimeSec = endTimeSec;
             entry.companionExpireGameDays = companionExpireGameDays;
-            entry.lastPacifyApplySec = 0.0;
+            entry.lastSuppressionApplySec = 0.0;
             entry.lastPackageEvalSec = 0.0;
             entry.disposition = disposition;
             entry.temporaryTeammateApplied = temporaryTeammateApplied;
@@ -1701,7 +1708,7 @@ namespace TFD::HostilityController
             if (session.primaryMode == Mode::Tame && session.disposition == TameDisposition::Companion) {
                 session.armedSinceSec = 0.0;
             }
-            else if ((nowSec - session.startTimeSec) >= kArmedGraceSec && IsPlayerArmedForPacify(player)) {
+            else if ((nowSec - session.startTimeSec) >= kArmedGraceSec && IsPlayerArmedForSuppression(player)) {
                 if (session.armedSinceSec <= 0.0) {
                     session.armedSinceSec = nowSec;
                 }
@@ -1786,7 +1793,7 @@ namespace TFD::HostilityController
                 return std::nullopt;
             }
 
-            nowSec = PacifyNowSec();
+            nowSec = SuppressionNowSec();
             const double effectiveDurationSec = ResolveSessionDurationSec(mode, durationSec);
             const double endTimeSec =
                 IsFiniteDurationMode(mode) ?
@@ -1804,7 +1811,7 @@ namespace TFD::HostilityController
                 }
             }
 
-            if (IsPlayerArmedForPacify(player)) {
+            if (IsPlayerArmedForSuppression(player)) {
                 const bool allowForcedSheath = (mode == Mode::TruceInCombat || mode == Mode::TrucePreCombat);
                 if (allowForcedSheath) {
                     player->DrawWeaponMagicHands(false);
@@ -2123,7 +2130,7 @@ namespace TFD::HostilityController
                     continue;
                 }
                 if (auto* actor = ResolveActor(actorId)) {
-                    ApplyPacify(actor, it->second, nowSec);
+                    ApplySuppression(actor, it->second, nowSec);
                 }
             }
 
@@ -2176,6 +2183,74 @@ namespace TFD::HostilityController
 
 }  // namespace TFD::HostilityController
 
+namespace TFD::HostilityController
+{
+    void InstallBleedTruceRuntimeProviders(BleedTruceRuntimeProviders providers)
+    {
+        BleedTruceInternal::g_runtimeProviders = std::move(providers);
+    }
+
+    void ResetBleedTruceRuntimeProviders()
+    {
+        BleedTruceInternal::g_runtimeProviders = {};
+    }
+
+    bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason)
+    {
+        if (!BleedTruceInternal::g_runtimeProviders.startSessionForSpeaker) {
+            spdlog::warn("[TFD][HostilityController] bleed truce start ignored reason=no_runtime_provider");
+            return false;
+        }
+        return BleedTruceInternal::g_runtimeProviders.startSessionForSpeaker(player, speaker, reason ? reason : "unknown");
+    }
+
+    void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason)
+    {
+        if (!BleedTruceInternal::g_runtimeProviders.releaseSession) {
+            return;
+        }
+        BleedTruceInternal::g_runtimeProviders.releaseSession(reason);
+    }
+
+    bool HasActiveDialoguePhaseFaction(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+        constexpr const char* kPhaseFactionEditorIds[] = {
+            "TFDPreCombatTruceFaction",
+            "TFDInCombatTruceFaction",
+            "TFDBleedOutFaction",
+            "TFDBleedoutFaction",
+            "TFDCaptiveFaction",
+            "TFDWorkingCaptiveFaction",
+            "TFDAfterPleasureFaction",
+            "TFDSaviorFaction"
+        };
+        for (auto* editorID : kPhaseFactionEditorIds) {
+            auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>(editorID);
+            if (faction && actor->IsInFaction(faction)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool IsActorTemporarilySuppressed(RE::Actor* actor)
+    {
+        if (!actor || actor->IsDead() || actor->IsDisabled()) {
+            return false;
+        }
+        if (IsSuppressed(actor)) {
+            return true;
+        }
+        if (TFD::FactionManager::HasReleaseFollowGrace(actor)) {
+            return true;
+        }
+        return HasActiveDialoguePhaseFaction(actor);
+    }
+}
+
 namespace TFD::HostilityController::Runtime
 {
     EntryMap& Entries()
@@ -2190,7 +2265,7 @@ namespace TFD::HostilityController::Runtime
 
     double NowSec()
     {
-        return PacifyNowSec();
+        return SuppressionNowSec();
     }
 
     double GameDays()
@@ -2282,7 +2357,7 @@ namespace TFD::HostilityController
     void Update(double nowSec)
     {
         (void)nowSec;
-        nowSec = PacifyNowSec();
+        nowSec = SuppressionNowSec();
 
         std::vector<std::pair<RE::FormID, ReleaseReason>> sessionsToRelease;
         sessionsToRelease.reserve(g_sessions.size());
@@ -2320,7 +2395,7 @@ namespace TFD::HostilityController
                 continue;
             }
 
-            ApplyPacify(actor, entry, nowSec);
+            ApplySuppression(actor, entry, nowSec);
         }
 
         for (RE::FormID actorId : entriesToErase) {
@@ -2330,7 +2405,7 @@ namespace TFD::HostilityController
             }
 
             if (auto* actor = ResolveActor(actorId)) {
-                RemovePacify(actor, it->second);
+                RemoveSuppression(actor, it->second);
             }
 
             g_entries.erase(it);
@@ -2403,7 +2478,7 @@ namespace TFD::HostilityController
     }
 
 
-    bool IsPacified(RE::Actor* actor)
+    bool IsSuppressed(RE::Actor* actor)
     {
         if (!actor) {
             return false;
@@ -2517,7 +2592,7 @@ namespace TFD::HostilityController
             player = ResolveActor(sessionIt->second.playerId);
         }
 
-        const double releaseNowSec = PacifyNowSec();
+        const double releaseNowSec = SuppressionNowSec();
         const bool suppressRehostile = reason == ReleaseReason::FlowHandoff;
         const bool suppressUnassign = reason == ReleaseReason::FlowHandoff || primarySuppressBridgeEvents;
 
@@ -2529,7 +2604,7 @@ namespace TFD::HostilityController
 
             Entry releasedEntry = it->second;
             if (auto* actor = ResolveActor(actorId)) {
-                RemovePacify(actor, releasedEntry);
+                RemoveSuppression(actor, releasedEntry);
 
                 const bool shouldRehostileTame =
                     releasedEntry.mode == Mode::Tame &&
@@ -2714,7 +2789,7 @@ namespace TFD::HostilityController
             return;
         }
 
-        QueueRehostileRetry(actor, player, 0, reason, PacifyNowSec(), drawWeapon);
+        QueueRehostileRetry(actor, player, 0, reason, SuppressionNowSec(), drawWeapon);
     }
 
     const char* ToString(Mode mode)

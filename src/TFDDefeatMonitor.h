@@ -29,50 +29,17 @@ namespace TFD::DefeatMonitor
 	void SetPendingDefeatedDialogueTarget(RE::Actor* actor);
 	bool HandlePassiveInvalidationAgainstActor(RE::Actor* actor, const char* reason = nullptr);
 
-	enum class DialogueContextKind : std::uint8_t
-	{
-		None = 0,
-		PreCombat,
-		InCombat,
-		Bleedout,
-		Captive,
-		AfterPleasure,
-		JoinedEnemy
-	};
-
-	enum class PassiveHoldKind : std::uint8_t
-	{
-		None = 0,
-		Dialogue,
-		Grace,
-		Pleasure,
-		Captive,
-		JoinedEnemy
-	};
-	bool IsCaptivePhase();
 	std::uint32_t GetCaptivePhaseRaw();
 	const char* GetCaptivePhaseName();
 	bool IsCaptiveFamily();
 	bool IsBleedoutActive();
 	bool HandleBleedoutHotkey();
 	bool IsLeftForDeadRecoveryActive();
-	DialogueContextKind GetDialogueContextKind();
-	const char* GetDialogueContextName();
-	bool IsDialogueContextActive();
-	PassiveHoldKind GetPassiveHoldKind();
-	const char* GetPassiveHoldName();
-	bool IsPassiveHoldActive();
-	bool IsPassiveHoldProtectedHandoff();
-	bool IsPleasureLockActive();
-	bool IsPreCombatBlocked();
 	bool IsPlayerBleedHoldTargetBlocked();
 	bool IsObservedCombatCommitInProgress();
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct = 55.0f);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
-	bool HasReleaseFollowGraceForActor(RE::Actor* actor);
-	void ApplyReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason = nullptr);
-	void RemoveReleaseFollowGraceForSpeakerAndCrowd(RE::Actor* speaker, const char* reason = nullptr);
 	void NoteEnemyTargetingPlayer(RE::Actor* actor);
 	RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
 	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);
@@ -82,5 +49,4 @@ namespace TFD::DefeatMonitor
 	bool IsCreatureDefeatedEnemy(RE::Actor* actor);
 	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor);
 	bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor);
-	bool RecruitDefeatedCreatureAsTeammate(RE::Actor* actor, double nowSec);
 }

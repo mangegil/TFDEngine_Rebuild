@@ -50,7 +50,7 @@ namespace TFD::PreCombatGreet
 
 		struct Pending
 		{
-			RE::FormID pacifySessionId{ 0 };
+			RE::FormID truceSessionId{ 0 };
 			TFD::InteractionRouter::Action action{ TFD::InteractionRouter::Action::None };
 
 			double expiresSec{ 0.0 };
@@ -310,7 +310,7 @@ namespace TFD::PreCombatGreet
 				return false;
 			}
 
-			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
+			if (TFD::FlowController::IsPreCombatBlocked()) {
 				return false;
 			}
 
@@ -573,12 +573,12 @@ namespace TFD::PreCombatGreet
 			Pending& pending,
 			double cooldownSec,
 			const char* reason,
-			TFD::Tame::ReleaseReason pacifyReason)
+			TFD::Tame::ReleaseReason releaseReason)
 		{
 
-			if (pending.pacifySessionId != 0) {
-				TFD::HostilityController::ReleaseSession(pending.pacifySessionId, pacifyReason);
-				pending.pacifySessionId = 0;
+			if (pending.truceSessionId != 0) {
+				TFD::HostilityController::ReleaseSession(pending.truceSessionId, releaseReason);
+				pending.truceSessionId = 0;
 			}
 
 			if (pending.assignSent) {
@@ -615,9 +615,9 @@ namespace TFD::PreCombatGreet
 				auto sp = RE::Actor::LookupByHandle(handle);
 				auto* actor = sp.get();
 
-				if (pending.pacifySessionId != 0) {
-					TFD::HostilityController::ReleaseSession(pending.pacifySessionId, TFD::Tame::ReleaseReason::Generic);
-					pending.pacifySessionId = 0;
+				if (pending.truceSessionId != 0) {
+					TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::Tame::ReleaseReason::Generic);
+					pending.truceSessionId = 0;
 				}
 
 				if (pending.assignSent) {
@@ -806,29 +806,29 @@ namespace TFD::PreCombatGreet
 				return;
 			}
 
-			if (TFD::DefeatMonitor::IsPreCombatBlocked()) {
+			if (TFD::FlowController::IsPreCombatBlocked()) {
 				std::scoped_lock lk(gLock);
-				const auto ctxKind = TFD::DefeatMonitor::GetDialogueContextKind();
-				const auto holdKind = TFD::DefeatMonitor::GetPassiveHoldKind();
+				const auto ctxKind = TFD::FlowController::GetDialogueContextKind();
+				const auto holdKind = TFD::FlowController::GetPassiveHoldKind();
 				const bool preserveAfterPleasureHandoff =
-					ctxKind == TFD::DefeatMonitor::DialogueContextKind::AfterPleasure &&
-					holdKind == TFD::DefeatMonitor::PassiveHoldKind::Pleasure;
+					ctxKind == TFD::FlowController::DialogueContextKind::AfterPleasure &&
+					holdKind == TFD::FlowController::PassiveHoldKind::Pleasure;
 				const bool preserveProtectedHandoff =
 					preserveAfterPleasureHandoff ||
-					(TFD::DefeatMonitor::IsPassiveHoldProtectedHandoff() &&
+					(TFD::FlowController::IsPassiveHoldProtectedHandoff() &&
 						HasProtectedPleasurePendingLocked());
 
 				if (!preserveProtectedHandoff) {
 					spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} -> clear pending",
-						TFD::DefeatMonitor::GetDialogueContextName(),
-						TFD::DefeatMonitor::GetPassiveHoldName());
+						TFD::FlowController::GetDialogueContextName(),
+						TFD::FlowController::GetPassiveHoldName());
 					ClearAllPendingLocked();
 					return;
 				}
 
 				spdlog::info("[TFD][PreCombatGreet] blocked ctx={} hold={} but preserve handoff",
-					TFD::DefeatMonitor::GetDialogueContextName(),
-					TFD::DefeatMonitor::GetPassiveHoldName());
+					TFD::FlowController::GetDialogueContextName(),
+					TFD::FlowController::GetPassiveHoldName());
 			}
 
 			const bool dialogueOpen = IsDialogueOpen();
@@ -844,15 +844,15 @@ namespace TFD::PreCombatGreet
 				auto& pending = it->second;
 
 				if (!IsActorStillValid(actor)) {
-					if (pending.pacifySessionId != 0) {
-						TFD::HostilityController::ReleaseSession(pending.pacifySessionId, TFD::Tame::ReleaseReason::Generic);
+					if (pending.truceSessionId != 0) {
+						TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::Tame::ReleaseReason::Generic);
 					}
 					it = gPending.erase(it);
 					continue;
 				}
 
-				if (!TFD::HostilityController::IsPacified(actor)) {
-					CleanupOne(actor, pending, kCooldownAfterFailSec, "pacify_lost", TFD::Tame::ReleaseReason::Generic);
+				if (!TFD::HostilityController::IsSuppressed(actor)) {
+					CleanupOne(actor, pending, kCooldownAfterFailSec, "truce_lost", TFD::Tame::ReleaseReason::Generic);
 					it = gPending.erase(it);
 					continue;
 				}
@@ -1080,7 +1080,7 @@ namespace TFD::PreCombatGreet
 		}
 
 		Pending pending{};
-		pending.pacifySessionId = result.sessionId;
+		pending.truceSessionId = result.sessionId;
 		pending.action = result.action;
 		pending.expiresSec = now + kManualWindowSec;
 		pending.dialogueRequested = result.dialogueRequested;

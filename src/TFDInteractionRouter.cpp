@@ -100,7 +100,7 @@ namespace TFD::InteractionRouter
                 return false;
             }
 
-            if (!TFD::HostilityController::IsPacified(actor)) {
+            if (!TFD::HostilityController::IsSuppressed(actor)) {
                 return false;
             }
 
@@ -778,7 +778,7 @@ namespace TFD::InteractionRouter
             result.handled = true;
             result.action = ShiftHotkeyAction::RecruitDefeatedCreature;
             result.target = defeatedCreature;
-            result.success = TFD::DefeatMonitor::RecruitDefeatedCreatureAsTeammate(defeatedCreature, nowSec);
+            result.success = TFD::Tame::RecruitDefeatedCreatureAsTeammate(defeatedCreature, nowSec);
             result.notification = result.success ?
                 "TFD: Defeated Creature Recruited" :
                 "TFD: Defeated Recruit Failed";
