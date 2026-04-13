@@ -6,8 +6,8 @@
 #include "TFDRescue.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDDefeatMonitor.h"
-#include "TFDActorScan.h"
 #include "TFDTeammateManager.h"
+#include "TFDActor.h"
 
 #include <spdlog/spdlog.h>
 
@@ -38,7 +38,7 @@ namespace TFD::InteractionRouter
 
         bool IsTargetValid(RE::Actor* target)
         {
-            return TFD::TargetClassifier::IsValidActor(target);
+            return TFD::Actor::Interaction::IsValidActor(target);
         }
 
         bool IsTargetInCombat(RE::Actor* target)
@@ -94,7 +94,7 @@ namespace TFD::InteractionRouter
             return false;
         }
 
-        bool IsNonHostileActiveTameFollower(RE::Actor* actor, const TFD::ActorScan::Entry& entry)
+        bool IsNonHostileActiveTameFollower(RE::Actor* actor, const TFD::Actor::Scan::Entry& entry)
         {
             if (!actor) {
                 return false;
@@ -185,7 +185,7 @@ namespace TFD::InteractionRouter
         float ScoreTruceCandidate(
             RE::Actor* actor,
             RE::PlayerCharacter* player,
-            const TFD::ActorScan::Entry& entry,
+            const TFD::Actor::Scan::Entry& entry,
             Action desiredAction)
         {
             if (!actor || !player) {
@@ -199,7 +199,7 @@ namespace TFD::InteractionRouter
             const bool inCombat = IsActorActivelyTargetingPlayerSide(actor, player);
             const bool weaponDrawn = actor->IsWeaponDrawn();
 
-            const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+            const auto classify = TFD::Actor::Interaction::ClassifyTarget(
                 player,
                 actor,
                 false,
@@ -207,7 +207,7 @@ namespace TFD::InteractionRouter
                 entry.dist);
 
             if (!classify.valid ||
-                classify.intent != TFD::TargetClassifier::InteractionIntent::Truce) {
+                classify.intent != TFD::Actor::Interaction::Intent::Truce) {
                 return -1.0e30f;
             }
 
@@ -255,7 +255,7 @@ namespace TFD::InteractionRouter
         float ScoreTameCandidate(
             RE::Actor* actor,
             RE::PlayerCharacter* player,
-            const TFD::ActorScan::Entry& entry)
+            const TFD::Actor::Scan::Entry& entry)
         {
             if (!actor || !player) {
                 return -1.0e30f;
@@ -272,7 +272,7 @@ namespace TFD::InteractionRouter
             const bool inCombat = actor->IsInCombat() || entry.inCombat;
             const bool weaponDrawn = actor->IsWeaponDrawn();
 
-            const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+            const auto classify = TFD::Actor::Interaction::ClassifyTarget(
                 player,
                 actor,
                 false,
@@ -280,7 +280,7 @@ namespace TFD::InteractionRouter
                 entry.dist);
 
             if (!classify.valid ||
-                classify.intent != TFD::TargetClassifier::InteractionIntent::Tame) {
+                classify.intent != TFD::Actor::Interaction::Intent::Tame) {
                 return -1.0e30f;
             }
 
@@ -307,9 +307,9 @@ namespace TFD::InteractionRouter
             return score;
         }
 
-        FailReason TranslateClassifierReject(TFD::TargetClassifier::RejectReason reason)
+        FailReason TranslateClassifierReject(TFD::Actor::Interaction::RejectReason reason)
         {
-            using RejectReason = TFD::TargetClassifier::RejectReason;
+            using RejectReason = TFD::Actor::Interaction::RejectReason;
 
             switch (reason) {
             case RejectReason::None:
@@ -364,7 +364,7 @@ namespace TFD::InteractionRouter
         const bool targetInCombat = IsTargetInCombat(target);
         const float distanceToPlayer = GetDistance(player, target);
 
-        const auto classify = TFD::TargetClassifier::ClassifyForHotkey(
+        const auto classify = TFD::Actor::Interaction::ClassifyTarget(
             player,
             target,
             isCaptivePhase,
@@ -380,12 +380,12 @@ namespace TFD::InteractionRouter
             targetInCombat ? 1 : 0,
             enemyToPlayer ? 1 : 0,
             distanceToPlayer,
-            TFD::TargetClassifier::ToString(classify.creatureClass),
-            TFD::TargetClassifier::ToString(classify.kind),
-            TFD::TargetClassifier::ToString(classify.intent),
+            TFD::Actor::Interaction::ToString(classify.creatureClass),
+            TFD::Actor::Interaction::ToString(classify.kind),
+            TFD::Actor::Interaction::ToString(classify.intent),
             classify.allowDialogue ? 1 : 0,
             classify.valid ? 1 : 0,
-            TFD::TargetClassifier::ToString(classify.rejectReason));
+            TFD::Actor::Interaction::ToString(classify.rejectReason));
 
         if (!classify.valid) {
             result.valid = false;
@@ -393,7 +393,7 @@ namespace TFD::InteractionRouter
             return result;
         }
 
-        if (classify.intent == TFD::TargetClassifier::InteractionIntent::Truce && !enemyToPlayer) {
+        if (classify.intent == TFD::Actor::Interaction::Intent::Truce && !enemyToPlayer) {
             spdlog::info(
                 "[TFD][Router] reject target={:08X} reason=not_enemy_to_player",
                 target->GetFormID());
@@ -403,7 +403,7 @@ namespace TFD::InteractionRouter
         }
 
         switch (classify.intent) {
-        case TFD::TargetClassifier::InteractionIntent::Tame:
+        case TFD::Actor::Interaction::Intent::Tame:
             if (!TFD::Tame::CanStart(target)) {
                 spdlog::info(
                     "[TFD][Router] reject tame target={:08X} reason=active_tame_requires_feed",
@@ -429,7 +429,7 @@ namespace TFD::InteractionRouter
             result.shouldOpenDialogue = classify.allowDialogue;
             return result;
 
-        case TFD::TargetClassifier::InteractionIntent::Truce:
+        case TFD::Actor::Interaction::Intent::Truce:
             if (!TFD::HostilityController::CanStartTruce(target)) {
                 result.valid = false;
                 result.failReason = FailReason::TruceUnavailable;
@@ -443,7 +443,7 @@ namespace TFD::InteractionRouter
             result.shouldOpenDialogue = classify.allowDialogue;
             return result;
 
-        case TFD::TargetClassifier::InteractionIntent::None:
+        case TFD::Actor::Interaction::Intent::None:
         default:
             result.valid = false;
             result.failReason = FailReason::NoUsableAction;
@@ -615,15 +615,15 @@ namespace TFD::InteractionRouter
 
         const Action preferredAction = ResolvePreferredTruceAction(snapshot);
 
-        TFD::ActorScan::Rescan(radius, false);
+        TFD::Actor::Scan::Rescan(radius, false);
 
         RE::Actor* bestTarget = nullptr;
         float bestScore = -1.0e30f;
 
-        const auto count = TFD::ActorScan::GetCount();
+        const auto count = TFD::Actor::Scan::GetCount();
         for (int i = 0; i < count; ++i) {
-            const auto entry = TFD::ActorScan::GetEntry(i);
-            auto* actor = TFD::ActorScan::GetActor(i);
+            const auto entry = TFD::Actor::Scan::GetEntry(i);
+            auto* actor = TFD::Actor::Scan::GetActor(i);
             if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 continue;
             }
@@ -651,8 +651,8 @@ namespace TFD::InteractionRouter
         bestScore = -1.0e30f;
 
         for (int i = 0; i < count; ++i) {
-            const auto entry = TFD::ActorScan::GetEntry(i);
-            auto* actor = TFD::ActorScan::GetActor(i);
+            const auto entry = TFD::Actor::Scan::GetEntry(i);
+            auto* actor = TFD::Actor::Scan::GetActor(i);
             if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 continue;
             }
@@ -807,15 +807,15 @@ namespace TFD::InteractionRouter
             return nullptr;
         }
 
-        TFD::ActorScan::Rescan(radius, false);
+        TFD::Actor::Scan::Rescan(radius, false);
 
         RE::Actor* best = nullptr;
         float bestScore = -1.0e30f;
 
-        const auto count = TFD::ActorScan::GetCount();
+        const auto count = TFD::Actor::Scan::GetCount();
         for (int i = 0; i < count; ++i) {
-            auto entry = TFD::ActorScan::GetEntry(i);
-            auto* actor = TFD::ActorScan::GetActor(i);
+            auto entry = TFD::Actor::Scan::GetEntry(i);
+            auto* actor = TFD::Actor::Scan::GetActor(i);
             if (!actor) {
                 continue;
             }
@@ -860,7 +860,7 @@ namespace TFD::InteractionRouter
             return nullptr;
         }
 
-        auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
+        auto scoreActor = [&](RE::Actor* actor, const TFD::Actor::Scan::Entry& entry) -> float {
             if (!actor) {
                 return -1.0e30f;
             }
@@ -893,15 +893,15 @@ namespace TFD::InteractionRouter
             return score;
         };
 
-        TFD::ActorScan::Rescan(radius, false);
+        TFD::Actor::Scan::Rescan(radius, false);
 
         RE::Actor* best = nullptr;
         float bestScore = -1.0e30f;
 
-        const auto count = TFD::ActorScan::GetCount();
+        const auto count = TFD::Actor::Scan::GetCount();
         for (int i = 0; i < count; ++i) {
-            auto entry = TFD::ActorScan::GetEntry(i);
-            auto* actor = TFD::ActorScan::GetActor(i);
+            auto entry = TFD::Actor::Scan::GetEntry(i);
+            auto* actor = TFD::Actor::Scan::GetActor(i);
             const float score = scoreActor(actor, entry);
             if (score > bestScore) {
                 bestScore = score;
@@ -912,12 +912,12 @@ namespace TFD::InteractionRouter
         if (!best) {
             const auto restored = TFD::TeammateManager::RestoreNow();
             if (restored > 0) {
-                TFD::ActorScan::Rescan(radius, false);
+                TFD::Actor::Scan::Rescan(radius, false);
 
-                const auto retryCount = TFD::ActorScan::GetCount();
+                const auto retryCount = TFD::Actor::Scan::GetCount();
                 for (int i = 0; i < retryCount; ++i) {
-                    auto entry = TFD::ActorScan::GetEntry(i);
-                    auto* actor = TFD::ActorScan::GetActor(i);
+                    auto entry = TFD::Actor::Scan::GetEntry(i);
+                    auto* actor = TFD::Actor::Scan::GetActor(i);
                     const float score = scoreActor(actor, entry);
                     if (score > bestScore) {
                         bestScore = score;
@@ -937,7 +937,7 @@ namespace TFD::InteractionRouter
             return nullptr;
         }
 
-        auto scoreActor = [&](RE::Actor* actor, const TFD::ActorScan::Entry& entry) -> float {
+        auto scoreActor = [&](RE::Actor* actor, const TFD::Actor::Scan::Entry& entry) -> float {
             if (!actor) {
                 return -1.0e30f;
             }
@@ -970,15 +970,15 @@ namespace TFD::InteractionRouter
             return score;
         };
 
-        TFD::ActorScan::Rescan(radius, false);
+        TFD::Actor::Scan::Rescan(radius, false);
 
         RE::Actor* best = nullptr;
         float bestScore = -1.0e30f;
 
-        const auto count = TFD::ActorScan::GetCount();
+        const auto count = TFD::Actor::Scan::GetCount();
         for (int i = 0; i < count; ++i) {
-            auto entry = TFD::ActorScan::GetEntry(i);
-            auto* actor = TFD::ActorScan::GetActor(i);
+            auto entry = TFD::Actor::Scan::GetEntry(i);
+            auto* actor = TFD::Actor::Scan::GetActor(i);
             const float score = scoreActor(actor, entry);
             if (score > bestScore) {
                 bestScore = score;

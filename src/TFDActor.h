@@ -1,0 +1,218 @@
+﻿#pragma once
+
+#include <RE/Skyrim.h>
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace TFD::Actor
+{
+    bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs);
+
+    struct ScanOptions
+    {
+        float radius{ 0.0f };
+        bool npcOnly{ false };
+    };
+
+    enum class ParticipationKind : std::uint8_t
+    {
+        None = 0,
+        Participant,
+        Outsider
+    };
+
+    struct ActorInfo
+    {
+        RE::ActorHandle actor{};
+        std::uint32_t formID{ 0 };
+        float dist{ 0.0f };
+        bool hostileToPlayer{ false };
+        bool inCombat{ false };
+        bool standing{ false };
+        bool playerSide{ false };
+        ParticipationKind participation{ ParticipationKind::None };
+        std::int32_t coalitionID{ -1 };
+        RE::ActorHandle currentTarget{};
+        std::uint32_t currentTargetFormID{ 0 };
+        std::vector<std::uint32_t> targetedBy;
+        bool isTargetingAnyone{ false };
+        bool isTargetedByAnyone{ false };
+        bool isMutuallyEngaged{ false };
+        bool isBattleParticipant{ false };
+        bool isOutsider{ false };
+
+        [[nodiscard]] RE::Actor* get() const
+        {
+            auto sp = actor.get();
+            return sp.get();
+        }
+
+        [[nodiscard]] RE::Actor* getCurrentTarget() const
+        {
+            auto sp = currentTarget.get();
+            return sp.get();
+        }
+    };
+
+    struct CoalitionInfo
+    {
+        std::int32_t coalitionID{ -1 };
+        bool playerSide{ false };
+        bool hostileToPlayerSide{ false };
+        std::uint32_t memberCount{ 0 };
+        std::uint32_t standingCount{ 0 };
+        std::vector<std::uint32_t> memberFormIDs;
+        std::vector<std::uint32_t> standingMemberFormIDs;
+        std::uint32_t speakerCandidateFormID{ 0 };
+        std::vector<std::uint32_t> crowdCandidateFormIDs;
+    };
+
+    struct Snapshot
+    {
+        RE::ActorHandle player{};
+        ScanOptions options{};
+        std::vector<ActorInfo> actors;
+        std::vector<CoalitionInfo> coalitions;
+        std::vector<std::uint32_t> outsiderFormIDs;
+        std::int32_t playerCoalitionID{ -1 };
+        std::int32_t winningCoalitionCandidateID{ -1 };
+        std::uint32_t activeCoalitionCount{ 0 };
+        bool conflictResolved{ true };
+    };
+
+    [[nodiscard]] Snapshot BuildSnapshot(float radius, bool npcOnly = false);
+    [[nodiscard]] Snapshot BuildSnapshot(RE::Actor* player, const ScanOptions& options);
+    [[nodiscard]] const ActorInfo* FindActorInfo(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] const ActorInfo* FindActorInfo(const Snapshot& snapshot, std::uint32_t formID);
+    [[nodiscard]] const CoalitionInfo* FindCoalition(const Snapshot& snapshot, std::int32_t coalitionID);
+    [[nodiscard]] RE::Actor* GetCurrentTarget(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] RE::Actor* ResolveSpeakerCandidate(const Snapshot& snapshot, std::int32_t coalitionID);
+    [[nodiscard]] std::vector<RE::Actor*> ResolveCrowdCandidates(const Snapshot& snapshot, std::int32_t coalitionID);
+    [[nodiscard]] std::vector<RE::Actor*> GetAttackersOf(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool IsActorTargetingAnyone(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool IsActorTargetedByAnyone(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool IsMutuallyEngaged(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool IsActorParticipatingInBattle(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool IsActorOutsider(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] bool HasStandingPlayerSide(const Snapshot& snapshot);
+    [[nodiscard]] bool HasStandingTeammateOnPlayerSide(const Snapshot& snapshot);
+    [[nodiscard]] bool HasStandingHostileCoalition(const Snapshot& snapshot);
+    [[nodiscard]] bool IsConflictResolved(const Snapshot& snapshot);
+
+    namespace Scan
+    {
+        struct Entry
+        {
+            RE::ActorHandle actor;
+            float dist{ 0.0f };
+            bool hostile{ false };
+            bool inCombat{ false };
+        };
+
+        std::int32_t Rescan(float radius, bool npcOnly);
+        std::int32_t GetCount();
+        RE::Actor* GetActor(std::int32_t index);
+        Entry GetEntry(std::int32_t index);
+        std::string GetActorName(std::int32_t index);
+        RE::Actor* SelectFacingTarget();
+    }
+
+    namespace Interaction
+    {
+        enum class TargetKind : std::uint8_t
+        {
+            None = 0,
+            Negotiable,
+            Creature,
+            Ignore
+        };
+
+        enum class Intent : std::uint8_t
+        {
+            None = 0,
+            Tame,
+            Truce
+        };
+
+        enum class RejectReason : std::uint8_t
+        {
+            None = 0,
+            InvalidActor,
+            NotNegotiable,
+            NotCreature,
+            TameRequiresPreCombat,
+            TooFar,
+            UnsafeState,
+            CaptiveOnlyMode
+        };
+
+        enum class CreatureClass : std::uint8_t
+        {
+            None = 0,
+            FullDialogue,
+            SimpleCommand,
+            NonverbalIntelligent,
+            Beast,
+            UnknownFallback
+        };
+
+        struct ClassifyResult
+        {
+            TargetKind kind{ TargetKind::None };
+            Intent intent{ Intent::None };
+            RejectReason rejectReason{ RejectReason::None };
+            CreatureClass creatureClass{ CreatureClass::None };
+
+            bool valid{ false };
+            bool negotiable{ false };
+            bool tameable{ false };
+
+            bool allowDialogue{ false };
+            bool requiresPreCombat{ false };
+            bool allowsInCombat{ false };
+        };
+
+        bool IsValidActor(RE::Actor* actor);
+        bool IsNegotiable(RE::Actor* actor);
+        bool IsCreature(RE::Actor* actor);
+        CreatureClass GetCreatureClass(RE::Actor* actor);
+        bool CanUseTruce(RE::Actor* actor);
+        bool CanUseTame(RE::Actor* actor);
+        ClassifyResult ClassifyTarget(
+            RE::Actor* player,
+            RE::Actor* target,
+            bool isCaptivePhase,
+            bool targetInCombat,
+            float distanceToPlayer);
+        const char* ToString(TargetKind value);
+        const char* ToString(Intent value);
+        const char* ToString(RejectReason value);
+        const char* ToString(CreatureClass value);
+    }
+
+    namespace Ops
+    {
+        inline constexpr const char* kAllowListEditorId = "TFDHostileFactionAllowList";
+
+        void Initialize();
+        bool ApplyAggressorFactionContext(RE::Actor* aggressor);
+        void ClearAggressorFactionContext();
+        bool HasAggressorFactionContext();
+        bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs);
+
+        std::vector<RE::Actor*> CollectTruceActors();
+        bool HasAnyReleaseFollowGrace();
+        bool HasReleaseFollowGrace(RE::Actor* actor);
+        void ApplyReleaseFollowGraceToSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason = nullptr);
+        void RemoveReleaseFollowGraceFromSpeakerAndCrowd(RE::Actor* speaker, const char* reason = nullptr);
+        void CancelReleaseFollowGraceFromPlayerAggression(RE::Actor* actor, const char* reason = nullptr);
+        void MaintainReleaseFollowGrace();
+        void ClearAllReleaseFollowGrace(const char* reason = nullptr);
+
+        void SyncDefeatedEnemyMirror(RE::Actor* actor, int& aliasSlot, bool& factionApplied);
+        void ClearDefeatedEnemyMirror(RE::Actor* actor, int& aliasSlot, bool& factionApplied, const char* reason = nullptr);
+        void ClearAllDefeatedEnemyMirrors(const char* reason = nullptr);
+    }
+}

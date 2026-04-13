@@ -1,12 +1,11 @@
 #include "TFDCaptive.h"
 #include "TFDCaptiveGreet.h"
+#include "TFDActor.h"
 
-#include "TFDActorScan.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDSettings.h"
 #include "TFDLocation.h"
-#include "TFDFactionManager.h"
 
 #include "TFDFlowController.h"
 
@@ -85,15 +84,15 @@ namespace TFD::Captive
 			}
 
 			const float searchRadius = (std::max)(radius, 12288.0f);
-			TFD::ActorScan::Rescan(searchRadius, false);
+			TFD::Actor::Scan::Rescan(searchRadius, false);
 
 			RE::Actor* best = nullptr;
 			float bestScore = 1.0e30f;
 
-			const auto n = TFD::ActorScan::GetCount();
+			const auto n = TFD::Actor::Scan::GetCount();
 			for (int i = 0; i < n; ++i) {
-				auto e = TFD::ActorScan::GetEntry(i);
-				auto* a = TFD::ActorScan::GetActor(i);
+				auto e = TFD::Actor::Scan::GetEntry(i);
+				auto* a = TFD::Actor::Scan::GetActor(i);
 				if (!a) continue;
 				if (!IsCaptorSupportedActor(a)) continue;
 				if (!IsActorSameSpace(a, player)) continue;
@@ -151,13 +150,13 @@ namespace TFD::Captive
 			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
 			TFD::HostilityController::StopCombatSweep(sweepRadius, true);
 			TFD::HostilityController::ScheduleStopCombatWaves(sweepRadius, true, 10, 120);
-			TFD::ActorScan::Rescan(sweepRadius, false);
+			TFD::Actor::Scan::Rescan(sweepRadius, false);
 
 			auto* pCell = player->GetParentCell();
-			const auto count = TFD::ActorScan::GetCount();
+			const auto count = TFD::Actor::Scan::GetCount();
 			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
-				auto* actor = TFD::ActorScan::GetActor(i);
+				auto entry = TFD::Actor::Scan::GetEntry(i);
+				auto* actor = TFD::Actor::Scan::GetActor(i);
 				if (!actor || actor->IsDead() || actor->IsDisabled()) {
 					continue;
 				}
@@ -1118,7 +1117,7 @@ namespace TFD::Captive
 			return false;
 		}
 
-		TFD::FactionManager::Clear();
+		TFD::Actor::Ops::ClearAggressorFactionContext();
 		TFD::HostilityController::ClearAggressionClamp();
 		if (handlers.setGraceActive) {
 			handlers.setGraceActive(false);

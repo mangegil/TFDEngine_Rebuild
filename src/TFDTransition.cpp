@@ -1,12 +1,10 @@
-#include "TFDTransition.h"
+﻿#include "TFDTransition.h"
+#include "TFDActor.h"
 
 #include "EditorIdCache.h"
-#include "TFDActorScan.h"
 #include "TFDHostilityController.h"
 
-#include "TFDFactionManager.h"
 #include "TFDLocation.h"
-#include "TFDHostilityController.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDSettings.h"
 
@@ -826,10 +824,10 @@ namespace TFD::Transition
 				queueOne(primary, true);
 			}
 
-			TFD::ActorScan::Rescan(radius, false);
-			const auto n = TFD::ActorScan::GetCount();
+			TFD::Actor::Scan::Rescan(radius, false);
+			const auto n = TFD::Actor::Scan::GetCount();
 			for (int i = 0; i < n; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
+				auto entry = TFD::Actor::Scan::GetEntry(i);
 				auto sp = entry.actor.get();
 				auto* actor = sp.get();
 				if (!actor || actor == primary) {
@@ -866,7 +864,7 @@ namespace TFD::Transition
 				followerToRestore = sp.get();
 			}
 			TFD::HostilityController::ClearAggressionClamp();
-			TFD::FactionManager::Clear();
+			TFD::Actor::Ops::ClearAggressorFactionContext();
 			if (g_leftForDeadNeedsAggroKick) {
 				QueuePostRecoveryAggroKick("left_for_dead_recovery_finished", handlers);
 			}
@@ -1180,10 +1178,10 @@ namespace TFD::Transition
 				++applied;
 			}
 		} else {
-			TFD::ActorScan::Rescan(radius, false);
-			const auto count = TFD::ActorScan::GetCount();
+			TFD::Actor::Scan::Rescan(radius, false);
+			const auto count = TFD::Actor::Scan::GetCount();
 			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
+				auto entry = TFD::Actor::Scan::GetEntry(i);
 				auto actorSP = entry.actor.get();
 				auto* actor = actorSP.get();
 				if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(handlers, actor)) {

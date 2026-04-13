@@ -1,13 +1,11 @@
 #include "TFDHostilityController.h"
+#include "TFDActor.h"
 
 #include "TFDTame.h"
 
-#include "TFDActorScan.h"
 #include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
-#include "TFDFactionManager.h"
 #include "TFDSettings.h"
-#include "TFDTargetClassifier.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -55,11 +53,11 @@ namespace
 
             player->StopCombat();
 
-            TFD::ActorScan::Rescan(radius, npcOnly);
-            const auto count = TFD::ActorScan::GetCount();
+            TFD::Actor::Scan::Rescan(radius, npcOnly);
+            const auto count = TFD::Actor::Scan::GetCount();
 
             for (std::int32_t i = 0; i < count; i++) {
-                auto* actor = TFD::ActorScan::GetActor(i);
+                auto* actor = TFD::Actor::Scan::GetActor(i);
                 if (!actor) {
                     continue;
                 }
@@ -212,9 +210,9 @@ namespace
             }
             g_triedResolve = true;
 
-            g_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionManager::kAllowListEditorId);
+            g_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::Actor::Ops::kAllowListEditorId);
             if (!g_allowList) {
-                spdlog::warn("[TFD][HostilityController] allowlist missing (EditorID='{}')", TFD::FactionManager::kAllowListEditorId);
+                spdlog::warn("[TFD][HostilityController] allowlist missing (EditorID='{}')", TFD::Actor::Ops::kAllowListEditorId);
                 return;
             }
 
@@ -352,11 +350,11 @@ namespace
             }
 
             const float radius = TFD::Settings::GetSweepRadius();
-            TFD::ActorScan::Rescan(radius, true);
+            TFD::Actor::Scan::Rescan(radius, true);
 
-            const auto count = TFD::ActorScan::GetCount();
+            const auto count = TFD::Actor::Scan::GetCount();
             for (std::int32_t i = 0; i < count; i++) {
-                auto scanEntry = TFD::ActorScan::GetEntry(i);
+                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
                 auto* actor = scanEntry.actor.get().get();
                 if (!actor || actor == player) {
                     continue;
@@ -699,7 +697,7 @@ namespace TFD::HostilityController
                 return false;
             }
 
-            return TFD::TargetClassifier::IsNegotiable(actor);
+            return TFD::Actor::Interaction::IsNegotiable(actor);
         }
 
         bool ActorHasAnyExactFaction(RE::Actor* actor)
@@ -771,7 +769,7 @@ namespace TFD::HostilityController
                 return false;
             }
 
-            if (TFD::FactionManager::SharesAllowedFactionExact(actor, primaryTarget)) {
+            if (TFD::Actor::SharesAllowedFactionExact(actor, primaryTarget)) {
                 return true;
             }
 
@@ -929,7 +927,7 @@ namespace TFD::HostilityController
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry)
+            const TFD::Actor::Scan::Entry& scanEntry)
         {
             (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
@@ -989,16 +987,16 @@ namespace TFD::HostilityController
             std::size_t& truceClusterCount)
         {
             std::vector<TruceCandidate> candidates;
-            TFD::ActorScan::Rescan(scanRadius, false);
-            const auto count = TFD::ActorScan::GetCount();
+            TFD::Actor::Scan::Rescan(scanRadius, false);
+            const auto count = TFD::Actor::Scan::GetCount();
             candidates.reserve(count);
 
             auto* playerCell = player ? player->GetParentCell() : nullptr;
             auto* primaryCell = primaryTarget ? primaryTarget->GetParentCell() : nullptr;
 
             for (int i = 0; i < count; ++i) {
-                auto scanEntry = TFD::ActorScan::GetEntry(i);
-                auto* actor = TFD::ActorScan::GetActor(i);
+                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
+                auto* actor = TFD::Actor::Scan::GetActor(i);
                 if (!IsEligibleActiveTruceCombatant(actor, player, primaryTarget, scanEntry)) {
                     continue;
                 }
@@ -1107,7 +1105,7 @@ namespace TFD::HostilityController
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry,
+            const TFD::Actor::Scan::Entry& scanEntry,
             float radius)
         {
             (void)scanEntry;
@@ -1188,7 +1186,7 @@ namespace TFD::HostilityController
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry)
+            const TFD::Actor::Scan::Entry& scanEntry)
         {
             (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
@@ -1223,7 +1221,7 @@ namespace TFD::HostilityController
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry)
+            const TFD::Actor::Scan::Entry& scanEntry)
         {
             (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
@@ -1979,11 +1977,11 @@ namespace TFD::HostilityController
             }
             else if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
-                TFD::ActorScan::Rescan(scanRadius, false);
-                const auto count = TFD::ActorScan::GetCount();
+                TFD::Actor::Scan::Rescan(scanRadius, false);
+                const auto count = TFD::Actor::Scan::GetCount();
                 for (int i = 0; i < count; ++i) {
-                    auto scanEntry = TFD::ActorScan::GetEntry(i);
-                    auto* actor = TFD::ActorScan::GetActor(i);
+                    auto scanEntry = TFD::Actor::Scan::GetEntry(i);
+                    auto* actor = TFD::Actor::Scan::GetActor(i);
                     if (!IsEligibleCellBubbleActor(actor, player, primaryTarget, scanEntry)) {
                         continue;
                     }
@@ -2244,7 +2242,7 @@ namespace TFD::HostilityController
         if (IsSuppressed(actor)) {
             return true;
         }
-        if (TFD::FactionManager::HasReleaseFollowGrace(actor)) {
+        if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
             return true;
         }
         return HasActiveDialoguePhaseFaction(actor);

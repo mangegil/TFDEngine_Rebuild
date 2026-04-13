@@ -35,9 +35,8 @@ add_library(TFDEngine SHARED
     src/TFDCaptive.cpp
     src/TFDRescue.cpp
     src/TFDVictory.cpp
-    src/TFDActorScan.cpp
+    src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
-    src/TFDFactionManager.cpp
     src/TFDPreCombatGreet.cpp
     src/TFDInCombat.cpp
     src/TFDInCombatGreet.cpp
@@ -45,7 +44,6 @@ add_library(TFDEngine SHARED
     src/TFDBleedoutGreet.cpp
     src/TFDHostilityHooks.cpp
     src/TFDHostilityController.cpp
-    src/TFDTargetClassifier.cpp
     src/TFDInteractionRouter.cpp
     src/MenuFramework.cpp
     src/TFDTame.cpp

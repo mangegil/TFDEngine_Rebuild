@@ -4,6 +4,7 @@
 #include "SKSE/SKSE.h"
 #include "SKSE/Interfaces.h"
 #include "SKSE/Version.h"
+#include "TFDActor.h"
 
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
@@ -16,7 +17,6 @@
 
 #include "TFDDefeatMonitor.h"
 #include "TFDLocation.h"
-#include "TFDFactionManager.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDCaptiveGreet.h"
 #include "TFDInCombat.h"
@@ -124,7 +124,7 @@ static void InitOnceAfterLoad()
     spdlog::info("[TFD] InitOnceAfterLoad");
 
     TFD::Location::Initialize();
-    TFD::FactionManager::Initialize();
+    TFD::Actor::Ops::Initialize();
     TFD::DefeatMonitor::Install();
     TFD::InCombat::Install();
     TFD::InCombatGreet::Install();

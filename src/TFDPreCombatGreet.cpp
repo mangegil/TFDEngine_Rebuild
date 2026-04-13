@@ -1,3 +1,4 @@
+#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -19,7 +20,6 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDDefeatMonitor.h"
-#include "TFDFactionManager.h"
 #include "TFDInteractionRouter.h"
 #include "TFDLocation.h"
 #include "TFDHostilityController.h"

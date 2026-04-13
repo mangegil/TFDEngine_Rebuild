@@ -1,4 +1,5 @@
 #include "TFDHostilityHooks.h"
+#include "TFDActor.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -9,7 +10,6 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDDefeatMonitor.h"
-#include "TFDFactionManager.h"
 
 #ifdef SKYRIM_SUPPORT_AE
 #define TFD_RELID(SE, AE) REL::ID(AE)
@@ -63,7 +63,7 @@ namespace TFD::HostilityHooks
 
             static bool IsReleaseGraceActor(RE::Actor* actor)
             {
-                return actor && TFD::FactionManager::HasReleaseFollowGrace(actor);
+                return actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor);
             }
 
             static void ClearInvalidCombatTarget(RE::Character* actor)

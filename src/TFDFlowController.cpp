@@ -3,7 +3,6 @@
 #include "TFDBleedoutGreet.h"
 #include "TFDCaptive.h"
 #include "TFDCaptiveGreet.h"
-#include "TFDFactionManager.h"
 #include "TFDHostilityController.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
@@ -11,6 +10,7 @@
 #include "TFDPreCombatGreet.h"
 #include "TFDTransition.h"
 #include "TFDTame.h"
+#include "TFDActor.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -153,7 +153,7 @@ namespace
             if (actor == primary) {
                 return true;
             }
-            if (TFD::FactionManager::SharesAllowedFactionExact(actor, primary)) {
+            if (TFD::Actor::SharesAllowedFactionExact(actor, primary)) {
                 return true;
             }
         }
@@ -957,7 +957,7 @@ namespace TFD::FlowController
         }
 
         TFD::HostilityController::ClearAggressionClamp();
-        TFD::FactionManager::Clear();
+        TFD::Actor::Ops::ClearAggressorFactionContext();
 
         auto& flow = Controller::GetSingleton();
         switch (contextKind) {

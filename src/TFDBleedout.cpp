@@ -1,4 +1,5 @@
-#include "TFDBleedout.h"
+﻿#include "TFDBleedout.h"
+#include "TFDActor.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -16,8 +17,6 @@
 #include <utility>
 #include <thread>
 
-#include "TFDActorScan.h"
-#include "TFDFactionManager.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
 #include "TFDHostilityController.h"
@@ -205,7 +204,7 @@ namespace TFD::Bleedout
 			static bool s_tried = false;
 			if (!s_allowList && !s_tried) {
 				s_tried = true;
-				s_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::FactionManager::kAllowListEditorId);
+				s_allowList = RE::TESForm::LookupByEditorID<RE::BGSListForm>(TFD::Actor::Ops::kAllowListEditorId);
 			}
 			return s_allowList;
 		}
@@ -437,6 +436,47 @@ namespace TFD::Bleedout
 			return ActorHasAllowListFaction(actor);
 		}
 
+		TFD::Actor::Snapshot BuildCoalitionSnapshot(float radius, const SpeakerLogicHandlers& handlers)
+		{
+			auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
+			if (!player) {
+				return {};
+			}
+			TFD::Actor::ScanOptions options{};
+			options.radius = (std::max)(radius, 2000.0f);
+			options.npcOnly = false;
+			return TFD::Actor::BuildSnapshot(player, options);
+		}
+
+		RE::Actor* ResolveCoalitionSpeakerCandidate(const TFD::Actor::Snapshot& snapshot, RE::Actor* preferred, float maxDist,
+			const SpeakerLogicHandlers& handlers,
+			const std::function<bool(RE::Actor*, float&)>& validator)
+		{
+			auto tryActor = [&](RE::Actor* actor) -> RE::Actor* {
+				float dist = 99999.0f;
+				if (actor && validator && validator(actor, dist)) {
+					return actor;
+				}
+				return nullptr;
+			};
+
+			if (preferred) {
+				if (auto* info = TFD::Actor::FindActorInfo(snapshot, preferred); info && info->coalitionID >= 0) {
+					if (auto* actor = tryActor(TFD::Actor::ResolveSpeakerCandidate(snapshot, info->coalitionID))) {
+						return actor;
+					}
+				}
+			}
+
+			if (snapshot.winningCoalitionCandidateID >= 0) {
+				if (auto* actor = tryActor(TFD::Actor::ResolveSpeakerCandidate(snapshot, snapshot.winningCoalitionCandidateID))) {
+					return actor;
+				}
+			}
+
+			return nullptr;
+		}
+
 		RE::Actor* FindBestHotkeySpeakerImpl(float radius, float maxDist, RE::Actor* preferred, const SpeakerLogicHandlers& handlers)
 		{
 			auto* player = handlers.getPlayer ? handlers.getPlayer() : nullptr;
@@ -449,13 +489,21 @@ namespace TFD::Bleedout
 				return preferred;
 			}
 
-			TFD::ActorScan::Rescan(radius, false);
+			auto snapshot = BuildCoalitionSnapshot(radius, handlers);
+			auto validator = [&](RE::Actor* actor, float& outDist) {
+				return IsReasonableHotkeySpeakerImpl(actor, player, maxDist, handlers, &outDist);
+			};
+			if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, maxDist, handlers, validator)) {
+				return coalitionSpeaker;
+			}
+
+			TFD::Actor::Scan::Rescan(radius, false);
 			RE::Actor* best = nullptr;
 			float bestScore = std::numeric_limits<float>::max();
 			auto* lastAggressor = handlers.resolveLastAggressor ? handlers.resolveLastAggressor() : nullptr;
-			const auto count = TFD::ActorScan::GetCount();
+			const auto count = TFD::Actor::Scan::GetCount();
 			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::ActorScan::GetEntry(i);
+				auto entry = TFD::Actor::Scan::GetEntry(i);
 				auto actorSp = entry.actor.get();
 				auto* actor = actorSp.get();
 				float dist = 99999.0f;
@@ -497,31 +545,60 @@ namespace TFD::Bleedout
 		}
 
 		const float scanRadius = (std::max)(radius, 2000.0f);
-		TFD::ActorScan::Rescan(scanRadius, false);
-		const auto count = TFD::ActorScan::GetCount();
-		for (int i = 0; i < count; ++i) {
-			auto entry = TFD::ActorScan::GetEntry(i);
-			auto actorSp = entry.actor.get();
-			auto* actor = actorSp.get();
-			if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
-			if (!actor->Is3DLoaded()) continue;
-			if (actor->GetFormID() == player->GetFormID()) continue;
-			if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) continue;
-			if (!handlers.isBleedCrowdSupportedAggressor || !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
-			if (entry.dist > scanRadius) continue;
+		auto snapshot = BuildCoalitionSnapshot(scanRadius, handlers);
+		std::int32_t coalitionID = -1;
+		if (preferred) {
+			if (auto* info = TFD::Actor::FindActorInfo(snapshot, preferred)) {
+				coalitionID = info->coalitionID;
+			}
+		}
+		if (coalitionID < 0) {
+			coalitionID = snapshot.winningCoalitionCandidateID;
+		}
+		if (coalitionID >= 0) {
+			for (auto* actor : TFD::Actor::ResolveCrowdCandidates(snapshot, coalitionID)) {
+				if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
+				if (!actor->Is3DLoaded()) continue;
+				if (actor->GetFormID() == player->GetFormID()) continue;
+				if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) continue;
+				if (!handlers.isBleedCrowdSupportedAggressor || !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
+				const float dist = Distance3D(actor, player);
+				if (dist > scanRadius) continue;
+				const bool preserved = preserveAssigned && handlers.isPreservedAssigned && handlers.isPreservedAssigned(actor);
+				float score = dist;
+				if (preserved) score -= 90.0f;
+				if (handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
+				scored.emplace_back(score, actor);
+			}
+		}
 
-			const bool targetingPlayer = entry.hostile || entry.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
-			const bool preserved = preserveAssigned && handlers.isPreservedAssigned && handlers.isPreservedAssigned(actor);
-			if (!targetingPlayer && !preserved && actor != preferred) continue;
+		if (scored.empty()) {
+			TFD::Actor::Scan::Rescan(scanRadius, false);
+			const auto count = TFD::Actor::Scan::GetCount();
+			for (int i = 0; i < count; ++i) {
+				auto entry = TFD::Actor::Scan::GetEntry(i);
+				auto actorSp = entry.actor.get();
+				auto* actor = actorSp.get();
+				if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
+				if (!actor->Is3DLoaded()) continue;
+				if (actor->GetFormID() == player->GetFormID()) continue;
+				if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) continue;
+				if (!handlers.isBleedCrowdSupportedAggressor || !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
+				if (entry.dist > scanRadius) continue;
 
-			float score = entry.dist;
-			if (actor == preferred) score -= 1000.0f;
-			if (targetingPlayer) score -= 140.0f;
-			if (entry.hostile) score -= 80.0f;
-			if (entry.inCombat || actor->IsInCombat()) score -= 60.0f;
-			if (preserved) score -= 90.0f;
-			if (handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
-			scored.emplace_back(score, actor);
+				const bool targetingPlayer = entry.hostile || entry.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
+				const bool preserved = preserveAssigned && handlers.isPreservedAssigned && handlers.isPreservedAssigned(actor);
+				if (!targetingPlayer && !preserved && actor != preferred) continue;
+
+				float score = entry.dist;
+				if (actor == preferred) score -= 1000.0f;
+				if (targetingPlayer) score -= 140.0f;
+				if (entry.hostile) score -= 80.0f;
+				if (entry.inCombat || actor->IsInCombat()) score -= 60.0f;
+				if (preserved) score -= 90.0f;
+				if (handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
+				scored.emplace_back(score, actor);
+			}
 		}
 
 		std::sort(scored.begin(), scored.end(), [](const auto& a, const auto& b) {
@@ -611,12 +688,20 @@ namespace TFD::Bleedout
 			return preferred;
 		}
 
-		TFD::ActorScan::Rescan(radius, false);
+		auto snapshot = BuildCoalitionSnapshot(radius, handlers);
+		auto validator = [&](RE::Actor* actor, float& outDist) {
+			return isStrongPreferred(actor, outDist);
+		};
+		if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, maxDist, handlers, validator)) {
+			return coalitionSpeaker;
+		}
+
+		TFD::Actor::Scan::Rescan(radius, false);
 		RE::Actor* best = nullptr;
 		float bestScore = std::numeric_limits<float>::max();
-		const auto count = TFD::ActorScan::GetCount();
+		const auto count = TFD::Actor::Scan::GetCount();
 		for (int i = 0; i < count; ++i) {
-			auto entry = TFD::ActorScan::GetEntry(i);
+			auto entry = TFD::Actor::Scan::GetEntry(i);
 			auto actorSp = entry.actor.get();
 			auto* actor = actorSp.get();
 			float dist = 99999.0f;

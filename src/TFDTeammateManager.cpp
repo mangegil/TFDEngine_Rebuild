@@ -1,4 +1,5 @@
 #include "TFDTeammateManager.h"
+#include "TFDActor.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -22,7 +23,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "TFDActorScan.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
@@ -534,13 +534,13 @@ namespace
             }
 
             const float useRadius = (std::max)(radius, 6000.0f);
-            TFD::ActorScan::Rescan(useRadius, false);
-            const auto count = TFD::ActorScan::GetCount();
+            TFD::Actor::Scan::Rescan(useRadius, false);
+            const auto count = TFD::Actor::Scan::GetCount();
             std::unordered_set<RE::FormID> seen;
             out.reserve(8);
 
             for (int i = 0; i < count; ++i) {
-                auto entry = TFD::ActorScan::GetEntry(i);
+                auto entry = TFD::Actor::Scan::GetEntry(i);
                 auto actorSP = entry.actor.get();
                 auto* actor = actorSP.get();
                 if (!IsValidTeammate(actor)) {
@@ -828,11 +828,11 @@ namespace TFD::TeammateManager
             out.push_back(actor);
         }
 
-        TFD::ActorScan::Rescan(maxRadius, false);
-        const auto count = TFD::ActorScan::GetCount();
+        TFD::Actor::Scan::Rescan(maxRadius, false);
+        const auto count = TFD::Actor::Scan::GetCount();
         auto* pCell = player->GetParentCell();
         for (int i = 0; i < count; ++i) {
-            auto entry = TFD::ActorScan::GetEntry(i);
+            auto entry = TFD::Actor::Scan::GetEntry(i);
             auto sp = entry.actor.get();
             auto* actor = sp.get();
             if (!actor || actor == player || actor->IsDisabled()) {

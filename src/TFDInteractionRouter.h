@@ -1,11 +1,12 @@
 #pragma once
 
+#include "TFDActor.h"
+
 #include <RE/Skyrim.h>
 
 #include <cstdint>
 
 #include "TFDHostilityController.h"
-#include "TFDTargetClassifier.h"
 #include "TFDFlowController.h"
 
 namespace TFD::InteractionRouter
@@ -43,7 +44,7 @@ namespace TFD::InteractionRouter
         bool shouldBeginSession{ false };
         bool shouldOpenDialogue{ false };
 
-        TFD::TargetClassifier::ClassifyResult classify{};
+        TFD::Actor::Interaction::ClassifyResult classify{};
     };
 
     struct ExecuteResult

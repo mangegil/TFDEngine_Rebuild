@@ -1,6 +1,6 @@
 #include "TFDTame.h"
+#include "TFDActor.h"
 
-#include "TFDActorScan.h"
 #include "TFDBleedout.h"
 #include "TFDHostilityController.h"
 #include "TFDDefeatMonitor.h"
@@ -126,7 +126,7 @@ namespace TFD::Tame
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::ActorScan::Entry& scanEntry,
+            const TFD::Actor::Scan::Entry& scanEntry,
             float radius)
         {
             (void)scanEntry;
@@ -204,12 +204,12 @@ namespace TFD::Tame
 
             const float effectiveRadius = std::clamp(splashRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
             const float scanRadius = effectiveRadius + 256.0f;
-            TFD::ActorScan::Rescan(scanRadius, false);
+            TFD::Actor::Scan::Rescan(scanRadius, false);
 
-            const auto count = TFD::ActorScan::GetCount();
+            const auto count = TFD::Actor::Scan::GetCount();
             for (int i = 0; i < count; ++i) {
-                auto scanEntry = TFD::ActorScan::GetEntry(i);
-                auto* actor = TFD::ActorScan::GetActor(i);
+                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
+                auto* actor = TFD::Actor::Scan::GetActor(i);
                 if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, effectiveRadius)) {
                     continue;
                 }
