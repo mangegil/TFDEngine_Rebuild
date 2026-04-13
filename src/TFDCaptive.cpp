@@ -1,4 +1,4 @@
-#include "TFDCaptive.h"
+﻿#include "TFDCaptive.h"
 #include "TFDCaptiveGreet.h"
 #include "TFDActor.h"
 
@@ -84,24 +84,22 @@ namespace TFD::Captive
 			}
 
 			const float searchRadius = (std::max)(radius, 12288.0f);
-			TFD::Actor::Scan::Rescan(searchRadius, false);
+			auto snapshot = TFD::Actor::BuildSnapshot(searchRadius, false);
 
 			RE::Actor* best = nullptr;
 			float bestScore = 1.0e30f;
 
-			const auto n = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < n; ++i) {
-				auto e = TFD::Actor::Scan::GetEntry(i);
-				auto* a = TFD::Actor::Scan::GetActor(i);
+			for (const auto& info : snapshot.actors) {
+				auto* a = info.get();
 				if (!a) continue;
 				if (!IsCaptorSupportedActor(a)) continue;
 				if (!IsActorSameSpace(a, player)) continue;
-				if (e.dist > searchRadius) continue;
+				if (info.dist > searchRadius) continue;
 				if (!ActorHasLOS(a, player)) continue;
 
-				float score = e.dist;
-				if (e.hostile || a->IsHostileToActor(player)) score -= 140.0f;
-				if (e.inCombat || a->IsInCombat()) score -= 100.0f;
+				float score = info.dist;
+				if (info.hostileToPlayer || a->IsHostileToActor(player)) score -= 140.0f;
+				if (info.inCombat || a->IsInCombat()) score -= 100.0f;
 				if (score < bestScore) {
 					bestScore = score;
 					best = a;
@@ -150,13 +148,11 @@ namespace TFD::Captive
 			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
 			TFD::HostilityController::StopCombatSweep(sweepRadius, true);
 			TFD::HostilityController::ScheduleStopCombatWaves(sweepRadius, true, 10, 120);
-			TFD::Actor::Scan::Rescan(sweepRadius, false);
+			auto snapshot = TFD::Actor::BuildSnapshot(sweepRadius, false);
 
 			auto* pCell = player->GetParentCell();
-			const auto count = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::Actor::Scan::GetEntry(i);
-				auto* actor = TFD::Actor::Scan::GetActor(i);
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
 				if (!actor || actor->IsDead() || actor->IsDisabled()) {
 					continue;
 				}
@@ -169,7 +165,7 @@ namespace TFD::Captive
 				if (pCell && actor->GetParentCell() != pCell) {
 					continue;
 				}
-				if (actor->GetFormID() != primaryTarget->GetFormID() && !entry.hostile && !entry.inCombat) {
+				if (actor->GetFormID() != primaryTarget->GetFormID() && !info.hostileToPlayer && !info.inCombat) {
 					continue;
 				}
 

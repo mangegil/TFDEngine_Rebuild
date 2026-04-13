@@ -448,8 +448,7 @@ namespace TFD::Bleedout
 			return TFD::Actor::BuildSnapshot(player, options);
 		}
 
-		RE::Actor* ResolveCoalitionSpeakerCandidate(const TFD::Actor::Snapshot& snapshot, RE::Actor* preferred, float maxDist,
-			const SpeakerLogicHandlers& handlers,
+		RE::Actor* ResolveCoalitionSpeakerCandidate(const TFD::Actor::Snapshot& snapshot, RE::Actor* preferred,
 			const std::function<bool(RE::Actor*, float&)>& validator)
 		{
 			auto tryActor = [&](RE::Actor* actor) -> RE::Actor* {
@@ -493,19 +492,15 @@ namespace TFD::Bleedout
 			auto validator = [&](RE::Actor* actor, float& outDist) {
 				return IsReasonableHotkeySpeakerImpl(actor, player, maxDist, handlers, &outDist);
 			};
-			if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, maxDist, handlers, validator)) {
+			if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, validator)) {
 				return coalitionSpeaker;
 			}
 
-			TFD::Actor::Scan::Rescan(radius, false);
 			RE::Actor* best = nullptr;
 			float bestScore = std::numeric_limits<float>::max();
 			auto* lastAggressor = handlers.resolveLastAggressor ? handlers.resolveLastAggressor() : nullptr;
-			const auto count = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::Actor::Scan::GetEntry(i);
-				auto actorSp = entry.actor.get();
-				auto* actor = actorSp.get();
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
 				float dist = 99999.0f;
 				if (!IsReasonableHotkeySpeakerImpl(actor, player, maxDist, handlers, &dist)) {
 					continue;
@@ -514,8 +509,8 @@ namespace TFD::Bleedout
 				auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
 				const bool targetsPlayer = currentTarget == player;
 				const bool targetsFollower = currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget);
-				const bool hostile = entry.hostile || actor->IsHostileToActor(player);
-				const bool inCombat = entry.inCombat || actor->IsInCombat();
+				const bool hostile = info.hostileToPlayer || actor->IsHostileToActor(player);
+				const bool inCombat = info.inCombat || actor->IsInCombat();
 				const bool los = handlers.hasLineOfSightToPlayer && handlers.hasLineOfSightToPlayer(actor, player);
 				float score = dist;
 				if (targetsPlayer) score -= 900.0f;
@@ -573,28 +568,25 @@ namespace TFD::Bleedout
 		}
 
 		if (scored.empty()) {
-			TFD::Actor::Scan::Rescan(scanRadius, false);
-			const auto count = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::Actor::Scan::GetEntry(i);
-				auto actorSp = entry.actor.get();
-				auto* actor = actorSp.get();
+			auto fallbackSnapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+			for (const auto& info : fallbackSnapshot.actors) {
+				auto* actor = info.get();
 				if (!actor || actor->IsDead() || actor->IsDisabled()) continue;
 				if (!actor->Is3DLoaded()) continue;
 				if (actor->GetFormID() == player->GetFormID()) continue;
 				if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) continue;
 				if (!handlers.isBleedCrowdSupportedAggressor || !handlers.isBleedCrowdSupportedAggressor(actor)) continue;
-				if (entry.dist > scanRadius) continue;
+				if (info.dist > scanRadius) continue;
 
-				const bool targetingPlayer = entry.hostile || entry.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
+				const bool targetingPlayer = info.hostileToPlayer || info.inCombat || actor->IsInCombat() || actor->IsHostileToActor(player);
 				const bool preserved = preserveAssigned && handlers.isPreservedAssigned && handlers.isPreservedAssigned(actor);
 				if (!targetingPlayer && !preserved && actor != preferred) continue;
 
-				float score = entry.dist;
+				float score = info.dist;
 				if (actor == preferred) score -= 1000.0f;
 				if (targetingPlayer) score -= 140.0f;
-				if (entry.hostile) score -= 80.0f;
-				if (entry.inCombat || actor->IsInCombat()) score -= 60.0f;
+				if (info.hostileToPlayer) score -= 80.0f;
+				if (info.inCombat || actor->IsInCombat()) score -= 60.0f;
 				if (preserved) score -= 90.0f;
 				if (handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 320.0f)) score -= 120.0f;
 				scored.emplace_back(score, actor);
@@ -692,18 +684,14 @@ namespace TFD::Bleedout
 		auto validator = [&](RE::Actor* actor, float& outDist) {
 			return isStrongPreferred(actor, outDist);
 		};
-		if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, maxDist, handlers, validator)) {
+		if (auto* coalitionSpeaker = ResolveCoalitionSpeakerCandidate(snapshot, preferred, validator)) {
 			return coalitionSpeaker;
 		}
 
-		TFD::Actor::Scan::Rescan(radius, false);
 		RE::Actor* best = nullptr;
 		float bestScore = std::numeric_limits<float>::max();
-		const auto count = TFD::Actor::Scan::GetCount();
-		for (int i = 0; i < count; ++i) {
-			auto entry = TFD::Actor::Scan::GetEntry(i);
-			auto actorSp = entry.actor.get();
-			auto* actor = actorSp.get();
+		for (const auto& info : snapshot.actors) {
+			auto* actor = info.get();
 			float dist = 99999.0f;
 			if (!IsReasonableSpeakerImpl(actor, player, maxDist, &dist, handlers)) {
 				continue;
@@ -712,8 +700,8 @@ namespace TFD::Bleedout
 			auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
 			const bool targetsPlayer = currentTarget == player;
 			const bool targetsFollower = currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget);
-			const bool hostile = entry.hostile || actor->IsHostileToActor(player);
-			const bool inCombat = entry.inCombat || actor->IsInCombat();
+			const bool hostile = info.hostileToPlayer || actor->IsHostileToActor(player);
+			const bool inCombat = info.inCombat || actor->IsInCombat();
 			const bool front = handlers.isActorCloseAndFront && handlers.isActorCloseAndFront(actor, player, 448.0f);
 			if (!hostile && !inCombat && !targetsPlayer && !targetsFollower) {
 				continue;

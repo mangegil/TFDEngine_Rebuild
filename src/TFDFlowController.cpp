@@ -1,4 +1,4 @@
-#include "TFDFlowController.h"
+﻿#include "TFDFlowController.h"
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
 #include "TFDCaptive.h"
@@ -345,6 +345,59 @@ namespace TFD::FlowController
     void ResetBattleObserverRuntimeProviders()
     {
         g_battleObserverRuntimeProviders = {};
+    }
+
+    ObservedDefeatResolution EvaluateObservedDefeatResolution(const ObservedDefeatInput& input)
+    {
+        if (input.forceCaptive) {
+            return ObservedDefeatResolution::Captive;
+        }
+
+        if (!input.conflictResolved) {
+            return ObservedDefeatResolution::ContinueObserve;
+        }
+
+        if (input.hasStandingPlayerSide || input.hasStandingTeammate) {
+            return ObservedDefeatResolution::NonCaptiveChoice;
+        }
+
+        if (input.hasStandingHostileCoalition && (input.hasCaptiveMarker || input.canUseCaptiveFallback)) {
+            return ObservedDefeatResolution::Captive;
+        }
+
+        return ObservedDefeatResolution::LeftForDead;
+    }
+
+    bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason)
+    {
+        const auto resolution = EvaluateObservedDefeatResolution(input);
+        const std::string reasonText = reason.empty() ? std::string{"observed_defeat_resolution"} : std::string{reason};
+        const auto* why = reasonText.c_str();
+        switch (resolution) {
+        case ObservedDefeatResolution::ContinueObserve:
+            spdlog::info("[TFD][Flow] observed defeat decision=continue reason={}", why);
+            return false;
+        case ObservedDefeatResolution::NonCaptiveChoice:
+            HandleObservedBattleWin(why);
+            return true;
+        case ObservedDefeatResolution::LeftForDead:
+            HandleObservedLeftForDead(why);
+            return true;
+        case ObservedDefeatResolution::Captive: {
+            auto actorFormID = input.actorFormID != 0 ? input.actorFormID : ResolveBleedFlowActorFormIDFromProviders();
+            const bool ok = Controller::GetSingleton().BeginCaptive(actorFormID, CaptiveMode::Kidnapped, why);
+            if (!ok) {
+                spdlog::warn("[TFD][Flow] observed defeat decision=captive reject actor={:08X} reason={}", actorFormID, why);
+            } else {
+                spdlog::info("[TFD][Flow] observed defeat decision=captive actor={:08X} reason={}", actorFormID, why);
+            }
+            return ok;
+        }
+        case ObservedDefeatResolution::None:
+        default:
+            break;
+        }
+        return false;
     }
 
     void HandleObservedBattleWin(const char* reason)

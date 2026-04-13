@@ -1,4 +1,4 @@
-#include "TFDTeammateManager.h"
+﻿#include "TFDTeammateManager.h"
 #include "TFDActor.h"
 
 #include <RE/Skyrim.h>
@@ -534,19 +534,16 @@ namespace
             }
 
             const float useRadius = (std::max)(radius, 6000.0f);
-            TFD::Actor::Scan::Rescan(useRadius, false);
-            const auto count = TFD::Actor::Scan::GetCount();
+            auto snapshot = TFD::Actor::BuildSnapshot(useRadius, false);
             std::unordered_set<RE::FormID> seen;
             out.reserve(8);
 
-            for (int i = 0; i < count; ++i) {
-                auto entry = TFD::Actor::Scan::GetEntry(i);
-                auto actorSP = entry.actor.get();
-                auto* actor = actorSP.get();
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
                 if (!IsValidTeammate(actor)) {
                     continue;
                 }
-                if (entry.dist > useRadius) {
+                if (info.dist > useRadius) {
                     continue;
                 }
                 if (!seen.insert(actor->GetFormID()).second) {
@@ -828,20 +825,17 @@ namespace TFD::TeammateManager
             out.push_back(actor);
         }
 
-        TFD::Actor::Scan::Rescan(maxRadius, false);
-        const auto count = TFD::Actor::Scan::GetCount();
+        auto snapshot = TFD::Actor::BuildSnapshot(maxRadius, false);
         auto* pCell = player->GetParentCell();
-        for (int i = 0; i < count; ++i) {
-            auto entry = TFD::Actor::Scan::GetEntry(i);
-            auto sp = entry.actor.get();
-            auto* actor = sp.get();
+        for (const auto& info : snapshot.actors) {
+            auto* actor = info.get();
             if (!actor || actor == player || actor->IsDisabled()) {
                 continue;
             }
             if (actor->GetParentCell() != pCell) {
                 continue;
             }
-            if (entry.dist > maxRadius) {
+            if (info.dist > maxRadius) {
                 continue;
             }
             if (!actor->IsPlayerTeammate() && !BridgeInternal::HasFollowerAnchorFaction(actor)) {

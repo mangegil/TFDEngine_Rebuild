@@ -1,4 +1,4 @@
-#include "TFDTame.h"
+﻿#include "TFDTame.h"
 #include "TFDActor.h"
 
 #include "TFDBleedout.h"
@@ -126,10 +126,8 @@ namespace TFD::Tame
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::Actor::Scan::Entry& scanEntry,
             float radius)
         {
-            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -204,13 +202,11 @@ namespace TFD::Tame
 
             const float effectiveRadius = std::clamp(splashRadius, kLocalHostileSplashRadiusMin, kLocalHostileSplashRadiusMax);
             const float scanRadius = effectiveRadius + 256.0f;
-            TFD::Actor::Scan::Rescan(scanRadius, false);
+            auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
 
-            const auto count = TFD::Actor::Scan::GetCount();
-            for (int i = 0; i < count; ++i) {
-                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
-                auto* actor = TFD::Actor::Scan::GetActor(i);
-                if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, scanEntry, effectiveRadius)) {
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!IsEligibleLocalSplashActor(actor, player, primaryTarget, effectiveRadius)) {
                     continue;
                 }
                 if (!IsSamePackSpecies(actor, primaryTarget)) {

@@ -1,4 +1,4 @@
-#include "TFDHostilityController.h"
+﻿#include "TFDHostilityController.h"
 #include "TFDActor.h"
 
 #include "TFDTame.h"
@@ -53,11 +53,10 @@ namespace
 
             player->StopCombat();
 
-            TFD::Actor::Scan::Rescan(radius, npcOnly);
-            const auto count = TFD::Actor::Scan::GetCount();
+            const auto snapshot = TFD::Actor::BuildSnapshot(radius, npcOnly);
 
-            for (std::int32_t i = 0; i < count; i++) {
-                auto* actor = TFD::Actor::Scan::GetActor(i);
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
                 if (!actor) {
                     continue;
                 }
@@ -350,12 +349,10 @@ namespace
             }
 
             const float radius = TFD::Settings::GetSweepRadius();
-            TFD::Actor::Scan::Rescan(radius, true);
+            const auto snapshot = TFD::Actor::BuildSnapshot(radius, true);
 
-            const auto count = TFD::Actor::Scan::GetCount();
-            for (std::int32_t i = 0; i < count; i++) {
-                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
-                auto* actor = scanEntry.actor.get().get();
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
                 if (!actor || actor == player) {
                     continue;
                 }
@@ -365,7 +362,7 @@ namespace
                 if (!IsAllowlistedActor(actor)) {
                     continue;
                 }
-                if (!scanEntry.hostile && !scanEntry.inCombat) {
+                if (!info.hostileToPlayer && !info.inCombat) {
                     continue;
                 }
 
@@ -926,10 +923,8 @@ namespace TFD::HostilityController
         bool IsEligibleActiveTruceCombatant(
             RE::Actor* actor,
             RE::Actor* player,
-            RE::Actor* primaryTarget,
-            const TFD::Actor::Scan::Entry& scanEntry)
+            RE::Actor* primaryTarget)
         {
-            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -987,17 +982,15 @@ namespace TFD::HostilityController
             std::size_t& truceClusterCount)
         {
             std::vector<TruceCandidate> candidates;
-            TFD::Actor::Scan::Rescan(scanRadius, false);
-            const auto count = TFD::Actor::Scan::GetCount();
-            candidates.reserve(count);
+            auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+            candidates.reserve(snapshot.actors.size());
 
             auto* playerCell = player ? player->GetParentCell() : nullptr;
             auto* primaryCell = primaryTarget ? primaryTarget->GetParentCell() : nullptr;
 
-            for (int i = 0; i < count; ++i) {
-                auto scanEntry = TFD::Actor::Scan::GetEntry(i);
-                auto* actor = TFD::Actor::Scan::GetActor(i);
-                if (!IsEligibleActiveTruceCombatant(actor, player, primaryTarget, scanEntry)) {
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!IsEligibleActiveTruceCombatant(actor, player, primaryTarget)) {
                     continue;
                 }
 
@@ -1005,7 +998,7 @@ namespace TFD::HostilityController
                 c.actor = actor;
                 c.actorId = actor->GetFormID();
                 c.isPrimary = c.actorId == primaryTarget->GetFormID();
-                auto* combatTarget = ResolveCurrentCombatTarget(actor);
+                auto* combatTarget = info.getCurrentTarget();
                 c.targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
                 c.distanceToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
                 c.distanceToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
@@ -1105,10 +1098,8 @@ namespace TFD::HostilityController
             RE::Actor* actor,
             RE::Actor* player,
             RE::Actor* primaryTarget,
-            const TFD::Actor::Scan::Entry& scanEntry,
             float radius)
         {
-            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -1185,10 +1176,8 @@ namespace TFD::HostilityController
         bool IsEligibleCellBubbleActor(
             RE::Actor* actor,
             RE::Actor* player,
-            RE::Actor* primaryTarget,
-            const TFD::Actor::Scan::Entry& scanEntry)
+            RE::Actor* primaryTarget)
         {
-            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -1220,10 +1209,8 @@ namespace TFD::HostilityController
         bool IsEligibleTruceClusterActor(
             RE::Actor* actor,
             RE::Actor* player,
-            RE::Actor* primaryTarget,
-            const TFD::Actor::Scan::Entry& scanEntry)
+            RE::Actor* primaryTarget)
         {
-            (void)scanEntry;
             if (!IsActorStillValid(actor) || !player || !primaryTarget) {
                 return false;
             }
@@ -1977,12 +1964,10 @@ namespace TFD::HostilityController
             }
             else if (applyCellBubble) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
-                TFD::Actor::Scan::Rescan(scanRadius, false);
-                const auto count = TFD::Actor::Scan::GetCount();
-                for (int i = 0; i < count; ++i) {
-                    auto scanEntry = TFD::Actor::Scan::GetEntry(i);
-                    auto* actor = TFD::Actor::Scan::GetActor(i);
-                    if (!IsEligibleCellBubbleActor(actor, player, primaryTarget, scanEntry)) {
+                auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+                for (const auto& info : snapshot.actors) {
+                    auto* actor = info.get();
+                    if (!IsEligibleCellBubbleActor(actor, player, primaryTarget)) {
                         continue;
                     }
 

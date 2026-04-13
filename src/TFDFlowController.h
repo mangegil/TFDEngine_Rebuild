@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstdint>
 #include <functional>
@@ -178,6 +178,28 @@ namespace TFD::FlowController
     bool HandlePassiveBreakHitEvent(RE::Actor* causeActor, RE::Actor* targetActor);
     bool HandlePassiveBreakModEvent(const char* eventName, const char* strArg = nullptr);
 
+
+    enum class ObservedDefeatResolution : std::uint8_t
+    {
+        None = 0,
+        ContinueObserve,
+        NonCaptiveChoice,
+        LeftForDead,
+        Captive
+    };
+
+    struct ObservedDefeatInput
+    {
+        bool conflictResolved{ false };
+        bool hasStandingPlayerSide{ false };
+        bool hasStandingTeammate{ false };
+        bool hasStandingHostileCoalition{ false };
+        bool hasCaptiveMarker{ false };
+        bool canUseCaptiveFallback{ false };
+        bool forceCaptive{ false };
+        std::uint32_t actorFormID{ 0 };
+    };
+
     struct BattleObserverRuntimeProviders
     {
         std::function<void(const char*)> clearBridgeAliases;
@@ -196,6 +218,8 @@ namespace TFD::FlowController
 
     void InstallBattleObserverRuntimeProviders(BattleObserverRuntimeProviders providers);
     void ResetBattleObserverRuntimeProviders();
+    ObservedDefeatResolution EvaluateObservedDefeatResolution(const ObservedDefeatInput& input);
+    bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason);
     void HandleObservedBattleWin(const char* reason = nullptr);
     void HandleObservedLeftForDead(const char* reason = nullptr);
 

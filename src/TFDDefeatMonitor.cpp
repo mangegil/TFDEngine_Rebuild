@@ -1,4 +1,4 @@
-#include "TFDDefeatMonitor.h"
+﻿#include "TFDDefeatMonitor.h"
 #include "TFDActor.h"
 
 #include <atomic>
@@ -1445,7 +1445,29 @@ namespace TFD::DefeatMonitor
 
 		static std::vector<RE::Actor*> CollectBleedStandingFollowers(float radius)
 		{
-			return TFD::TeammateManager::CollectStandingFollowers(radius);
+			std::vector<RE::Actor*> out;
+			std::unordered_set<RE::FormID> seen;
+
+			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
+			for (auto* actor : TFD::Actor::ResolveStandingPlayerSideActors(snapshot, false)) {
+				if (!IsStandingAllyThresholdActor(actor)) {
+					continue;
+				}
+				if (seen.insert(actor->GetFormID()).second) {
+					out.push_back(actor);
+				}
+			}
+
+			for (auto* actor : TFD::TeammateManager::CollectStandingFollowers(radius)) {
+				if (!IsStandingAllyThresholdActor(actor)) {
+					continue;
+				}
+				if (seen.insert(actor->GetFormID()).second) {
+					out.push_back(actor);
+				}
+			}
+
+			return out;
 		}
 
 		static bool IsStandingObserverActor(RE::Actor* actor)
@@ -1884,17 +1906,31 @@ namespace TFD::DefeatMonitor
 			TFD::Bleedout::TickRuntimeBattleObservePending(BuildBleedRuntimeHostStateRefs(), Player(), BuildBleedRuntimeHostHandlers());
 		}
 
+		static bool ApplyObservedDefeatResolution(bool hasStandingPlayerSide, bool hasStandingTeammate, bool hasStandingHostileCoalition, bool hasCaptiveMarker, bool canUseCaptiveFallback, bool forceCaptive, const char* reason)
+		{
+			TFD::FlowController::ObservedDefeatInput input{};
+			input.conflictResolved = true;
+			input.hasStandingPlayerSide = hasStandingPlayerSide;
+			input.hasStandingTeammate = hasStandingTeammate;
+			input.hasStandingHostileCoalition = hasStandingHostileCoalition;
+			input.hasCaptiveMarker = hasCaptiveMarker;
+			input.canUseCaptiveFallback = canUseCaptiveFallback;
+			input.forceCaptive = forceCaptive;
+			input.actorFormID = ResolveBleedFlowActorFormID();
+			return TFD::FlowController::ApplyObservedDefeatResolution(input, reason ? reason : "observed_defeat_resolution");
+		}
+
 		static void EnterObservedBattleWin()
 		{
 			g_lastAggressor.reset();
 			g_bleedBattleObservePending = false;
-			TFD::FlowController::HandleObservedBattleWin("battle_observe_win");
+			(void)ApplyObservedDefeatResolution(true, true, false, false, false, false, "battle_observe_win");
 		}
 
 		static void EnterObservedLeftForDead(const char* reason)
 		{
 			g_lastAggressor.reset();
-			TFD::FlowController::HandleObservedLeftForDead(reason ? reason : "battle_observe_loss");
+			(void)ApplyObservedDefeatResolution(false, false, true, false, false, false, reason ? reason : "battle_observe_loss");
 		}
 
 		static void TickBleedBattleObserve()
@@ -3029,7 +3065,7 @@ namespace TFD::DefeatMonitor
 			handlers.clearLastAggressor = [&]() { g_lastAggressor.reset(); };
 			handlers.beginCaptiveFlow = [&]() {
 				RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
-				(void)TFD::FlowController::Controller::GetSingleton().BeginCaptive(ResolveBleedFlowActorFormID(), TFD::FlowController::CaptiveMode::Kidnapped, "bleed_blackout_teleport");
+				(void)ApplyObservedDefeatResolution(false, false, true, true, true, true, "bleed_blackout_teleport");
 			};
 			handlers.clearPendingCinematicFadeIn = [&]() { TFD::Transition::ClearPendingFadeIn(); };
 			handlers.queueCaptiveFadeTransition = [&]() -> bool { return TFD::Transition::QueueRequest(TFD::Transition::Kind::Captive, false, "captive_blackout"); };
@@ -3142,6 +3178,52 @@ namespace TFD::DefeatMonitor
 				}
 				if (auto* actor = sp.get(); actor) {
 					spdlog::info("[TFD][Defeat] discard stale last aggressor {:08X} reason=combat_invalid", actor->GetFormID());
+				}
+			}
+
+			auto snapshot = TFD::Actor::BuildSnapshot(maxAggressorDist, false);
+			RE::Actor* best = nullptr;
+			float bestScore = std::numeric_limits<float>::max();
+			for (auto* attacker : TFD::Actor::GetAttackersOf(snapshot, player)) {
+				if (!attacker || TFD::Actor::IsActorOutsider(snapshot, attacker)) {
+					continue;
+				}
+				float dist = -1.0f;
+				if (!IsReasonableCombatAggressor(attacker, player, maxAggressorDist, &dist)) {
+					continue;
+				}
+				float score = dist;
+				if (auto* info = TFD::Actor::FindActorInfo(snapshot, attacker)) {
+					if (info->hostileToPlayer) {
+						score -= 180.0f;
+					}
+					if (info->isMutuallyEngaged) {
+						score -= 120.0f;
+					}
+					if (info->currentTargetFormID == player->GetFormID()) {
+						score -= 260.0f;
+					}
+				}
+				if (score < bestScore) {
+					bestScore = score;
+					best = attacker;
+				}
+			}
+			if (best) {
+				g_lastAggressor = best->GetHandle();
+				return best;
+			}
+
+			if (snapshot.winningCoalitionCandidateID >= 0) {
+				if (auto* coalition = TFD::Actor::FindCoalition(snapshot, snapshot.winningCoalitionCandidateID);
+					coalition && coalition->hostileToPlayerSide) {
+					if (auto* speaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, coalition->coalitionID)) {
+						float dist = -1.0f;
+						if (IsReasonableCombatAggressor(speaker, player, maxAggressorDist, &dist)) {
+							g_lastAggressor = speaker->GetHandle();
+							return speaker;
+						}
+					}
 				}
 			}
 
@@ -3496,7 +3578,7 @@ namespace TFD::DefeatMonitor
 			handlers.clearLastAggressor = []() { g_lastAggressor.reset(); };
 			handlers.beginCaptiveFlow = [](const char* why) {
 				RE::DebugNotification("TFDEngine: Blackout -> Captive (1h)");
-				(void)TFD::FlowController::Controller::GetSingleton().BeginCaptive(ResolveBleedFlowActorFormID(), TFD::FlowController::CaptiveMode::Kidnapped, why ? why : "captive_enter");
+				(void)ApplyObservedDefeatResolution(false, false, true, true, true, true, why ? why : "captive_enter");
 			};
 			handlers.setCaptiveRuntimeCaptive = []() { TFD::Captive::SetRuntimeState(true, CaptivePhaseValue::Captive); };
 			handlers.isDialogueOpen = []() { return IsDialogueOpen(); };

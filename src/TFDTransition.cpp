@@ -824,19 +824,16 @@ namespace TFD::Transition
 				queueOne(primary, true);
 			}
 
-			TFD::Actor::Scan::Rescan(radius, false);
-			const auto n = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < n; ++i) {
-				auto entry = TFD::Actor::Scan::GetEntry(i);
-				auto sp = entry.actor.get();
-				auto* actor = sp.get();
+			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
 				if (!actor || actor == primary) {
 					continue;
 				}
-				if (entry.dist > radius) {
+				if (info.dist > radius) {
 					continue;
 				}
-				if (!entry.hostile && !entry.inCombat && !actor->IsInCombat() && !actor->IsHostileToActor(player)) {
+				if (!info.hostileToPlayer && !info.inCombat && !actor->IsInCombat() && !actor->IsHostileToActor(player)) {
 					continue;
 				}
 
@@ -1178,12 +1175,9 @@ namespace TFD::Transition
 				++applied;
 			}
 		} else {
-			TFD::Actor::Scan::Rescan(radius, false);
-			const auto count = TFD::Actor::Scan::GetCount();
-			for (int i = 0; i < count; ++i) {
-				auto entry = TFD::Actor::Scan::GetEntry(i);
-				auto actorSP = entry.actor.get();
-				auto* actor = actorSP.get();
+			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
 				if (!actor || actor->IsDead() || actor->IsDisabled() || IsActiveFollowerActor(handlers, actor)) {
 					continue;
 				}

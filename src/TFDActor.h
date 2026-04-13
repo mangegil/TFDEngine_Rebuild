@@ -90,6 +90,8 @@ namespace TFD::Actor
     [[nodiscard]] RE::Actor* GetCurrentTarget(const Snapshot& snapshot, RE::Actor* actor);
     [[nodiscard]] RE::Actor* ResolveSpeakerCandidate(const Snapshot& snapshot, std::int32_t coalitionID);
     [[nodiscard]] std::vector<RE::Actor*> ResolveCrowdCandidates(const Snapshot& snapshot, std::int32_t coalitionID);
+    [[nodiscard]] std::vector<RE::Actor*> ResolveStandingCoalitionMembers(const Snapshot& snapshot, std::int32_t coalitionID);
+    [[nodiscard]] std::vector<RE::Actor*> ResolveStandingPlayerSideActors(const Snapshot& snapshot, bool includePlayer = false);
     [[nodiscard]] std::vector<RE::Actor*> GetAttackersOf(const Snapshot& snapshot, RE::Actor* actor);
     [[nodiscard]] bool IsActorTargetingAnyone(const Snapshot& snapshot, RE::Actor* actor);
     [[nodiscard]] bool IsActorTargetedByAnyone(const Snapshot& snapshot, RE::Actor* actor);

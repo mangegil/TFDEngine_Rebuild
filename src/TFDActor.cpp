@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <unordered_map>
@@ -720,6 +721,50 @@ namespace TFD::Actor
                 if (auto* actor = info->get()) {
                     out.push_back(actor);
                 }
+            }
+        }
+        return out;
+    }
+
+    std::vector<RE::Actor*> ResolveStandingCoalitionMembers(const Snapshot& snapshot, std::int32_t coalitionID)
+    {
+        std::vector<RE::Actor*> out;
+        auto* coalition = FindCoalition(snapshot, coalitionID);
+        if (!coalition) {
+            return out;
+        }
+        out.reserve(coalition->standingMemberFormIDs.size());
+        for (auto formID : coalition->standingMemberFormIDs) {
+            if (auto* info = FindActorInfo(snapshot, formID)) {
+                if (auto* actor = info->get()) {
+                    out.push_back(actor);
+                }
+            }
+        }
+        return out;
+    }
+
+    std::vector<RE::Actor*> ResolveStandingPlayerSideActors(const Snapshot& snapshot, bool includePlayer)
+    {
+        std::vector<RE::Actor*> out;
+        auto* coalition = FindCoalition(snapshot, snapshot.playerCoalitionID);
+        if (!coalition) {
+            return out;
+        }
+        out.reserve(coalition->standingMemberFormIDs.size());
+        for (auto formID : coalition->standingMemberFormIDs) {
+            if (auto* info = FindActorInfo(snapshot, formID)) {
+                auto* actor = info->get();
+                if (!actor) {
+                    continue;
+                }
+                if (!includePlayer) {
+                    auto playerSp = snapshot.player.get();
+                    if (auto* player = playerSp.get(); player && actor == player) {
+                        continue;
+                    }
+                }
+                out.push_back(actor);
             }
         }
         return out;
@@ -1719,13 +1764,35 @@ namespace TFD::Actor::Ops
 				found);
 		}
 
+		static RE::Actor* ResolveCoalitionSpeakerFromSnapshot(const TFD::Actor::Snapshot& snapshot)
+		{
+			if (snapshot.winningCoalitionCandidateID >= 0) {
+				if (auto* speaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, snapshot.winningCoalitionCandidateID)) {
+					return speaker;
+				}
+			}
+
+			RE::Actor* bestSpeaker = nullptr;
+			float bestDist = std::numeric_limits<float>::max();
+			for (const auto& coalition : snapshot.coalitions) {
+				if (!coalition.hostileToPlayerSide || coalition.standingCount == 0) {
+					continue;
+				}
+				auto* speaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, coalition.coalitionID);
+				if (!speaker) {
+					continue;
+				}
+				if (const auto* info = TFD::Actor::FindActorInfo(snapshot, speaker); info && info->dist < bestDist) {
+					bestDist = info->dist;
+					bestSpeaker = speaker;
+				}
+			}
+			return bestSpeaker;
+		}
+
 		static std::vector<RE::Actor*> CollectCoalitionActorsForSpeaker(RE::Actor* speaker)
 		{
 			std::vector<RE::Actor*> actors{};
-			if (!speaker) {
-				return actors;
-			}
-
 			auto addUnique = [&](RE::Actor* actor) {
 				if (!actor || actor->IsDead() || actor->IsDisabled() || actor == Player()) {
 					return;
@@ -1748,6 +1815,9 @@ namespace TFD::Actor::Ops
 			options.radius = (std::max)(2000.0f, TFD::Settings::GetSweepRadius());
 			options.npcOnly = false;
 			auto snapshot = TFD::Actor::BuildSnapshot(player, options);
+			if (!speaker) {
+				speaker = ResolveCoalitionSpeakerFromSnapshot(snapshot);
+			}
 			if (auto* info = TFD::Actor::FindActorInfo(snapshot, speaker); info && info->coalitionID >= 0) {
 				addUnique(speaker);
 				for (auto* actor : TFD::Actor::ResolveCrowdCandidates(snapshot, info->coalitionID)) {
@@ -1765,7 +1835,10 @@ namespace TFD::Actor::Ops
 		static std::vector<RE::Actor*> CollectTruceActorsInternal(RE::Actor* speaker)
 		{
 			ResolveTruceQuestRegistry();
-			std::vector<RE::Actor*> actors{};
+			std::vector<RE::Actor*> actors = CollectCoalitionActorsForSpeaker(speaker);
+			if (!actors.empty()) {
+				return actors;
+			}
 			auto addUnique = [&](RE::Actor* actor) {
 				if (!actor || actor->IsDead() || actor->IsDisabled() || actor == Player()) {
 					return;
@@ -1777,9 +1850,6 @@ namespace TFD::Actor::Ops
 				}
 				actors.push_back(actor);
 			};
-			for (auto* actor : CollectCoalitionActorsForSpeaker(speaker)) {
-				addUnique(actor);
-			}
 			for (auto* alias : g_truceQuestRegistry.truceAliases) {
 				if (!alias) {
 					continue;
