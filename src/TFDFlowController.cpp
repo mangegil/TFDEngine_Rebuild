@@ -399,7 +399,7 @@ namespace TFD::FlowController
             return true;
         case ObservedDefeatResolution::Captive: {
             auto actorFormID = input.actorFormID != 0 ? input.actorFormID : ResolveBleedFlowActorFormIDFromProviders();
-            const bool ok = Controller::GetSingleton().BeginCaptive(actorFormID, CaptiveMode::Kidnapped, why);
+            const bool ok = Controller::GetSingleton().RequestCaptive(actorFormID, CaptiveMode::Kidnapped, why);
             if (!ok) {
                 spdlog::warn("[TFD][Flow] observed defeat decision=captive reject actor={:08X} reason={}", actorFormID, why);
             } else {
@@ -576,11 +576,11 @@ namespace TFD::FlowController
             [&](const char* reason) { TFD::InCombat::ClearDialogueOutcome(reason); },
             [&](std::uint32_t actorFormID, const char* reason) -> bool {
                 auto& flow = TFD::FlowController::Controller::GetSingleton();
-                return flow.BeginCaptiveFromModEvent(actorFormID, reason ? reason : "mod_event_captive");
+                return flow.RequestCaptiveFromModEvent(actorFormID, reason ? reason : "mod_event_captive");
             },
             [&](std::uint32_t actorFormID, const char* reason) -> bool {
                 auto& flow = TFD::FlowController::Controller::GetSingleton();
-                return flow.BeginCaptivePleasureFromModEvent(actorFormID, reason ? reason : "mod_event_pleasure");
+                return flow.RequestCaptivePleasureFromModEvent(actorFormID, reason ? reason : "mod_event_pleasure");
             },
             [&](const char* reason) {
                 if (g_outcomeRuntimeProviders.preparePlayerForCaptivePleasureScene) {
@@ -672,7 +672,7 @@ namespace TFD::FlowController
             [&](const char* reason) { TFD::Bleedout::ClearSystemEventOutcomeWindow(reason); },
             [&](std::uint32_t actorFormID, const char* reason) -> bool {
                 auto& flow = TFD::FlowController::Controller::GetSingleton();
-                return flow.BeginCaptivePleasureFromModEvent(actorFormID, reason ? reason : "mod_event_pleasure");
+                return flow.RequestCaptivePleasureFromModEvent(actorFormID, reason ? reason : "mod_event_pleasure");
             },
             [&](const char* reason) {
                 if (g_outcomeRuntimeProviders.preparePlayerForCaptivePleasureScene) {
@@ -1057,6 +1057,86 @@ namespace TFD::FlowController
         return _snapshot;
     }
 
+    bool Controller::RequestPreCombat(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginPreCombat(actorFormID, reason);
+    }
+
+    bool Controller::RequestInCombat(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginInCombat(actorFormID, reason);
+    }
+
+    bool Controller::RequestCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason)
+    {
+        return BeginCaptive(actorFormID, mode, reason);
+    }
+
+    bool Controller::RequestVictory(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginVictory(actorFormID, reason);
+    }
+
+    bool Controller::RequestTruceDecision(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginTruceDecision(actorFormID, reason);
+    }
+
+    bool Controller::RequestPlayerBleedoutDecision(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginPlayerBleedoutDecision(actorFormID, reason);
+    }
+
+    bool Controller::RequestEnemyBleedoutDecision(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginEnemyBleedoutDecision(actorFormID, reason);
+    }
+
+    bool Controller::RequestResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolvePreCombatOutcome(outcome, actorFormID, reason);
+    }
+
+    bool Controller::RequestResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveBleedoutOutcome(outcome, actorFormID, reason);
+    }
+
+    bool Controller::RequestResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveVictoryOutcome(outcome, actorFormID, reason);
+    }
+
+    bool Controller::RequestResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveCaptiveOutcome(outcome, actorFormID, reason);
+    }
+
+    bool Controller::RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginAfterPleasure(actorFormID, reason);
+    }
+
+    bool Controller::RequestCompleteAfterPleasure(std::string_view reason)
+    {
+        return CompleteAfterPleasure(reason);
+    }
+
+    bool Controller::RequestCompleteTerminalContext(std::string_view reason)
+    {
+        return CompleteTerminalContext(reason);
+    }
+
+    bool Controller::RequestCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginCaptiveFromModEvent(actorFormID, reason);
+    }
+
+    bool Controller::RequestCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return BeginCaptivePleasureFromModEvent(actorFormID, reason);
+    }
+
     void Controller::ResetRuntime(std::string_view reason)
     {
         std::scoped_lock lk(_lock);
@@ -1439,12 +1519,12 @@ namespace TFD::FlowController
 
     void Controller::NotifyPlayerBleedout(std::uint32_t actorFormID, std::string_view reason)
     {
-        (void)BeginPlayerBleedoutDecision(actorFormID, reason);
+        (void)RequestPlayerBleedoutDecision(actorFormID, reason);
     }
 
     void Controller::NotifyEnemyBleedout(std::uint32_t actorFormID, std::string_view reason)
     {
-        (void)BeginEnemyBleedoutDecision(actorFormID, reason);
+        (void)RequestEnemyBleedoutDecision(actorFormID, reason);
     }
 
     bool Controller::CanStartPreCombat() const
@@ -1557,16 +1637,16 @@ namespace TFD::FlowController
 
     bool Controller::BeginCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason)
     {
-        return BeginCaptive(actorFormID, CaptiveMode::Kidnapped, reason.empty() ? std::string_view{"mod_event_captive"} : reason);
+        return RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason.empty() ? std::string_view{"mod_event_captive"} : reason);
     }
 
     bool Controller::BeginCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason)
     {
-        if (!BeginCaptive(actorFormID, CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
+        if (!RequestCaptive(actorFormID, CaptiveMode::Kidnapped, "mod_event_captive_pleasure_begin")) {
             spdlog::warn("[TFD][Flow] ignore mod_event_pleasure reason=begin_captive_reject actor={:08X}", actorFormID);
             return false;
         }
-        if (!ResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason.empty() ? std::string_view{"mod_event_pleasure"} : reason)) {
+        if (!RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason.empty() ? std::string_view{"mod_event_pleasure"} : reason)) {
             spdlog::warn("[TFD][Flow] ignore mod_event_pleasure reason=captive_flow_reject actor={:08X}", actorFormID);
             return false;
         }

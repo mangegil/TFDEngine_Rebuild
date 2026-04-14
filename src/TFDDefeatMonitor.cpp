@@ -1439,6 +1439,92 @@ namespace TFD::DefeatMonitor
 			RE::Actor* downed{ nullptr };
 		};
 
+		struct PlayerThresholdOutcomeScan
+		{
+			float scanRadius{ 0.0f };
+			RE::Actor* initialAggressor{ nullptr };
+			TFD::Actor::Snapshot coalitionSnapshot{};
+			std::vector<RE::Actor*> standingFollowers{};
+			bool unresolvedBattle{ false };
+			bool playerSideStanding{ false };
+			bool hostileCoalitionStanding{ false };
+		};
+
+		struct PlayerThresholdOutcomeClassification
+		{
+			RE::Actor* rememberedAggressor{ nullptr };
+			bool observeUnresolvedBattle{ false };
+			bool observeStandingFollowers{ false };
+		};
+
+		static void RememberAggressorForOutcome(RE::Actor* actor)
+		{
+			if (actor && !IsObserverAlly(actor)) {
+				g_lastAggressor = actor->GetHandle();
+			}
+		}
+
+		static PlayerThresholdOutcomeScan ScanPlayerThresholdOutcome(RE::Actor* player)
+		{
+			(void)player;
+			PlayerThresholdOutcomeScan scan{};
+			scan.scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+			scan.initialAggressor = ResolveAggressor();
+			if (!scan.initialAggressor) {
+				scan.initialAggressor = FindBestAggressor(scan.scanRadius);
+			}
+			scan.coalitionSnapshot = TFD::Actor::BuildSnapshot(scan.scanRadius, false);
+			scan.unresolvedBattle = !TFD::Actor::IsConflictResolved(scan.coalitionSnapshot);
+			scan.playerSideStanding = TFD::Actor::HasStandingTeammateOnPlayerSide(scan.coalitionSnapshot);
+			scan.hostileCoalitionStanding = TFD::Actor::HasStandingHostileCoalition(scan.coalitionSnapshot);
+			scan.standingFollowers = CollectBleedStandingFollowers(scan.scanRadius);
+			return scan;
+		}
+
+		static PlayerThresholdOutcomeClassification ClassifyPlayerThresholdOutcome(const PlayerThresholdOutcomeScan& scan)
+		{
+			PlayerThresholdOutcomeClassification classification{};
+			classification.rememberedAggressor =
+				(scan.initialAggressor && !IsObserverAlly(scan.initialAggressor)) ? scan.initialAggressor : nullptr;
+			classification.observeUnresolvedBattle = scan.unresolvedBattle && scan.hostileCoalitionStanding;
+			classification.observeStandingFollowers = !scan.standingFollowers.empty();
+			return classification;
+		}
+
+		static bool DispatchPlayerThresholdOutcome(
+			RE::Actor* player,
+			const PlayerThresholdOutcomeScan& scan,
+			const PlayerThresholdOutcomeClassification& classification)
+		{
+			RememberAggressorForOutcome(classification.rememberedAggressor);
+
+			if (classification.observeUnresolvedBattle) {
+				spdlog::info("[TFD][Defeat] delay outcome unresolved battle coalitions={} playerSideStanding={}",
+					scan.coalitionSnapshot.activeCoalitionCount,
+					scan.playerSideStanding ? 1 : 0);
+				if (StartBleedBattleObservePending(player)) {
+					SetGraceSeconds(1);
+					return true;
+				}
+			}
+
+			if (classification.observeStandingFollowers) {
+				if (StartBleedBattleObservePending(player)) {
+					SetGraceSeconds(1);
+					return true;
+				}
+			}
+
+			auto* speaker = FindBestBleedoutSpeaker(scan.scanRadius, 768.0f, classification.rememberedAggressor);
+			RememberAggressorForOutcome(speaker);
+			if (!speaker) {
+				spdlog::info("[TFD][Defeat] no dialogue-capable aggressor and no standing follower -> bleed countdown without speaker");
+			}
+			StartBleedWindow(player, speaker);
+			SetGraceSeconds(1);
+			return true;
+		}
+
 		static FollowerResolution ResolveFollowerCandidates(float radius)
 		{
 			auto external = TFD::TeammateManager::ResolveFollowerCandidates(radius);
@@ -2765,54 +2851,12 @@ else {
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
 			if (pct <= thresh) {
 				EnterBleedLock(player, BleedLockKind::Player, thresh, "player_threshold");
-				const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
-				ClearEnemyTargetsToPlayerForDefeat(player, scanRadius, "player_threshold");
-				auto* aggressor = ResolveAggressor();
-				if (!aggressor) {
-					aggressor = FindBestAggressor(scanRadius);
+				auto thresholdScan = ScanPlayerThresholdOutcome(player);
+				ClearEnemyTargetsToPlayerForDefeat(player, thresholdScan.scanRadius, "player_threshold");
+				auto thresholdClassification = ClassifyPlayerThresholdOutcome(thresholdScan);
+				if (DispatchPlayerThresholdOutcome(player, thresholdScan, thresholdClassification)) {
+					return;
 				}
-				auto coalitionSnapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
-				const bool unresolvedBattle = !TFD::Actor::IsConflictResolved(coalitionSnapshot);
-				const bool playerSideStanding = TFD::Actor::HasStandingTeammateOnPlayerSide(coalitionSnapshot);
-				const bool hostileCoalitionStanding = TFD::Actor::HasStandingHostileCoalition(coalitionSnapshot);
-				if (unresolvedBattle && hostileCoalitionStanding) {
-					if (aggressor && !IsObserverAlly(aggressor)) {
-						g_lastAggressor = aggressor->GetHandle();
-					}
-					spdlog::info("[TFD][Defeat] delay outcome unresolved battle coalitions={} playerSideStanding={}",
-						coalitionSnapshot.activeCoalitionCount,
-						playerSideStanding ? 1 : 0);
-					if (StartBleedBattleObservePending(player)) {
-						SetGraceSeconds(1);
-						return;
-					}
-				}
-				auto standingFollowers = CollectBleedStandingFollowers(scanRadius);
-				if (!standingFollowers.empty()) {
-					if (aggressor && !IsObserverAlly(aggressor)) {
-						g_lastAggressor = aggressor->GetHandle();
-					}
-					if (StartBleedBattleObservePending(player)) {
-						SetGraceSeconds(1);
-						return;
-					}
-				}
-				if (aggressor && IsObserverAlly(aggressor)) {
-					aggressor = nullptr;
-				}
-				if (aggressor && !IsObserverAlly(aggressor)) {
-					g_lastAggressor = aggressor->GetHandle();
-				}
-				aggressor = FindBestBleedoutSpeaker(scanRadius, 768.0f, aggressor);
-				if (aggressor && !IsObserverAlly(aggressor)) {
-					g_lastAggressor = aggressor->GetHandle();
-				}
-				if (!aggressor) {
-					spdlog::info("[TFD][Defeat] no dialogue-capable aggressor and no standing follower -> bleed countdown without speaker");
-				}
-				StartBleedWindow(player, aggressor);
-				SetGraceSeconds(1);
-				return;
 			}
 		}
 

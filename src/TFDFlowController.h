@@ -256,6 +256,26 @@ namespace TFD::FlowController
         void ResetRuntime(std::string_view reason);
         void ResetForLoad(std::string_view reason);
 
+        bool RequestPreCombat(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestInCombat(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason);
+        bool RequestVictory(std::uint32_t actorFormID, std::string_view reason);
+
+        bool RequestTruceDecision(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestPlayerBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestEnemyBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
+
+        bool RequestResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+
+        bool RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestCompleteAfterPleasure(std::string_view reason);
+        bool RequestCompleteTerminalContext(std::string_view reason);
+        bool RequestCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason);
+
         bool BeginPreCombat(std::uint32_t actorFormID, std::string_view reason);
         bool BeginInCombat(std::uint32_t actorFormID, std::string_view reason);
         bool BeginCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason);

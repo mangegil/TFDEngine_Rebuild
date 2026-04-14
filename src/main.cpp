@@ -28,6 +28,7 @@
 #include "TFDHostilityHooks.h"
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
+#include "TFDSettings.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -348,6 +349,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     spdlog::info("[TFD] SKSEPlugin_Load");
     spdlog::info("[TFD] {}", BuildStamp());
 
+    TFD::Settings::EnsureInitialized();
     TFD::HostilityHooks::Install();
 
 #if TFDEnableSmf

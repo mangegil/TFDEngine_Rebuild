@@ -4,6 +4,9 @@
 
 namespace TFD::Settings
 {
+	void EnsureInitialized();
+	bool IsInitialized();
+
 	void InitProfileIniPersistence();
 	void FlushNow();
 

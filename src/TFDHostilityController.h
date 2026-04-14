@@ -34,7 +34,10 @@ namespace TFD::HostilityController
     };
 }
 
-#include "TFDTame.h"
+namespace TFD::Tame
+{
+    enum class TameDisposition : std::uint8_t;
+}
 
 namespace TFD::HostilityController
 {
@@ -53,7 +56,7 @@ namespace TFD::HostilityController
         double lastSuppressionApplySec{ 0.0 };
         double lastPackageEvalSec{ 0.0 };
 
-        TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
+        TFD::Tame::TameDisposition disposition{ static_cast<TFD::Tame::TameDisposition>(0) };
         bool temporaryTeammateApplied{ false };
         bool allowDialogue{ false };
         bool isPrimaryTarget{ false };
@@ -80,7 +83,7 @@ namespace TFD::HostilityController
         RE::NiPoint3 lastPlayerPos{};
         bool hasPlayerSample{ false };
 
-        TFD::Tame::TameDisposition disposition{ TFD::Tame::TameDisposition::None };
+        TFD::Tame::TameDisposition disposition{ static_cast<TFD::Tame::TameDisposition>(0) };
         bool temporaryTeammateApplied{ false };
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
@@ -155,13 +158,13 @@ namespace TFD::HostilityController
     struct BleedTruceRuntimeProviders
     {
         std::function<bool(RE::Actor*, RE::Actor*, const char*)> startSessionForSpeaker;
-        std::function<void(TFD::Tame::ReleaseReason)> releaseSession;
+        std::function<void(ReleaseReason)> releaseSession;
     };
 
     void InstallBleedTruceRuntimeProviders(BleedTruceRuntimeProviders providers);
     void ResetBleedTruceRuntimeProviders();
     bool StartBleedTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason);
-    void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason);
+    void ReleaseBleedTruceSession(ReleaseReason reason);
 
     bool HasActiveDialoguePhaseFaction(RE::Actor* actor);
     bool IsActorTemporarilySuppressed(RE::Actor* actor);

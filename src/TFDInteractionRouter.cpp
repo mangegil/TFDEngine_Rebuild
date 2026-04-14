@@ -1,4 +1,6 @@
-﻿#include "TFDInteractionRouter.h"
+#include "TFDInteractionRouter.h"
+#include "TFDFlowController.h"
+#include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDInCombatGreet.h"
 #include "TFDPreCombatGreet.h"
@@ -328,6 +330,209 @@ namespace TFD::InteractionRouter
                 return FailReason::TargetRejected;
             }
         }
+   
+        ResolveResult MakeResolveFailure(
+            FailReason reason,
+            RE::FormID playerId = 0,
+            RE::FormID targetId = 0,
+            Action action = Action::None)
+        {
+            ResolveResult result{};
+            result.action = action;
+            result.failReason = reason;
+            result.playerId = playerId;
+            result.targetId = targetId;
+            result.valid = false;
+            result.shouldBeginSession = false;
+            result.shouldOpenDialogue = false;
+            return result;
+        }
+
+        Action ResolveIntentAction(TFD::Actor::Interaction::Intent intent, bool targetInCombat)
+        {
+            switch (intent) {
+            case TFD::Actor::Interaction::Intent::Tame:
+                return Action::Tame;
+            case TFD::Actor::Interaction::Intent::Truce:
+                return targetInCombat ? Action::TruceInCombat : Action::TrucePreCombat;
+            case TFD::Actor::Interaction::Intent::None:
+            default:
+                return Action::None;
+            }
+        }
+
+        ResolveResult ResolveValidatedHotkeyAction(
+            RE::Actor* player,
+            RE::Actor* target,
+            bool isCaptivePhase,
+            bool targetInCombat,
+            float distanceToPlayer)
+        {
+            if (isCaptivePhase) {
+                return MakeResolveFailure(FailReason::NoUsableAction, player->GetFormID(), target->GetFormID());
+            }
+
+            const auto classify = TFD::Actor::Interaction::ClassifyTarget(
+                player,
+                target,
+                isCaptivePhase,
+                targetInCombat,
+                distanceToPlayer);
+            const bool enemyToPlayer = IsEnemyToPlayer(player, target);
+
+            spdlog::info(
+                "[TFD][Router] classify target={:08X} inCombat={} hostileToPlayer={} dist={:.1f} class={} kind={} intent={} allowDialogue={} valid={} reject={}",
+                target->GetFormID(),
+                targetInCombat ? 1 : 0,
+                enemyToPlayer ? 1 : 0,
+                distanceToPlayer,
+                TFD::Actor::Interaction::ToString(classify.creatureClass),
+                TFD::Actor::Interaction::ToString(classify.kind),
+                TFD::Actor::Interaction::ToString(classify.intent),
+                classify.allowDialogue ? 1 : 0,
+                classify.valid ? 1 : 0,
+                TFD::Actor::Interaction::ToString(classify.rejectReason));
+
+            if (!classify.valid) {
+                return MakeResolveFailure(
+                    TranslateClassifierReject(classify.rejectReason),
+                    player->GetFormID(),
+                    target->GetFormID());
+            }
+
+            if (classify.intent == TFD::Actor::Interaction::Intent::Truce && !enemyToPlayer) {
+                spdlog::info(
+                    "[TFD][Router] reject target={:08X} reason=not_enemy_to_player",
+                    target->GetFormID());
+                return MakeResolveFailure(
+                    FailReason::TargetRejected,
+                    player->GetFormID(),
+                    target->GetFormID());
+            }
+
+            const Action action = ResolveIntentAction(classify.intent, targetInCombat);
+            switch (action) {
+            case Action::Tame:
+                if (!TFD::Tame::CanStart(target)) {
+                    spdlog::info(
+                        "[TFD][Router] reject tame target={:08X} reason=active_tame_requires_feed",
+                        target->GetFormID());
+                    return MakeResolveFailure(
+                        FailReason::TameAlreadyActive,
+                        player->GetFormID(),
+                        target->GetFormID(),
+                        Action::Tame);
+                }
+
+                if (TFD::Tame::CollectValidBaits(player, target).empty()) {
+                    spdlog::info(
+                        "[TFD][Router] reject tame target={:08X} reason=no_valid_bait",
+                        target->GetFormID());
+                    return MakeResolveFailure(
+                        FailReason::NoValidBait,
+                        player->GetFormID(),
+                        target->GetFormID(),
+                        Action::Tame);
+                }
+                break;
+
+            case Action::TrucePreCombat:
+            case Action::TruceInCombat:
+                if (!TFD::HostilityController::CanStartTruce(target)) {
+                    return MakeResolveFailure(
+                        FailReason::TruceUnavailable,
+                        player->GetFormID(),
+                        target->GetFormID(),
+                        action);
+                }
+                break;
+
+            case Action::None:
+            default:
+                return MakeResolveFailure(
+                    FailReason::NoUsableAction,
+                    player->GetFormID(),
+                    target->GetFormID());
+            }
+
+            ResolveResult result{};
+            result.action = action;
+            result.failReason = FailReason::None;
+            result.playerId = player->GetFormID();
+            result.targetId = target->GetFormID();
+            result.valid = true;
+            result.shouldBeginSession = true;
+            result.shouldOpenDialogue = classify.allowDialogue;
+            return result;
+        }
+
+        std::optional<RE::FormID> TryBeginResolvedAction(
+            RE::Actor* player,
+            RE::Actor* target,
+            const ResolveResult& resolved,
+            double nowSec)
+        {
+            switch (resolved.action) {
+            case Action::Tame:
+                return TFD::Tame::BeginSession(
+                    player,
+                    target,
+                    nowSec,
+                    resolved.shouldOpenDialogue,
+                    true);
+
+            case Action::TrucePreCombat:
+                return TFD::HostilityController::BeginTrucePreCombatSession(player, target, nowSec);
+
+            case Action::TruceInCombat:
+                return TFD::HostilityController::BeginTruceInCombatSession(
+                    player,
+                    target,
+                    nowSec,
+                    resolved.shouldOpenDialogue);
+
+            case Action::None:
+            default:
+                return std::nullopt;
+            }
+        }
+
+        const char* NotificationForPrimaryFailure(FailReason reason)
+        {
+            switch (reason) {
+            case FailReason::TameAlreadyActive:
+                return "TFD: Already Tamed. Use Shift+H to Feed";
+            case FailReason::NoValidBait:
+                return "TFD: No Valid Bait";
+            case FailReason::SessionBeginFailed:
+                return "TFD: Pack Tame Failed";
+            case FailReason::TruceUnavailable:
+                return "TFD: Truce Failed";
+            case FailReason::InvalidTarget:
+                return "TFD: No Valid Target";
+            case FailReason::InvalidPlayer:
+            case FailReason::NoUsableAction:
+            case FailReason::TargetRejected:
+            case FailReason::None:
+            default:
+                return "TFD: Interaction Failed";
+            }
+        }
+
+        const char* NotificationForPrimarySuccess(Action action)
+        {
+            switch (action) {
+            case Action::TruceInCombat:
+                return "TFD: InCombat Truce";
+            case Action::TrucePreCombat:
+                return "TFD: PreCombat Truce";
+            case Action::Tame:
+                return "TFD: Tame";
+            case Action::None:
+            default:
+                return "TFD: Interaction Started";
+            }
+        }
     }
 
     ResolveResult ResolveHotkeyAction(
@@ -338,118 +543,22 @@ namespace TFD::InteractionRouter
     {
         (void)nowSec;
 
-        ResolveResult result{};
-
         if (!IsPlayerValid(player)) {
-            result.valid = false;
-            result.failReason = FailReason::InvalidPlayer;
-            return result;
-        }
-
-        result.playerId = player->GetFormID();
-
-        if (isCaptivePhase) {
-            result.valid = false;
-            result.failReason = FailReason::NoUsableAction;
-            return result;
+            return MakeResolveFailure(FailReason::InvalidPlayer);
         }
 
         if (!IsTargetValid(target)) {
-            result.valid = false;
-            result.failReason = FailReason::InvalidTarget;
-            return result;
+            return MakeResolveFailure(FailReason::InvalidTarget, player->GetFormID());
         }
-
-        result.targetId = target->GetFormID();
 
         const bool targetInCombat = IsTargetInCombat(target);
         const float distanceToPlayer = GetDistance(player, target);
-
-        const auto classify = TFD::Actor::Interaction::ClassifyTarget(
+        return ResolveValidatedHotkeyAction(
             player,
             target,
             isCaptivePhase,
             targetInCombat,
             distanceToPlayer);
-        const bool enemyToPlayer = IsEnemyToPlayer(player, target);
-
-        result.classify = classify;
-
-        spdlog::info(
-            "[TFD][Router] classify target={:08X} inCombat={} hostileToPlayer={} dist={:.1f} class={} kind={} intent={} allowDialogue={} valid={} reject={}",
-            target->GetFormID(),
-            targetInCombat ? 1 : 0,
-            enemyToPlayer ? 1 : 0,
-            distanceToPlayer,
-            TFD::Actor::Interaction::ToString(classify.creatureClass),
-            TFD::Actor::Interaction::ToString(classify.kind),
-            TFD::Actor::Interaction::ToString(classify.intent),
-            classify.allowDialogue ? 1 : 0,
-            classify.valid ? 1 : 0,
-            TFD::Actor::Interaction::ToString(classify.rejectReason));
-
-        if (!classify.valid) {
-            result.valid = false;
-            result.failReason = TranslateClassifierReject(classify.rejectReason);
-            return result;
-        }
-
-        if (classify.intent == TFD::Actor::Interaction::Intent::Truce && !enemyToPlayer) {
-            spdlog::info(
-                "[TFD][Router] reject target={:08X} reason=not_enemy_to_player",
-                target->GetFormID());
-            result.valid = false;
-            result.failReason = FailReason::TargetRejected;
-            return result;
-        }
-
-        switch (classify.intent) {
-        case TFD::Actor::Interaction::Intent::Tame:
-            if (!TFD::Tame::CanStart(target)) {
-                spdlog::info(
-                    "[TFD][Router] reject tame target={:08X} reason=active_tame_requires_feed",
-                    target->GetFormID());
-                result.valid = false;
-                result.failReason = FailReason::TameAlreadyActive;
-                return result;
-            }
-
-            if (TFD::Tame::CollectValidBaits(player, target).empty()) {
-                spdlog::info(
-                    "[TFD][Router] reject tame target={:08X} reason=no_valid_bait",
-                    target->GetFormID());
-                result.valid = false;
-                result.failReason = FailReason::NoValidBait;
-                return result;
-            }
-
-            result.action = Action::Tame;
-            result.valid = true;
-            result.failReason = FailReason::None;
-            result.shouldBeginSession = true;
-            result.shouldOpenDialogue = classify.allowDialogue;
-            return result;
-
-        case TFD::Actor::Interaction::Intent::Truce:
-            if (!TFD::HostilityController::CanStartTruce(target)) {
-                result.valid = false;
-                result.failReason = FailReason::TruceUnavailable;
-                return result;
-            }
-
-            result.action = targetInCombat ? Action::TruceInCombat : Action::TrucePreCombat;
-            result.valid = true;
-            result.failReason = FailReason::None;
-            result.shouldBeginSession = true;
-            result.shouldOpenDialogue = classify.allowDialogue;
-            return result;
-
-        case TFD::Actor::Interaction::Intent::None:
-        default:
-            result.valid = false;
-            result.failReason = FailReason::NoUsableAction;
-            return result;
-        }
     }
 
     ExecuteResult ExecuteResolvedAction(
@@ -473,38 +582,11 @@ namespace TFD::InteractionRouter
             return result;
         }
 
-        std::optional<RE::FormID> sessionId;
-
-        switch (resolved.action) {
-        case Action::Tame:
-            sessionId = TFD::Tame::BeginSession(
-                player,
-                target,
-                nowSec,
-                resolved.shouldOpenDialogue,
-                true);
-            break;
-
-        case Action::TrucePreCombat:
-            sessionId = TFD::HostilityController::BeginTrucePreCombatSession(player, target, nowSec);
-            break;
-
-        case Action::TruceInCombat:
-            sessionId = TFD::HostilityController::BeginTruceInCombatSession(
-                player,
-                target,
-                nowSec,
-                resolved.shouldOpenDialogue);
-            break;
-
-        case Action::None:
-        default:
-            result.failReason = FailReason::NoUsableAction;
-            return result;
-        }
-
+        const auto sessionId = TryBeginResolvedAction(player, target, resolved, nowSec);
         if (!sessionId.has_value()) {
-            result.failReason = FailReason::SessionBeginFailed;
+            result.failReason = (resolved.action == Action::None)
+                ? FailReason::NoUsableAction
+                : FailReason::SessionBeginFailed;
             return result;
         }
 
@@ -687,7 +769,7 @@ namespace TFD::InteractionRouter
 
         if (!pick.valid || !pick.target || pick.action == Action::None) {
             result.failReason = FailReason::InvalidTarget;
-            result.notification = "TFD: No Valid Target";
+            result.notification = NotificationForPrimaryFailure(result.failReason);
             return result;
         }
 
@@ -697,26 +779,13 @@ namespace TFD::InteractionRouter
             result.finalAction = exec.action == Action::None ? Action::Tame : exec.action;
 
             if (!exec.executed) {
-                switch (exec.failReason) {
-                case FailReason::TameAlreadyActive:
-                    result.notification = "TFD: Already Tamed. Use Shift+H to Feed";
-                    break;
-                case FailReason::NoValidBait:
-                    result.notification = "TFD: No Valid Bait";
-                    break;
-                case FailReason::SessionBeginFailed:
-                    result.notification = "TFD: Pack Tame Failed";
-                    break;
-                default:
-                    result.notification = "TFD: Interaction Failed";
-                    break;
-                }
+                result.notification = NotificationForPrimaryFailure(exec.failReason);
                 return result;
             }
 
             result.success = true;
             result.interactionState = InteractionStateForAction(Action::Tame);
-            result.notification = (exec.action == Action::Tame) ? "TFD: Tame" : "TFD: Tame Started";
+            result.notification = NotificationForPrimarySuccess(result.finalAction);
             return result;
         }
 
@@ -724,7 +793,7 @@ namespace TFD::InteractionRouter
         const bool started = BeginTruceForAction(pick.target, pick.action, &startedAction);
         if (!started) {
             result.failReason = FailReason::TruceUnavailable;
-            result.notification = "TFD: Truce Failed";
+            result.notification = NotificationForPrimaryFailure(result.failReason);
             return result;
         }
 
@@ -735,23 +804,7 @@ namespace TFD::InteractionRouter
         result.success = true;
         result.finalAction = startedAction;
         result.interactionState = InteractionStateForAction(startedAction);
-
-        switch (startedAction) {
-        case Action::TruceInCombat:
-            result.notification = "TFD: InCombat Truce";
-            break;
-        case Action::TrucePreCombat:
-            result.notification = "TFD: PreCombat Truce";
-            break;
-        case Action::Tame:
-            result.notification = "TFD: Tame";
-            break;
-        case Action::None:
-        default:
-            result.notification = "TFD: Interaction Started";
-            break;
-        }
-
+        result.notification = NotificationForPrimarySuccess(startedAction);
         return result;
     }
 

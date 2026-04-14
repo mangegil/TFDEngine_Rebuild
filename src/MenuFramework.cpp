@@ -1946,7 +1946,9 @@ namespace TFDMenu
 		}
 		started = true;
 
-		TFD::Settings::InitProfileIniPersistence();
+		if (!TFD::Settings::IsInitialized()) {
+			spdlog::warn("[TFD][Menu] Settings were not initialized before menu init");
+		}
 
 		spdlog::info("[TFD][Menu] Init()");
 

@@ -41,6 +41,7 @@ namespace TFD::Settings
 		std::atomic<int>      g_hotkeyCooldownMs{ 350 };
 		std::atomic_bool      g_hotkeyWave{ true };
 
+		std::atomic_bool g_initialized{ false };
 		std::atomic_bool g_dirty{ false };
 		std::chrono::steady_clock::time_point g_lastChange{};
 
@@ -294,8 +295,13 @@ namespace TFD::Settings
 		}
 	}
 
-	void InitProfileIniPersistence()
+	void EnsureInitialized()
 	{
+		bool expected = false;
+		if (!g_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+			return;
+		}
+
 		g_profileId = LoadProfileId();
 		g_settingsPath = GetSettingsPathForProfile(g_profileId);
 
@@ -304,6 +310,16 @@ namespace TFD::Settings
 
 		LoadFromDisk();
 		EnsureWorkerStarted();
+	}
+
+	bool IsInitialized()
+	{
+		return g_initialized.load(std::memory_order_acquire);
+	}
+
+	void InitProfileIniPersistence()
+	{
+		EnsureInitialized();
 	}
 
 	void FlushNow()

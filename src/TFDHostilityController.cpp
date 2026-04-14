@@ -1,4 +1,4 @@
-﻿#include "TFDHostilityController.h"
+#include "TFDHostilityController.h"
 #include "TFDActor.h"
 
 #include "TFDTame.h"
@@ -2188,7 +2188,7 @@ namespace TFD::HostilityController
         return BleedTruceInternal::g_runtimeProviders.startSessionForSpeaker(player, speaker, reason ? reason : "unknown");
     }
 
-    void ReleaseBleedTruceSession(TFD::Tame::ReleaseReason reason)
+    void ReleaseBleedTruceSession(ReleaseReason reason)
     {
         if (!BleedTruceInternal::g_runtimeProviders.releaseSession) {
             return;
