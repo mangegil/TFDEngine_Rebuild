@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <chrono>
 #include <unordered_set>
@@ -16,6 +16,12 @@ namespace RE
 	class TESForm;
 	class TESQuest;
 	class BGSRefAlias;
+}
+
+namespace TFD::Transition
+{
+	struct RuntimeHandlers;
+	struct CaptiveHandlers;
 }
 
 namespace TFD::Bleedout
@@ -163,11 +169,11 @@ namespace TFD::Bleedout
 		std::function<void()> clearNoMarkerFallbackState;
 		std::function<void(const char*)> releaseNoSpeakerTameSession;
 		std::function<void(const char*)> clearBleedSupportBridgeAliases;
+		std::function<void()> resetBattleObserveTracking;
 		std::function<void()> releaseTruceSession;
 		std::function<void(const char*)> resetGreetRuntime;
 		std::function<void(const char*)> clearCaptorAliases;
 		std::function<void(const char*)> clearDialogueOutcome;
-		std::function<void()> resetBattleObserveTracking;
 		std::function<void(bool)> setPlayerBleedImmune;
 		std::function<void(RE::Actor*, float)> clampHealth;
 		std::function<std::vector<RE::Actor*>(float)> collectBleedStandingFollowers;
@@ -463,4 +469,326 @@ namespace TFD::Bleedout
 	bool IsActive();
 	bool OwnsCurrentFlow();
 	std::uint32_t ResolveActorFormID(RE::Actor* actor);
+}
+
+// Consolidated from former TFDBleedoutBuilders / TFDBleedoutRuntimeHost staging modules
+namespace TFD::Bleedout::Builders
+{
+    struct PendingSystemEventProvider
+    {
+        std::function<void(const char*)> clearDialogueOutcome;
+        std::function<void(const char*)> clearOutcomeWindow;
+        std::function<void(const char*)> completePayRelease;
+        std::function<void()> releaseFlowHandoff;
+        std::function<bool()> resolveCaptiveMarker;
+        std::function<void()> doBlackoutTeleport;
+        std::function<void(int)> setGraceSeconds;
+        std::function<void(const char*)> releaseNoSpeakerTameSession;
+        std::function<void()> exitBleedState;
+        std::function<void(const char*)> enterNonCaptiveChoice;
+    };
+
+    struct DialogueCloseProvider
+    {
+        std::function<void(const char*)> clearDialogueOutcome;
+        std::function<void(const char*)> completePayRelease;
+    };
+
+    struct TimeoutProvider
+    {
+        std::function<void()> releaseTruceGeneric;
+        std::function<bool()> resolveCaptiveMarker;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void()> doBlackoutTeleport;
+        std::function<void(int)> setGraceSeconds;
+        std::function<void(const char*)> enterNonCaptiveChoice;
+    };
+
+    struct BaseCompletionProvider
+    {
+        std::function<void(const char*)> clearOutcomeWindow;
+        std::function<bool(TerminalCommit, const char*)> tryBeginTerminalCommit;
+        std::function<void()> clearPendingCinematicFadeIn;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void()> clearEscapeContext;
+        std::function<void()> resetLockpickWatch;
+        std::function<void(bool)> setGraceActive;
+        std::function<void(bool)> setCaptiveRuntime;
+        std::function<void(bool)> setPlayerBleedImmune;
+        std::function<void()> recoverPlayerForTransition;
+        std::function<float()> getSweepRadius;
+        std::function<void(float)> applyCalmBubble;
+        std::function<void()> updatePreCombatState;
+        std::function<RE::Actor*()> resolveRuntimeSpeaker;
+        std::function<void(RE::Actor*, bool, const char*)> beginPleasure;
+        std::function<void(bool)> setPrevDialogueOpen;
+        std::function<void(bool)> setPrevLockpickOpen;
+    };
+
+    struct CaptivePleasureCompletionExtras
+    {
+        std::function<void()> clearLastAggressor;
+        std::function<void(bool)> resetBleedRuntimeState;
+        std::function<void(const char*)> syncPlayerCaptiveAlias;
+    };
+
+    struct PayReleaseCompletionExtras
+    {
+        std::function<void()> clearFactionState;
+        std::function<void()> clearLastAggressor;
+        std::function<void(bool)> resetBleedRuntimeState;
+        std::function<void(int)> beginLeftForDeadCooldown;
+        std::function<void(int)> setGraceSeconds;
+    };
+
+    struct BleedPleasureCompletionExtras
+    {
+        std::function<void(const char*)> transitionBleedRuntimeToPleasureCommit;
+        std::function<void(int)> beginLeftForDeadCooldown;
+        std::function<void(int)> setGraceSeconds;
+        std::function<void()> refreshPostDefeatGlobals;
+    };
+
+    struct NonCaptiveChoiceProvider
+    {
+        std::function<bool()> hasBlockingCommit;
+        std::function<const char*()> getBlockingCommitName;
+        std::function<bool(const char*)> beginResolvedNoMarkerFallback;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void()> clearPendingCinematicFadeIn;
+        std::function<void()> clearFactionState;
+        std::function<void()> clearEscapeContext;
+        std::function<void()> resetLockpickWatch;
+        std::function<void(bool)> setGraceActive;
+        std::function<void()> clearLastAggressor;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void(bool)> setPrevDialogueOpen;
+        std::function<void(bool)> setPrevLockpickOpen;
+        std::function<void(bool)> setCaptiveRuntime;
+        std::function<void(bool)> setPlayerBleedImmune;
+        std::function<void(const char*)> queueLegacyRequest;
+        std::function<void(const char*)> resetFlowRuntime;
+    };
+
+    struct BlackoutProvider
+    {
+        std::function<bool()> hasBlockingCommit;
+        std::function<const char*()> getBlockingCommitName;
+        std::function<bool()> resolveCaptiveMarker;
+        std::function<void(const char*)> enterNonCaptiveChoice;
+        std::function<bool(const char*)> tryBeginCaptiveCommit;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void()> clearLastAggressor;
+        std::function<void()> beginCaptiveFlow;
+        std::function<void()> clearPendingCinematicFadeIn;
+        std::function<bool()> queueCaptiveFadeTransition;
+        std::function<void()> showBlackoutFader;
+        std::function<void(const char*)> completeCaptiveTransitionNow;
+        std::function<void()> hideBlackoutFader;
+    };
+
+    struct TransitionRuntimeProvider
+    {
+        std::function<RE::Actor*()> getPlayer;
+        std::function<RE::Actor*()> resolveAggressor;
+        std::function<RE::Actor*(float)> findBestAggressor;
+        std::function<bool(RE::Actor*)> isCombatSupportedAggressor;
+        std::function<bool(RE::Actor*)> isActiveFollowerActor;
+        std::function<bool(RE::Actor*)> isStandingAllyThresholdActor;
+        std::function<std::vector<RE::Actor*>()> collectRegisteredTeammates;
+        std::function<std::vector<RE::Actor*>(float, RE::Actor*, bool)> collectBleedoutCrowd;
+        std::function<std::vector<RE::FormID>()> getBleedCrowdAssigned;
+        std::function<bool(float)> tryAbortPleasureDueToHostileIntrusion;
+        std::function<void(const char*, bool)> releasePlayerBleedLock;
+        std::function<void(int)> setGraceSeconds;
+        std::function<void(int)> setRescueStateValue;
+        std::function<void()> refreshPostDefeatGlobals;
+        std::function<void()> updatePreCombatState;
+    };
+
+    struct TransitionCaptiveProvider
+    {
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void()> clearLastAggressor;
+        std::function<void(const char*)> beginCaptiveFlow;
+        std::function<void()> setCaptiveRuntimeCaptive;
+        std::function<bool()> isDialogueOpen;
+        std::function<void(bool)> setPrevDialogueOpen;
+        std::function<void()> captureCurrentLockpickMenuState;
+        std::function<void()> resetLockpickWatch;
+        std::function<void()> armEscapeContextFromCurrentState;
+        std::function<void()> sealCaptiveDoorIfPresent;
+        std::function<void(float)> applyCalmBubble;
+        std::function<void(const char*, bool)> queuePendingCaptiveConfiscation;
+        std::function<void(RE::Actor*, const char*)> syncPlayerCaptiveAlias;
+    };
+
+    void InstallPendingSystemEventProvider(PendingSystemEventProvider provider);
+    void InstallDialogueCloseProvider(DialogueCloseProvider provider);
+    void InstallTimeoutProvider(TimeoutProvider provider);
+    void InstallBaseCompletionProvider(BaseCompletionProvider provider);
+    void InstallCaptivePleasureCompletionExtras(CaptivePleasureCompletionExtras provider);
+    void InstallPayReleaseCompletionExtras(PayReleaseCompletionExtras provider);
+    void InstallBleedPleasureCompletionExtras(BleedPleasureCompletionExtras provider);
+    void InstallNonCaptiveChoiceProvider(NonCaptiveChoiceProvider provider);
+    void InstallBlackoutProvider(BlackoutProvider provider);
+    void InstallTransitionRuntimeProvider(TransitionRuntimeProvider provider);
+    void InstallTransitionCaptiveProvider(TransitionCaptiveProvider provider);
+    void Reset();
+
+    PendingSystemEventHandlers BuildPendingSystemEventHandlers();
+    DialogueCloseHandlers BuildDialogueCloseHandlers();
+    TimeoutHandlers BuildTimeoutHandlers();
+    CompletionHandlers BuildCaptivePleasureCompletionHandlers();
+    CompletionHandlers BuildPayReleaseCompletionHandlers();
+    CompletionHandlers BuildBleedPleasureCompletionHandlers();
+    NonCaptiveChoiceHandlers BuildNonCaptiveChoiceHandlers();
+    BlackoutHandlers BuildBlackoutHandlers();
+    TFD::Transition::RuntimeHandlers BuildTransitionRuntimeHandlers();
+    TFD::Transition::CaptiveHandlers BuildTransitionCaptiveHandlers();
+}
+
+
+namespace TFD::Bleedout::RuntimeHost
+{
+	struct Provider
+	{
+		std::atomic_bool* inBleedState = nullptr;
+		float* minHp = nullptr;
+		std::chrono::steady_clock::time_point* bleedStart = nullptr;
+		int* bleedLastSeconds = nullptr;
+		bool* bleedPaused = nullptr;
+		std::chrono::steady_clock::time_point* bleedPauseStarted = nullptr;
+		std::chrono::steady_clock::time_point* bleedLastCalmPulse = nullptr;
+		std::function<bool()> isEscapeBreakBleedPending;
+		std::function<void(bool)> setEscapeBreakBleedPending;
+		bool* bleedPendingCaptiveOutcome = nullptr;
+		bool* bleedPendingNonCaptiveOutcome = nullptr;
+		bool* bleedBattleObservePending = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObservePendingUntil = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObservePendingLastRedirect = nullptr;
+		int* bleedBattleObservePendingEmptyEnemyTicks = nullptr;
+		bool* bleedBattleObserveActive = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObserveSince = nullptr;
+		std::chrono::steady_clock::time_point* bleedBattleObserveLastRedirect = nullptr;
+		int* bleedBattleObserveActiveEmptyEnemyTicks = nullptr;
+		std::function<TFD::Bleedout::RuntimeHostHandlers()> buildRuntimeHostHandlers;
+		std::function<TFD::Bleedout::DialogueHotkeyHandlers()> buildDialogueHotkeyHandlers;
+		std::function<RE::Actor*()> getPlayer;
+		std::function<float()> getDialogueHotkeyRadius;
+		std::function<float()> getDialogueHotkeyMaxSpeakerDist;
+	};
+
+	void InstallProvider(Provider provider);
+	void Reset();
+
+	TFD::Bleedout::RuntimeHostStateRefs BuildStateRefs();
+	TFD::Bleedout::RuntimeHostHandlers BuildHandlers();
+
+	void StartWindow(RE::Actor* player, RE::Actor* aggressor);
+	bool BeginDialogueHotkey();
+	bool StartBattleObservePending(RE::Actor* player);
+	void TickBattleObservePending();
+	void TickBattleObserve();
+	bool HandlePendingEscapeBreak();
+	void MaintainSpeakerKick();
+}
+
+
+
+namespace TFD::Bleedout::DefeatGlue
+{
+	struct Provider
+	{
+		std::atomic_bool* graceActive = nullptr;
+		std::chrono::steady_clock::time_point* graceUntil = nullptr;
+		bool* prevDialogueOpen = nullptr;
+		std::function<void()> clearPendingFadeIn;
+		std::function<void()> clearEscapeContext;
+		std::function<void()> resetLockpickWatch;
+		std::function<void(bool)> setPrevLockpickOpen;
+		std::function<void()> clearCaptiveRuntime;
+		std::function<RE::Actor*()> getPlayer;
+		std::function<void(const char*, bool)> releasePlayerBleedLock;
+		std::function<std::uint32_t()> currentBleedSpeakerId;
+		std::function<RE::Actor*()> currentBleedSpeaker;
+		std::function<TFD::Bleedout::SpeakerLogicHandlers()> buildSpeakerHandlers;
+		std::function<bool()> isDialogueOpen;
+		std::function<RE::Actor*()> resolveAggressor;
+		std::function<RE::Actor*(float)> findBestAggressor;
+		std::function<void(const char*)> releaseNoSpeakerTameSession;
+		std::function<void()> releaseTruceSession;
+		std::function<bool(RE::Actor*, RE::Actor*, const char*)> startTruceSessionForSpeaker;
+		std::function<void()> resetSpeakerKick;
+		std::function<void(const char*)> resetGreetRuntime;
+		std::function<void(RE::Actor*, const char*)> beginGreet;
+		std::function<void(const char*)> clearBleedSupportBridgeAliases;
+		std::function<void()> resetBattleObserveTracking;
+		std::function<bool()> isObservedCombatCommitInProgress;
+		std::function<void(RE::Actor*)> noteEnemyTargetingPlayer;
+		std::function<void(bool)> setPlayerBleedImmune;
+		std::function<void(RE::Actor*, float)> clampHealth;
+		std::function<std::vector<RE::Actor*>(float)> collectBleedStandingFollowers;
+		std::function<float(RE::Actor*, const std::vector<RE::Actor*>&, float)> computeBleedBattleEnemyScanRadius;
+		std::function<RE::Actor*(float, double)> resolveLastEnemyTargetingPlayer;
+		std::function<bool(RE::Actor*)> isObserverAlly;
+		std::function<std::vector<RE::Actor*>(RE::Actor*, float, RE::Actor*, const std::vector<RE::Actor*>&)> collectCurrentObservedEnemies;
+		std::function<void(RE::Actor*, const std::vector<RE::Actor*>&, const std::vector<RE::Actor*>&, RE::Actor*)> updateObserverRoster;
+		std::function<std::vector<RE::Actor*>()> collectStandingFollowersFromSnapshot;
+		std::function<std::vector<RE::Actor*>()> collectStandingEnemiesFromSnapshot;
+		std::function<bool()> hadValidObservedEnemy;
+		std::function<void()> enterObservedBattleWin;
+		std::function<void(const char*)> enterObservedLeftForDead;
+		std::function<RE::Actor*(float, float, RE::Actor*)> findBestSpeaker;
+		std::function<bool(RE::Actor*, RE::Actor*, float, float*)> isReasonableSpeaker;
+		std::function<std::vector<RE::Actor*>(float, RE::Actor*, bool)> collectBleedoutCrowd;
+		std::function<bool(RE::Actor*)> isCaptiveSupportedAggressor;
+		std::function<bool(RE::Actor*)> applyAllowedFactionFromAggressor;
+		std::function<bool()> resolveCaptiveMarkerForOutcome;
+		std::function<bool(RE::Actor*, RE::Actor*, bool, float*)> canUseCaptiveFallbackHeuristic;
+		std::function<bool(const std::vector<RE::Actor*>&, const char*)> tryEnsureNoSpeakerTameSession;
+		std::function<void(RE::Actor*)> setLastAggressor;
+		std::function<bool(RE::Actor*)> isBleedCrowdSupportedAggressor;
+		std::function<bool(RE::Actor*, RE::Actor*)> isBleedSpaceCompatible;
+		std::function<void(const char*)> debugNotification;
+		std::function<void(RE::Actor*, float, const char*)> clearEnemyTargetsToPlayerForDefeat;
+		std::function<RE::Actor*(float)> resolveEscapeBreakPreferredAggressor;
+		std::function<bool(RE::Actor*, RE::Actor*, float*)> canUseAggressorForBleedoutGreet;
+		std::function<void(RE::Actor*, RE::Actor*, const char*, bool)> applyDialogueOverdrive;
+		std::function<bool(RE::Actor*)> isStandingAllyThresholdActor;
+		std::function<bool(RE::Actor*)> isStandingEnemyThresholdActor;
+	};
+
+	void InstallProvider(Provider provider);
+	void Reset();
+
+	void ClearCaptiveOrchestrationResidue(bool clearPendingFadeIn);
+	RE::Actor* ResolveBleedRuntimeSpeaker();
+	void BeginBleedPleasureRuntime(RE::Actor* speaker, bool captive, const char* reason);
+	void ExitSystemEventRuntime();
+	TFD::Bleedout::DialogueHotkeyHandlers BuildDialogueHotkeyHandlers();
+	bool BeginDialogueHotkey();
+	bool IsBleedoutActive();
+	bool IsPlayerBleedHoldTargetBlocked();
+	bool IsObservedCombatCommitInProgress();
+	void NoteEnemyTargetingPlayer(RE::Actor* actor);
+	void PreparePlayerForBleedoutPleasureScene(const char* reason);
+	void PreparePlayerForCaptivePleasureScene(const char* reason);
+	TFD::Bleedout::RuntimeHostHandlers BuildLocalRuntimeHostHandlers();
+	bool HandlePendingEscapeBreak();
+	void MaintainSpeakerKick();
+	bool IsObserverAlly(RE::Actor* actor);
+	float ComputeObservedEnemyScanRadius(RE::Actor* player, const std::vector<RE::Actor*>& allies, float baseRadius);
+	std::vector<RE::Actor*> CollectCurrentObservedEnemies(RE::Actor* player, float radius, RE::Actor* preferredEnemy, const std::vector<RE::Actor*>& allies);
+	void UpdateObservedBattleRoster(RE::Actor* player, const std::vector<RE::Actor*>& followers, const std::vector<RE::Actor*>& enemies, RE::Actor* preferredEnemy);
+	std::vector<RE::Actor*> CollectStandingFollowersFromSnapshot();
+	std::vector<RE::Actor*> CollectStandingEnemiesFromSnapshot();
+	RE::Actor* ResolveBleedRedirectTarget(RE::Actor* actor);
+	RE::Actor* ResolveBleedFollowerAggroTarget(RE::Actor* actor);
+	void ResetObservedRuntimeTracking();
+	bool HadValidObservedEnemy();
+	void HandleObservedBattleWin(const char* reason = nullptr);
+	void HandleObservedLeftForDead(const char* reason = nullptr);
 }

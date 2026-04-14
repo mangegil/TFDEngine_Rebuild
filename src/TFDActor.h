@@ -2,6 +2,7 @@
 
 #include <RE/Skyrim.h>
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -103,6 +104,7 @@ namespace TFD::Actor
     [[nodiscard]] bool HasStandingHostileCoalition(const Snapshot& snapshot);
     [[nodiscard]] bool IsConflictResolved(const Snapshot& snapshot);
 
+    // Legacy compatibility shim. Snapshot-based APIs should be preferred by new callers.
     namespace Scan
     {
         struct Entry
@@ -213,8 +215,45 @@ namespace TFD::Actor
         void MaintainReleaseFollowGrace();
         void ClearAllReleaseFollowGrace(const char* reason = nullptr);
 
+        struct DefeatedEnemyQueryHooks
+        {
+            bool (*isTrackedEnemy)(RE::Actor* actor){ nullptr };
+            bool (*isLastAggressor)(RE::Actor* actor){ nullptr };
+        };
+
+        struct DefeatedEnemyStateHooks
+        {
+            bool (*tryGetState)(RE::Actor* actor, std::uint8_t* lockKindValue, bool* defeatedManaged, std::chrono::steady_clock::time_point* deadline){ nullptr };
+        };
+
+        void InstallDefeatedEnemyQueryHooks(const DefeatedEnemyQueryHooks& hooks);
+        void InstallDefeatedEnemyStateHooks(const DefeatedEnemyStateHooks& hooks);
+        bool IsDefeatedEnemyCandidate(RE::Actor* actor);
+        void SuppressDefeatedEnemyReentry(RE::Actor* actor, double seconds, const char* reason = nullptr);
+        void ApplyDefeatedEnemyPassiveOverride(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden);
+        void RestoreDefeatedEnemyPassiveOverride(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden);
+        bool IsDefeatedEnemyKnocked(RE::Actor* actor);
+        bool IsDefeatedEnemyKnocked(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged);
+        bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor);
+        bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged);
+        bool IsCreatureDefeatedEnemy(RE::Actor* actor);
+        bool IsCreatureDefeatedEnemy(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged);
+        double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor);
+        double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor, bool defeatedManaged, std::chrono::steady_clock::time_point deadline);
+
         void SyncDefeatedEnemyMirror(RE::Actor* actor, int& aliasSlot, bool& factionApplied);
         void ClearDefeatedEnemyMirror(RE::Actor* actor, int& aliasSlot, bool& factionApplied, const char* reason = nullptr);
+        void ClearDefeatedEnemyState(
+            RE::Actor* actor,
+            int& aliasSlot,
+            bool& factionApplied,
+            bool& defeatedManaged,
+            bool& defeatedAutoDeathIssued,
+            bool& defeatedFatalDamageApplied,
+            std::chrono::steady_clock::time_point& defeatedDeadline,
+            float& savedAggression,
+            bool& aggressionOverridden,
+            const char* reason = nullptr);
         void ClearAllDefeatedEnemyMirrors(const char* reason = nullptr);
     }
 }

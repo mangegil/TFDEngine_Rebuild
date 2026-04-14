@@ -1,4 +1,5 @@
 ﻿#include "TFDTransition.h"
+#include "TFDBleedout.h"
 #include "TFDActor.h"
 
 #include "EditorIdCache.h"
@@ -1056,6 +1057,11 @@ namespace TFD::Transition
 		queue->ProcessCommands();
 	}
 
+	bool HasRecoveryPotionAvailable()
+	{
+		return ResolveRecoveryPotionCandidate() != nullptr;
+	}
+
 	bool IsRecoveryActive()
 	{
 		return g_leftForDeadActive;
@@ -1601,3 +1607,113 @@ namespace TFD::Transition
 			});
 	}
 }
+
+// Consolidated from former TFDDefeatTransitionGlue staging module
+namespace TFD::Transition::DefeatGlue
+{
+    namespace
+    {
+        TFD::Bleedout::Builders::NonCaptiveChoiceProvider g_nonCaptiveChoice{};
+        TFD::Bleedout::Builders::BlackoutProvider g_blackout{};
+        TFD::Bleedout::Builders::TransitionRuntimeProvider g_transitionRuntime{};
+        TFD::Bleedout::Builders::TransitionCaptiveProvider g_transitionCaptive{};
+        RuntimeProviders g_runtime{};
+    }
+
+    void InstallProviders(
+        TFD::Bleedout::Builders::NonCaptiveChoiceProvider nonCaptiveChoice,
+        TFD::Bleedout::Builders::BlackoutProvider blackout,
+        TFD::Bleedout::Builders::TransitionRuntimeProvider transitionRuntime,
+        TFD::Bleedout::Builders::TransitionCaptiveProvider transitionCaptive,
+        RuntimeProviders runtime)
+    {
+        g_nonCaptiveChoice = std::move(nonCaptiveChoice);
+        g_blackout = std::move(blackout);
+        g_transitionRuntime = std::move(transitionRuntime);
+        g_transitionCaptive = std::move(transitionCaptive);
+        g_runtime = std::move(runtime);
+
+        auto nonCaptiveForward = g_nonCaptiveChoice;
+        nonCaptiveForward.beginResolvedNoMarkerFallback = [](const char* reason) {
+            return BeginResolvedNoMarkerFallback(reason);
+        };
+        TFD::Bleedout::Builders::InstallNonCaptiveChoiceProvider(std::move(nonCaptiveForward));
+        TFD::Bleedout::Builders::InstallBlackoutProvider(g_blackout);
+        TFD::Bleedout::Builders::InstallTransitionRuntimeProvider(g_transitionRuntime);
+        TFD::Bleedout::Builders::InstallTransitionCaptiveProvider(g_transitionCaptive);
+    }
+
+    void Reset()
+    {
+        g_nonCaptiveChoice = {};
+        g_blackout = {};
+        g_transitionRuntime = {};
+        g_transitionCaptive = {};
+        g_runtime = {};
+    }
+
+    TFD::Transition::RuntimeHandlers BuildTransitionRuntimeHandlers()
+    {
+        return TFD::Bleedout::Builders::BuildTransitionRuntimeHandlers();
+    }
+
+    TFD::Transition::CaptiveHandlers BuildTransitionCaptiveHandlers()
+    {
+        return TFD::Bleedout::Builders::BuildTransitionCaptiveHandlers();
+    }
+
+    bool BeginResolvedNoMarkerFallback(const char* reason)
+    {
+        if (!g_runtime.tryBeginTerminalCommit ||
+            !g_runtime.clearCaptiveOrchestrationResidue ||
+            !g_runtime.getPlayer ||
+            !g_runtime.clearBridgeAliases ||
+            !g_runtime.setPlayerBleedImmune ||
+            !g_runtime.resetBleedRuntimeState ||
+            !g_runtime.clearLastAggressor ||
+            !g_runtime.updatePreCombatState) {
+            return false;
+        }
+
+        const auto why = reason ? reason : "noncaptive_fallback";
+        if (!g_runtime.tryBeginTerminalCommit(TFD::Bleedout::TerminalCommit::NonCaptiveFallback, why)) {
+            return false;
+        }
+
+        g_runtime.clearCaptiveOrchestrationResidue();
+
+        auto* player = g_runtime.getPlayer();
+        if (player && player->IsWeaponDrawn()) {
+            player->DrawWeaponMagicHands(false);
+        }
+
+        const auto branch = TFD::Transition::ResolveNoMarkerFallback(reason, BuildTransitionRuntimeHandlers());
+        if (branch == TFD::Transition::FallbackBranch::None) {
+            return false;
+        }
+
+        g_runtime.clearBridgeAliases(why);
+        g_runtime.setPlayerBleedImmune(false);
+        g_runtime.resetBleedRuntimeState();
+        if (player && !player->IsDead() && !player->IsDisabled()) {
+            player->NotifyAnimationGraph("BleedoutStart");
+        }
+        g_runtime.clearLastAggressor();
+        g_runtime.updatePreCombatState();
+
+        spdlog::info("[TFD][Transition] committed no-marker fallback branch={} reason={}",
+            TFD::Transition::GetBranchName(branch), why);
+
+        if (branch == TFD::Transition::FallbackBranch::RescueCached) {
+            if (!TFD::Transition::BeginRescueTransition(reason ? reason : "rescue_cached", BuildTransitionRuntimeHandlers())) {
+                TFD::Transition::ForceLeftForDeadSolo(BuildTransitionRuntimeHandlers());
+                TFD::Transition::BeginRecoverTransition("rescue_cached_fallback_left_for_dead", BuildTransitionRuntimeHandlers());
+            }
+            return true;
+        }
+
+        TFD::Transition::BeginRecoverTransition(reason ? reason : TFD::Transition::GetBranchName(branch), BuildTransitionRuntimeHandlers());
+        return true;
+    }
+}
+

@@ -5,6 +5,7 @@
 #include "TFDHostilityController.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
+#include "TFDTeammateManager.h"
 
 #include <algorithm>
 #include <array>
@@ -1053,7 +1054,7 @@ namespace TFD::Tame
 
         if (reviveAfterFeed) {
             const float reviveHealPct = action == FeedAction::Teammate ? 60.0f : 45.0f;
-            if (!TFD::DefeatMonitor::ReviveDownedAlly(actor, reviveHealPct)) {
+            if (!TFD::TeammateManager::ReviveDownedAlly(actor, reviveHealPct)) {
                 spdlog::warn("TFDTame: feed revive failed actor={:08X} action={}", actor->GetFormID(), action == FeedAction::Teammate ? "teammate" : "calm");
             }
         }

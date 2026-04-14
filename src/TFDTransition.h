@@ -7,6 +7,19 @@
 
 #include <RE/Skyrim.h>
 
+namespace TFD::Bleedout
+{
+    enum class TerminalCommit : std::uint8_t;
+
+    namespace Builders
+    {
+        struct NonCaptiveChoiceProvider;
+        struct BlackoutProvider;
+        struct TransitionRuntimeProvider;
+        struct TransitionCaptiveProvider;
+    }
+}
+
 namespace TFD::Transition
 {
 	enum class Kind
@@ -87,6 +100,7 @@ namespace TFD::Transition
 
 	void ClearNoMarkerFallbackState();
 	bool IsRecoveryActive();
+	bool HasRecoveryPotionAvailable();
 	void BeginLeftForDeadCooldown(int seconds);
 	bool IsLeftForDeadCooldownActive(const RuntimeHandlers& handlers);
 	void TickLeftForDeadCooldown(const RuntimeHandlers& handlers);
@@ -104,3 +118,33 @@ namespace TFD::Transition
 	bool TeleportPlayerToCachedMarkerNow(const RuntimeHandlers& handlers);
 	bool CompleteCaptiveTransitionNow(const char* reason, const RuntimeHandlers& handlers, const CaptiveHandlers& captiveHandlers);
 }
+
+// Consolidated from former TFDDefeatTransitionGlue staging module
+namespace TFD::Transition::DefeatGlue
+{
+    struct RuntimeProviders
+    {
+        std::function<bool(TFD::Bleedout::TerminalCommit, const char*)> tryBeginTerminalCommit;
+        std::function<void()> clearCaptiveOrchestrationResidue;
+        std::function<RE::Actor*()> getPlayer;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void(bool)> setPlayerBleedImmune;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void()> clearLastAggressor;
+        std::function<void()> updatePreCombatState;
+    };
+
+    void InstallProviders(
+        TFD::Bleedout::Builders::NonCaptiveChoiceProvider nonCaptiveChoice,
+        TFD::Bleedout::Builders::BlackoutProvider blackout,
+        TFD::Bleedout::Builders::TransitionRuntimeProvider transitionRuntime,
+        TFD::Bleedout::Builders::TransitionCaptiveProvider transitionCaptive,
+        RuntimeProviders runtime);
+
+    void Reset();
+
+    TFD::Transition::RuntimeHandlers BuildTransitionRuntimeHandlers();
+    TFD::Transition::CaptiveHandlers BuildTransitionCaptiveHandlers();
+    bool BeginResolvedNoMarkerFallback(const char* reason);
+}
+

@@ -6,6 +6,7 @@
 #include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
+#include "TFDBleedout.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -42,7 +43,7 @@ namespace
 
         void SweepOnce(float radius, bool npcOnly)
         {
-            if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+            if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
                 return;
             }
 
@@ -322,7 +323,7 @@ namespace
                 return;
             }
 
-            if (TFD::DefeatMonitor::IsPlayerBleedHoldTargetBlocked()) {
+            if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
                 RestoreAll();
                 return;
             }
@@ -608,7 +609,7 @@ namespace TFD::HostilityController
                 return false;
             }
 
-            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                 spdlog::info(
                     "TFDHostilityController: rehostile skipped actor={:08X} player={:08X} reason={} defeated_knock=1",
                     actor->GetFormID(),
@@ -1528,7 +1529,7 @@ namespace TFD::HostilityController
             if (!actor || !player) {
                 return;
             }
-            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                 spdlog::info(
                     "TFDHostilityController: skip queue rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
                     actor->GetFormID(),
@@ -1585,7 +1586,7 @@ namespace TFD::HostilityController
                     continue;
                 }
 
-                if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+                if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                     spdlog::info(
                         "TFDHostilityController: cancel queued rehostile actor={:08X} player={:08X} session={} reason={} defeated_knock=1",
                         req.actorId,
@@ -2472,7 +2473,7 @@ namespace TFD::HostilityController
             return it->second.disposition != TameDisposition::Companion;
         }
 
-        return TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor);
+        return TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor);
     }
 
     Mode GetMode(RE::Actor* actor)
@@ -2501,7 +2502,7 @@ namespace TFD::HostilityController
             return entry.allowDialogue;
         }
 
-        return TFD::DefeatMonitor::IsDialogueCapableDefeatedEnemy(actor);
+        return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor);
     }
 
     bool CanStartTruce(RE::Actor* actor)
@@ -2510,7 +2511,7 @@ namespace TFD::HostilityController
             return false;
         }
 
-        if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+        if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
             return false;
         }
 

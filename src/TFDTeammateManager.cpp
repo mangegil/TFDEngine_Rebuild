@@ -931,6 +931,18 @@ namespace TFD::TeammateManager
         }
     }
 
+    bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct)
+    {
+        return BridgeInternal::g_runtimeProviders.reviveDownedAlly ? BridgeInternal::g_runtimeProviders.reviveDownedAlly(actor, targetHealthPct) : false;
+    }
+
+    void SetPendingDefeatedDialogueTarget(RE::Actor* actor)
+    {
+        if (BridgeInternal::g_runtimeProviders.setPendingDefeatedDialogueTarget) {
+            BridgeInternal::g_runtimeProviders.setPendingDefeatedDialogueTarget(actor);
+        }
+    }
+
     bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor)
     {
         if (!actor) {

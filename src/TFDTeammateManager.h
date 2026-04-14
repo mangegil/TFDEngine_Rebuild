@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <cstddef>
 #include <functional>
@@ -29,6 +29,8 @@ namespace TFD::TeammateManager
         std::function<void(RE::Actor*, float, float, float, float, float, const char*)> restoreActorHealthToSafePct;
         std::function<RE::Actor*()> resolvePendingDefeatedDialogueTarget;
         std::function<void()> clearPendingDefeatedDialogueTarget;
+        std::function<void(RE::Actor*)> setPendingDefeatedDialogueTarget;
+        std::function<bool(RE::Actor*, float)> reviveDownedAlly;
     };
 
     void Install();
@@ -46,6 +48,8 @@ namespace TFD::TeammateManager
     FollowerResolution ResolveFollowerCandidates(float radius);
     std::vector<RE::Actor*> CollectStandingFollowers(float radius);
     void RecoverVictoryTeammates();
+    bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct = 55.0f);
+    void SetPendingDefeatedDialogueTarget(RE::Actor* actor);
     bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor);
 
     bool IsCreatureCompanion(RE::Actor* actor);

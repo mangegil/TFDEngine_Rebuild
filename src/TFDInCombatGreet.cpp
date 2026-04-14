@@ -1,4 +1,4 @@
-#include "TFDInCombatGreet.h"
+﻿#include "TFDInCombatGreet.h"
 
 #include <atomic>
 #include <cmath>
@@ -14,6 +14,7 @@
 #include "TFDDefeatMonitor.h"
 #include "SKSE/SKSE.h"
 #include "TFDInCombat.h"
+#include "TFDTransition.h"
 
 namespace TFD::InCombatGreet
 {
@@ -90,7 +91,7 @@ namespace TFD::InCombatGreet
 			if (actor->GetFormID() == player->GetFormID()) {
 				return false;
 			}
-			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+			if (TFD::Transition::IsRecoveryActive()) {
 				return false;
 			}
 			return true;

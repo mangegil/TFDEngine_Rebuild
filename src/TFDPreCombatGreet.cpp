@@ -1,4 +1,4 @@
-#include "TFDActor.h"
+﻿#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -26,6 +26,7 @@
 #include "TFDTame.h"
 #include "TFDFlowController.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDTransition.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -314,7 +315,7 @@ namespace TFD::PreCombatGreet
 				return false;
 			}
 
-			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+			if (TFD::Transition::IsRecoveryActive()) {
 				return false;
 			}
 
@@ -794,7 +795,7 @@ namespace TFD::PreCombatGreet
 				}
 			}
 
-			if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+			if (TFD::Transition::IsRecoveryActive()) {
 				std::scoped_lock lk(gLock);
 				ClearAllPendingLocked();
 				return;
@@ -1017,7 +1018,7 @@ namespace TFD::PreCombatGreet
 			*outAction = TFD::InteractionRouter::Action::None;
 		}
 
-		if (TFD::DefeatMonitor::IsLeftForDeadRecoveryActive()) {
+		if (TFD::Transition::IsRecoveryActive()) {
 			return false;
 		}
 

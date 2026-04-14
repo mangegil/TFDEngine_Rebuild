@@ -29,21 +29,6 @@
           "type": "BOOL"
         },
         {
-          "name": "CMAKE_CXX_STANDARD",
-          "value": "23",
-          "type": "STRING"
-        },
-        {
-          "name": "CMAKE_CXX_STANDARD_REQUIRED",
-          "value": "True",
-          "type": "BOOL"
-        },
-        {
-          "name": "CMAKE_CXX_EXTENSIONS",
-          "value": "False",
-          "type": "BOOL"
-        },
-        {
           "name": "BUILD_TESTING",
           "value": "False",
           "type": "BOOL"
@@ -72,11 +57,6 @@
           "name": "TFDEnableSmf",
           "value": "True",
           "type": "BOOL"
-        },
-        {
-          "name": "CMAKE_MAKE_PROGRAM",
-          "value": "C:\\Users\\ROG\\AppData\\Local\\Microsoft\\WinGet\\Links\\ninja.exe",
-          "type": "FILEPATH"
         }
       ]
     },
@@ -109,21 +89,6 @@
           "type": "BOOL"
         },
         {
-          "name": "CMAKE_CXX_STANDARD",
-          "value": "23",
-          "type": "STRING"
-        },
-        {
-          "name": "CMAKE_CXX_STANDARD_REQUIRED",
-          "value": "True",
-          "type": "BOOL"
-        },
-        {
-          "name": "CMAKE_CXX_EXTENSIONS",
-          "value": "False",
-          "type": "BOOL"
-        },
-        {
           "name": "BUILD_TESTING",
           "value": "False",
           "type": "BOOL"
@@ -152,11 +117,6 @@
           "name": "TFDEnableSmf",
           "value": "True",
           "type": "BOOL"
-        },
-        {
-          "name": "CMAKE_MAKE_PROGRAM",
-          "value": "C:\\Users\\ROG\\AppData\\Local\\Microsoft\\WinGet\\Links\\ninja.exe",
-          "type": "FILEPATH"
         }
       ]
     }

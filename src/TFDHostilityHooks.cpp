@@ -1,4 +1,4 @@
-#include "TFDHostilityHooks.h"
+﻿#include "TFDHostilityHooks.h"
 #include "TFDActor.h"
 
 #include <RE/Skyrim.h>
@@ -10,6 +10,7 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDBleedout.h"
 
 #ifdef SKYRIM_SUPPORT_AE
 #define TFD_RELID(SE, AE) REL::ID(AE)
@@ -76,7 +77,7 @@ namespace TFD::HostilityHooks
                 auto* target = targetSp.get();
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (player && target == player) {
-                    TFD::DefeatMonitor::NoteEnemyTargetingPlayer(actor);
+                    TFD::Bleedout::DefeatGlue::NoteEnemyTargetingPlayer(actor);
                 }
 
                 if (!target || !IsInvalidCombatTarget(target)) {
@@ -85,10 +86,10 @@ namespace TFD::HostilityHooks
 
                 RE::Actor* replacement = nullptr;
                 if (actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) {
-                    replacement = TFD::DefeatMonitor::ResolveBleedFollowerAggroTarget(actor);
+                    replacement = TFD::Bleedout::DefeatGlue::ResolveBleedFollowerAggroTarget(actor);
                 }
                 if (!replacement) {
-                    replacement = TFD::DefeatMonitor::ResolveBleedRedirectTarget(actor);
+                    replacement = TFD::Bleedout::DefeatGlue::ResolveBleedRedirectTarget(actor);
                 }
                 if (replacement && replacement != actor && replacement != target && !IsInvalidCombatTarget(replacement)) {
                     actor->GetActorRuntimeData().currentCombatTarget = replacement->GetHandle();
@@ -152,7 +153,7 @@ namespace TFD::HostilityHooks
                 }
 
                 auto targetSp = actor ? actor->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
-                if (TFD::DefeatMonitor::IsObservedCombatCommitInProgress()) {
+                if (TFD::Bleedout::DefeatGlue::IsObservedCombatCommitInProgress()) {
                     _UpdateCombat(actor);
                     return;
                 }
@@ -182,7 +183,7 @@ namespace TFD::HostilityHooks
 
                 auto* player = RE::PlayerCharacter::GetSingleton();
                 if (viewer && target && player && target == player) {
-                    TFD::DefeatMonitor::NoteEnemyTargetingPlayer(viewer);
+                    TFD::Bleedout::DefeatGlue::NoteEnemyTargetingPlayer(viewer);
                 }
 
                 if (target && !TFD::DefeatMonitor::IsThresholdCombatTargetValid(target)) {

@@ -1,6 +1,7 @@
 ﻿#include "TFDActor.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
+#include "TFDTame.h"
 
 #include <algorithm>
 #include <array>
@@ -371,6 +372,18 @@ namespace TFD::Actor
 {
     namespace
     {
+        std::vector<Scan::Entry> CollectEntriesFromLegacyScan(float radius, bool npcOnly)
+        {
+            Scan::Rescan(radius, npcOnly);
+            const auto count = Scan::GetCount();
+            std::vector<Scan::Entry> out;
+            out.reserve(static_cast<std::size_t>(count));
+            for (int i = 0; i < count; ++i) {
+                out.push_back(Scan::GetEntry(i));
+            }
+            return out;
+        }
+
         bool IsStandingActor(RE::Actor* actor)
         {
             if (!actor || actor->IsDead() || actor->IsDisabled()) {
@@ -503,16 +516,15 @@ namespace TFD::Actor
         snapshot.player = player->GetHandle();
         snapshot.options = options;
 
-        Scan::Rescan(options.radius, options.npcOnly);
-        const auto count = Scan::GetCount();
-        snapshot.actors.reserve(static_cast<std::size_t>(count));
+        const auto scannedEntries = CollectEntriesFromLegacyScan(options.radius, options.npcOnly);
+        snapshot.actors.reserve(scannedEntries.size());
 
         std::unordered_map<std::uint32_t, std::size_t> indexByFormID;
-        indexByFormID.reserve(static_cast<std::size_t>(count) * 2);
+        indexByFormID.reserve(scannedEntries.size() * 2);
 
-        for (int i = 0; i < count; ++i) {
-            auto entry = Scan::GetEntry(i);
-            auto* actor = Scan::GetActor(i);
+        for (auto const& entry : scannedEntries) {
+            auto actorSp = entry.actor.get();
+            auto* actor = actorSp.get();
             if (!actor) {
                 continue;
             }
@@ -1413,6 +1425,9 @@ namespace TFD::Actor::Ops
 		TruceQuestRegistryCache g_truceQuestRegistry{};
 		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
 		std::unordered_map<RE::FormID, ReleaseFollowGraceEntry> g_releaseFollowGraceEntries{};
+		TFD::Actor::Ops::DefeatedEnemyQueryHooks g_defeatedEnemyQueryHooks{};
+		TFD::Actor::Ops::DefeatedEnemyStateHooks g_defeatedEnemyStateHooks{};
+		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
 
 		static RE::TESGlobal* g_joinEnemyStateGlobal = nullptr;
 		static RE::TESFaction* g_releaseFollowHelperFaction = nullptr;
@@ -1562,6 +1577,79 @@ namespace TFD::Actor::Ops
 				}
 			}
 			return false;
+		}
+
+		static RE::BGSKeyword* LookupKeyword(const char* editorID)
+		{
+			if (!editorID || !editorID[0]) {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
+		}
+
+		static bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto* kw = LookupKeyword(editorID);
+			return kw && actor->HasKeyword(kw);
+		}
+
+		static bool IsCaptiveSupportedAggressor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return true;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeGhost") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeUndead")) {
+				return false;
+			}
+			return false;
+		}
+
+		static bool IsBleedCrowdSupportedAggressor(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			if (TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeDragon") || ActorHasKeywordByEditorID(actor, "ActorTypeGhost")) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeUndead") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra")) {
+				return true;
+			}
+			return false;
+		}
+
+		static bool IsDefeatedReentrySuppressedInternal(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			auto it = g_defeatedReentrySuppress.find(actor->GetFormID());
+			if (it == g_defeatedReentrySuppress.end()) {
+				return false;
+			}
+			if (Now() >= it->second) {
+				g_defeatedReentrySuppress.erase(it);
+				return false;
+			}
+			return true;
 		}
 
 		static void ResolveDefeatedEnemyRegistry()
@@ -1719,6 +1807,123 @@ namespace TFD::Actor::Ops
 				spdlog::info("[TFD][FactionManager] defeated enemy alias clear alias='{}' actor={:08X} reason={}",
 					alias->aliasName.c_str(), current->GetFormID(), reason ? reason : "unknown");
 			}
+		}
+
+		static bool IsTrackedDefeatedEnemy(RE::Actor* actor)
+		{
+			return g_defeatedEnemyQueryHooks.isTrackedEnemy ? g_defeatedEnemyQueryHooks.isTrackedEnemy(actor) : false;
+		}
+
+		static bool IsLastAggressorActor(RE::Actor* actor)
+		{
+			return g_defeatedEnemyQueryHooks.isLastAggressor ? g_defeatedEnemyQueryHooks.isLastAggressor(actor) : false;
+		}
+
+		static bool IsDefeatedEnemyCandidateInternal(RE::Actor* actor)
+		{
+			auto* player = Player();
+			if (!actor || !player || actor == player || actor->IsDead() || actor->IsDisabled()) {
+				return false;
+			}
+			if (IsDefeatedReentrySuppressedInternal(actor)) {
+				return false;
+			}
+			if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+				return false;
+			}
+			if (TFD::Tame::IsCompanion(actor) || TFD::Tame::HasActiveSession(actor)) {
+				return false;
+			}
+			if (!IsBleedCrowdSupportedAggressor(actor)) {
+				return false;
+			}
+			if (actor->IsHostileToActor(player)) {
+				return true;
+			}
+			auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+			if (auto* current = targetSp.get()) {
+				if (current == player || TFD::TeammateManager::IsActiveFollowerActor(current)) {
+					return true;
+				}
+			}
+			if (IsTrackedDefeatedEnemy(actor)) {
+				return true;
+			}
+			if (IsLastAggressorActor(actor)) {
+				return true;
+			}
+			return actor->IsInCombat();
+		}
+
+		static bool IsDefeatedEnemyKnockedInternal(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+		{
+			if (!actor) {
+				return false;
+			}
+			return lockKindValue == 2 && defeatedManaged;
+		}
+
+		static bool IsDialogueCapableDefeatedEnemyInternal(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+		{
+			return IsDefeatedEnemyKnockedInternal(actor, lockKindValue, defeatedManaged) && actor && IsCaptiveSupportedAggressor(actor);
+		}
+
+		static bool IsCreatureDefeatedEnemyInternal(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+		{
+			if (!IsDefeatedEnemyKnockedInternal(actor, lockKindValue, defeatedManaged) || !actor) {
+				return false;
+			}
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+				return false;
+			}
+			return ActorHasKeywordByEditorID(actor, "ActorTypeCreature") || ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") || ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") || ActorHasKeywordByEditorID(actor, "ActorTypeUndead");
+		}
+
+		static double GetDefeatedEnemyRemainingSecondsInternal(bool defeatedManaged, std::chrono::steady_clock::time_point deadline)
+		{
+			if (!defeatedManaged) {
+				return 0.0;
+			}
+			const auto now = Now();
+			if (deadline <= now) {
+				return 0.0;
+			}
+			return std::chrono::duration<double>(deadline - now).count();
+		}
+
+		static void ApplyDefeatedEnemyPassiveOverrideInternal(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden)
+		{
+			auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+			if (!avo) {
+				return;
+			}
+			if (!aggressionOverridden) {
+				savedAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+				aggressionOverridden = true;
+			}
+			avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+		}
+
+		static void RestoreDefeatedEnemyPassiveOverrideInternal(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden)
+		{
+			if (!aggressionOverridden) {
+				return;
+			}
+			auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+			if (avo) {
+				avo->SetActorValue(RE::ActorValue::kAggression, savedAggression);
+			}
+			aggressionOverridden = false;
+		}
+
+		static void ClearDefeatedEnemyStateInternal(RE::Actor* actor, int& aliasSlot, bool& factionApplied, bool& defeatedManaged, bool& defeatedAutoDeathIssued, bool& defeatedFatalDamageApplied, std::chrono::steady_clock::time_point& defeatedDeadline, float& savedAggression, bool& aggressionOverridden, const char* reason)
+		{
+			ClearDefeatedEnemyMirrorInternal(actor, aliasSlot, factionApplied, reason);
+			RestoreDefeatedEnemyPassiveOverrideInternal(actor, savedAggression, aggressionOverridden);
+			defeatedManaged = false;
+			defeatedAutoDeathIssued = false;
+			defeatedFatalDamageApplied = false;
+			defeatedDeadline = {};
 		}
 
 		static void ResolveTruceQuestRegistry()
@@ -2165,6 +2370,120 @@ namespace TFD::Actor::Ops
 		}
 	}
 
+	void InstallDefeatedEnemyQueryHooks(const DefeatedEnemyQueryHooks& hooks)
+	{
+		g_defeatedEnemyQueryHooks = hooks;
+	}
+
+	void InstallDefeatedEnemyStateHooks(const DefeatedEnemyStateHooks& hooks)
+	{
+		g_defeatedEnemyStateHooks = hooks;
+	}
+
+	bool IsDefeatedEnemyCandidate(RE::Actor* actor)
+	{
+		Initialize();
+		return IsDefeatedEnemyCandidateInternal(actor);
+	}
+
+	void SuppressDefeatedEnemyReentry(RE::Actor* actor, double seconds, const char* reason)
+	{
+		Initialize();
+		if (!actor) {
+			return;
+		}
+		const auto secs = (std::max)(0.5, seconds);
+		g_defeatedReentrySuppress[actor->GetFormID()] = Now() + std::chrono::milliseconds(static_cast<int>(secs * 1000.0));
+		spdlog::info("[TFD][FactionManager] defeated reentry suppress actor={:08X} seconds={:.1f} reason={}",
+			actor->GetFormID(),
+			secs,
+			reason ? reason : "unknown");
+	}
+
+	void ApplyDefeatedEnemyPassiveOverride(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden)
+	{
+		Initialize();
+		ApplyDefeatedEnemyPassiveOverrideInternal(actor, savedAggression, aggressionOverridden);
+	}
+
+	void RestoreDefeatedEnemyPassiveOverride(RE::Actor* actor, float& savedAggression, bool& aggressionOverridden)
+	{
+		Initialize();
+		RestoreDefeatedEnemyPassiveOverrideInternal(actor, savedAggression, aggressionOverridden);
+	}
+
+
+	static bool QueryDefeatedEnemyState(RE::Actor* actor, std::uint8_t& lockKindValue, bool& defeatedManaged, std::chrono::steady_clock::time_point& deadline)
+	{
+		if (!g_defeatedEnemyStateHooks.tryGetState) {
+			return false;
+		}
+		return g_defeatedEnemyStateHooks.tryGetState(actor, &lockKindValue, &defeatedManaged, &deadline);
+	}
+
+	bool IsDefeatedEnemyKnocked(RE::Actor* actor)
+	{
+		Initialize();
+		std::uint8_t lockKindValue = 0;
+		bool defeatedManaged = false;
+		std::chrono::steady_clock::time_point deadline{};
+		return QueryDefeatedEnemyState(actor, lockKindValue, defeatedManaged, deadline) && IsDefeatedEnemyKnockedInternal(actor, lockKindValue, defeatedManaged);
+	}
+	bool IsDefeatedEnemyKnocked(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+	{
+		Initialize();
+		return IsDefeatedEnemyKnockedInternal(actor, lockKindValue, defeatedManaged);
+	}
+
+
+	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor)
+	{
+		Initialize();
+		std::uint8_t lockKindValue = 0;
+		bool defeatedManaged = false;
+		std::chrono::steady_clock::time_point deadline{};
+		return QueryDefeatedEnemyState(actor, lockKindValue, defeatedManaged, deadline) && IsDialogueCapableDefeatedEnemyInternal(actor, lockKindValue, defeatedManaged);
+	}
+	bool IsDialogueCapableDefeatedEnemy(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+	{
+		Initialize();
+		return IsDialogueCapableDefeatedEnemyInternal(actor, lockKindValue, defeatedManaged);
+	}
+
+
+	bool IsCreatureDefeatedEnemy(RE::Actor* actor)
+	{
+		Initialize();
+		std::uint8_t lockKindValue = 0;
+		bool defeatedManaged = false;
+		std::chrono::steady_clock::time_point deadline{};
+		return QueryDefeatedEnemyState(actor, lockKindValue, defeatedManaged, deadline) && IsCreatureDefeatedEnemyInternal(actor, lockKindValue, defeatedManaged);
+	}
+	bool IsCreatureDefeatedEnemy(RE::Actor* actor, std::uint8_t lockKindValue, bool defeatedManaged)
+	{
+		Initialize();
+		return IsCreatureDefeatedEnemyInternal(actor, lockKindValue, defeatedManaged);
+	}
+
+
+	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor)
+	{
+		Initialize();
+		std::uint8_t lockKindValue = 0;
+		bool defeatedManaged = false;
+		std::chrono::steady_clock::time_point deadline{};
+		if (!QueryDefeatedEnemyState(actor, lockKindValue, defeatedManaged, deadline)) {
+			return 0.0;
+		}
+		return GetDefeatedEnemyRemainingSecondsInternal(defeatedManaged, deadline);
+	}
+	double GetDefeatedEnemyRemainingSeconds(RE::Actor* actor, bool defeatedManaged, std::chrono::steady_clock::time_point deadline)
+	{
+		Initialize();
+		(void) actor;
+		return GetDefeatedEnemyRemainingSecondsInternal(defeatedManaged, deadline);
+	}
+
 	void SyncDefeatedEnemyMirror(RE::Actor* actor, int& aliasSlot, bool& factionApplied)
 	{
 		Initialize();
@@ -2175,6 +2494,12 @@ namespace TFD::Actor::Ops
 	{
 		Initialize();
 		ClearDefeatedEnemyMirrorInternal(actor, aliasSlot, factionApplied, reason);
+	}
+
+	void ClearDefeatedEnemyState(RE::Actor* actor, int& aliasSlot, bool& factionApplied, bool& defeatedManaged, bool& defeatedAutoDeathIssued, bool& defeatedFatalDamageApplied, std::chrono::steady_clock::time_point& defeatedDeadline, float& savedAggression, bool& aggressionOverridden, const char* reason)
+	{
+		Initialize();
+		ClearDefeatedEnemyStateInternal(actor, aliasSlot, factionApplied, defeatedManaged, defeatedAutoDeathIssued, defeatedFatalDamageApplied, defeatedDeadline, savedAggression, aggressionOverridden, reason);
 	}
 
 	void ClearAllDefeatedEnemyMirrors(const char* reason)

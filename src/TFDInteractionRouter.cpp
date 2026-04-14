@@ -8,6 +8,7 @@
 #include "TFDDefeatMonitor.h"
 #include "TFDTeammateManager.h"
 #include "TFDActor.h"
+#include "TFDBleedout.h"
 
 #include <spdlog/spdlog.h>
 
@@ -191,7 +192,7 @@ namespace TFD::InteractionRouter
             if (!actor || !player) {
                 return -1.0e30f;
             }
-            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                 return -1.0e30f;
             }
 
@@ -260,7 +261,7 @@ namespace TFD::InteractionRouter
             if (!actor || !player) {
                 return -1.0e30f;
             }
-            if (TFD::DefeatMonitor::IsDefeatedEnemyKnocked(actor)) {
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                 return -1.0e30f;
             }
 
@@ -585,7 +586,7 @@ namespace TFD::InteractionRouter
             result.kind = FlowOwnedPrimaryKind::Bleedout;
             result.interactionState = 5;
             result.handled = true;
-            result.success = TFD::DefeatMonitor::HandleBleedoutHotkey();
+            result.success = TFD::Bleedout::DefeatGlue::BeginDialogueHotkey();
             result.notification = result.success ? "TFD: BleedOut Truce" : "TFD: No Response";
             return result;
         }
@@ -822,7 +823,7 @@ namespace TFD::InteractionRouter
             if (actor->GetParentCell() != player->GetParentCell()) {
                 continue;
             }
-            if (!TFD::DefeatMonitor::IsDialogueCapableDefeatedEnemy(actor)) {
+            if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
                 continue;
             }
 
@@ -933,10 +934,10 @@ namespace TFD::InteractionRouter
             if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 return -1.0e30f;
             }
-            if (!TFD::DefeatMonitor::IsCreatureDefeatedEnemy(actor)) {
+            if (!TFD::Actor::Ops::IsCreatureDefeatedEnemy(actor)) {
                 return -1.0e30f;
             }
-            if (TFD::DefeatMonitor::GetDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
+            if (TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
                 return -1.0e30f;
             }
             if (info.dist > radius) {
