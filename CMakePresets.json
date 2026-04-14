@@ -1,0 +1,62 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "installDir": "${sourceDir}/out/install/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "VCPKG_MANIFEST_MODE": "ON",
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static",
+        "VCPKG_HOST_TRIPLET": "x64-windows-static",
+        "BUILD_TESTING": "OFF",
+        "BUILD_TESTS": "OFF",
+        "TFDCopyToSksePlugins": "OFF"
+      }
+    },
+    {
+      "name": "x64-debug-se1597",
+      "inherits": "base",
+      "displayName": "TFD x64 Debug SE 1.5.97",
+      "description": "Debug build for Skyrim SE 1.5.97 using vcpkg manifest mode",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "ENABLE_SKYRIM_SE": "ON",
+        "ENABLE_SKYRIM_AE": "OFF",
+        "ENABLE_SKYRIM_VR": "OFF",
+        "TFDEnableSmf": "ON"
+      }
+    },
+    {
+      "name": "x64-release-se1597",
+      "inherits": "base",
+      "displayName": "TFD x64 Release SE 1.5.97",
+      "description": "Release build for Skyrim SE 1.5.97 using vcpkg manifest mode",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ENABLE_SKYRIM_SE": "ON",
+        "ENABLE_SKYRIM_AE": "OFF",
+        "ENABLE_SKYRIM_VR": "OFF",
+        "TFDEnableSmf": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-debug-se1597",
+      "configurePreset": "x64-debug-se1597"
+    },
+    {
+      "name": "build-release-se1597",
+      "configurePreset": "x64-release-se1597"
+    }
+  ]
+}

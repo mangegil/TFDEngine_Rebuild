@@ -218,6 +218,16 @@ namespace TFD::FlowController
 
     void InstallBattleObserverRuntimeProviders(BattleObserverRuntimeProviders providers);
     void ResetBattleObserverRuntimeProviders();
+	struct DefeatLifecycleProviders
+	{
+		PassiveRuntimeProviders passive;
+		OutcomeRuntimeProviders outcome;
+		BattleObserverRuntimeProviders battleObserver;
+	};
+
+	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers);
+	void ResetDefeatLifecycleProviders();
+
     ObservedDefeatResolution EvaluateObservedDefeatResolution(const ObservedDefeatInput& input);
     bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason);
     void HandleObservedBattleWin(const char* reason = nullptr);

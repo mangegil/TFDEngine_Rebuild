@@ -363,3 +363,9 @@ MigrationBackup/
 FodyWeavers.xsd
 /TFDEngine_Rebuild.zip
 /.gitignore
+
+# Local CMake preset override
+CMakeUserPresets.json
+
+# Local vcpkg installed artifacts
+vcpkg_installed/

@@ -317,6 +317,20 @@ namespace TFD::FlowController
     }
 
 
+	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers)
+	{
+		InstallPassiveRuntimeProviders(std::move(providers.passive));
+		InstallOutcomeRuntimeProviders(std::move(providers.outcome));
+		InstallBattleObserverRuntimeProviders(std::move(providers.battleObserver));
+	}
+
+	void ResetDefeatLifecycleProviders()
+	{
+		ResetPassiveRuntimeProviders();
+		ResetOutcomeRuntimeProviders();
+		ResetBattleObserverRuntimeProviders();
+	}
+
     void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers)
     {
         g_passiveRuntimeProviders = std::move(providers);

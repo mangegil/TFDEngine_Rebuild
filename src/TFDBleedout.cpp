@@ -2877,6 +2877,30 @@ namespace TFD::Bleedout::Builders
 }
 
 
+namespace TFD::Bleedout
+{
+	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers)
+	{
+		Builders::InstallPendingSystemEventProvider(std::move(providers.pendingSystemEvent));
+		Builders::InstallDialogueCloseProvider(std::move(providers.dialogueClose));
+		Builders::InstallTimeoutProvider(std::move(providers.timeout));
+		Builders::InstallBaseCompletionProvider(std::move(providers.baseCompletion));
+		Builders::InstallCaptivePleasureCompletionExtras(std::move(providers.captivePleasureCompletion));
+		Builders::InstallPayReleaseCompletionExtras(std::move(providers.payReleaseCompletion));
+		Builders::InstallBleedPleasureCompletionExtras(std::move(providers.bleedPleasureCompletion));
+		RuntimeHost::InstallProvider(std::move(providers.runtimeHost));
+		DefeatGlue::InstallProvider(std::move(providers.defeatGlue));
+	}
+
+	void ResetDefeatLifecycleProviders()
+	{
+		Builders::Reset();
+		RuntimeHost::Reset();
+		DefeatGlue::Reset();
+	}
+}
+
+
 namespace TFD::Bleedout::RuntimeHost
 {
 	namespace

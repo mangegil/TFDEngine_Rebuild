@@ -115,5 +115,14 @@ namespace TFD::Captive
 
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
 
+	struct ApplyQueuedDefeatProgressHandlers
+	{
+		std::function<RE::Actor*()> getPlayer;
+		std::function<bool()> isDialogueOpen;
+		std::function<void(bool)> setPrevDialogueOpen;
+	};
+
+	void ApplyQueuedDefeatProgressState(const ApplyQueuedDefeatProgressHandlers& handlers);
+
 	void ResetForLoad();
 }

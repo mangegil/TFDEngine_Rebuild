@@ -792,3 +792,22 @@ namespace TFD::Bleedout::DefeatGlue
 	void HandleObservedBattleWin(const char* reason = nullptr);
 	void HandleObservedLeftForDead(const char* reason = nullptr);
 }
+
+namespace TFD::Bleedout
+{
+	struct DefeatLifecycleProviders
+	{
+		Builders::PendingSystemEventProvider pendingSystemEvent;
+		Builders::DialogueCloseProvider dialogueClose;
+		Builders::TimeoutProvider timeout;
+		Builders::BaseCompletionProvider baseCompletion;
+		Builders::CaptivePleasureCompletionExtras captivePleasureCompletion;
+		Builders::PayReleaseCompletionExtras payReleaseCompletion;
+		Builders::BleedPleasureCompletionExtras bleedPleasureCompletion;
+		RuntimeHost::Provider runtimeHost;
+		DefeatGlue::Provider defeatGlue;
+	};
+
+	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers);
+	void ResetDefeatLifecycleProviders();
+}

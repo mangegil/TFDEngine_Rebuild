@@ -1262,6 +1262,24 @@ namespace TFD::Captive
 		return true;
 	}
 
+	void ApplyQueuedDefeatProgressState(const ApplyQueuedDefeatProgressHandlers& handlers)
+	{
+		SetRuntimeState(GetQueuedStateFlag(), GetQueuedPhase());
+		if (handlers.setPrevDialogueOpen && handlers.isDialogueOpen) {
+			handlers.setPrevDialogueOpen(handlers.isDialogueOpen());
+		}
+		CaptureCurrentLockpickMenuState();
+		if (GetQueuedStateFlag() && GetQueuedPhase() == PhaseValue::Captive) {
+			TFD::Location::RescanCaptiveMarker();
+			if (handlers.getPlayer) {
+				ArmEscapeContextFromCurrentState(handlers.getPlayer());
+			}
+		} else {
+			ResetLockpickWatch();
+			ClearEscapeContext();
+		}
+	}
+
 	void ResetForLoad()
 	{
 		g_state = false;
