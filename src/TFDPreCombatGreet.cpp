@@ -1097,12 +1097,6 @@ namespace TFD::PreCombatGreet
 				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::Tame::ReleaseReason::Generic);
 				return false;
 			}
-
-			const auto bridge = GetBridgeEventNames(result.action);
-			if (bridge.assign) {
-				SendBridgeEvent(bridge.assign, actor);
-				pending.assignSent = true;
-			}
 		}
 
 		if (result.dialogueRequested) {

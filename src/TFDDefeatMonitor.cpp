@@ -1691,19 +1691,6 @@ namespace TFD::DefeatMonitor
 
 			return false;
 		}
-		static std::uint32_t ResolveRouterCombatActorFormID(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
-		{
-			for (auto* enemy : enemies) {
-				if (IsActorActivelyTargetingPlayerSideForRouter(enemy, player)) {
-					return enemy->GetFormID();
-				}
-			}
-			const auto flowActorFormID = ResolveBleedFlowActorFormID();
-			if (flowActorFormID != 0) {
-				return flowActorFormID;
-			}
-			return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
-		}
 
 		static int ComputeDefeatState(RE::Actor* player, bool combatContext)
 		{
@@ -1851,12 +1838,8 @@ namespace TFD::DefeatMonitor
 			const bool defeatContext = IsDefeatCombatContextActive(player, enemies);
 			const bool victoryContext = IsVictoryCombatContextActive(player, enemies);
 			const bool routerCombatContext = IsRouterCombatContextActive(player, enemies);
-			const auto routerCombatActorFormID = ResolveRouterCombatActorFormID(player, enemies);
 			const bool pleasurePassiveLock = TFD::PleasureRuntime::IsPassiveLockActive();
 			if (pleasurePassiveLock) {
-				if (g_lastRouterCombatContextActive) {
-					TFD::InCombat::ObserveCombat(0, false, "pleasure_passive_lock");
-				}
 				g_lastRouterCombatContextActive = false;
 				SetGlobalInt(g_defeatStateGlobal, 0);
 				TFD::Victory::SetStateValue(0);
@@ -1867,7 +1850,6 @@ namespace TFD::DefeatMonitor
 				SetGlobalInt(g_leftForDeadStateGlobal, 0);
 				return;
 			}
-			TFD::InCombat::ObserveCombat(routerCombatActorFormID, routerCombatContext, "observed_combat_tick");
 			g_lastRouterCombatContextActive = routerCombatContext;
 			SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(player, defeatContext));
 			TFD::Victory::SetStateValue(ComputeVictoryState(player, victoryContext, enemies));
@@ -2104,12 +2086,35 @@ namespace TFD::DefeatMonitor
 			return BleedLockKind::Other;
 		}
 
-		static bool ShouldEnterBleedLock(RE::Actor* actor, float thresholdPct)
+		static bool HasImmediatePlayerSideBleedThreat(RE::Actor* player, const TFD::Actor::Snapshot& snapshot, float radius)
+		{
+			if (!player) {
+				return false;
+			}
+			if (player->IsInCombat()) {
+				return true;
+			}
+			if (ResolveAggressor()) {
+				return true;
+			}
+			if (FindBestAggressor(radius)) {
+				return true;
+			}
+			return TFD::Actor::HasStandingHostileCoalition(snapshot);
+		}
+
+		static bool ShouldEnterBleedLock(RE::Actor* actor, float thresholdPct, bool hasRelevantThreat)
 		{
 			if (!actor || actor->IsDisabled() || actor->IsDead()) {
 				return false;
 			}
-			return GetActorHealthPct(actor) <= std::clamp(thresholdPct, 2.0f, 95.0f);
+			if (GetActorHealthPct(actor) > std::clamp(thresholdPct, 2.0f, 95.0f)) {
+				return false;
+			}
+			if (actor == Player() || IsActiveFollowerActor(actor)) {
+				return hasRelevantThreat;
+			}
+			return hasRelevantThreat || TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor);
 		}
 
 		static void EnterBleedLock(RE::Actor* actor, BleedLockKind kind, float thresholdPct, const char* reason)
@@ -2253,20 +2258,27 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 
+			const float radius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
+			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
+			const bool playerSideThreat = HasImmediatePlayerSideBleedThreat(player, snapshot, radius);
+
 			const float playerThreshold = ResolveBleedLockThresholdPct(player);
-			if (ShouldEnterBleedLock(player, playerThreshold)) {
+			if (ShouldEnterBleedLock(player, playerThreshold, playerSideThreat)) {
 				EnterBleedLock(player, BleedLockKind::Player, playerThreshold, "threshold_scan_player");
+			} else if (GetActorHealthPct(player) <= std::clamp(playerThreshold, 2.0f, 95.0f) && !playerSideThreat) {
+				spdlog::info("[TFD][Defeat] skip bleed lock player reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}",
+					GetActorHealthPct(player),
+					std::clamp(playerThreshold, 2.0f, 95.0f));
 			}
 
-			const float radius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
 			for (auto* actor : TFD::TeammateManager::CollectKnownTeammates(radius)) {
 				const float threshold = ResolveBleedLockThresholdPct(actor);
-				if (ShouldEnterBleedLock(actor, threshold)) {
+				const bool followerThreat = playerSideThreat || (actor && actor->IsInCombat());
+				if (ShouldEnterBleedLock(actor, threshold, followerThreat)) {
 					EnterBleedLock(actor, ResolveBleedLockKind(actor), threshold, "threshold_scan_follower");
 				}
 			}
 
-			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
 			for (const auto& info : snapshot.actors) {
 				auto* actor = info.get();
 				if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
@@ -2276,7 +2288,8 @@ namespace TFD::DefeatMonitor
 					continue;
 				}
 				const float threshold = ResolveBleedLockThresholdPct(actor);
-				if (ShouldEnterBleedLock(actor, threshold)) {
+				const bool enemyThreat = TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor);
+				if (ShouldEnterBleedLock(actor, threshold, enemyThreat)) {
 					EnterBleedLock(actor, ResolveBleedLockKind(actor), threshold, "threshold_scan_other");
 				}
 			}
@@ -2850,8 +2863,13 @@ else {
 			const float pct = (hpNow / hpMax) * 100.0f;
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
 			if (pct <= thresh) {
-				EnterBleedLock(player, BleedLockKind::Player, thresh, "player_threshold");
 				auto thresholdScan = ScanPlayerThresholdOutcome(player);
+				const bool immediateThreat = player->IsInCombat() || thresholdScan.initialAggressor != nullptr || thresholdScan.hostileCoalitionStanding;
+				if (!immediateThreat) {
+					spdlog::info("[TFD][Defeat] skip player threshold outcome reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}", pct, thresh);
+					return;
+				}
+				EnterBleedLock(player, BleedLockKind::Player, thresh, "player_threshold");
 				ClearEnemyTargetsToPlayerForDefeat(player, thresholdScan.scanRadius, "player_threshold");
 				auto thresholdClassification = ClassifyPlayerThresholdOutcome(thresholdScan);
 				if (DispatchPlayerThresholdOutcome(player, thresholdScan, thresholdClassification)) {

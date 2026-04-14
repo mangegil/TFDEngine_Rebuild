@@ -242,9 +242,7 @@ namespace TFD::InCombatGreet
 			if (player && player->IsInCombat()) {
 				player->StopCombat();
 			}
-			SendBridgeEvent("TFDInCombatAssign", speaker);
 			if (!Begin(speaker, "incombat_dialogue_begin")) {
-				SendBridgeEvent("TFDInCombatClear", speaker);
 				TFD::HostilityController::ReleaseSession(result.sessionId, TFD::HostilityController::ReleaseReason::Generic);
 				TFD::InCombat::Complete("incombat_greet_begin_failed");
 				return false;

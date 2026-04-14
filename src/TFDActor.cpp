@@ -888,7 +888,8 @@ namespace TFD::Actor::Interaction
     namespace
     {
         constexpr float kMaxTameDistance = 768.0f;
-        constexpr float kMaxTruceDistance = 1024.0f;
+        constexpr float kMaxTrucePreCombatDistance = 2500.0f;
+        constexpr float kMaxTruceInCombatDistance = 1600.0f;
 
         constexpr const char* kPluginName = "TFDEngine.esp";
 
@@ -981,9 +982,25 @@ namespace TFD::Actor::Interaction
             return distanceToPlayer > kMaxTameDistance;
         }
 
-        bool IsDistanceTooFarForTruce(float distanceToPlayer)
+        float GetMaxTruceDistance(TFD::Actor::Interaction::TruceMode truceMode, bool targetInCombat)
         {
-            return distanceToPlayer > kMaxTruceDistance;
+            switch (truceMode) {
+            case TFD::Actor::Interaction::TruceMode::PreCombat:
+                return kMaxTrucePreCombatDistance;
+            case TFD::Actor::Interaction::TruceMode::InCombat:
+                return kMaxTruceInCombatDistance;
+            case TFD::Actor::Interaction::TruceMode::Auto:
+            default:
+                return targetInCombat ? kMaxTruceInCombatDistance : kMaxTrucePreCombatDistance;
+            }
+        }
+
+        bool IsDistanceTooFarForTruce(
+            float distanceToPlayer,
+            TFD::Actor::Interaction::TruceMode truceMode,
+            bool targetInCombat)
+        {
+            return distanceToPlayer > GetMaxTruceDistance(truceMode, targetInCombat);
         }
 
         RE::FormID ResolveRuntimeFormID(std::uint32_t localFormID)
@@ -1237,7 +1254,8 @@ namespace TFD::Actor::Interaction
         RE::Actor* target,
         bool isCaptivePhase,
         bool targetInCombat,
-        float distanceToPlayer)
+        float distanceToPlayer,
+        TruceMode truceMode)
     {
         ClassifyResult result{};
 
@@ -1271,7 +1289,7 @@ namespace TFD::Actor::Interaction
         }
 
         if (result.creatureClass == CreatureClass::FullDialogue) {
-            if (IsDistanceTooFarForTruce(distanceToPlayer)) {
+            if (IsDistanceTooFarForTruce(distanceToPlayer, truceMode, targetInCombat)) {
                 result.valid = false;
                 result.rejectReason = RejectReason::TooFar;
                 return result;
@@ -1284,7 +1302,7 @@ namespace TFD::Actor::Interaction
             result.negotiable = true;
             result.tameable = false;
             result.allowDialogue = true;
-            result.requiresPreCombat = false;
+            result.requiresPreCombat = !targetInCombat;
             result.allowsInCombat = true;
             return result;
         }

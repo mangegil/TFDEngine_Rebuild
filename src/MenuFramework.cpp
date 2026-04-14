@@ -31,6 +31,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDTame.h"
 #include "TFDFeedPopup.h"
+#include "TFDActor.h"
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 #include "TFDCaptive.h"
@@ -1458,6 +1459,120 @@ namespace TFDMenu
 			}
 		}
 
+
+		static const char* DecodeAggressionValue(float value)
+		{
+			const int rounded = static_cast<int>(std::lround(value));
+			switch (rounded) {
+			case 0:
+				return "Unaggressive";
+			case 1:
+				return "Aggressive";
+			case 2:
+				return "VeryAggressive";
+			case 3:
+				return "Frenzied";
+			default:
+				return "Unknown";
+			}
+		}
+
+		static void RenderActorsDebugSection()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				ImGuiMCP::Text("Player not ready");
+				return;
+			}
+
+			constexpr float kDebugRadius = 8000.0f;
+			const auto snapshot = TFD::Actor::BuildSnapshot(kDebugRadius, false);
+			const RE::FormID playerId = player->GetFormID();
+
+			ImGuiMCP::SetWindowFontScale(0.90f);
+			ImGuiMCP::Text("Radius: %.0f | Scanned Actors: %d", kDebugRadius, static_cast<int>(snapshot.actors.size()));
+			ImGuiMCP::Separator();
+
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
+				if (!actor) {
+					continue;
+				}
+
+				const bool targetPlayer = info.currentTargetFormID == playerId;
+				bool targetPlayerSide = targetPlayer;
+				if (!targetPlayer && info.currentTargetFormID != 0) {
+					if (const auto* targetInfo = TFD::Actor::FindActorInfo(snapshot, info.currentTargetFormID)) {
+						targetPlayerSide = targetInfo->playerSide;
+					}
+					else if (auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get()) {
+						if (auto* currentTarget = targetSp.get()) {
+							targetPlayerSide = currentTarget->IsPlayerRef() || currentTarget->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(currentTarget);
+						}
+					}
+				}
+
+				const float aggressionValue = actor->GetActorValue(RE::ActorValue::kAggression);
+				const bool actorInCombat = actor->IsInCombat() || info.inCombat;
+				const bool committedHostile = actorInCombat || targetPlayerSide;
+				const auto creatureClass = TFD::Actor::Interaction::GetCreatureClass(actor);
+				const auto classifyNow = TFD::Actor::Interaction::ClassifyTarget(player, actor, false, committedHostile, info.dist);
+				const bool truceAble =
+					classifyNow.valid &&
+					classifyNow.intent == TFD::Actor::Interaction::Intent::Truce &&
+					TFD::HostilityController::CanStartTruce(actor);
+				const bool preCombatContext =
+					!actorInCombat &&
+					!targetPlayer &&
+					!targetPlayerSide &&
+					info.currentTargetFormID == 0;
+				const bool inCombatContext =
+					actorInCombat &&
+					(targetPlayer || targetPlayerSide || info.currentTargetFormID != 0);
+				const bool preCombatTruceAble = truceAble && preCombatContext;
+				const bool inCombatTruceAble = truceAble && inCombatContext;
+
+				const char* actorName = actor->GetName();
+				if (!actorName || !actorName[0]) {
+					actorName = "<unnamed>";
+				}
+
+				ImGuiMCP::BulletText(
+					"%s | %08X | dist=%.1f | class=%s",
+					actorName,
+					actor->GetFormID(),
+					info.dist,
+					TFD::Actor::Interaction::ToString(creatureClass));
+
+				ImGuiMCP::Indent();
+				ImGuiMCP::Text(
+					"aggr=%d(%s) | hostile=%s | combat=%s | targetPlayer=%s | targetPlayerSide=%s",
+					static_cast<int>(std::lround(aggressionValue)),
+					DecodeAggressionValue(aggressionValue),
+					YesNo(info.hostileToPlayer),
+					YesNo(actorInCombat),
+					YesNo(targetPlayer),
+					YesNo(targetPlayerSide));
+
+				ImGuiMCP::Text(
+					"currentTarget=%08X | valid=%s | intent=%s | truceAble=%s | reject=%s",
+					info.currentTargetFormID,
+					YesNo(classifyNow.valid),
+					TFD::Actor::Interaction::ToString(classifyNow.intent),
+					YesNo(truceAble),
+					TFD::Actor::Interaction::ToString(classifyNow.rejectReason));
+
+				ImGuiMCP::Text(
+					"preCombatTruceAble=%s | inCombatTruceAble=%s",
+					YesNo(preCombatTruceAble),
+					YesNo(inCombatTruceAble));
+				ImGuiMCP::Unindent();
+				ImGuiMCP::Spacing();
+			}
+
+			ImGuiMCP::SetWindowFontScale(1.0f);
+		}
+
 		static void RenderDebugPage()
 		{
 			ResolveGlobals();
@@ -1471,6 +1586,10 @@ namespace TFDMenu
 
 			if (ImGuiMCP::CollapsingHeader("Global State")) {
 				RenderDebugGlobalsSection();
+			}
+
+			if (ImGuiMCP::CollapsingHeader("Actors")) {
+				RenderActorsDebugSection();
 			}
 
 			if (ImGuiMCP::CollapsingHeader("Quest Alias Monitor")) {

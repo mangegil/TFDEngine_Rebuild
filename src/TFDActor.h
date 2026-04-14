@@ -162,6 +162,13 @@ namespace TFD::Actor
             UnknownFallback
         };
 
+        enum class TruceMode : std::uint8_t
+        {
+            Auto = 0,
+            PreCombat,
+            InCombat
+        };
+
         struct ClassifyResult
         {
             TargetKind kind{ TargetKind::None };
@@ -189,7 +196,8 @@ namespace TFD::Actor
             RE::Actor* target,
             bool isCaptivePhase,
             bool targetInCombat,
-            float distanceToPlayer);
+            float distanceToPlayer,
+            TruceMode truceMode = TruceMode::Auto);
         const char* ToString(TargetKind value);
         const char* ToString(Intent value);
         const char* ToString(RejectReason value);

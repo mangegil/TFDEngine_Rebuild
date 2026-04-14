@@ -11,6 +11,7 @@
 #include "TFDTame.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDBleedout.h"
+#include "TFDFlowController.h"
 
 #ifdef SKYRIM_SUPPORT_AE
 #define TFD_RELID(SE, AE) REL::ID(AE)
@@ -65,6 +66,40 @@ namespace TFD::HostilityHooks
             static bool IsReleaseGraceActor(RE::Actor* actor)
             {
                 return actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+            }
+
+            static void SyncPlayerCombatFlow(RE::Character* actor)
+            {
+                if (!actor || !actor->IsPlayerRef()) {
+                    return;
+                }
+
+                static std::atomic_bool gPlayerCombatActive{ false };
+                static std::atomic<std::uint32_t> gPlayerCombatTargetId{ 0 };
+
+                auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                auto* target = targetSp.get();
+                const auto targetId = target ? target->GetFormID() : 0u;
+                const bool active = actor->IsInCombat() && targetId != 0;
+
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                const bool wasActive = gPlayerCombatActive.load(std::memory_order_acquire);
+                const auto lastTargetId = gPlayerCombatTargetId.load(std::memory_order_acquire);
+
+                if (active) {
+                    if (!wasActive || lastTargetId != targetId) {
+                        flow.NotifyCombatStarted(targetId, "hostilityhooks_player_combat");
+                    }
+                    gPlayerCombatTargetId.store(targetId, std::memory_order_release);
+                    gPlayerCombatActive.store(true, std::memory_order_release);
+                    return;
+                }
+
+                if (wasActive) {
+                    flow.NotifyCombatEnded("hostilityhooks_player_combat_end");
+                }
+                gPlayerCombatTargetId.store(0, std::memory_order_release);
+                gPlayerCombatActive.store(false, std::memory_order_release);
             }
 
             static void ClearInvalidCombatTarget(RE::Character* actor)
@@ -161,6 +196,7 @@ namespace TFD::HostilityHooks
                 ClearInvalidCombatTarget(actor);
                 _UpdateCombat(actor);
                 ClearInvalidCombatTarget(actor);
+                SyncPlayerCombatFlow(actor);
             }
 
             static std::uint8_t* DoDetect(

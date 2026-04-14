@@ -79,6 +79,45 @@ namespace TFD::InteractionRouter
             return IsPlayerSideActor(combatTarget, player);
         }
 
+        void ResolveSnapshotTargetContext(
+            const TFD::Actor::Snapshot& snapshot,
+            RE::Actor* actor,
+            RE::PlayerCharacter* player,
+            const TFD::Actor::ActorInfo& info,
+            bool& outTargetPlayer,
+            bool& outTargetPlayerSide,
+            bool& outActorInCombat)
+        {
+            outTargetPlayer = false;
+            outTargetPlayerSide = false;
+            outActorInCombat = false;
+
+            if (!actor || !player) {
+                return;
+            }
+
+            const RE::FormID playerId = player->GetFormID();
+            outTargetPlayer = info.currentTargetFormID == playerId;
+            outTargetPlayerSide = outTargetPlayer;
+
+            if (!outTargetPlayer && info.currentTargetFormID != 0) {
+                if (const auto* targetInfo = TFD::Actor::FindActorInfo(snapshot, info.currentTargetFormID)) {
+                    outTargetPlayerSide = targetInfo->playerSide;
+                }
+                else if (auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get()) {
+                    if (auto* currentTarget = targetSp.get()) {
+                        outTargetPlayerSide =
+                            currentTarget->IsPlayerRef() ||
+                            currentTarget->IsPlayerTeammate() ||
+                            TFD::TeammateManager::IsActiveFollowerActor(currentTarget) ||
+                            TFD::Tame::IsCompanion(currentTarget);
+                    }
+                }
+            }
+
+            outActorInCombat = actor->IsInCombat() || info.inCombat;
+        }
+
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* target)
         {
             if (!player || !target) {
@@ -186,6 +225,7 @@ namespace TFD::InteractionRouter
         }
 
         float ScoreTruceCandidate(
+            const TFD::Actor::Snapshot& snapshot,
             RE::Actor* actor,
             RE::PlayerCharacter* player,
             const TFD::Actor::ActorInfo& info,
@@ -198,16 +238,26 @@ namespace TFD::InteractionRouter
                 return -1.0e30f;
             }
 
-            const bool front = IsActorCloseAndFront(actor, player, 1400.0f);
-            const bool inCombat = IsActorActivelyTargetingPlayerSide(actor, player);
+            const float dot = GetActorFrontDot2D(actor, player);
+            const bool front = dot >= 0.15f;
             const bool weaponDrawn = actor->IsWeaponDrawn();
+
+            bool targetPlayer = false;
+            bool targetingPlayerSide = false;
+            bool actorInCombat = false;
+            ResolveSnapshotTargetContext(snapshot, actor, player, info, targetPlayer, targetingPlayerSide, actorInCombat);
+
+            const bool committedHostile = actorInCombat || targetingPlayerSide;
 
             const auto classify = TFD::Actor::Interaction::ClassifyTarget(
                 player,
                 actor,
                 false,
-                inCombat,
-                info.dist);
+                committedHostile,
+                info.dist,
+                desiredAction == Action::TrucePreCombat
+                ? TFD::Actor::Interaction::TruceMode::PreCombat
+                : TFD::Actor::Interaction::TruceMode::InCombat);
 
             if (!classify.valid ||
                 classify.intent != TFD::Actor::Interaction::Intent::Truce) {
@@ -215,40 +265,76 @@ namespace TFD::InteractionRouter
             }
 
             if (desiredAction == Action::TrucePreCombat) {
-                if (!inCombat || !front || info.dist > 1150.0f) {
+                if (actorInCombat || targetPlayer || targetingPlayerSide || info.currentTargetFormID != 0) {
+                    if (classify.valid && classify.intent == TFD::Actor::Interaction::Intent::Truce) {
+                        spdlog::info(
+                            "[TFD][Router] reject precombat target={:08X} reason=context combat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
+                            actor->GetFormID(),
+                            actorInCombat ? 1 : 0,
+                            targetPlayer ? 1 : 0,
+                            targetingPlayerSide ? 1 : 0,
+                            info.currentTargetFormID);
+                    }
+                    return -1.0e30f;
+                }
+                if (info.dist > 3500.0f) {
                     return -1.0e30f;
                 }
 
-                float score = 50000.0f;
+                float score = 12000.0f;
                 score -= info.dist;
-                if (weaponDrawn) {
-                    score += 900.0f;
+                if (front) {
+                    score += 1200.0f;
+                }
+                if (classify.allowDialogue) {
+                    score += 500.0f;
                 }
                 if (info.hostileToPlayer) {
                     score += 350.0f;
                 }
-                if (classify.allowDialogue) {
-                    score += 250.0f;
+                if (weaponDrawn) {
+                    score += 100.0f;
                 }
+                score += (dot * 250.0f);
                 return score;
             }
 
             if (desiredAction == Action::TruceInCombat) {
-                if (!inCombat || info.dist > 1400.0f) {
+                const bool inCombatContext = actorInCombat && (targetPlayer || targetingPlayerSide || info.currentTargetFormID != 0);
+                if (!inCombatContext) {
+                    if (classify.valid && classify.intent == TFD::Actor::Interaction::Intent::Truce) {
+                        spdlog::info(
+                            "[TFD][Router] reject incombat target={:08X} reason=context combat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
+                            actor->GetFormID(),
+                            actorInCombat ? 1 : 0,
+                            targetPlayer ? 1 : 0,
+                            targetingPlayerSide ? 1 : 0,
+                            info.currentTargetFormID);
+                    }
+                    return -1.0e30f;
+                }
+                if (info.dist > 3500.0f) {
                     return -1.0e30f;
                 }
 
-                float score = 20000.0f;
+                float score = 22000.0f;
                 score -= info.dist;
                 if (front) {
-                    score += 500.0f;
-                }
-                if (info.hostileToPlayer) {
-                    score += 150.0f;
+                    score += 700.0f;
                 }
                 if (classify.allowDialogue) {
-                    score += 250.0f;
+                    score += 500.0f;
                 }
+                if (targetPlayer) {
+                    score += 700.0f;
+                }
+                if (info.hostileToPlayer) {
+                    score += 300.0f;
+                }
+                if (weaponDrawn) {
+                    score += 100.0f;
+                }
+                score += (dot * 250.0f);
                 return score;
             }
 
@@ -280,7 +366,8 @@ namespace TFD::InteractionRouter
                 actor,
                 false,
                 inCombat,
-                info.dist);
+                info.dist,
+                TFD::Actor::Interaction::TruceMode::Auto);
 
             if (!classify.valid ||
                 classify.intent != TFD::Actor::Interaction::Intent::Tame) {
@@ -330,7 +417,7 @@ namespace TFD::InteractionRouter
                 return FailReason::TargetRejected;
             }
         }
-   
+
         ResolveResult MakeResolveFailure(
             FailReason reason,
             RE::FormID playerId = 0,
@@ -377,7 +464,10 @@ namespace TFD::InteractionRouter
                 target,
                 isCaptivePhase,
                 targetInCombat,
-                distanceToPlayer);
+                distanceToPlayer,
+                targetInCombat
+                ? TFD::Actor::Interaction::TruceMode::InCombat
+                : TFD::Actor::Interaction::TruceMode::PreCombat);
             const bool enemyToPlayer = IsEnemyToPlayer(player, target);
 
             spdlog::info(
@@ -400,9 +490,9 @@ namespace TFD::InteractionRouter
                     target->GetFormID());
             }
 
-            if (classify.intent == TFD::Actor::Interaction::Intent::Truce && !enemyToPlayer) {
+            if (classify.intent == TFD::Actor::Interaction::Intent::Truce && targetInCombat && !enemyToPlayer) {
                 spdlog::info(
-                    "[TFD][Router] reject target={:08X} reason=not_enemy_to_player",
+                    "[TFD][Router] reject target={:08X} reason=not_enemy_to_player_incombat",
                     target->GetFormID());
                 return MakeResolveFailure(
                     FailReason::TargetRejected,
@@ -623,6 +713,18 @@ namespace TFD::InteractionRouter
         return snapshot.root == TFD::FlowController::RootFlow::InCombat ? Action::TruceInCombat : Action::TrucePreCombat;
     }
 
+    Action FallbackTruceAction(Action action)
+    {
+        switch (action) {
+        case Action::TrucePreCombat:
+            return Action::TruceInCombat;
+        case Action::TruceInCombat:
+            return Action::TrucePreCombat;
+        default:
+            return Action::None;
+        }
+    }
+
     bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction)
     {
         switch (preferredAction) {
@@ -697,28 +799,71 @@ namespace TFD::InteractionRouter
         }
 
         const Action preferredAction = ResolvePreferredTruceAction(snapshot);
+        const Action fallbackAction = FallbackTruceAction(preferredAction);
         const auto actorSnapshot = TFD::Actor::BuildSnapshot(radius, false);
+
+        auto tryPickForAction = [&](Action action, RE::Actor*& outTarget, float& outScore) {
+            outTarget = nullptr;
+            outScore = -1.0e30f;
+            for (const auto& info : actorSnapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                    continue;
+                }
+
+                const float score = ScoreTruceCandidate(actorSnapshot, actor, player, info, action);
+                if (score > outScore) {
+                    outScore = score;
+                    outTarget = actor;
+                }
+            }
+            };
 
         RE::Actor* bestTarget = nullptr;
         float bestScore = -1.0e30f;
+        Action chosenAction = Action::None;
 
-        for (const auto& info : actorSnapshot.actors) {
-            auto* actor = info.get();
-            if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-                continue;
-            }
-
-            const float score = ScoreTruceCandidate(actor, player, info, preferredAction);
-            if (score > bestScore) {
-                bestScore = score;
-                bestTarget = actor;
+        tryPickForAction(preferredAction, bestTarget, bestScore);
+        if (bestTarget) {
+            chosenAction = preferredAction;
+        }
+        else if (fallbackAction != Action::None) {
+            tryPickForAction(fallbackAction, bestTarget, bestScore);
+            if (bestTarget) {
+                chosenAction = fallbackAction;
             }
         }
 
         if (bestTarget) {
+            bool targetPlayer = false;
+            bool targetPlayerSide = false;
+            bool actorInCombat = false;
+            std::uint32_t currentTargetFormID = 0;
+            if (const auto* bestInfo = TFD::Actor::FindActorInfo(actorSnapshot, bestTarget)) {
+                ResolveSnapshotTargetContext(actorSnapshot, bestTarget, player, *bestInfo, targetPlayer, targetPlayerSide, actorInCombat);
+                currentTargetFormID = bestInfo->currentTargetFormID;
+            }
+            else {
+                RE::Actor* currentTarget = ResolveCurrentCombatTarget(bestTarget);
+                targetPlayer = currentTarget == player;
+                targetPlayerSide = IsPlayerSideActor(currentTarget, player);
+                actorInCombat = bestTarget->IsInCombat();
+                currentTargetFormID = currentTarget ? currentTarget->GetFormID() : 0u;
+            }
+
+            spdlog::info(
+                "[TFD][Router] primary pick target={:08X} action={} score={:.1f} dist={:.1f} inCombat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
+                bestTarget->GetFormID(),
+                ToString(chosenAction),
+                bestScore,
+                GetDistance(player, bestTarget),
+                actorInCombat ? 1 : 0,
+                targetPlayer ? 1 : 0,
+                targetPlayerSide ? 1 : 0,
+                currentTargetFormID);
             result.target = bestTarget;
-            result.action = preferredAction;
-            result.interactionState = InteractionStateForAction(preferredAction);
+            result.action = chosenAction;
+            result.interactionState = InteractionStateForAction(chosenAction);
             result.valid = true;
             return result;
         }
@@ -763,11 +908,32 @@ namespace TFD::InteractionRouter
         PrimaryHotkeyExecuteResult result{};
         result.handled = true;
 
-        auto* pc = player ? player->As<RE::PlayerCharacter>() : nullptr;
+        RE::PlayerCharacter* pc = nullptr;
+        if (player) {
+            if (player->IsPlayerRef()) {
+                pc = RE::PlayerCharacter::GetSingleton();
+            }
+            if (!pc) {
+                pc = player->As<RE::PlayerCharacter>();
+            }
+        }
+
+        if (!pc) {
+            spdlog::info("[TFD][Router] primary execute abort reason=player_cast_failed actor={:08X}",
+                player ? player->GetFormID() : 0u);
+            result.failReason = FailReason::InvalidPlayer;
+            result.notification = NotificationForPrimaryFailure(result.failReason);
+            return result;
+        }
+
         const auto pick = PickPrimaryHotkeyTarget(pc, snapshot, radius, allowTameFallback);
         result.requestedAction = pick.action;
 
         if (!pick.valid || !pick.target || pick.action == Action::None) {
+            spdlog::info("[TFD][Router] primary execute no valid pick action={} valid={} target={:08X}",
+                ToString(pick.action),
+                pick.valid ? 1 : 0,
+                pick.target ? pick.target->GetFormID() : 0u);
             result.failReason = FailReason::InvalidTarget;
             result.notification = NotificationForPrimaryFailure(result.failReason);
             return result;
@@ -888,7 +1054,8 @@ namespace TFD::InteractionRouter
             float score = (frontDot * 100000.0f) - info.dist;
             if (frontDot >= 0.96f) {
                 score += 4000.0f;
-            } else if (frontDot >= 0.90f) {
+            }
+            else if (frontDot >= 0.90f) {
                 score += 2000.0f;
             }
 
@@ -930,16 +1097,18 @@ namespace TFD::InteractionRouter
             float score = (frontDot * 100000.0f) - info.dist;
             if (frontDot >= 0.98f) {
                 score += 6000.0f;
-            } else if (frontDot >= 0.94f) {
+            }
+            else if (frontDot >= 0.94f) {
                 score += 3500.0f;
-            } else if (frontDot >= 0.90f) {
+            }
+            else if (frontDot >= 0.90f) {
                 score += 1500.0f;
             }
             if (actor->IsInCombat() || info.inCombat) {
                 score += 50.0f;
             }
             return score;
-        };
+            };
 
         auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
 
@@ -1005,13 +1174,15 @@ namespace TFD::InteractionRouter
             float score = (frontDot * 100000.0f) - info.dist;
             if (frontDot >= 0.98f) {
                 score += 6000.0f;
-            } else if (frontDot >= 0.94f) {
+            }
+            else if (frontDot >= 0.94f) {
                 score += 3500.0f;
-            } else if (frontDot >= 0.90f) {
+            }
+            else if (frontDot >= 0.90f) {
                 score += 1500.0f;
             }
             return score;
-        };
+            };
 
         const auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
 
@@ -1073,372 +1244,373 @@ namespace TFD::InteractionRouter
     }
 
 
-namespace DialogueOpen
-{
-	namespace
-	{
-		using Clock = std::chrono::steady_clock;
+    namespace DialogueOpen
+    {
+        namespace
+        {
+            using Clock = std::chrono::steady_clock;
 
-		constexpr auto kInitialDelay = std::chrono::milliseconds(90);
-		constexpr auto kRetryDelay = std::chrono::milliseconds(180);
-		constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
-		constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
-		constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
-		constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
-		constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
-		constexpr auto kCommitQuietWindow = std::chrono::milliseconds(900);
+            constexpr auto kInitialDelay = std::chrono::milliseconds(90);
+            constexpr auto kRetryDelay = std::chrono::milliseconds(180);
+            constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
+            constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
+            constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
+            constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
+            constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
+            constexpr auto kCommitQuietWindow = std::chrono::milliseconds(900);
 
-		struct PendingState
-		{
-			std::mutex lock{};
-			RE::ActorHandle speaker{};
-			Mode mode = Mode::None;
-			bool active = false;
-			bool succeeded = false;
-			bool requestIssued = false;
-			std::uint32_t attempts = 0;
-			Clock::time_point started{};
-			Clock::time_point nextAttempt{};
-			Clock::time_point deadline{};
-			Clock::time_point quietUntil{};
-			Clock::time_point lastPackageRefresh{};
-			Clock::time_point lastHardReset{};
-		};
+            struct PendingState
+            {
+                std::mutex lock{};
+                RE::ActorHandle speaker{};
+                Mode mode = Mode::None;
+                bool active = false;
+                bool succeeded = false;
+                bool requestIssued = false;
+                std::uint32_t attempts = 0;
+                Clock::time_point started{};
+                Clock::time_point nextAttempt{};
+                Clock::time_point deadline{};
+                Clock::time_point quietUntil{};
+                Clock::time_point lastPackageRefresh{};
+                Clock::time_point lastHardReset{};
+            };
 
-		PendingState g_pending{};
-		RE::TESGlobal* g_dialogueStateGlobal = nullptr;
-		bool g_loggedDialogueStateMissing = false;
+            PendingState g_pending{};
+            RE::TESGlobal* g_dialogueStateGlobal = nullptr;
+            bool g_loggedDialogueStateMissing = false;
 
-		const char* ModeName(Mode mode)
-		{
-			switch (mode) {
-			case Mode::Bleedout:
-				return "Bleedout";
-			case Mode::CaptiveMarker:
-				return "CaptiveMarker";
-			case Mode::InCombatTruce:
-				return "InCombatTruce";
-			case Mode::PreCombatTruce:
-				return "PreCombatTruce";
-			case Mode::AfterPleasure:
-				return "AfterPleasure";
-			case Mode::Rescue:
-				return "Rescue";
-			default:
-				return "None";
-			}
-		}
+            const char* ModeName(Mode mode)
+            {
+                switch (mode) {
+                case Mode::Bleedout:
+                    return "Bleedout";
+                case Mode::CaptiveMarker:
+                    return "CaptiveMarker";
+                case Mode::InCombatTruce:
+                    return "InCombatTruce";
+                case Mode::PreCombatTruce:
+                    return "PreCombatTruce";
+                case Mode::AfterPleasure:
+                    return "AfterPleasure";
+                case Mode::Rescue:
+                    return "Rescue";
+                default:
+                    return "None";
+                }
+            }
 
-		void ResolveDialogueStateGlobal()
-		{
-			if (g_dialogueStateGlobal) {
-				return;
-			}
-			g_dialogueStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDialogueState");
-			if (!g_dialogueStateGlobal && !g_loggedDialogueStateMissing) {
-				g_loggedDialogueStateMissing = true;
-				spdlog::warn("[TFD][DialogueOpen] global TFDDialogueState not found");
-			}
-		}
+            void ResolveDialogueStateGlobal()
+            {
+                if (g_dialogueStateGlobal) {
+                    return;
+                }
+                g_dialogueStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDialogueState");
+                if (!g_dialogueStateGlobal && !g_loggedDialogueStateMissing) {
+                    g_loggedDialogueStateMissing = true;
+                    spdlog::warn("[TFD][DialogueOpen] global TFDDialogueState not found");
+                }
+            }
 
-		bool IsDialogueOpen()
-		{
-			auto* ui = RE::UI::GetSingleton();
-			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
-		}
+            bool IsDialogueOpen()
+            {
+                auto* ui = RE::UI::GetSingleton();
+                return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+            }
 
-		void SetDialogueStateValue(int value)
-		{
-			ResolveDialogueStateGlobal();
-			if (!g_dialogueStateGlobal) {
-				return;
-			}
-			const float desired = static_cast<float>(value);
-			if (g_dialogueStateGlobal->value != desired) {
-				g_dialogueStateGlobal->value = desired;
-			}
-		}
+            void SetDialogueStateValue(int value)
+            {
+                ResolveDialogueStateGlobal();
+                if (!g_dialogueStateGlobal) {
+                    return;
+                }
+                const float desired = static_cast<float>(value);
+                if (g_dialogueStateGlobal->value != desired) {
+                    g_dialogueStateGlobal->value = desired;
+                }
+            }
 
-		void SyncDialogueStateLocked(bool dialogueOpen)
-		{
-			SetDialogueStateValue((g_pending.active || dialogueOpen) ? 1 : 0);
-		}
+            void SyncDialogueStateLocked(bool dialogueOpen)
+            {
+                SetDialogueStateValue((g_pending.active || dialogueOpen) ? 1 : 0);
+            }
 
-		bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
-		{
-			return player && speaker && speaker != player && !speaker->IsDead() && !speaker->IsDisabled();
-		}
+            bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                return player && speaker && speaker != player && !speaker->IsDead() && !speaker->IsDisabled();
+            }
 
-		std::uint32_t PendingSpeakerFormID()
-		{
-			auto sp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
-			auto* actor = sp.get();
-			return actor ? actor->GetFormID() : 0u;
-		}
+            std::uint32_t PendingSpeakerFormID()
+            {
+                auto sp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
+                auto* actor = sp.get();
+                return actor ? actor->GetFormID() : 0u;
+            }
 
-		void ResetLocked()
-		{
-			g_pending.speaker = {};
-			g_pending.mode = Mode::None;
-			g_pending.active = false;
-			g_pending.succeeded = false;
-			g_pending.requestIssued = false;
-			g_pending.attempts = 0;
-			g_pending.started = {};
-			g_pending.nextAttempt = {};
-			g_pending.deadline = {};
-			g_pending.quietUntil = {};
-			g_pending.lastPackageRefresh = {};
-			g_pending.lastHardReset = {};
-		}
+            void ResetLocked()
+            {
+                g_pending.speaker = {};
+                g_pending.mode = Mode::None;
+                g_pending.active = false;
+                g_pending.succeeded = false;
+                g_pending.requestIssued = false;
+                g_pending.attempts = 0;
+                g_pending.started = {};
+                g_pending.nextAttempt = {};
+                g_pending.deadline = {};
+                g_pending.quietUntil = {};
+                g_pending.lastPackageRefresh = {};
+                g_pending.lastHardReset = {};
+            }
 
-		void CancelLocked(const char* reason)
-		{
-			if (g_pending.active || g_pending.mode != Mode::None) {
-				spdlog::info(
-					"[TFD][DialogueOpen] cancel mode={} reason={} speaker={:08X} attempts={} requestIssued={} succeeded={}",
-					ModeName(g_pending.mode),
-					reason ? reason : "unknown",
-					PendingSpeakerFormID(),
-					g_pending.attempts,
-					g_pending.requestIssued ? 1 : 0,
-					g_pending.succeeded ? 1 : 0);
-			}
-			ResetLocked();
-			SyncDialogueStateLocked(IsDialogueOpen());
-		}
+            void CancelLocked(const char* reason)
+            {
+                if (g_pending.active || g_pending.mode != Mode::None) {
+                    spdlog::info(
+                        "[TFD][DialogueOpen] cancel mode={} reason={} speaker={:08X} attempts={} requestIssued={} succeeded={}",
+                        ModeName(g_pending.mode),
+                        reason ? reason : "unknown",
+                        PendingSpeakerFormID(),
+                        g_pending.attempts,
+                        g_pending.requestIssued ? 1 : 0,
+                        g_pending.succeeded ? 1 : 0);
+                }
+                ResetLocked();
+                SyncDialogueStateLocked(IsDialogueOpen());
+            }
 
-		void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
-		{
-			if (!player || !speaker) {
-				return;
-			}
+            void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
+            {
+                if (!player || !speaker) {
+                    return;
+                }
 
-			if (!speaker->IsAIEnabled()) {
-				speaker->EnableAI(true);
-			}
+                if (!speaker->IsAIEnabled()) {
+                    speaker->EnableAI(true);
+                }
 
-			speaker->AllowPCDialogue(true);
+                speaker->AllowPCDialogue(true);
 
-			if (hardReset) {
-				speaker->SetDialogueWithPlayer(false, false, nullptr);
-			}
+                if (hardReset) {
+                    speaker->SetDialogueWithPlayer(false, false, nullptr);
+                }
 
-			speaker->EvaluatePackage(false, true);
-			speaker->EvaluatePackage(true, true);
-		}
+                speaker->EvaluatePackage(false, true);
+                speaker->EvaluatePackage(true, true);
+            }
 
-		void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
-		{
-			std::scoped_lock lk(g_pending.lock);
-			ResetLocked();
+            void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
+            {
+                std::scoped_lock lk(g_pending.lock);
+                ResetLocked();
 
-			if (!speaker || speaker->IsDead() || speaker->IsDisabled()) {
-				SyncDialogueStateLocked(IsDialogueOpen());
-				spdlog::warn(
-					"[TFD][DialogueOpen] begin rejected mode={} reason={} speaker={:08X}",
-					ModeName(mode),
-					reason ? reason : "unknown",
-					speaker ? speaker->GetFormID() : 0u);
-				return;
-			}
+                if (!speaker || speaker->IsDead() || speaker->IsDisabled()) {
+                    SyncDialogueStateLocked(IsDialogueOpen());
+                    spdlog::warn(
+                        "[TFD][DialogueOpen] begin rejected mode={} reason={} speaker={:08X}",
+                        ModeName(mode),
+                        reason ? reason : "unknown",
+                        speaker ? speaker->GetFormID() : 0u);
+                    return;
+                }
 
-			const auto now = Clock::now();
-			const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : (mode == Mode::AfterPleasure ? kAfterPleasureTimeout : kDefaultTimeout);
-			g_pending.speaker = speaker->GetHandle();
-			g_pending.mode = mode;
-			g_pending.active = true;
-			g_pending.succeeded = false;
-			g_pending.requestIssued = false;
-			g_pending.attempts = 0;
-			g_pending.started = now;
-			g_pending.nextAttempt = now + kInitialDelay;
-			g_pending.deadline = now + timeout;
-			g_pending.quietUntil = {};
-			g_pending.lastPackageRefresh = {};
-			g_pending.lastHardReset = {};
-			SyncDialogueStateLocked(IsDialogueOpen());
+                const auto now = Clock::now();
+                const auto timeout = mode == Mode::Bleedout ? kBleedoutTimeout : (mode == Mode::AfterPleasure ? kAfterPleasureTimeout : kDefaultTimeout);
+                g_pending.speaker = speaker->GetHandle();
+                g_pending.mode = mode;
+                g_pending.active = true;
+                g_pending.succeeded = false;
+                g_pending.requestIssued = false;
+                g_pending.attempts = 0;
+                g_pending.started = now;
+                g_pending.nextAttempt = now + kInitialDelay;
+                g_pending.deadline = now + timeout;
+                g_pending.quietUntil = {};
+                g_pending.lastPackageRefresh = {};
+                g_pending.lastHardReset = {};
+                SyncDialogueStateLocked(IsDialogueOpen());
 
-			spdlog::info(
-				"[TFD][DialogueOpen] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={}",
-				ModeName(mode),
-				reason ? reason : "unknown",
-				speaker->GetFormID(),
-				static_cast<int>(kInitialDelay.count()),
-				static_cast<int>(timeout.count()));
-		}
-	}
+                spdlog::info(
+                    "[TFD][DialogueOpen] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={}",
+                    ModeName(mode),
+                    reason ? reason : "unknown",
+                    speaker->GetFormID(),
+                    static_cast<int>(kInitialDelay.count()),
+                    static_cast<int>(timeout.count()));
+            }
+        }
 
-	void Install()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		ResetLocked();
-		ResolveDialogueStateGlobal();
-		SyncDialogueStateLocked(IsDialogueOpen());
-		spdlog::info("[TFD][DialogueOpen] Install active (native open pending)");
-	}
+        void Install()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            ResetLocked();
+            ResolveDialogueStateGlobal();
+            SyncDialogueStateLocked(IsDialogueOpen());
+            spdlog::info("[TFD][DialogueOpen] Install active (native open pending)");
+        }
 
-	void BeginBleedout(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::Bleedout, "bleedout");
-	}
+        void BeginBleedout(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::Bleedout, "bleedout");
+        }
 
-	void BeginCaptiveMarker(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::CaptiveMarker, "captive_marker");
-	}
+        void BeginCaptiveMarker(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::CaptiveMarker, "captive_marker");
+        }
 
-	void BeginInCombatTruce(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::InCombatTruce, "incombat_truce");
-	}
+        void BeginInCombatTruce(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::InCombatTruce, "incombat_truce");
+        }
 
-	void BeginPreCombatTruce(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::PreCombatTruce, "precombat_truce");
-	}
+        void BeginPreCombatTruce(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::PreCombatTruce, "precombat_truce");
+        }
 
-	void BeginAfterPleasure(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
-	}
+        void BeginAfterPleasure(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
+        }
 
-	void BeginRescue(RE::Actor* speaker)
-	{
-		BeginCommon(speaker, Mode::Rescue, "rescue");
-	}
+        void BeginRescue(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::Rescue, "rescue");
+        }
 
-	void Tick()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		const bool dialogueOpen = IsDialogueOpen();
-		SyncDialogueStateLocked(dialogueOpen);
-		if (!g_pending.active) {
-			return;
-		}
+        void Tick()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            const bool dialogueOpen = IsDialogueOpen();
+            SyncDialogueStateLocked(dialogueOpen);
+            if (!g_pending.active) {
+                return;
+            }
 
-		if (dialogueOpen) {
-			const auto completedMode = g_pending.mode;
-			g_pending.succeeded = true;
-			g_pending.active = false;
-			g_pending.mode = Mode::None;
-			SyncDialogueStateLocked(true);
-			spdlog::info(
-				"[TFD][DialogueOpen] success mode={} speaker={:08X} attempts={} requestIssued={}",
-				ModeName(completedMode),
-				PendingSpeakerFormID(),
-				g_pending.attempts,
-				g_pending.requestIssued ? 1 : 0);
-			return;
-		}
+            if (dialogueOpen) {
+                const auto completedMode = g_pending.mode;
+                g_pending.succeeded = true;
+                g_pending.active = false;
+                g_pending.mode = Mode::None;
+                SyncDialogueStateLocked(true);
+                spdlog::info(
+                    "[TFD][DialogueOpen] success mode={} speaker={:08X} attempts={} requestIssued={}",
+                    ModeName(completedMode),
+                    PendingSpeakerFormID(),
+                    g_pending.attempts,
+                    g_pending.requestIssued ? 1 : 0);
+                return;
+            }
 
-		auto* player = RE::PlayerCharacter::GetSingleton();
-		auto speakerSp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
-		auto* speaker = speakerSp.get();
-		const auto now = Clock::now();
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            auto speakerSp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
+            auto* speaker = speakerSp.get();
+            const auto now = Clock::now();
 
-		if (!CanAttemptOpen(player, speaker)) {
-			CancelLocked("invalid_target");
-			return;
-		}
+            if (!CanAttemptOpen(player, speaker)) {
+                CancelLocked("invalid_target");
+                return;
+            }
 
-		if (now >= g_pending.deadline) {
-			spdlog::warn(
-				"[TFD][DialogueOpen] timeout mode={} speaker={:08X} attempts={} requestIssued={}",
-				ModeName(g_pending.mode),
-				speaker->GetFormID(),
-				g_pending.attempts,
-				g_pending.requestIssued ? 1 : 0);
-			ResetLocked();
-			SyncDialogueStateLocked(IsDialogueOpen());
-			return;
-		}
+            if (now >= g_pending.deadline) {
+                spdlog::warn(
+                    "[TFD][DialogueOpen] timeout mode={} speaker={:08X} attempts={} requestIssued={}",
+                    ModeName(g_pending.mode),
+                    speaker->GetFormID(),
+                    g_pending.attempts,
+                    g_pending.requestIssued ? 1 : 0);
+                ResetLocked();
+                SyncDialogueStateLocked(IsDialogueOpen());
+                return;
+            }
 
-		if (g_pending.requestIssued && g_pending.quietUntil.time_since_epoch().count() != 0 && now < g_pending.quietUntil) {
-			return;
-		}
+            if (g_pending.requestIssued && g_pending.quietUntil.time_since_epoch().count() != 0 && now < g_pending.quietUntil) {
+                return;
+            }
 
-		const bool shouldHardReset =
-			!g_pending.requestIssued &&
-			(g_pending.lastHardReset.time_since_epoch().count() == 0 ||
-			 g_pending.attempts == 0 ||
-			 (now - g_pending.lastHardReset) >= kHardResetDelay);
+            const bool shouldHardReset =
+                !g_pending.requestIssued &&
+                (g_pending.lastHardReset.time_since_epoch().count() == 0 ||
+                    g_pending.attempts == 0 ||
+                    (now - g_pending.lastHardReset) >= kHardResetDelay);
 
-		if (shouldHardReset) {
-			PrepareSpeakerForDialogue(player, speaker, true);
-			g_pending.lastHardReset = now;
-			spdlog::info(
-				"[TFD][DialogueOpen] handshake reset mode={} speaker={:08X} attempts={} requestIssued={}",
-				ModeName(g_pending.mode),
-				speaker->GetFormID(),
-				g_pending.attempts,
-				g_pending.requestIssued ? 1 : 0);
-		}
-		else if (!g_pending.requestIssued &&
-			(g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
-			 (now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay)) {
-			PrepareSpeakerForDialogue(player, speaker, false);
-			g_pending.lastPackageRefresh = now;
-		}
+            if (shouldHardReset) {
+                PrepareSpeakerForDialogue(player, speaker, true);
+                g_pending.lastHardReset = now;
+                spdlog::info(
+                    "[TFD][DialogueOpen] handshake reset mode={} speaker={:08X} attempts={} requestIssued={}",
+                    ModeName(g_pending.mode),
+                    speaker->GetFormID(),
+                    g_pending.attempts,
+                    g_pending.requestIssued ? 1 : 0);
+            }
+            else if (!g_pending.requestIssued &&
+                (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
+                    (now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay)) {
+                PrepareSpeakerForDialogue(player, speaker, false);
+                g_pending.lastPackageRefresh = now;
+            }
 
-		if (now < g_pending.nextAttempt) {
-			return;
-		}
+            if (now < g_pending.nextAttempt) {
+                return;
+            }
 
-		const bool ok = speaker->SetDialogueWithPlayer(true, false, nullptr);
-		++g_pending.attempts;
-		const bool firstIssued = ok && !g_pending.requestIssued;
-		g_pending.requestIssued = g_pending.requestIssued || ok;
-		if (g_pending.requestIssued) {
-			g_pending.quietUntil = now + kCommitQuietWindow;
-			g_pending.nextAttempt = g_pending.quietUntil;
-		} else {
-			g_pending.nextAttempt = now + kRetryDelay;
-		}
-		SyncDialogueStateLocked(IsDialogueOpen());
+            const bool ok = speaker->SetDialogueWithPlayer(true, false, nullptr);
+            ++g_pending.attempts;
+            const bool firstIssued = ok && !g_pending.requestIssued;
+            g_pending.requestIssued = g_pending.requestIssued || ok;
+            if (g_pending.requestIssued) {
+                g_pending.quietUntil = now + kCommitQuietWindow;
+                g_pending.nextAttempt = g_pending.quietUntil;
+            }
+            else {
+                g_pending.nextAttempt = now + kRetryDelay;
+            }
+            SyncDialogueStateLocked(IsDialogueOpen());
 
-		spdlog::info(
-			"[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={}",
-			ModeName(g_pending.mode),
-			speaker->GetFormID(),
-			g_pending.attempts,
-			ok ? 1 : 0,
-			g_pending.requestIssued ? 1 : 0);
+            spdlog::info(
+                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={}",
+                ModeName(g_pending.mode),
+                speaker->GetFormID(),
+                g_pending.attempts,
+                ok ? 1 : 0,
+                g_pending.requestIssued ? 1 : 0);
 
-		if (firstIssued) {
-			spdlog::info(
-				"[TFD][DialogueOpen] quiet window mode={} speaker={:08X} holdMs={} attempt={}",
-				ModeName(g_pending.mode),
-				speaker->GetFormID(),
-				static_cast<int>(kCommitQuietWindow.count()),
-				g_pending.attempts);
-		}
-	}
+            if (firstIssued) {
+                spdlog::info(
+                    "[TFD][DialogueOpen] quiet window mode={} speaker={:08X} holdMs={} attempt={}",
+                    ModeName(g_pending.mode),
+                    speaker->GetFormID(),
+                    static_cast<int>(kCommitQuietWindow.count()),
+                    g_pending.attempts);
+            }
+        }
 
-	void Cancel()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		CancelLocked("api_cancel");
-	}
+        void Cancel()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            CancelLocked("api_cancel");
+        }
 
-	bool IsActive()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		return g_pending.active;
-	}
+        bool IsActive()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            return g_pending.active;
+        }
 
-	bool DidSucceed()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		const bool result = g_pending.succeeded;
-		g_pending.succeeded = false;
-		return result;
-	}
+        bool DidSucceed()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            const bool result = g_pending.succeeded;
+            g_pending.succeeded = false;
+            return result;
+        }
 
-	Mode GetMode()
-	{
-		std::scoped_lock lk(g_pending.lock);
-		return g_pending.active ? g_pending.mode : Mode::None;
-	}
-}
+        Mode GetMode()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            return g_pending.active ? g_pending.mode : Mode::None;
+        }
+    }
 }
