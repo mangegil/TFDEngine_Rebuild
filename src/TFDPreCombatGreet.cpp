@@ -1,4 +1,4 @@
-#include "TFDActor.h"
+﻿#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -51,6 +51,7 @@ namespace TFD::PreCombatGreet
 		constexpr const char* kPreCombatOutcomeJoinEnemyEvent = "TFDPreCombatOutcomeJoinEnemy";
 		constexpr const char* kPreCombatOutcomeRecruitEvent = "TFDPreCombatOutcomeRecruit";
 		constexpr const char* kPreCombatOutcomeReleaseEvent = "TFDPreCombatOutcomeRelease";
+		constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
 		constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
 
 		struct Pending
@@ -855,6 +856,7 @@ namespace TFD::PreCombatGreet
 					name == kPreCombatOutcomeJoinEnemyEvent ||
 					name == kPreCombatOutcomeRecruitEvent ||
 					name == kPreCombatOutcomeReleaseEvent ||
+					name == kPreCombatOutcomeFollowEvent ||
 					name == kPreCombatOutcomePleasureEvent) {
 					std::scoped_lock lk(gLock);
 					RE::Actor* pendingActor = actor ? actor : ResolveSinglePendingActorLocked();
@@ -901,34 +903,29 @@ namespace TFD::PreCombatGreet
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_release");
 					}
+					else if (name == kPreCombatOutcomeFollowEvent) {
+						if (matchedPending) {
+							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+						}
+						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_follow");
+					}
 					else if (name == kPreCombatOutcomePleasureEvent) {
 						if (matchedPending) {
 							MarkPleasureChoiceCommittedLocked(*matchedPending, pendingActor, rawName);
 						}
-
-						RE::Actor* runtimeActor = pendingActor ? pendingActor : actor;
-						bool runtimeStarted = false;
-						if (runtimeActor) {
-							runtimeStarted = TFD::PleasureRuntime::BeginPleasure(
-								runtimeActor,
-								TFD::PleasureRuntime::SourceContext::PreCombat,
-								"mod_event_precombat_pleasure");
-							if (runtimeStarted) {
-								CacheRecentActor(runtimeActor, 0.0, "mod_event_precombat_pleasure");
-							}
-						}
-
-						spdlog::info(
-							"[TFD][PreCombatGreet] precombat pleasure accepted actor={:08X} runtime={}",
-							actorFormID,
-							runtimeStarted ? "armed" : "skipped");
 						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pleasure, actorFormID, "mod_event_precombat_pleasure");
+					}
+					else if (name == kPreCombatOutcomeRecruitEvent) {
+						if (matchedPending) {
+							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+						}
+						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
 					}
 					else {
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
-						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
+						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_terminal");
 					}
 					return RE::BSEventNotifyControl::kContinue;
 				}

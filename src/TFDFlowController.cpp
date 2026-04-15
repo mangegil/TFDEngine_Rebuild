@@ -46,6 +46,7 @@ namespace
     constexpr const char* kInCombatOutcomeResetEvent = "TFDInCombatOutcomeReset";
     constexpr const char* kInCombatOutcomeReleaseEvent = "TFDInCombatOutcomeRelease";
     constexpr const char* kInCombatOutcomeFollowEvent = "TFDInCombatOutcomeFollow";
+    constexpr const char* kPreCombatOutcomeCaptiveEvent = "TFDPreCombatOutcomeCaptive";
     constexpr const char* kPleasureOutcomeReleaseEvent = "TFDPleasureOutcomeRelease";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
     constexpr const char* kPassiveBreakCrimeEvent = "TFDPassiveBreakCrime";
@@ -614,6 +615,25 @@ void InstallRuntime()
                     }
                 });
             return true;
+        }
+
+        if (name == kPreCombatOutcomeCaptiveEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            if (actor) {
+                (void)flow.BeginCaptive(actor->GetFormID(), TFD::FlowController::CaptiveMode::Surrendered, "mod_event_precombat_captive_begin");
+            }
+            const auto snapshot = flow.GetSnapshot();
+            if (snapshot.root == TFD::FlowController::RootFlow::Captive) {
+                if (TFD::Transition::ResolveCaptiveMarkerForOutcome(TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers())) {
+                    (void)TFD::Transition::CompleteCaptiveTransitionNow(
+                        "precombat_captive",
+                        TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers(),
+                        TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers());
+                } else {
+                    spdlog::warn("[TFD][Flow] precombat captive transition skipped reason=no_captive_marker actor={:08X}", actor ? actor->GetFormID() : 0u);
+                }
+            }
         }
 
         SKSE::ModCallbackEvent callbackEv{ eventName, strArg ? strArg : "", numArg, sender };
