@@ -284,6 +284,44 @@ namespace TFD::PleasureRuntime
 			}
 		}
 
+		std::uint32_t ParseActorFormIDToken(const std::string& token, std::uint32_t fallback = 0)
+		{
+			if (token.empty()) {
+				return fallback;
+			}
+
+			try {
+				if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
+					return static_cast<std::uint32_t>(std::stoul(token, nullptr, 16));
+				}
+
+				for (char ch : token) {
+					if ((ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')) {
+						return static_cast<std::uint32_t>(std::stoul(token, nullptr, 16));
+					}
+				}
+
+				return static_cast<std::uint32_t>(std::stoul(token, nullptr, 10));
+			}
+			catch (...) {
+				return fallback;
+			}
+		}
+
+		int ParseIntToken(const std::string& token, int fallback = 0)
+		{
+			if (token.empty()) {
+				return fallback;
+			}
+
+			try {
+				return std::stoi(token);
+			}
+			catch (...) {
+				return fallback;
+			}
+		}
+
 		EventInfo ParseEventInfo(const RE::BSFixedString& strArg, float numArg, RE::TESForm* sender)
 		{
 			EventInfo info{};
@@ -308,36 +346,31 @@ namespace TFD::PleasureRuntime
 			auto first = token.find('|');
 			auto second = token.find('|', first == std::string::npos ? first : first + 1);
 
-			try {
-				if (first != std::string::npos) {
-					const auto a = token.substr(0, first);
-					if (!a.empty()) {
-						info.actorFormID = static_cast<std::uint32_t>(std::stoul(a, nullptr, 16));
-					}
+			if (first != std::string::npos) {
+				const auto a = token.substr(0, first);
+				if (!a.empty()) {
+					info.actorFormID = ParseActorFormIDToken(a, info.actorFormID);
+				}
 
-					if (second != std::string::npos) {
-						const auto b = token.substr(first + 1, second - first - 1);
-						const auto c = token.substr(second + 1);
-						if (!b.empty()) {
-							info.sourceFlow = std::stoi(b);
-						}
-						if (!c.empty()) {
-							info.threadID = std::stoi(c);
-						}
+				if (second != std::string::npos) {
+					const auto b = token.substr(first + 1, second - first - 1);
+					const auto c = token.substr(second + 1);
+					if (!b.empty()) {
+						info.sourceFlow = ParseIntToken(b, info.sourceFlow);
 					}
-					else {
-						const auto b = token.substr(first + 1);
-						if (!b.empty()) {
-							info.sourceFlow = std::stoi(b);
-						}
+					if (!c.empty()) {
+						info.threadID = ParseIntToken(c, info.threadID);
 					}
 				}
 				else {
-					info.actorFormID = static_cast<std::uint32_t>(std::stoul(token, nullptr, 16));
+					const auto b = token.substr(first + 1);
+					if (!b.empty()) {
+						info.sourceFlow = ParseIntToken(b, info.sourceFlow);
+					}
 				}
 			}
-			catch (...) {
-				// shell awal: gagal parse cukup diam
+			else {
+				info.actorFormID = ParseActorFormIDToken(token, info.actorFormID);
 			}
 
 			if (!info.actor && info.actorFormID) {
