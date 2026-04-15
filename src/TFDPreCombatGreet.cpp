@@ -815,11 +815,14 @@ namespace TFD::PreCombatGreet
 					TFD::Extortion::HandlePreCombatOutcomeEvent(rawName, pendingActor ? pendingActor : actor);
 					const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
 					if (name == kPreCombatOutcomePayEvent) {
+						bool startedExtortion = false;
 						if (pendingActor) {
-							TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
-							CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
+							startedExtortion = TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
+							if (startedExtortion) {
+								CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
+							}
 						}
-						spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion handoff", actorFormID);
+						spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
 					}
 					else if (name == kPreCombatOutcomeFightEvent) {
 						if (matchedPending) {
@@ -971,8 +974,15 @@ namespace TFD::PreCombatGreet
 				}
 
 				if (pending.dialogueRequested) {
-					if (TFD::Extortion::TickPreCombat(actor, now, dialogueOpen, IsDialogueOpenActiveForPreCombatLocked())) {
+					auto extortionTick = TFD::Extortion::TickPreCombat(actor, now, dialogueOpen, IsDialogueOpenActiveForPreCombatLocked());
+					if (extortionTick == TFD::Extortion::TickResult::Consumed) {
 						++it;
+						continue;
+					}
+					if (extortionTick == TFD::Extortion::TickResult::AllowAbort) {
+						CacheRecentActor(actor, 0.0, "extortion_abort");
+						CleanupOne(actor, pending, kCooldownAfterDoneSec, "extortion_abort", TFD::Tame::ReleaseReason::DialogueClosed);
+						it = gPending.erase(it);
 						continue;
 					}
 

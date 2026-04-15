@@ -1,5 +1,6 @@
 #include "TFDExtortion.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -18,8 +19,11 @@ namespace TFD::Extortion
         using Clock = std::chrono::steady_clock;
 
         constexpr double kPreCombatWindowSec = 20.0;
-        constexpr double kRetryDelaySec = 1.25;
-        constexpr double kCloseGraceSec = 0.55;
+        constexpr double kRetryDelaySec = 0.75;
+        constexpr double kCloseGraceSec = 0.85;
+        constexpr double kFollowupStableSec = 0.40;
+        constexpr double kDuplicatePayProtectSec = 1.20;
+        constexpr std::uint32_t kInitialCloseStableTicksNeeded = 1;
         constexpr std::uint32_t kMaxRetries = 1;
 
         struct PreCombatState
@@ -28,9 +32,13 @@ namespace TFD::Extortion
             bool waitForInitialClose{ false };
             bool menuSeen{ false };
             bool terminalCommitted{ false };
+            bool initialCloseLatched{ false };
+            std::uint32_t initialClosedStableTicks{ 0 };
             std::uint32_t retryCount{ 0 };
             double nextRetrySec{ 0.0 };
             double closeGraceUntilSec{ 0.0 };
+            double followupSeenAtSec{ 0.0 };
+            double duplicatePayProtectUntilSec{ 0.0 };
             double expiresSec{ 0.0 };
         };
 
@@ -108,28 +116,48 @@ namespace TFD::Extortion
         CancelAll("post_load");
     }
 
-    void BeginPreCombat(RE::Actor* actor, const char* reason)
+    bool BeginPreCombat(RE::Actor* actor, const char* reason)
     {
         if (!actor) {
-            return;
+            return false;
         }
 
         std::scoped_lock lk(gLock);
-        auto& state = gPreCombat[GetHandleId(actor)];
+        const auto handle = GetHandleId(actor);
+        const auto nowSec = NowSec();
+        auto it = gPreCombat.find(handle);
+        if (it != gPreCombat.end() && it->second.active) {
+            it->second.expiresSec = std::max(it->second.expiresSec, nowSec + kPreCombatWindowSec);
+            it->second.closeGraceUntilSec = 0.0;
+            it->second.duplicatePayProtectUntilSec = std::max(it->second.duplicatePayProtectUntilSec, nowSec + kDuplicatePayProtectSec);
+            spdlog::info(
+                "[TFD][Extortion] begin ignored actor={:08X} reason={} state=already_active protect={:.2f}s",
+                actor->GetFormID(),
+                reason ? reason : "unknown",
+                kDuplicatePayProtectSec);
+            return false;
+        }
+
+        auto& state = gPreCombat[handle];
         state.active = true;
         state.waitForInitialClose = true;
         state.menuSeen = false;
         state.terminalCommitted = false;
+        state.initialCloseLatched = false;
+        state.initialClosedStableTicks = 0;
         state.retryCount = 0;
         state.nextRetrySec = 0.0;
         state.closeGraceUntilSec = 0.0;
-        state.expiresSec = NowSec() + kPreCombatWindowSec;
+        state.followupSeenAtSec = 0.0;
+        state.duplicatePayProtectUntilSec = 0.0;
+        state.expiresSec = nowSec + kPreCombatWindowSec;
 
         spdlog::info(
             "[TFD][Extortion] begin precombat actor={:08X} reason={} window={:.1f}s",
             actor->GetFormID(),
             reason ? reason : "unknown",
             kPreCombatWindowSec);
+        return true;
     }
 
     void HandlePreCombatOutcomeEvent(const char* eventName, RE::Actor* actor)
@@ -140,22 +168,29 @@ namespace TFD::Extortion
 
         const std::string_view name{ eventName };
         if (name == std::string_view("TFDPreCombatOutcomePay")) {
-            BeginPreCombat(actor, eventName);
             return;
         }
 
-        std::scoped_lock lk(gLock);
-        auto it = gPreCombat.find(GetHandleId(actor));
-        if (it == gPreCombat.end()) {
-            return;
+        bool cancelDialogue = false;
+        {
+            std::scoped_lock lk(gLock);
+            auto it = gPreCombat.find(GetHandleId(actor));
+            if (it == gPreCombat.end()) {
+                return;
+            }
+
+            it->second.terminalCommitted = true;
+            spdlog::info(
+                "[TFD][Extortion] terminal outcome actor={:08X} event={}",
+                actor->GetFormID(),
+                eventName);
+            gPreCombat.erase(it);
+            cancelDialogue = true;
         }
 
-        it->second.terminalCommitted = true;
-        spdlog::info(
-            "[TFD][Extortion] terminal outcome actor={:08X} event={}",
-            actor->GetFormID(),
-            eventName);
-        gPreCombat.erase(it);
+        if (cancelDialogue) {
+            TFD::InteractionRouter::DialogueOpen::Cancel();
+        }
     }
 
     bool HasActive()
@@ -174,20 +209,20 @@ namespace TFD::Extortion
         return gPreCombat.contains(GetHandleId(actor));
     }
 
-    bool TickPreCombat(
+    TickResult TickPreCombat(
         RE::Actor* actor,
         double nowSec,
         bool dialogueOpen,
         bool dialogueOpenActiveForPreCombat)
     {
         if (!actor) {
-            return false;
+            return TickResult::NotActive;
         }
 
         std::scoped_lock lk(gLock);
         auto it = gPreCombat.find(GetHandleId(actor));
         if (it == gPreCombat.end()) {
-            return false;
+            return TickResult::NotActive;
         }
 
         auto& state = it->second;
@@ -198,16 +233,37 @@ namespace TFD::Extortion
                 state.menuSeen ? 1 : 0,
                 state.retryCount);
             gPreCombat.erase(it);
-            return false;
+            return TickResult::AllowAbort;
         }
 
         if (state.waitForInitialClose) {
             if (dialogueOpen || dialogueOpenActiveForPreCombat) {
-                return true;
+                state.initialCloseLatched = true;
+                state.initialClosedStableTicks = 0;
+                return TickResult::Consumed;
+            }
+
+            // Pay handoff stays immediate from the user's perspective, but we still
+            // require the root dialogue to be stably closed for a couple of UI ticks
+            // before issuing the followup reopen. This avoids reopening on the same
+            // frame the root menu is still tearing down.
+            if (!state.initialCloseLatched) {
+                state.initialCloseLatched = true;
+                state.initialClosedStableTicks = 1;
+                return TickResult::Consumed;
+            }
+
+            if (state.initialClosedStableTicks < kInitialCloseStableTicksNeeded) {
+                ++state.initialClosedStableTicks;
+                return TickResult::Consumed;
             }
 
             state.waitForInitialClose = false;
             state.nextRetrySec = nowSec;
+            spdlog::info(
+                "[TFD][Extortion] root close latched actor={:08X} stableTicks={}",
+                actor->GetFormID(),
+                state.initialClosedStableTicks);
         }
 
         if (dialogueOpen) {
@@ -217,25 +273,46 @@ namespace TFD::Extortion
                     actor->GetFormID());
             }
             state.menuSeen = true;
+            if (state.followupSeenAtSec <= 0.0) {
+                state.followupSeenAtSec = nowSec;
+            }
             state.closeGraceUntilSec = 0.0;
-            return true;
+            return TickResult::Consumed;
         }
 
         if (dialogueOpenActiveForPreCombat) {
-            return true;
+            return TickResult::Consumed;
         }
 
         if (!state.menuSeen) {
             if (state.retryCount < kMaxRetries + 1 && nowSec >= state.nextRetrySec) {
+                const bool canonical = (state.retryCount == 0);
                 ++state.retryCount;
                 state.nextRetrySec = nowSec + kRetryDelaySec;
+
+                // Make the first followup reopen deterministic: hard-reset any stale
+                // dialogue-open handshake before issuing the canonical reopen.
+                if (canonical) {
+                    TFD::InteractionRouter::DialogueOpen::Cancel();
+                }
+
                 TFD::InteractionRouter::DialogueOpen::BeginPreCombatTruce(actor);
-                spdlog::info(
-                    "[TFD][Extortion] reopen followup actor={:08X} retry={}/{}",
-                    actor->GetFormID(),
-                    state.retryCount,
-                    kMaxRetries + 1);
-                return true;
+                if (canonical) {
+                    spdlog::info(
+                        "[TFD][Extortion] canonical reopen actor={:08X} retry={}/{} delay={:.2f}s",
+                        actor->GetFormID(),
+                        state.retryCount,
+                        kMaxRetries + 1,
+                        kRetryDelaySec);
+                } else {
+                    spdlog::info(
+                        "[TFD][Extortion] reopen followup actor={:08X} retry={}/{} delay={:.2f}s",
+                        actor->GetFormID(),
+                        state.retryCount,
+                        kMaxRetries + 1,
+                        kRetryDelaySec);
+                }
+                return TickResult::Consumed;
             }
 
             if (state.retryCount >= kMaxRetries + 1 && nowSec >= state.nextRetrySec) {
@@ -243,10 +320,18 @@ namespace TFD::Extortion
                     "[TFD][Extortion] retries exhausted actor={:08X}",
                     actor->GetFormID());
                 gPreCombat.erase(it);
-                return false;
+                return TickResult::AllowAbort;
             }
 
-            return true;
+            return TickResult::Consumed;
+        }
+
+        if (nowSec < state.duplicatePayProtectUntilSec) {
+            return TickResult::Consumed;
+        }
+
+        if ((nowSec - state.followupSeenAtSec) < kFollowupStableSec) {
+            return TickResult::Consumed;
         }
 
         if (state.closeGraceUntilSec <= 0.0) {
@@ -255,17 +340,18 @@ namespace TFD::Extortion
                 "[TFD][Extortion] close grace armed actor={:08X} grace={:.2f}s",
                 actor->GetFormID(),
                 kCloseGraceSec);
-            return true;
+            return TickResult::Consumed;
         }
 
         if (nowSec < state.closeGraceUntilSec) {
-            return true;
+            return TickResult::Consumed;
         }
 
         spdlog::info(
-            "[TFD][Extortion] close grace expired actor={:08X}",
-            actor->GetFormID());
+            "[TFD][Extortion] close grace expired actor={:08X} stableFor={:.2f}s",
+            actor->GetFormID(),
+            nowSec - state.followupSeenAtSec);
         gPreCombat.erase(it);
-        return false;
+        return TickResult::AllowAbort;
     }
 }

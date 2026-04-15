@@ -16,13 +16,20 @@ namespace TFD::Extortion
     void OnPreLoadGame();
     void OnPostLoadGame();
 
-    void BeginPreCombat(RE::Actor* actor, const char* reason);
+    bool BeginPreCombat(RE::Actor* actor, const char* reason);
     void HandlePreCombatOutcomeEvent(const char* eventName, RE::Actor* actor);
 
     bool HasActive();
     bool IsActive(RE::Actor* actor);
 
-    bool TickPreCombat(
+    enum class TickResult
+    {
+        NotActive = 0,
+        Consumed,
+        AllowAbort
+    };
+
+    TickResult TickPreCombat(
         RE::Actor* actor,
         double nowSec,
         bool dialogueOpen,
