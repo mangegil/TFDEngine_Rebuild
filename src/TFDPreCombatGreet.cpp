@@ -1,4 +1,4 @@
-﻿#include "TFDActor.h"
+#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -600,46 +600,6 @@ namespace TFD::PreCombatGreet
 			}
 		}
 
-		void QueuePreCombatCaptiveTransition(std::uint32_t actorFormID, const char* reason)
-		{
-			if (actorFormID == 0) {
-				return;
-			}
-
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				spdlog::warn("[TFD][PreCombatGreet] captive transition queue failed actor={:08X} reason=no_task_interface source={}",
-					actorFormID,
-					reason ? reason : "unknown");
-				return;
-			}
-
-			const std::string why = reason ? reason : "precombat_captive";
-			task->AddTask([actorFormID, why]() {
-				auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
-				auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
-
-				if (!TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
-					spdlog::warn("[TFD][PreCombatGreet] captive transition rejected actor={:08X} reason=no_captive_marker source={}",
-						actorFormID,
-						why);
-					return;
-				}
-
-				const bool ok = TFD::Transition::CompleteCaptiveTransitionNow(why.c_str(), runtimeHandlers, captiveHandlers);
-				if (ok) {
-					TFD::PreCombatGreet::OnCaptiveHandoffArrived();
-					spdlog::info("[TFD][PreCombatGreet] captive transition started actor={:08X} source={}",
-						actorFormID,
-						why);
-				} else {
-					spdlog::warn("[TFD][PreCombatGreet] captive transition failed actor={:08X} source={}",
-						actorFormID,
-						why);
-				}
-			});
-		}
-
 		bool ShouldStickyReopenLocked(const Pending& pending)
 		{
 			(void)pending;
@@ -928,7 +888,6 @@ namespace TFD::PreCombatGreet
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
 						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive");
-						QueuePreCombatCaptiveTransition(actorFormID, "precombat_captive");
 					}
 					else if (name == kPreCombatOutcomeJoinEnemyEvent) {
 						if (matchedPending) {
@@ -952,6 +911,10 @@ namespace TFD::PreCombatGreet
 						if (matchedPending) {
 							MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
 						}
+						if (pendingActor) {
+							CacheRecentActor(pendingActor, 0.0, rawName);
+						}
+						spdlog::info("[TFD][PreCombatGreet] recruit choice committed action=TrucePreCombat actor={:08X} reason={}", actorFormID, rawName ? rawName : "TFDPreCombatOutcomeRecruit");
 						ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
 					}
 					return RE::BSEventNotifyControl::kContinue;
