@@ -4,10 +4,12 @@
 #include "TFDCaptive.h"
 #include "TFDCaptiveGreet.h"
 #include "TFDHostilityController.h"
+#include "TFDInteractionRouter.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDPreCombatGreet.h"
+#include "TFDRelease.h"
 #include "TFDTransition.h"
 #include "TFDTame.h"
 #include "TFDActor.h"
@@ -30,6 +32,7 @@ namespace
     static TFD::FlowController::PassiveRuntimeProviders g_passiveRuntimeProviders{};
     static TFD::FlowController::OutcomeRuntimeProviders g_outcomeRuntimeProviders{};
     static TFD::FlowController::BattleObserverRuntimeProviders g_battleObserverRuntimeProviders{};
+    static bool g_flowRuntimeInstalled = false;
 
     constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
     constexpr const char* kBleedoutOutcomePleasureEvent = "TFDBleedoutOutcomePleasure";
@@ -228,7 +231,33 @@ namespace
 namespace TFD::FlowController
 {
 
-    void Controller::RefreshFlowGlobalsLocked()
+void InstallRuntime()
+    {
+        g_flowRuntimeInstalled = true;
+        TFD::Release::Install();
+        spdlog::info("[TFD][Flow] Runtime Install");
+    }
+
+    void ResetRuntimeLifecycle()
+    {
+        TFD::InteractionRouter::DialogueOpen::Cancel();
+        TFD::Release::Reset();
+        spdlog::info("[TFD][Flow] Runtime ResetLifecycle");
+    }
+
+    void TickRuntime()
+    {
+        if (!g_flowRuntimeInstalled) {
+            return;
+        }
+
+        TFD::InteractionRouter::DialogueOpen::Tick();
+        TFD::PleasureRuntime::Tick();
+        TFD::Actor::Ops::MaintainReleaseFollowGrace();
+        TFD::Release::Tick();
+    }
+
+        void Controller::RefreshFlowGlobalsLocked()
     {
         ResolveGlobal(g_preCombatState, "TFDPreCombatState");
         ResolveGlobal(g_inCombatState, "TFDInCombatState");
@@ -539,6 +568,9 @@ namespace TFD::FlowController
         }
 
         SKSE::ModCallbackEvent callbackEv{ eventName, strArg ? strArg : "", numArg, sender };
+        if (TFD::Release::HandleModCallbackEvent(&callbackEv)) {
+            return true;
+        }
         if (TFD::PreCombatGreet::HandleModCallbackEvent(
             &callbackEv,
             TFD::PreCombatGreet::GraceEventHandlers{

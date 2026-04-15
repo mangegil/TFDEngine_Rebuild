@@ -51,6 +51,7 @@ add_library(TFDEngine SHARED
     src/TFDCaptiveDoorController.cpp
     src/TFDTeammateManager.cpp
     src/TFDFlowController.cpp
+    src/TFDRelease.cpp
     
     src/TFDPleasureRuntime.cpp
     src/TFDTransition.cpp

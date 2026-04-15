@@ -157,6 +157,10 @@ namespace TFD::FlowController
         std::function<void()> clearPendingDialogueTarget;
     };
 
+    void InstallRuntime();
+    void ResetRuntimeLifecycle();
+    void TickRuntime();
+
     void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers);
     void ResetPassiveRuntimeProviders();
 

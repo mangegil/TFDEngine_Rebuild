@@ -1,4 +1,4 @@
-#include <RE/Skyrim.h>
+﻿#include <RE/Skyrim.h>
 #include <RE/A/ActorValues.h>
 #include <type_traits>
 #include "SKSE/SKSE.h"
@@ -24,6 +24,7 @@
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
 #include "TFDRescueGreet.h"
+#include "TFDRelease.h"
 #include "TFDHostilityController.h"
 #include "TFDHostilityHooks.h"
 #include "TFDTeammateManager.h"
@@ -90,6 +91,7 @@ static void ResetTransientStateForLoad()
     TFD::InCombat::ResetForLoad();
     TFD::InCombatGreet::Reset();
     TFD::Bleedout::ResetForLoad();
+    TFD::FlowController::ResetRuntimeLifecycle();
     TFD::BleedoutGreet::Reset();
     TFD::HostilityController::Reset();
     TFD::DefeatMonitor::ResetForLoad();
@@ -133,6 +135,7 @@ static void InitOnceAfterLoad()
     TFD::Bleedout::Install();
     TFD::BleedoutGreet::Install();
     TFD::PreCombatGreet::Install();
+    TFD::FlowController::InstallRuntime();
     TFD::CaptiveGreet::Install();
     TFD::RescueGreet::Install();
     TFD::TeammateManager::Install();

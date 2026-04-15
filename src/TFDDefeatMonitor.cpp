@@ -2527,10 +2527,8 @@ namespace TFD::DefeatMonitor
 				RefreshPostDefeatGlobals();
 				return;
 			}
-			TFD::InteractionRouter::DialogueOpen::Tick();
-			TFD::PleasureRuntime::Tick();
+			TFD::FlowController::TickRuntime();
 			TFD::Location::UpdateAmbientKidnapAvailability(false);
-			TFD::Actor::Ops::MaintainReleaseFollowGrace();
 			if (HandlePendingEscapeBreakBleed()) {
 				return;
 			}
