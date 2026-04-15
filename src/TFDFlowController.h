@@ -157,9 +157,21 @@ namespace TFD::FlowController
         std::function<void()> clearPendingDialogueTarget;
     };
 
+    struct ContinuousRuntimeProviders
+    {
+        std::function<bool()> preRuntimeFlowTick;
+        std::function<bool(RE::Actor*)> postRuntimeFlowTick;
+        std::function<bool()> isGamePaused;
+        std::function<RE::Actor*()> resolvePlayer;
+        std::function<void()> onNoPlayerTick;
+        std::function<void(bool)> updateAmbientKidnapAvailability;
+    };
+
     void InstallRuntime();
     void ResetRuntimeLifecycle();
-    void TickRuntime();
+    bool TickRuntime();
+    void InstallContinuousRuntimeProviders(ContinuousRuntimeProviders providers);
+    void ResetContinuousRuntimeProviders();
 
     void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers);
     void ResetPassiveRuntimeProviders();
@@ -227,6 +239,7 @@ namespace TFD::FlowController
 		PassiveRuntimeProviders passive;
 		OutcomeRuntimeProviders outcome;
 		BattleObserverRuntimeProviders battleObserver;
+        ContinuousRuntimeProviders continuous;
 	};
 
 	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers);

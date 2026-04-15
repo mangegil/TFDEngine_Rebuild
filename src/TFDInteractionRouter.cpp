@@ -1,4 +1,4 @@
-#include "TFDInteractionRouter.h"
+﻿#include "TFDInteractionRouter.h"
 #include "TFDFlowController.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
@@ -1254,10 +1254,10 @@ namespace TFD::InteractionRouter
             constexpr auto kRetryDelay = std::chrono::milliseconds(180);
             constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
             constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
-            constexpr auto kDefaultTimeout = std::chrono::milliseconds(1500);
+            constexpr auto kDefaultTimeout = std::chrono::milliseconds(2500);
             constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
             constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
-            constexpr auto kCommitQuietWindow = std::chrono::milliseconds(900);
+            constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
 
             struct PendingState
             {

@@ -27,6 +27,7 @@
 #include "TFDFlowController.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDTransition.h"
+#include "TFDExtortion.h"
 
 namespace TFD::PreCombatGreet
 {
@@ -247,6 +248,11 @@ namespace TFD::PreCombatGreet
 				}
 
 				if (pending.terminalChoiceCommitted || pending.payFollowupPending) {
+					return true;
+				}
+
+				auto sp = RE::Actor::LookupByHandle(handle);
+				if (TFD::Extortion::IsActive(sp.get())) {
 					return true;
 				}
 			}
@@ -693,6 +699,7 @@ namespace TFD::PreCombatGreet
 		void ClearAllPendingLocked()
 		{
 			ClearAllBridgeAliases();
+			TFD::Extortion::CancelAll("precombat_clear_all_pending");
 
 			for (auto& [handle, pending] : gPending) {
 				auto sp = RE::Actor::LookupByHandle(handle);
@@ -805,12 +812,14 @@ namespace TFD::PreCombatGreet
 					if (matchedPending && ShouldSuppressTerminalEventLocked(*matchedPending, pendingActor, rawName)) {
 						return RE::BSEventNotifyControl::kContinue;
 					}
+					TFD::Extortion::HandlePreCombatOutcomeEvent(rawName, pendingActor ? pendingActor : actor);
 					const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
 					if (name == kPreCombatOutcomePayEvent) {
-						if (pendingActor && matchedPending) {
-							ArmPreCombatPayFollowupLocked(pendingActor, *matchedPending, "mod_event_precombat_pay");
+						if (pendingActor) {
+							TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
+							CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
 						}
-						spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> waiting for followup branch", actorFormID);
+						spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion handoff", actorFormID);
 					}
 					else if (name == kPreCombatOutcomeFightEvent) {
 						if (matchedPending) {
@@ -875,7 +884,7 @@ namespace TFD::PreCombatGreet
 
 			if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->IsInCombat()) {
 				std::scoped_lock lk(gLock);
-				if (gRecentActorHandle != 0 && !HasStickyPendingLocked()) {
+				if (gRecentActorHandle != 0 && !HasStickyPendingLocked() && !TFD::Extortion::HasActive()) {
 					ClearRecentActor("player_entered_combat");
 				}
 			}
@@ -962,6 +971,11 @@ namespace TFD::PreCombatGreet
 				}
 
 				if (pending.dialogueRequested) {
+					if (TFD::Extortion::TickPreCombat(actor, now, dialogueOpen, IsDialogueOpenActiveForPreCombatLocked())) {
+						++it;
+						continue;
+					}
+
 					if (dialogueOpen) {
 						pending.dialogSeen = true;
 						pending.stickyReopenPending = false;
@@ -971,7 +985,7 @@ namespace TFD::PreCombatGreet
 						continue;
 					}
 
-					if (pending.payFollowupPending) {
+					if (false && pending.payFollowupPending) {
 						if (!IsDialogueOpenActiveForPreCombatLocked()) {
 							pending.payFollowupPending = false;
 							BeginStickyReopenLocked(actor, pending, "precombat_pay_followup");
@@ -1066,6 +1080,8 @@ namespace TFD::PreCombatGreet
 			src->AddEventSink(&gPleasureEventSink);
 		}
 
+		TFD::Extortion::Install();
+
 		gSuspended.store(false, std::memory_order_release);
 		gRunning.store(true, std::memory_order_release);
 		gWorker = std::thread(WorkerLoop);
@@ -1099,6 +1115,7 @@ namespace TFD::PreCombatGreet
 			ClearRecentActor("shutdown");
 		}
 
+		TFD::Extortion::Shutdown();
 		gSuspended.store(false, std::memory_order_release);
 
 		spdlog::info("[TFD][PreCombatGreet] Shutdown");
@@ -1372,7 +1389,7 @@ namespace TFD::PreCombatGreet
 
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (player && player->IsInCombat()) {
-			if (!HasStickyPendingLocked()) {
+			if (!HasStickyPendingLocked() && !TFD::Extortion::HasActive()) {
 				ClearRecentActor("player_entered_combat");
 				return nullptr;
 			}
@@ -1406,6 +1423,7 @@ namespace TFD::PreCombatGreet
 
 	void OnPreLoadGame()
 	{
+		TFD::Extortion::OnPreLoadGame();
 		SetSuspended(true);
 		CancelAll();
 		gTickPending.clear(std::memory_order_release);
@@ -1420,6 +1438,7 @@ namespace TFD::PreCombatGreet
 
 	void OnPostLoadGame()
 	{
+		TFD::Extortion::OnPostLoadGame();
 		CancelAll();
 		SetSuspended(false);
 		gTickPending.clear(std::memory_order_release);
@@ -1448,6 +1467,7 @@ namespace TFD::PreCombatGreet
 	{
 		std::scoped_lock lk(gLock);
 		ClearAllPendingLocked();
+		TFD::Extortion::CancelAll("precombat_cancel_all");
 		gCooldownUntil.clear();
 		ClearRecentActor("cancel_all");
 

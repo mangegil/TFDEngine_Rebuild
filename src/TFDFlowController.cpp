@@ -32,6 +32,7 @@ namespace
     static TFD::FlowController::PassiveRuntimeProviders g_passiveRuntimeProviders{};
     static TFD::FlowController::OutcomeRuntimeProviders g_outcomeRuntimeProviders{};
     static TFD::FlowController::BattleObserverRuntimeProviders g_battleObserverRuntimeProviders{};
+    static TFD::FlowController::ContinuousRuntimeProviders g_continuousRuntimeProviders{};
     static bool g_flowRuntimeInstalled = false;
 
     constexpr const char* kBleedoutOutcomePayEvent = "TFDBleedoutOutcomePay";
@@ -245,16 +246,57 @@ void InstallRuntime()
         spdlog::info("[TFD][Flow] Runtime ResetLifecycle");
     }
 
-    void TickRuntime()
+    bool TickRuntime()
     {
         if (!g_flowRuntimeInstalled) {
-            return;
+            return false;
+        }
+
+        if (g_continuousRuntimeProviders.preRuntimeFlowTick && g_continuousRuntimeProviders.preRuntimeFlowTick()) {
+            return true;
+        }
+
+        if (g_continuousRuntimeProviders.isGamePaused && g_continuousRuntimeProviders.isGamePaused()) {
+            return true;
+        }
+
+        RE::Actor* player = nullptr;
+        if (g_continuousRuntimeProviders.resolvePlayer) {
+            player = g_continuousRuntimeProviders.resolvePlayer();
+        } else {
+            player = RE::PlayerCharacter::GetSingleton();
+        }
+        if (!player) {
+            if (g_continuousRuntimeProviders.onNoPlayerTick) {
+                g_continuousRuntimeProviders.onNoPlayerTick();
+            }
+            return true;
         }
 
         TFD::InteractionRouter::DialogueOpen::Tick();
         TFD::PleasureRuntime::Tick();
         TFD::Actor::Ops::MaintainReleaseFollowGrace();
         TFD::Release::Tick();
+
+        if (g_continuousRuntimeProviders.updateAmbientKidnapAvailability) {
+            g_continuousRuntimeProviders.updateAmbientKidnapAvailability(false);
+        }
+
+        if (g_continuousRuntimeProviders.postRuntimeFlowTick && g_continuousRuntimeProviders.postRuntimeFlowTick(player)) {
+            return true;
+        }
+
+        return false;
+    }
+
+    void InstallContinuousRuntimeProviders(ContinuousRuntimeProviders providers)
+    {
+        g_continuousRuntimeProviders = std::move(providers);
+    }
+
+    void ResetContinuousRuntimeProviders()
+    {
+        g_continuousRuntimeProviders = {};
     }
 
         void Controller::RefreshFlowGlobalsLocked()
@@ -351,6 +393,7 @@ void InstallRuntime()
 		InstallPassiveRuntimeProviders(std::move(providers.passive));
 		InstallOutcomeRuntimeProviders(std::move(providers.outcome));
 		InstallBattleObserverRuntimeProviders(std::move(providers.battleObserver));
+        InstallContinuousRuntimeProviders(std::move(providers.continuous));
 	}
 
 	void ResetDefeatLifecycleProviders()
@@ -358,6 +401,7 @@ void InstallRuntime()
 		ResetPassiveRuntimeProviders();
 		ResetOutcomeRuntimeProviders();
 		ResetBattleObserverRuntimeProviders();
+        ResetContinuousRuntimeProviders();
 	}
 
     void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers)
@@ -545,6 +589,11 @@ void InstallRuntime()
             } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
                 (void)TFD::CaptiveGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
                 spdlog::info("[TFD][Flow] captive after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
+            } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::PreCombat)) {
+                if (flow.RequestBeginAfterPleasure(actor->GetFormID(), "after_pleasure_enter")) {
+                    TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
+                    spdlog::info("[TFD][Flow] precombat after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
+                }
             }
             return true;
         }
