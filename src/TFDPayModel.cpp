@@ -81,41 +81,22 @@ namespace TFD::PayModel
             }
         }
 
-        void QueuePayQuoteEvent(const char* eventName, const char* contextName, float goldValue, RE::Actor* speaker)
+        void SendPayQuoteEventSync(const char* eventName, const char* contextName, float goldValue, RE::Actor* speaker)
         {
             if (!eventName || !eventName[0]) {
                 return;
             }
 
-            auto* task = SKSE::GetTaskInterface();
             auto* src = SKSE::GetModCallbackEventSource();
-            if (!task || !src) {
-                spdlog::warn("[TFD][PayModel] queue pay quote event skipped event={} hasTask={} hasSource={}",
-                    eventName,
-                    task ? 1 : 0,
-                    src ? 1 : 0);
+            if (!src) {
+                spdlog::warn("[TFD][PayModel] send pay quote event skipped event={} hasSource=0",
+                    eventName);
                 return;
             }
 
-            const std::string eventNameCopy{ eventName };
-            const std::string contextCopy = contextName ? std::string{ contextName } : std::string{};
-            const auto speakerHandle = speaker ? speaker->GetHandle().native_handle() : 0u;
-
-            task->AddTask([eventNameCopy, contextCopy, goldValue, speakerHandle]() {
-                auto* source = SKSE::GetModCallbackEventSource();
-                if (!source) {
-                    return;
-                }
-
-                RE::TESForm* sender = nullptr;
-                if (speakerHandle != 0) {
-                    auto speakerSp = RE::Actor::LookupByHandle(speakerHandle);
-                    sender = speakerSp.get();
-                }
-
-                SKSE::ModCallbackEvent ev{ eventNameCopy.c_str(), contextCopy.c_str(), goldValue, sender };
-                source->SendEvent(&ev);
-            });
+            const char* context = contextName ? contextName : "";
+            SKSE::ModCallbackEvent ev{ eventName, context, goldValue, speaker };
+            src->SendEvent(&ev);
         }
 
         std::string GetActorNameSafe(RE::Actor* actor)
@@ -492,7 +473,7 @@ namespace TFD::PayModel
         }
 
         payGlobal->value = static_cast<float>(gold);
-        QueuePayQuoteEvent("TFDPayQuoteUpdate", PayContextName(context), static_cast<float>(gold), speaker);
+        SendPayQuoteEventSync("TFDPayQuoteUpdate", PayContextName(context), static_cast<float>(gold), speaker);
         spdlog::info("[TFD][PayModel] publish shared gold speaker={:08X} context={} gold={} reason={} event=TFDPayQuoteUpdate",
             speaker->GetFormID(),
             static_cast<int>(context),
@@ -514,7 +495,7 @@ namespace TFD::PayModel
                 reason ? reason : "unknown");
         }
         payGlobal->value = 0.0f;
-        QueuePayQuoteEvent("TFDPayQuoteClear", "", 0.0f, nullptr);
+        SendPayQuoteEventSync("TFDPayQuoteClear", "", 0.0f, nullptr);
     }
 
     int GetContextPercent(PayContext context)
