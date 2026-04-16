@@ -52,12 +52,12 @@ add_library(TFDEngine SHARED
     src/TFDTeammateManager.cpp
     src/TFDFlowController.cpp
     src/TFDRelease.cpp
-    src/TFDExtortion.cpp
-    
+    src/TFDExtortion.cpp 
     src/TFDPleasureRuntime.cpp
     src/TFDTransition.cpp
     src/TFDCaptiveGreet.cpp
     src/TFDRescueGreet.cpp
+    src/TFDPayModel.cpp
 )
 
 if(TFDEnableSmf)

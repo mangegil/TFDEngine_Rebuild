@@ -1,0 +1,721 @@
+#include "TFDPayModel.h"
+
+#include "TFDActor.h"
+#include "TFDLocation.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
+#include <vector>
+
+#include <RE/Skyrim.h>
+#include <spdlog/spdlog.h>
+
+namespace TFD::PayModel
+{
+    namespace
+    {
+        using Clock = std::chrono::steady_clock;
+
+        constexpr float kScanRadius = 2200.0f;
+        constexpr int kEncounterGoldCap = 3000;
+
+        struct CacheState
+        {
+            bool valid{ false };
+            std::uint32_t speakerFormID{ 0 };
+            EncounterQuote quote{};
+            double builtAtSec{ 0.0 };
+        };
+
+        std::mutex gLock;
+        CacheState gCachedQuote{};
+        Clock::time_point gT0 = Clock::now();
+
+        double NowSec()
+        {
+            return std::chrono::duration<double>(Clock::now() - gT0).count();
+        }
+
+        std::string GetActorNameSafe(RE::Actor* actor)
+        {
+            if (!actor) {
+                return "";
+            }
+
+            if (auto* dn = actor->GetDisplayFullName(); dn && dn[0] != '\0') {
+                return std::string(dn);
+            }
+            if (auto* n = actor->GetName(); n && n[0] != '\0') {
+                return std::string(n);
+            }
+            return "";
+        }
+
+        std::string ToLowerAscii(std::string_view in)
+        {
+            std::string out;
+            out.reserve(in.size());
+            for (char c : in) {
+                out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+            return out;
+        }
+
+        bool ContainsNoCase(std::string_view haystack, std::string_view needle)
+        {
+            if (haystack.empty() || needle.empty()) {
+                return false;
+            }
+
+            const auto h = ToLowerAscii(haystack);
+            const auto n = ToLowerAscii(needle);
+            return h.find(n) != std::string::npos;
+        }
+
+        std::int32_t GetActorLevelSafe(RE::Actor* actor)
+        {
+            if (!actor) {
+                return 1;
+            }
+
+            const auto level = actor->GetLevel();
+            return std::max<std::int32_t>(1, static_cast<std::int32_t>(level));
+        }
+
+        RE::TESFaction* LookupFaction(const char* editorID)
+        {
+            if (!editorID || !editorID[0]) {
+                return nullptr;
+            }
+            return RE::TESForm::LookupByEditorID<RE::TESFaction>(editorID);
+        }
+
+        RE::BGSKeyword* LookupKeyword(const char* editorID)
+        {
+            if (!editorID || !editorID[0]) {
+                return nullptr;
+            }
+            return RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
+        }
+
+        bool ActorIsInFactionByEditorID(RE::Actor* actor, const char* editorID)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            auto* faction = LookupFaction(editorID);
+            return faction && actor->IsInFaction(faction);
+        }
+
+        bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            auto* kw = LookupKeyword(editorID);
+            return kw && actor->HasKeyword(kw);
+        }
+
+        bool ActorHasAnyFaction(RE::Actor* actor, std::initializer_list<const char*> editorIDs)
+        {
+            for (auto* id : editorIDs) {
+                if (ActorIsInFactionByEditorID(actor, id)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool ActorHasAnyKeyword(RE::Actor* actor, std::initializer_list<const char*> editorIDs)
+        {
+            for (auto* id : editorIDs) {
+                if (ActorHasKeywordByEditorID(actor, id)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool IsUnnaturalActor(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            return ActorHasAnyKeyword(actor, {
+                       "ActorTypeUndead",
+                       "ActorTypeDaedra",
+                       "ActorTypeGhost"
+                }) ||
+                ActorHasAnyFaction(actor, {
+                    "VampireFaction"
+                    });
+        }
+
+        int ScoreLevelDelta(std::int32_t enemyLevel, std::int32_t playerLevel)
+        {
+            const auto delta = enemyLevel - playerLevel;
+            if (delta <= -1) {
+                return 0;
+            }
+            if (delta == 0) {
+                return 10;
+            }
+            if (delta <= 4) {
+                return 25;
+            }
+            if (delta <= 9) {
+                return 50;
+            }
+            return 80;
+        }
+
+        int ScoreAbsoluteLevel(std::int32_t enemyLevel)
+        {
+            if (enemyLevel < 10) {
+                return 0;
+            }
+            if (enemyLevel < 20) {
+                return 5;
+            }
+            if (enemyLevel < 30) {
+                return 10;
+            }
+            if (enemyLevel < 40) {
+                return 20;
+            }
+            return 30;
+        }
+
+        int ScoreThreatTier(ThreatTier tier)
+        {
+            switch (tier) {
+            case ThreatTier::Weak:
+                return 0;
+            case ThreatTier::Normal:
+                return 15;
+            case ThreatTier::Strong:
+                return 35;
+            case ThreatTier::Elite:
+                return 60;
+            case ThreatTier::BossTier:
+                return 90;
+            default:
+                return 15;
+            }
+        }
+
+        int ScoreDurabilityTier(DurabilityTier tier)
+        {
+            switch (tier) {
+            case DurabilityTier::Low:
+                return 0;
+            case DurabilityTier::Medium:
+                return 10;
+            case DurabilityTier::High:
+                return 25;
+            case DurabilityTier::VeryHigh:
+                return 45;
+            default:
+                return 10;
+            }
+        }
+
+        int ScoreRaceClass(RaceClass rc)
+        {
+            switch (rc) {
+            case RaceClass::Human:
+                return 0;
+            case RaceClass::Mer:
+                return 5;
+            case RaceClass::Beastfolk:
+                return 5;
+            case RaceClass::Orc:
+                return 5;
+            case RaceClass::Unnatural:
+                return 15;
+            default:
+                return 0;
+            }
+        }
+
+        int ScoreEnemyType(EnemyType type)
+        {
+            switch (type) {
+            case EnemyType::Bandit:
+                return 0;
+            case EnemyType::Forsworn:
+                return 10;
+            case EnemyType::Necromancer:
+            case EnemyType::Mage:
+                return 20;
+            case EnemyType::Mercenary:
+            case EnemyType::Soldier:
+                return 25;
+            case EnemyType::Vampire:
+                return 30;
+            case EnemyType::Guard:
+                return 50;
+            case EnemyType::Thalmor:
+                return 70;
+            case EnemyType::CreatureHumanoid:
+                return 20;
+            case EnemyType::Unknown:
+            default:
+                return 10;
+            }
+        }
+
+        int ScoreBossRef(bool isBossRef)
+        {
+            return isBossRef ? 50 : 0;
+        }
+
+        int ResolveEncounterTotal(const std::vector<ActorBreakdown>& actors)
+        {
+            int total = 0;
+            for (const auto& entry : actors) {
+                total += entry.goldValue;
+            }
+            return std::min(total, kEncounterGoldCap);
+        }
+
+        std::vector<RE::Actor*> ResolveEncounterActors(RE::Actor* speaker)
+        {
+            std::vector<RE::Actor*> out;
+            if (!speaker) {
+                return out;
+            }
+
+            auto snapshot = TFD::Actor::BuildSnapshot(kScanRadius, true);
+            const auto* info = TFD::Actor::FindActorInfo(snapshot, speaker);
+
+            out.push_back(speaker);
+
+            if (!info || info->coalitionID < 0) {
+                return out;
+            }
+
+            auto crowd = TFD::Actor::ResolveCrowdCandidates(snapshot, info->coalitionID);
+            std::unordered_set<std::uint32_t> seen;
+            seen.insert(speaker->GetFormID());
+
+            for (auto* actor : crowd) {
+                if (!actor) {
+                    continue;
+                }
+
+                const auto id = actor->GetFormID();
+                if (id == 0) {
+                    continue;
+                }
+
+                auto [_, inserted] = seen.insert(id);
+                if (!inserted) {
+                    continue;
+                }
+
+                out.push_back(actor);
+            }
+
+            return out;
+        }
+    }
+
+    void Install()
+    {
+        std::scoped_lock lk(gLock);
+        gCachedQuote = {};
+        spdlog::info("[TFD][PayModel] Install");
+    }
+
+    void Shutdown()
+    {
+        std::scoped_lock lk(gLock);
+        gCachedQuote = {};
+        spdlog::info("[TFD][PayModel] Shutdown");
+    }
+
+    void ClearCachedPreCombatQuote(const char* reason)
+    {
+        std::scoped_lock lk(gLock);
+        if (gCachedQuote.valid) {
+            spdlog::info(
+                "[TFD][PayModel] clear cached quote speaker={:08X} total={} reason={}",
+                gCachedQuote.speakerFormID,
+                gCachedQuote.quote.totalGold,
+                reason ? reason : "unknown");
+        }
+        gCachedQuote = {};
+    }
+
+    EnemyType ClassifyEnemyType(RE::Actor* actor)
+    {
+        if (!actor) {
+            return EnemyType::Unknown;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "ThalmorFaction",
+                "ThalmorSplinterFaction"
+            })) {
+            return EnemyType::Thalmor;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "GuardFaction",
+                "CWImperialFaction",
+                "CWSonsFaction"
+            })) {
+            return EnemyType::Guard;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "BanditFaction",
+                "dunMistwatchBanditFaction",
+                "dunWhiteRiverFaction",
+                "dunValtheimFaction",
+                "dunBannermistFaction",
+                "dunHaltedStreamFaction"
+            })) {
+            return EnemyType::Bandit;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "ForswornFaction"
+            })) {
+            return EnemyType::Forsworn;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "NecromancerFaction"
+            })) {
+            return EnemyType::Necromancer;
+        }
+
+        if (ActorHasAnyFaction(actor, {
+                "VampireFaction"
+            })) {
+            return EnemyType::Vampire;
+        }
+
+        if (ActorHasAnyKeyword(actor, {
+                "ActorTypeUndead",
+                "ActorTypeDaedra"
+            })) {
+            return EnemyType::CreatureHumanoid;
+        }
+
+        if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+            return EnemyType::Soldier;
+        }
+
+        return EnemyType::Unknown;
+    }
+
+    ThreatTier ClassifyThreatTier(RE::Actor* actor, RE::Actor* player)
+    {
+        if (!actor) {
+            return ThreatTier::Weak;
+        }
+
+        auto* resolvedPlayer = player ? player : RE::PlayerCharacter::GetSingleton();
+
+        const auto actorLevel = GetActorLevelSafe(actor);
+        const auto playerLevel = GetActorLevelSafe(resolvedPlayer);
+        const auto delta = actorLevel - playerLevel;
+        const bool isBoss = HasBossRefType(actor);
+
+        if (isBoss || delta >= 10) {
+            return ThreatTier::BossTier;
+        }
+        if (delta >= 5) {
+            return ThreatTier::Elite;
+        }
+        if (delta >= 2) {
+            return ThreatTier::Strong;
+        }
+        if (delta >= 0) {
+            return ThreatTier::Normal;
+        }
+        return ThreatTier::Weak;
+    }
+
+    DurabilityTier ClassifyDurabilityTier(RE::Actor* actor)
+    {
+        if (!actor) {
+            return DurabilityTier::Low;
+        }
+
+        const float hp = actor->GetActorValue(RE::ActorValue::kHealth);
+        const float dr = actor->GetActorValue(RE::ActorValue::kDamageResist);
+
+        const float effective = hp + (dr * 1.25f);
+
+        if (effective >= 450.0f) {
+            return DurabilityTier::VeryHigh;
+        }
+        if (effective >= 250.0f) {
+            return DurabilityTier::High;
+        }
+        if (effective >= 120.0f) {
+            return DurabilityTier::Medium;
+        }
+        return DurabilityTier::Low;
+    }
+
+    RaceClass ClassifyRaceClass(RE::Actor* actor)
+    {
+        if (!actor) {
+            return RaceClass::Human;
+        }
+
+        if (IsUnnaturalActor(actor)) {
+            return RaceClass::Unnatural;
+        }
+
+        auto* race = actor->GetRace();
+        if (!race) {
+            return RaceClass::Human;
+        }
+
+        const std::string raceName = race->GetName() ? race->GetName() : "";
+
+        if (ContainsNoCase(raceName, "orc")) {
+            return RaceClass::Orc;
+        }
+        if (ContainsNoCase(raceName, "argonian") || ContainsNoCase(raceName, "khajiit")) {
+            return RaceClass::Beastfolk;
+        }
+        if (ContainsNoCase(raceName, "elf")) {
+            return RaceClass::Mer;
+        }
+
+        return RaceClass::Human;
+    }
+
+    bool HasBossRefType(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+
+        auto* loc = TFD::Location::GetLocationFromRef(actor);
+        if (!loc) {
+            return false;
+        }
+
+        auto* bossType = RE::TESForm::LookupByEditorID<RE::BGSLocationRefType>("Boss");
+        if (!bossType) {
+            return false;
+        }
+
+        for (std::uint32_t i = 0; i < loc->specialRefs.size(); ++i) {
+            const auto& sref = loc->specialRefs[i];
+
+            auto* type = sref.type;
+            if (!type) {
+                continue;
+            }
+
+            if (type != bossType && type->GetFormID() != bossType->GetFormID()) {
+                continue;
+            }
+
+            const auto refID = sref.refData.refID;
+            if (refID == 0) {
+                continue;
+            }
+
+            auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(refID);
+            if (!ref) {
+                continue;
+            }
+
+            if (ref->GetFormID() == actor->GetFormID()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    int ScoreToGold(int totalScore)
+    {
+        if (totalScore <= 20) {
+            return 50;
+        }
+        if (totalScore <= 40) {
+            return 100;
+        }
+        if (totalScore <= 60) {
+            return 150;
+        }
+        if (totalScore <= 80) {
+            return 250;
+        }
+        if (totalScore <= 110) {
+            return 400;
+        }
+        if (totalScore <= 140) {
+            return 600;
+        }
+        if (totalScore <= 180) {
+            return 900;
+        }
+        return 1300;
+    }
+
+    ActorBreakdown BuildActorBreakdown(RE::Actor* actor, RE::Actor* player)
+    {
+        ActorBreakdown out{};
+        if (!actor) {
+            return out;
+        }
+
+        auto* resolvedPlayer = player ? player : RE::PlayerCharacter::GetSingleton();
+
+        out.actorFormID = actor->GetFormID();
+        out.actorName = GetActorNameSafe(actor);
+
+        out.enemyType = ClassifyEnemyType(actor);
+        out.threatTier = ClassifyThreatTier(actor, resolvedPlayer);
+        out.durabilityTier = ClassifyDurabilityTier(actor);
+        out.raceClass = ClassifyRaceClass(actor);
+        out.isBossRef = HasBossRefType(actor);
+
+        out.level = GetActorLevelSafe(actor);
+        out.playerLevel = GetActorLevelSafe(resolvedPlayer);
+        out.levelDelta = out.level - out.playerLevel;
+
+        out.levelDeltaScore = ScoreLevelDelta(out.level, out.playerLevel);
+        out.absoluteLevelScore = ScoreAbsoluteLevel(out.level);
+        out.threatScore = ScoreThreatTier(out.threatTier);
+        out.durabilityScore = ScoreDurabilityTier(out.durabilityTier);
+        out.raceScore = ScoreRaceClass(out.raceClass);
+        out.typeScore = ScoreEnemyType(out.enemyType);
+        out.bossScore = ScoreBossRef(out.isBossRef);
+
+        out.totalScore =
+            out.levelDeltaScore +
+            out.absoluteLevelScore +
+            out.threatScore +
+            out.durabilityScore +
+            out.raceScore +
+            out.typeScore +
+            out.bossScore;
+
+        out.goldValue = ScoreToGold(out.totalScore);
+        return out;
+    }
+
+    EncounterQuote BuildPreCombatQuote(RE::Actor* speaker)
+    {
+        EncounterQuote quote{};
+        if (!speaker) {
+            return quote;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto actors = ResolveEncounterActors(speaker);
+
+        quote.speakerFormID = speaker->GetFormID();
+        quote.speakerName = GetActorNameSafe(speaker);
+
+        for (auto* actor : actors) {
+            if (!actor) {
+                continue;
+            }
+            quote.actors.push_back(BuildActorBreakdown(actor, player));
+        }
+
+        quote.actorCount = static_cast<int>(quote.actors.size());
+        quote.totalGold = ResolveEncounterTotal(quote.actors);
+
+        spdlog::info(
+            "[TFD][PayModel] built quote speaker={:08X} actors={} total={}",
+            quote.speakerFormID,
+            quote.actorCount,
+            quote.totalGold);
+
+        for (const auto& entry : quote.actors) {
+            spdlog::info(
+                "[TFD][PayModel] actor={:08X} name='{}' type={} threat={} dura={} race={} boss={} score={} gold={}",
+                entry.actorFormID,
+                entry.actorName,
+                static_cast<int>(entry.enemyType),
+                static_cast<int>(entry.threatTier),
+                static_cast<int>(entry.durabilityTier),
+                static_cast<int>(entry.raceClass),
+                entry.isBossRef ? 1 : 0,
+                entry.totalScore,
+                entry.goldValue);
+        }
+
+        return quote;
+    }
+
+    int BuildPreCombatQuoteGold(RE::Actor* speaker)
+    {
+        return BuildPreCombatQuote(speaker).totalGold;
+    }
+
+    bool PrimePreCombatQuote(RE::Actor* speaker)
+    {
+        if (!speaker) {
+            return false;
+        }
+
+        auto quote = BuildPreCombatQuote(speaker);
+
+        std::scoped_lock lk(gLock);
+        gCachedQuote.valid = true;
+        gCachedQuote.speakerFormID = speaker->GetFormID();
+        gCachedQuote.quote = std::move(quote);
+        gCachedQuote.builtAtSec = NowSec();
+
+        spdlog::info(
+            "[TFD][PayModel] cached quote speaker={:08X} total={} builtAt={:.2f}",
+            gCachedQuote.speakerFormID,
+            gCachedQuote.quote.totalGold,
+            gCachedQuote.builtAtSec);
+
+        return true;
+    }
+
+    int GetCachedPreCombatQuote(RE::Actor* speaker)
+    {
+        std::scoped_lock lk(gLock);
+        if (!gCachedQuote.valid) {
+            return 0;
+        }
+
+        if (speaker && gCachedQuote.speakerFormID != speaker->GetFormID()) {
+            return 0;
+        }
+
+        return gCachedQuote.quote.totalGold;
+    }
+
+    const EncounterQuote* GetCachedPreCombatQuoteData(RE::Actor* speaker)
+    {
+        std::scoped_lock lk(gLock);
+        if (!gCachedQuote.valid) {
+            return nullptr;
+        }
+
+        if (speaker && gCachedQuote.speakerFormID != speaker->GetFormID()) {
+            return nullptr;
+        }
+
+        return &gCachedQuote.quote;
+    }
+}
