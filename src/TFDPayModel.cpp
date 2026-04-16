@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cctype>
 #include <cstdint>
 #include <mutex>
@@ -28,6 +29,7 @@ namespace TFD::PayModel
         struct CacheState
         {
             bool valid{ false };
+            PayContext context{ PayContext::None };
             std::uint32_t speakerFormID{ 0 };
             EncounterQuote quote{};
             double builtAtSec{ 0.0 };
@@ -279,7 +281,7 @@ namespace TFD::PayModel
             return isBossRef ? 50 : 0;
         }
 
-        int ResolveEncounterTotal(const std::vector<ActorBreakdown>& actors)
+        int ResolveEncounterBaseGold(const std::vector<ActorBreakdown>& actors)
         {
             int total = 0;
             for (const auto& entry : actors) {
@@ -344,17 +346,45 @@ namespace TFD::PayModel
         spdlog::info("[TFD][PayModel] Shutdown");
     }
 
-    void ClearCachedPreCombatQuote(const char* reason)
+    void ClearCachedEncounterQuote(const char* reason)
     {
         std::scoped_lock lk(gLock);
         if (gCachedQuote.valid) {
             spdlog::info(
-                "[TFD][PayModel] clear cached quote speaker={:08X} total={} reason={}",
+                "[TFD][PayModel] clear cached quote speaker={:08X} context={} total={} reason={}",
                 gCachedQuote.speakerFormID,
+                static_cast<int>(gCachedQuote.context),
                 gCachedQuote.quote.totalGold,
                 reason ? reason : "unknown");
         }
         gCachedQuote = {};
+    }
+
+    int GetContextPercent(PayContext context)
+    {
+        switch (context) {
+        case PayContext::PreCombat:
+            return 0;
+        case PayContext::InCombat:
+            return 25;
+        case PayContext::Bleedout:
+            return 25;
+        case PayContext::Rescue:
+            return -40;
+        case PayContext::TeammateContract:
+            return 0;
+        case PayContext::None:
+        default:
+            return 0;
+        }
+    }
+
+    int ApplyContextAdjustment(int baseGold, PayContext context)
+    {
+        const int pct = GetContextPercent(context);
+        const int delta = static_cast<int>(std::lround(static_cast<double>(baseGold) * static_cast<double>(pct) / 100.0));
+        const int adjusted = baseGold + delta;
+        return std::max(0, adjusted);
     }
 
     EnemyType ClassifyEnemyType(RE::Actor* actor)
@@ -617,7 +647,7 @@ namespace TFD::PayModel
         return out;
     }
 
-    EncounterQuote BuildPreCombatQuote(RE::Actor* speaker)
+    EncounterQuote BuildEncounterQuote(RE::Actor* speaker, PayContext context)
     {
         EncounterQuote quote{};
         if (!speaker) {
@@ -627,6 +657,7 @@ namespace TFD::PayModel
         auto* player = RE::PlayerCharacter::GetSingleton();
         auto actors = ResolveEncounterActors(speaker);
 
+        quote.context = context;
         quote.speakerFormID = speaker->GetFormID();
         quote.speakerName = GetActorNameSafe(speaker);
 
@@ -638,12 +669,17 @@ namespace TFD::PayModel
         }
 
         quote.actorCount = static_cast<int>(quote.actors.size());
-        quote.totalGold = ResolveEncounterTotal(quote.actors);
+        quote.baseGold = ResolveEncounterBaseGold(quote.actors);
+        quote.contextPercent = GetContextPercent(context);
+        quote.totalGold = ApplyContextAdjustment(quote.baseGold, context);
 
         spdlog::info(
-            "[TFD][PayModel] built quote speaker={:08X} actors={} total={}",
+            "[TFD][PayModel] built quote speaker={:08X} context={} actors={} base={} pct={} total={}",
             quote.speakerFormID,
+            static_cast<int>(quote.context),
             quote.actorCount,
+            quote.baseGold,
+            quote.contextPercent,
             quote.totalGold);
 
         for (const auto& entry : quote.actors) {
@@ -663,35 +699,38 @@ namespace TFD::PayModel
         return quote;
     }
 
-    int BuildPreCombatQuoteGold(RE::Actor* speaker)
+    int BuildEncounterQuoteGold(RE::Actor* speaker, PayContext context)
     {
-        return BuildPreCombatQuote(speaker).totalGold;
+        return BuildEncounterQuote(speaker, context).totalGold;
     }
 
-    bool PrimePreCombatQuote(RE::Actor* speaker)
+    bool PrimeEncounterQuote(RE::Actor* speaker, PayContext context)
     {
         if (!speaker) {
             return false;
         }
 
-        auto quote = BuildPreCombatQuote(speaker);
+        auto quote = BuildEncounterQuote(speaker, context);
 
         std::scoped_lock lk(gLock);
         gCachedQuote.valid = true;
+        gCachedQuote.context = context;
         gCachedQuote.speakerFormID = speaker->GetFormID();
         gCachedQuote.quote = std::move(quote);
         gCachedQuote.builtAtSec = NowSec();
 
         spdlog::info(
-            "[TFD][PayModel] cached quote speaker={:08X} total={} builtAt={:.2f}",
+            "[TFD][PayModel] cached quote speaker={:08X} context={} base={} total={} builtAt={:.2f}",
             gCachedQuote.speakerFormID,
+            static_cast<int>(gCachedQuote.context),
+            gCachedQuote.quote.baseGold,
             gCachedQuote.quote.totalGold,
             gCachedQuote.builtAtSec);
 
         return true;
     }
 
-    int GetCachedPreCombatQuote(RE::Actor* speaker)
+    int GetCachedEncounterQuote(RE::Actor* speaker, PayContext context)
     {
         std::scoped_lock lk(gLock);
         if (!gCachedQuote.valid) {
@@ -702,10 +741,14 @@ namespace TFD::PayModel
             return 0;
         }
 
+        if (context != PayContext::None && gCachedQuote.context != context) {
+            return 0;
+        }
+
         return gCachedQuote.quote.totalGold;
     }
 
-    const EncounterQuote* GetCachedPreCombatQuoteData(RE::Actor* speaker)
+    const EncounterQuote* GetCachedEncounterQuoteData(RE::Actor* speaker, PayContext context)
     {
         std::scoped_lock lk(gLock);
         if (!gCachedQuote.valid) {
@@ -713,6 +756,10 @@ namespace TFD::PayModel
         }
 
         if (speaker && gCachedQuote.speakerFormID != speaker->GetFormID()) {
+            return nullptr;
+        }
+
+        if (context != PayContext::None && gCachedQuote.context != context) {
             return nullptr;
         }
 

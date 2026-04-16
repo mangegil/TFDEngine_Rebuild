@@ -30,6 +30,7 @@
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
+#include "TFDPayModel.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -97,6 +98,7 @@ static void ResetTransientStateForLoad()
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
     TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
+    TFD::PayModel::ClearCachedEncounterQuote("transient_reset_for_load");
 
     spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, suppression cleared)");
 }
@@ -139,6 +141,7 @@ static void InitOnceAfterLoad()
     TFD::CaptiveGreet::Install();
     TFD::RescueGreet::Install();
     TFD::TeammateManager::Install();
+    TFD::PayModel::Install();
 
     QueueHud("TFDEngine: Init OK (after load)");
     QueueHud(BuildStamp().c_str());

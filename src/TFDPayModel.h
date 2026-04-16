@@ -8,6 +8,16 @@
 
 namespace TFD::PayModel
 {
+    enum class PayContext : std::uint8_t
+    {
+        None = 0,
+        PreCombat,
+        InCombat,
+        Bleedout,
+        Rescue,
+        TeammateContract
+    };
+
     enum class EnemyType : std::uint8_t
     {
         Unknown = 0,
@@ -78,10 +88,14 @@ namespace TFD::PayModel
 
     struct EncounterQuote
     {
+        PayContext context{ PayContext::None };
+
         std::uint32_t speakerFormID{ 0 };
         std::string speakerName{};
 
         int actorCount{ 0 };
+        int baseGold{ 0 };
+        int contextPercent{ 0 };
         int totalGold{ 0 };
 
         std::vector<ActorBreakdown> actors;
@@ -90,14 +104,17 @@ namespace TFD::PayModel
     void Install();
     void Shutdown();
 
-    void ClearCachedPreCombatQuote(const char* reason = "clear");
+    void ClearCachedEncounterQuote(const char* reason = "clear");
 
-    [[nodiscard]] EncounterQuote BuildPreCombatQuote(RE::Actor* speaker);
-    [[nodiscard]] int BuildPreCombatQuoteGold(RE::Actor* speaker);
+    [[nodiscard]] int GetContextPercent(PayContext context);
+    [[nodiscard]] int ApplyContextAdjustment(int baseGold, PayContext context);
 
-    bool PrimePreCombatQuote(RE::Actor* speaker);
-    [[nodiscard]] int GetCachedPreCombatQuote(RE::Actor* speaker = nullptr);
-    [[nodiscard]] const EncounterQuote* GetCachedPreCombatQuoteData(RE::Actor* speaker = nullptr);
+    [[nodiscard]] EncounterQuote BuildEncounterQuote(RE::Actor* speaker, PayContext context);
+    [[nodiscard]] int BuildEncounterQuoteGold(RE::Actor* speaker, PayContext context);
+
+    bool PrimeEncounterQuote(RE::Actor* speaker, PayContext context);
+    [[nodiscard]] int GetCachedEncounterQuote(RE::Actor* speaker = nullptr, PayContext context = PayContext::None);
+    [[nodiscard]] const EncounterQuote* GetCachedEncounterQuoteData(RE::Actor* speaker = nullptr, PayContext context = PayContext::None);
 
     [[nodiscard]] EnemyType ClassifyEnemyType(RE::Actor* actor);
     [[nodiscard]] ThreatTier ClassifyThreatTier(RE::Actor* actor, RE::Actor* player = nullptr);
