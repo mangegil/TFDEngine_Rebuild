@@ -53,6 +53,7 @@ namespace TFD::PreCombatGreet
         constexpr const char* kPreCombatOutcomeRecruitEvent = "TFDPreCombatOutcomeRecruit";
         constexpr const char* kPreCombatOutcomeReleaseEvent = "TFDPreCombatOutcomeRelease";
         constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
+        constexpr const char* kPreCombatOutcomeFollowEndEvent = "TFDPreCombatOutcomeFollowEnd";
         constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
 
         struct Pending
@@ -104,7 +105,8 @@ namespace TFD::PreCombatGreet
         {
             return eventName == std::string_view("TFDPreCombatOutcomeRelease") ||
                 eventName == std::string_view("TFDPreCombatOutcomeFollow") ||
-                eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd");
+                eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd") ||
+                eventName == std::string_view("TFDPreCombatOutcomeFollowEnd");
         }
 
         RE::Actor* ResolveActorFromEventArgRaw(const char* eventArg)
@@ -910,6 +912,10 @@ namespace TFD::PreCombatGreet
                     const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
                     if (name == kPreCombatOutcomePayEvent) {
                         bool startedExtortion = false;
+                        if (matchedPending) {
+                            MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+                        }
+                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay");
                         if (matchedPending && pendingActor) {
                             ArmPreCombatPayFollowupLocked(pendingActor, *matchedPending, rawName);
                         }
@@ -1278,6 +1284,11 @@ namespace TFD::PreCombatGreet
             return false;
         }
 
+        if (TFD::Extortion::IsActive(actor)) {
+            spdlog::info("[TFD][PreCombatGreet] BeginForActor blocked actor={:08X} reason=extortion_active", actor ? actor->GetFormID() : 0u);
+            return false;
+        }
+
         const auto handle = GetHandleId(actor);
         const double now = NowSec();
 
@@ -1400,6 +1411,17 @@ namespace TFD::PreCombatGreet
 
             spdlog::info(
                 "[TFD][PreCombatGreet] grace handled actor={:08X} reason=precombat_release_end",
+                actor->GetFormID());
+            return true;
+        }
+
+        if (eventName == std::string_view("TFDPreCombatOutcomeFollowEnd")) {
+            if (handlers.removeGrace) {
+                handlers.removeGrace(actor, "precombat_follow_end");
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] grace handled actor={:08X} reason=precombat_follow_end",
                 actor->GetFormID());
             return true;
         }
