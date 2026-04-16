@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
 namespace TFD::PayModel
@@ -25,6 +26,7 @@ namespace TFD::PayModel
 
         constexpr float kScanRadius = 2200.0f;
         constexpr int kEncounterGoldCap = 3000;
+        constexpr const char* kSharedGoldGlobalEditorID = "TFDPayGold";
 
         struct CacheState
         {
@@ -38,10 +40,82 @@ namespace TFD::PayModel
         std::mutex gLock;
         CacheState gCachedQuote{};
         Clock::time_point gT0 = Clock::now();
+        RE::TESGlobal* gSharedGoldGlobal = nullptr;
+        bool gLoggedSharedGoldMissing = false;
 
         double NowSec()
         {
             return std::chrono::duration<double>(Clock::now() - gT0).count();
+        }
+
+        RE::TESGlobal* ResolveSharedGoldGlobal()
+        {
+            if (gSharedGoldGlobal) {
+                return gSharedGoldGlobal;
+            }
+
+            gSharedGoldGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>(kSharedGoldGlobalEditorID);
+            if (!gSharedGoldGlobal && !gLoggedSharedGoldMissing) {
+                gLoggedSharedGoldMissing = true;
+                spdlog::warn("[TFD][PayModel] shared gold global '{}' not found", kSharedGoldGlobalEditorID);
+            }
+            return gSharedGoldGlobal;
+        }
+
+        const char* PayContextName(PayContext context)
+        {
+            switch (context) {
+            case PayContext::PreCombat:
+                return "PreCombat";
+            case PayContext::InCombat:
+                return "InCombat";
+            case PayContext::Bleedout:
+                return "Bleedout";
+            case PayContext::Rescue:
+                return "Rescue";
+            case PayContext::TeammateContract:
+                return "TeammateContract";
+            case PayContext::None:
+            default:
+                return "None";
+            }
+        }
+
+        void QueuePayQuoteEvent(const char* eventName, const char* contextName, float goldValue, RE::Actor* speaker)
+        {
+            if (!eventName || !eventName[0]) {
+                return;
+            }
+
+            auto* task = SKSE::GetTaskInterface();
+            auto* src = SKSE::GetModCallbackEventSource();
+            if (!task || !src) {
+                spdlog::warn("[TFD][PayModel] queue pay quote event skipped event={} hasTask={} hasSource={}",
+                    eventName,
+                    task ? 1 : 0,
+                    src ? 1 : 0);
+                return;
+            }
+
+            const std::string eventNameCopy{ eventName };
+            const std::string contextCopy = contextName ? std::string{ contextName } : std::string{};
+            const auto speakerHandle = speaker ? speaker->GetHandle().native_handle() : 0u;
+
+            task->AddTask([eventNameCopy, contextCopy, goldValue, speakerHandle]() {
+                auto* source = SKSE::GetModCallbackEventSource();
+                if (!source) {
+                    return;
+                }
+
+                RE::TESForm* sender = nullptr;
+                if (speakerHandle != 0) {
+                    auto speakerSp = RE::Actor::LookupByHandle(speakerHandle);
+                    sender = speakerSp.get();
+                }
+
+                SKSE::ModCallbackEvent ev{ eventNameCopy.c_str(), contextCopy.c_str(), goldValue, sender };
+                source->SendEvent(&ev);
+            });
         }
 
         std::string GetActorNameSafe(RE::Actor* actor)
@@ -336,6 +410,8 @@ namespace TFD::PayModel
     {
         std::scoped_lock lk(gLock);
         gCachedQuote = {};
+        gSharedGoldGlobal = nullptr;
+        gLoggedSharedGoldMissing = false;
         spdlog::info("[TFD][PayModel] Install");
     }
 
@@ -343,6 +419,8 @@ namespace TFD::PayModel
     {
         std::scoped_lock lk(gLock);
         gCachedQuote = {};
+        gSharedGoldGlobal = nullptr;
+        gLoggedSharedGoldMissing = false;
         spdlog::info("[TFD][PayModel] Shutdown");
     }
 
@@ -358,6 +436,85 @@ namespace TFD::PayModel
                 reason ? reason : "unknown");
         }
         gCachedQuote = {};
+    }
+
+    bool PublishSharedGold(RE::Actor* speaker, PayContext context, const char* reason)
+    {
+        if (!speaker) {
+            spdlog::warn("[TFD][PayModel] publish shared gold rejected speaker=<null> context={} reason={}",
+                static_cast<int>(context),
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        auto* payGlobal = ResolveSharedGoldGlobal();
+        if (!payGlobal) {
+            spdlog::warn("[TFD][PayModel] publish shared gold rejected speaker={:08X} context={} reason={} missing_global=1",
+                speaker->GetFormID(),
+                static_cast<int>(context),
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        int gold = 0;
+        bool hasMatchingCache = false;
+        {
+            std::scoped_lock lk(gLock);
+            hasMatchingCache =
+                gCachedQuote.valid &&
+                gCachedQuote.speakerFormID == speaker->GetFormID() &&
+                gCachedQuote.context == context;
+            if (hasMatchingCache) {
+                gold = gCachedQuote.quote.totalGold;
+            }
+        }
+
+        if (!hasMatchingCache) {
+            if (!PrimeEncounterQuote(speaker, context)) {
+                spdlog::warn("[TFD][PayModel] publish shared gold prime failed speaker={:08X} context={} reason={}",
+                    speaker->GetFormID(),
+                    static_cast<int>(context),
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            std::scoped_lock lk(gLock);
+            if (!gCachedQuote.valid ||
+                gCachedQuote.speakerFormID != speaker->GetFormID() ||
+                gCachedQuote.context != context) {
+                spdlog::warn("[TFD][PayModel] publish shared gold cache mismatch speaker={:08X} context={} reason={}",
+                    speaker->GetFormID(),
+                    static_cast<int>(context),
+                    reason ? reason : "unknown");
+                return false;
+            }
+            gold = gCachedQuote.quote.totalGold;
+        }
+
+        payGlobal->value = static_cast<float>(gold);
+        QueuePayQuoteEvent("TFDPayQuoteUpdate", PayContextName(context), static_cast<float>(gold), speaker);
+        spdlog::info("[TFD][PayModel] publish shared gold speaker={:08X} context={} gold={} reason={} event=TFDPayQuoteUpdate",
+            speaker->GetFormID(),
+            static_cast<int>(context),
+            gold,
+            reason ? reason : "unknown");
+        return true;
+    }
+
+    void ClearSharedGold(const char* reason)
+    {
+        auto* payGlobal = ResolveSharedGoldGlobal();
+        if (!payGlobal) {
+            return;
+        }
+
+        if (payGlobal->value != 0.0f) {
+            spdlog::info("[TFD][PayModel] clear shared gold oldValue={:.0f} reason={}",
+                payGlobal->value,
+                reason ? reason : "unknown");
+        }
+        payGlobal->value = 0.0f;
+        QueuePayQuoteEvent("TFDPayQuoteClear", "", 0.0f, nullptr);
     }
 
     int GetContextPercent(PayContext context)
