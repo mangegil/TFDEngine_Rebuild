@@ -24,6 +24,7 @@
 #include "TFDLocation.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
+#include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 #include "TFDPayModel.h"
 #include "TFDPleasureRuntime.h"
@@ -389,6 +390,12 @@ namespace TFD::PreCombatGreet
                 return false;
             }
 
+            if (actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor)) {
+                return false;
+            }
+
             if (TFD::FlowController::IsPreCombatBlocked()) {
                 return false;
             }
@@ -398,6 +405,10 @@ namespace TFD::PreCombatGreet
             }
 
             if (IsPlayerDown()) {
+                return false;
+            }
+
+            if (!actor->IsHostileToActor(player)) {
                 return false;
             }
 
@@ -772,6 +783,10 @@ namespace TFD::PreCombatGreet
                 pending.assignSent = false;
             }
 
+            if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+                TFD::InteractionRouter::ClearInteractionStateValue();
+            }
+
             if (actor) {
                 gCooldownUntil[GetHandleId(actor)] = NowSec() + cooldownSec;
 
@@ -796,9 +811,15 @@ namespace TFD::PreCombatGreet
             TFD::Extortion::CancelAll("precombat_clear_all_pending");
             TFD::PayModel::ClearSharedGold("precombat_clear_all_pending");
 
+            bool hadPreCombatPending = false;
+
             for (auto& [handle, pending] : gPending) {
                 auto sp = RE::Actor::LookupByHandle(handle);
                 auto* actor = sp.get();
+
+                if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+                    hadPreCombatPending = true;
+                }
 
                 if (pending.truceSessionId != 0) {
                     TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::Tame::ReleaseReason::Generic);
@@ -815,6 +836,10 @@ namespace TFD::PreCombatGreet
             }
 
             gPending.clear();
+
+            if (hadPreCombatPending) {
+                TFD::InteractionRouter::ClearInteractionStateValue();
+            }
         }
 
         void AbortOnPlayerAttack(const RE::TESHitEvent* ev)
@@ -910,6 +935,7 @@ namespace TFD::PreCombatGreet
                     }
                     TFD::Extortion::HandlePreCombatOutcomeEvent(rawName, pendingActor ? pendingActor : actor);
                     const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
+                    bool shouldClearInteractionState = false;
                     if (name == kPreCombatOutcomePayEvent) {
                         bool startedExtortion = false;
                         if (matchedPending) {
@@ -926,12 +952,14 @@ namespace TFD::PreCombatGreet
                             }
                         }
                         spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeFightEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeCaptiveEvent) {
                         if (matchedPending) {
@@ -939,18 +967,21 @@ namespace TFD::PreCombatGreet
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive");
                         QueuePreCombatCaptiveTransition(actorFormID, "precombat_captive");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeJoinEnemyEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeReleaseEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_release");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeFollowEvent) {
                         if (matchedPending) {
@@ -966,6 +997,7 @@ namespace TFD::PreCombatGreet
                                 followDurationSec);
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_follow");
+                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomePleasureEvent) {
                         if (matchedPending) {
@@ -978,6 +1010,11 @@ namespace TFD::PreCombatGreet
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
                         ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
+                        shouldClearInteractionState = true;
+                    }
+
+                    if (shouldClearInteractionState) {
+                        TFD::InteractionRouter::ClearInteractionStateValue();
                     }
                     return RE::BSEventNotifyControl::kContinue;
                 }

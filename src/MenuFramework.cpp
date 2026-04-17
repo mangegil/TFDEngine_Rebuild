@@ -1,4 +1,4 @@
-﻿// src/MenuFramework.cpp
+// src/MenuFramework.cpp
 #include "RE/Skyrim.h"
 #include "SKSE/SKSE.h"
 
@@ -207,13 +207,12 @@ namespace TFDMenu
 
 		static void SetInteractionStateValue(int value)
 		{
-			ResolveGlobals();
-			SetGlobalInt(gInteractionState, value);
+			TFD::InteractionRouter::SetInteractionStateValue(value);
 		}
 
 		static void ClearInteractionStateValue()
 		{
-			SetInteractionStateValue(0);
+			TFD::InteractionRouter::ClearInteractionStateValue();
 		}
 
 		static const char* DecodeAvailabilityState(int value)

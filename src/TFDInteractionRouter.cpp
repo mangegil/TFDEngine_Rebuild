@@ -1,4 +1,4 @@
-﻿#include "TFDInteractionRouter.h"
+#include "TFDInteractionRouter.h"
 #include "TFDFlowController.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
@@ -67,7 +67,9 @@ namespace TFD::InteractionRouter
             if (actor == player) {
                 return true;
             }
-            return actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor);
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor);
         }
 
         bool IsActorActivelyTargetingPlayerSide(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -209,6 +211,9 @@ namespace TFD::InteractionRouter
             return GetActorFrontDot2D(actor, player) >= 0.20f;
         }
 
+        RE::TESGlobal* g_interactionStateGlobal = nullptr;
+        bool g_loggedInteractionStateMissing = false;
+
         int InteractionStateForAction(Action action)
         {
             switch (action) {
@@ -224,6 +229,19 @@ namespace TFD::InteractionRouter
             }
         }
 
+        void ResolveInteractionStateGlobal()
+        {
+            if (g_interactionStateGlobal) {
+                return;
+            }
+
+            g_interactionStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDInteractionState");
+            if (!g_interactionStateGlobal && !g_loggedInteractionStateMissing) {
+                g_loggedInteractionStateMissing = true;
+                spdlog::warn("[TFD][Router] global TFDInteractionState not found");
+            }
+        }
+
         float ScoreTruceCandidate(
             const TFD::Actor::Snapshot& snapshot,
             RE::Actor* actor,
@@ -232,6 +250,9 @@ namespace TFD::InteractionRouter
             Action desiredAction)
         {
             if (!actor || !player) {
+                return -1.0e30f;
+            }
+            if (IsPlayerSideActor(actor, player)) {
                 return -1.0e30f;
             }
             if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
@@ -265,6 +286,14 @@ namespace TFD::InteractionRouter
             }
 
             if (desiredAction == Action::TrucePreCombat) {
+                if (!actor->IsHostileToActor(player)) {
+                    if (classify.valid && classify.intent == TFD::Actor::Interaction::Intent::Truce) {
+                        spdlog::info(
+                            "[TFD][Router] reject precombat target={:08X} reason=not_hostile_to_player",
+                            actor->GetFormID());
+                    }
+                    return -1.0e30f;
+                }
                 if (actorInCombat || targetPlayer || targetingPlayerSide || info.currentTargetFormID != 0) {
                     if (classify.valid && classify.intent == TFD::Actor::Interaction::Intent::Truce) {
                         spdlog::info(
@@ -459,6 +488,16 @@ namespace TFD::InteractionRouter
                 return MakeResolveFailure(FailReason::NoUsableAction, player->GetFormID(), target->GetFormID());
             }
 
+            if (IsPlayerSideActor(target, player->As<RE::PlayerCharacter>())) {
+                spdlog::info(
+                    "[TFD][Router] reject target={:08X} reason=player_side_actor",
+                    target->GetFormID());
+                return MakeResolveFailure(
+                    FailReason::TargetRejected,
+                    player->GetFormID(),
+                    target->GetFormID());
+            }
+
             const auto classify = TFD::Actor::Interaction::ClassifyTarget(
                 player,
                 target,
@@ -527,6 +566,25 @@ namespace TFD::InteractionRouter
                 break;
 
             case Action::TrucePreCombat:
+                if (!target->IsHostileToActor(player)) {
+                    spdlog::info(
+                        "[TFD][Router] reject precombat target={:08X} reason=resolve_not_hostile_to_player",
+                        target->GetFormID());
+                    return MakeResolveFailure(
+                        FailReason::TargetRejected,
+                        player->GetFormID(),
+                        target->GetFormID(),
+                        action);
+                }
+                if (!TFD::HostilityController::CanStartTruce(target)) {
+                    return MakeResolveFailure(
+                        FailReason::TruceUnavailable,
+                        player->GetFormID(),
+                        target->GetFormID(),
+                        action);
+                }
+                break;
+
             case Action::TruceInCombat:
                 if (!TFD::HostilityController::CanStartTruce(target)) {
                     return MakeResolveFailure(
@@ -1014,6 +1072,44 @@ namespace TFD::InteractionRouter
         result.success = false;
         result.notification = "TFD: No Exact Tame Target";
         return result;
+    }
+
+    int GetInteractionStateForAction(Action action)
+    {
+        return InteractionStateForAction(action);
+    }
+
+    void SetInteractionStateValue(int value)
+    {
+        ResolveInteractionStateGlobal();
+        if (!g_interactionStateGlobal) {
+            return;
+        }
+
+        const float desired = static_cast<float>(value);
+        if (g_interactionStateGlobal->value != desired) {
+            g_interactionStateGlobal->value = desired;
+        }
+    }
+
+    void SetInteractionStateForAction(Action action)
+    {
+        SetInteractionStateValue(GetInteractionStateForAction(action));
+    }
+
+    void ClearInteractionStateValue()
+    {
+        SetInteractionStateValue(0);
+    }
+
+    int GetInteractionStateValue()
+    {
+        ResolveInteractionStateGlobal();
+        if (!g_interactionStateGlobal) {
+            return 0;
+        }
+
+        return static_cast<int>(std::lround(g_interactionStateGlobal->value));
     }
 
     RE::Actor* PickExactDialogueDefeatedTarget(float radius)

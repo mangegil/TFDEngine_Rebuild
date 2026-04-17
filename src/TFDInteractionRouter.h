@@ -106,6 +106,11 @@ namespace TFD::InteractionRouter
     };
 
     Action ResolvePreferredTruceAction(const TFD::FlowController::Snapshot& snapshot);
+    int GetInteractionStateForAction(Action action);
+    void SetInteractionStateValue(int value);
+    void SetInteractionStateForAction(Action action);
+    void ClearInteractionStateValue();
+    int GetInteractionStateValue();
     bool BeginTruceForAction(RE::Actor* target, Action preferredAction, Action* outAction = nullptr);
     FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::FlowController::Snapshot& snapshot);
 

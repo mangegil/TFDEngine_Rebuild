@@ -140,7 +140,8 @@ namespace
                         const auto index = static_cast<std::size_t>(slot - 1);
                         g_cache.teammateAliases[index] = refAlias;
                     }
-                } catch (...) {
+                }
+                catch (...) {
                 }
             }
 
@@ -289,13 +290,15 @@ namespace
                     task->AddTask([promise]() {
                         try {
                             promise->set_value(RestorePass());
-                        } catch (...) {
+                        }
+                        catch (...) {
                             try {
                                 promise->set_exception(std::current_exception());
-                            } catch (...) {
+                            }
+                            catch (...) {
                             }
                         }
-                    });
+                        });
 
                     if (future.wait_for(kRestoreTaskTimeout) != std::future_status::ready) {
                         spdlog::warn("[TFD][TeammateManager] restore pass timeout attempt={}", attempt);
@@ -305,7 +308,8 @@ namespace
                     RestorePassStats stats{};
                     try {
                         stats = future.get();
-                    } catch (...) {
+                    }
+                    catch (...) {
                         spdlog::warn("[TFD][TeammateManager] restore pass exception attempt={}", attempt);
                         continue;
                     }
@@ -325,7 +329,7 @@ namespace
                 if (g_restoreGeneration.load(std::memory_order_acquire) == generation) {
                     g_restoreQueued.store(false, std::memory_order_release);
                 }
-            }).detach();
+                }).detach();
         }
     }
 
@@ -381,7 +385,8 @@ namespace
                             const auto index = static_cast<std::size_t>(slot - 1);
                             g_registry.teammateAliases[index] = refAlias;
                         }
-                    } catch (...) {
+                    }
+                    catch (...) {
                     }
                 }
             }
@@ -485,13 +490,23 @@ namespace
             if (shouldHaveFaction) {
                 if (!hasFaction) {
                     actor->AddToFaction(g_registry.teammateFaction, 0);
+                    if (actor->IsInCombat()) {
+                        actor->StopCombat();
+                    }
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->StopCombatAndAlarmOnActor(actor, false);
+                    }
+                    if (actor->IsWeaponDrawn()) {
+                        actor->DrawWeaponMagicHands(false);
+                    }
                     actor->EvaluatePackage(false, true);
                     actor->EvaluatePackage(true, true);
-                    spdlog::info("[TFD][TeammateManager] add faction actor={:08X} faction={:08X}",
+                    spdlog::info("[TFD][TeammateManager] add faction actor={:08X} faction={:08X} calm=1",
                         actor->GetFormID(),
                         g_registry.teammateFaction->GetFormID());
                 }
-            } else if (hasFaction) {
+            }
+            else if (hasFaction) {
                 actor->RemoveFromFaction(g_registry.teammateFaction);
                 actor->EvaluatePackage(false, true);
                 actor->EvaluatePackage(true, true);
@@ -515,14 +530,59 @@ namespace
             if (actor) {
                 if (it != g_registry.quest->refAliasMap.end()) {
                     it->second = handle;
-                } else {
+                }
+                else {
                     g_registry.quest->refAliasMap.insert({ alias->aliasID, handle });
                 }
-            } else {
+            }
+            else {
                 if (it != g_registry.quest->refAliasMap.end()) {
                     g_registry.quest->refAliasMap.erase(it);
                 }
             }
+        }
+
+        bool IsActorAlreadyInAliasRegistry(RE::Actor* actor)
+        {
+            if (!actor || !g_registry.quest) {
+                return false;
+            }
+
+            const auto actorFormID = actor->GetFormID();
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+
+                auto* current = alias->GetActorReference();
+                if (!current) {
+                    continue;
+                }
+
+                if (current == actor || current->GetFormID() == actorFormID) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool IsAliasManagedSeed(RE::Actor* actor)
+        {
+            ResolveRegistry();
+            if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead()) {
+                return false;
+            }
+
+            if (IsActorAlreadyInAliasRegistry(actor)) {
+                return true;
+            }
+
+            if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
+                return true;
+            }
+
+            return false;
         }
 
         std::vector<RE::Actor*> CollectNearbyPlayerTeammates(float radius)
@@ -561,6 +621,10 @@ namespace
             ResolveRegistry();
 
             auto desired = CollectNearbyPlayerTeammates(8000.0f);
+            desired.erase(std::remove_if(desired.begin(), desired.end(), [](RE::Actor* actor) {
+                return !IsAliasManagedSeed(actor);
+                }), desired.end());
+
             const int teammateState = ComputeTeammateStateValue(desired);
             WriteTeammateState(teammateState);
 
@@ -596,7 +660,7 @@ namespace
                 SyncTeammateFaction(current, true);
                 remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](RE::Actor* actor) {
                     return actor == current || (actor && current && actor->GetFormID() == current->GetFormID());
-                }), remaining.end());
+                    }), remaining.end());
             }
 
             for (auto* alias : g_registry.teammateAliases) {
@@ -630,7 +694,8 @@ namespace
                 if (!g_tickPending.exchange(true, std::memory_order_acq_rel)) {
                     if (auto* task = SKSE::GetTaskInterface()) {
                         task->AddTask([]() { TickUI(); });
-                    } else {
+                    }
+                    else {
                         g_tickPending.store(false, std::memory_order_release);
                     }
                 }
@@ -643,78 +708,78 @@ namespace
 
 namespace TFD::TeammateManager::BridgeInternal
 {
-        constexpr const char* kDefeatedHumanoidRecruitEvent = "TFDDefeatedHumanoidRecruit";
-        constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
-        constexpr double kDefeatedReentrySuppressSeconds = 6.0;
+    constexpr const char* kDefeatedHumanoidRecruitEvent = "TFDDefeatedHumanoidRecruit";
+    constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
+    constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 
-        inline RuntimeProviders g_runtimeProviders{};
+    inline RuntimeProviders g_runtimeProviders{};
 
-        class DefeatedRecruitEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+    class DefeatedRecruitEventSink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
         {
-        public:
-            RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
-            {
-                if (!ev) {
-                    return RE::BSEventNotifyControl::kContinue;
-                }
-                std::string_view name(ev->eventName);
-                if (name.empty() || name != kDefeatedHumanoidRecruitEvent) {
-                    return RE::BSEventNotifyControl::kContinue;
-                }
-                auto* actor = g_runtimeProviders.resolvePendingDefeatedDialogueTarget ? g_runtimeProviders.resolvePendingDefeatedDialogueTarget() : nullptr;
-                if (!actor) {
-                    spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit event ignored reason=no_pending_target");
-                    return RE::BSEventNotifyControl::kContinue;
-                }
-                const bool ok = TFD::TeammateManager::RecruitDefeatedHumanoidAsTeammate(actor);
-                spdlog::info("[TFD][TeammateManager] defeated humanoid recruit event actor={} ok={}", static_cast<std::uint32_t>(actor->GetFormID()), ok ? 1 : 0);
+            if (!ev) {
                 return RE::BSEventNotifyControl::kContinue;
             }
-        };
+            std::string_view name(ev->eventName);
+            if (name.empty() || name != kDefeatedHumanoidRecruitEvent) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            auto* actor = g_runtimeProviders.resolvePendingDefeatedDialogueTarget ? g_runtimeProviders.resolvePendingDefeatedDialogueTarget() : nullptr;
+            if (!actor) {
+                spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit event ignored reason=no_pending_target");
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            const bool ok = TFD::TeammateManager::RecruitDefeatedHumanoidAsTeammate(actor);
+            spdlog::info("[TFD][TeammateManager] defeated humanoid recruit event actor={} ok={}", static_cast<std::uint32_t>(actor->GetFormID()), ok ? 1 : 0);
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
 
-        inline DefeatedRecruitEventSink g_defeatedRecruitEventSink{};
+    inline DefeatedRecruitEventSink g_defeatedRecruitEventSink{};
 
-        bool HasFollowerAnchorFaction(RE::Actor* actor)
-        {
-            if (!actor || actor->IsDisabled()) {
-                return false;
-            }
-            AliasInternal::ResolveRegistry();
-            if (AliasInternal::g_registry.currentFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.currentFollowerFaction)) {
-                return true;
-            }
-            if (AliasInternal::g_registry.playerFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.playerFollowerFaction)) {
-                return true;
-            }
+    bool HasFollowerAnchorFaction(RE::Actor* actor)
+    {
+        if (!actor || actor->IsDisabled()) {
             return false;
         }
-
-        std::vector<RE::Actor*> CollectRegisteredActors()
-        {
-            AliasInternal::ResolveRegistry();
-            std::vector<RE::Actor*> out;
-            out.reserve(AliasInternal::g_registry.teammateAliases.size());
-            for (auto* alias : AliasInternal::g_registry.teammateAliases) {
-                if (!alias) {
-                    continue;
-                }
-                auto* actor = alias->GetActorReference();
-                if (!actor || actor->IsDisabled()) {
-                    continue;
-                }
-                out.push_back(actor);
-            }
-            return out;
+        AliasInternal::ResolveRegistry();
+        if (AliasInternal::g_registry.currentFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.currentFollowerFaction)) {
+            return true;
         }
-
-        float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b)
-        {
-            const float dx = a.x - b.x;
-            const float dy = a.y - b.y;
-            const float dz = a.z - b.z;
-            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (AliasInternal::g_registry.playerFollowerFaction && actor->IsInFaction(AliasInternal::g_registry.playerFollowerFaction)) {
+            return true;
         }
+        return false;
     }
+
+    std::vector<RE::Actor*> CollectRegisteredActors()
+    {
+        AliasInternal::ResolveRegistry();
+        std::vector<RE::Actor*> out;
+        out.reserve(AliasInternal::g_registry.teammateAliases.size());
+        for (auto* alias : AliasInternal::g_registry.teammateAliases) {
+            if (!alias) {
+                continue;
+            }
+            auto* actor = alias->GetActorReference();
+            if (!actor || actor->IsDisabled()) {
+                continue;
+            }
+            out.push_back(actor);
+        }
+        return out;
+    }
+
+    float Distance3D(const RE::NiPoint3& a, const RE::NiPoint3& b)
+    {
+        const float dx = a.x - b.x;
+        const float dy = a.y - b.y;
+        const float dz = a.z - b.z;
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
+}
 
 namespace TFD::TeammateManager
 {
@@ -739,8 +804,9 @@ namespace TFD::TeammateManager
                 if (message->type == SKSE::MessagingInterface::kPostLoadGame) {
                     RestoreInternal::QueueRestoreAfterLoad();
                 }
-            });
-        } else {
+                });
+        }
+        else {
             spdlog::warn("[TFD][TeammateManager] MessagingInterface null");
         }
 
@@ -874,7 +940,8 @@ namespace TFD::TeammateManager
                     bestStandingDist = dist;
                     result.standing = actor;
                 }
-            } else if (dist < bestDownedDist) {
+            }
+            else if (dist < bestDownedDist) {
                 bestDownedDist = dist;
                 result.downed = actor;
             }

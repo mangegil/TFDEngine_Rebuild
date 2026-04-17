@@ -1,5 +1,6 @@
 #include "TFDPleasureRuntime.h"
 #include "TFDFlowController.h"
+#include "TFDInteractionRouter.h"
 
 #include <cmath>
 #include <mutex>

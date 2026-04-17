@@ -482,6 +482,9 @@ namespace TFD::Actor
             if (!ai.isBattleParticipant || !bi.isBattleParticipant) {
                 return false;
             }
+            if (ai.playerSide != bi.playerSide) {
+                return false;
+            }
             if (ai.playerSide && bi.playerSide) {
                 return true;
             }

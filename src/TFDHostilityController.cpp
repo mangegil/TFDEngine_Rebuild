@@ -2,6 +2,7 @@
 #include "TFDActor.h"
 
 #include "TFDTame.h"
+#include "TFDTeammateManager.h"
 
 #include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
@@ -755,6 +756,21 @@ namespace TFD::HostilityController
 
             if (actor->GetFormID() == primaryTarget->GetFormID()) {
                 return true;
+            }
+
+            const bool actorPlayerSide =
+                actor == player ||
+                actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor);
+            const bool primaryPlayerSide =
+                primaryTarget == player ||
+                primaryTarget->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(primaryTarget) ||
+                TFD::Tame::IsCompanion(primaryTarget);
+
+            if (actorPlayerSide != primaryPlayerSide) {
+                return false;
             }
 
             if (SharesAnyExactFaction(actor, primaryTarget)) {
