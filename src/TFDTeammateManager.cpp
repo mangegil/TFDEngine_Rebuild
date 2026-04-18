@@ -23,7 +23,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "TFDDefeatMonitor.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
 #include "TFDHostilityController.h"
@@ -441,7 +440,7 @@ namespace
                 return false;
             }
 
-            if (TFD::DefeatMonitor::IsThresholdDownedActor(actor)) {
+            if (TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct())) {
                 return false;
             }
 
@@ -934,7 +933,7 @@ namespace TFD::TeammateManager
             if (radius > 0.0f && dist > (std::max)(radius, 5000.0f)) {
                 continue;
             }
-            const bool downed = TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+            const bool downed = TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
             if (!downed) {
                 if (dist < bestStandingDist) {
                     bestStandingDist = dist;
@@ -956,7 +955,7 @@ namespace TFD::TeammateManager
             if (!actor || actor->IsDead() || actor->IsDisabled()) {
                 continue;
             }
-            if (TFD::DefeatMonitor::IsThresholdDownedActor(actor)) {
+            if (TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct())) {
                 continue;
             }
             out.push_back(actor);
@@ -982,7 +981,7 @@ namespace TFD::TeammateManager
 
             const bool isLockedAlly = BridgeInternal::g_runtimeProviders.hasAllyBleedLock ? BridgeInternal::g_runtimeProviders.hasAllyBleedLock(actor) : false;
             const bool isBleedingOut = BridgeInternal::g_runtimeProviders.isBleedingOutActor ? BridgeInternal::g_runtimeProviders.isBleedingOutActor(actor) : false;
-            const bool isDown = isLockedAlly || isBleedingOut || TFD::DefeatMonitor::IsThresholdDownedActor(actor);
+            const bool isDown = isLockedAlly || isBleedingOut || TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
             if (!isDown) {
                 continue;
             }

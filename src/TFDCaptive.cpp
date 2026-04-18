@@ -1227,6 +1227,41 @@ namespace TFD::Captive
 		return true;
 	}
 
+	bool TickRuntime(RE::Actor* player, bool captiveBleedOverlay, const RuntimeTickHandlers& handlers)
+	{
+		ProcessPendingConfiscation();
+		(void)NormalizeInvalidCaptivePair();
+
+		if (IsStandardCaptiveActive()) {
+			const bool dialogOpen = handlers.isDialogueOpen ? handlers.isDialogueOpen() : false;
+			const bool prevDialogueOpen = handlers.getPrevDialogueOpen ? handlers.getPrevDialogueOpen() : false;
+			if (dialogOpen) {
+				TFD::CaptiveGreet::NotifyDialogueOpened();
+			} else if (prevDialogueOpen && TFD::CaptiveGreet::IsActive()) {
+				TFD::CaptiveGreet::Cancel("dialogue_closed");
+			}
+			if (!dialogOpen && prevDialogueOpen) {
+				spdlog::info("[TFD][Captive] Dialogue closed -> no implicit action");
+			}
+			if (handlers.setPrevDialogueOpen) {
+				handlers.setPrevDialogueOpen(dialogOpen);
+			}
+			if (!captiveBleedOverlay) {
+				(void)TickCaptiveEscapePhase(player, handlers.escape);
+			}
+		} else if (IsEscapeActive()) {
+			if (!TickEscapeActivePhase(player, handlers.escape)) {
+				return false;
+			}
+		}
+
+		if (IsActive() && !captiveBleedOverlay) {
+			return false;
+		}
+
+		return true;
+	}
+
 	bool TriggerPlayerAggressionEscape(RE::Actor* actor, const char* reason)
 	{
 		if (!g_state) {

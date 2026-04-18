@@ -89,6 +89,7 @@ namespace TFD::Actor
     [[nodiscard]] const ActorInfo* FindActorInfo(const Snapshot& snapshot, std::uint32_t formID);
     [[nodiscard]] const CoalitionInfo* FindCoalition(const Snapshot& snapshot, std::int32_t coalitionID);
     [[nodiscard]] RE::Actor* GetCurrentTarget(const Snapshot& snapshot, RE::Actor* actor);
+    [[nodiscard]] RE::Actor* GetCurrentTarget(RE::Actor* actor);
     [[nodiscard]] RE::Actor* ResolveSpeakerCandidate(const Snapshot& snapshot, std::int32_t coalitionID);
     [[nodiscard]] std::vector<RE::Actor*> ResolveCrowdCandidates(const Snapshot& snapshot, std::int32_t coalitionID);
     [[nodiscard]] std::vector<RE::Actor*> ResolveStandingCoalitionMembers(const Snapshot& snapshot, std::int32_t coalitionID);
@@ -103,6 +104,10 @@ namespace TFD::Actor
     [[nodiscard]] bool HasStandingTeammateOnPlayerSide(const Snapshot& snapshot);
     [[nodiscard]] bool HasStandingHostileCoalition(const Snapshot& snapshot);
     [[nodiscard]] bool IsConflictResolved(const Snapshot& snapshot);
+
+    [[nodiscard]] bool IsDownByHealthThreshold(RE::Actor* actor, float thresholdPct);
+    [[nodiscard]] RE::Actor* FindBestAggressor(float radius, RE::Actor* player = nullptr);
+    [[nodiscard]] RE::Actor* ResolveAggressor(float radius = 0.0f, RE::Actor* player = nullptr);
 
     // Legacy compatibility shim. Snapshot-based APIs should be preferred by new callers.
     namespace Scan

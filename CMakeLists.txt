@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.25)
+cmake_minimum_required(VERSION 3.25)
 
 project(TFDEngine_Rebuild VERSION 0.1.0 LANGUAGES CXX)
 
@@ -35,6 +35,8 @@ add_library(TFDEngine SHARED
     src/TFDCaptive.cpp
     src/TFDRescue.cpp
     src/TFDVictory.cpp
+    src/TFDPostDefeatState.cpp
+    src/TFDDefeatBridge.cpp
     src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
     src/TFDPreCombatGreet.cpp
@@ -55,6 +57,8 @@ add_library(TFDEngine SHARED
     src/TFDExtortion.cpp 
     src/TFDPleasureRuntime.cpp
     src/TFDTransition.cpp
+    src/TFDRecovery.cpp
+    src/TFDLeftForDead.cpp
     src/TFDCaptiveGreet.cpp
     src/TFDRescueGreet.cpp
     src/TFDPayModel.cpp

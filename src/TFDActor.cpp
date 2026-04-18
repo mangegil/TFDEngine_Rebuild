@@ -397,6 +397,80 @@ namespace TFD::Actor
             return actor && (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor));
         }
 
+        float GetHealthPct(RE::Actor* actor)
+        {
+            if (!actor) {
+                return 0.0f;
+            }
+            const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float hpNow = (std::max)(0.0f, actor->GetActorValue(RE::ActorValue::kHealth));
+            return (hpNow / hpMax) * 100.0f;
+        }
+
+        bool IsCombatSupportedAggressor(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player || actor == player) {
+                return false;
+            }
+            if (actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            if (TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::Tame::IsCompanion(actor)) {
+                return false;
+            }
+            return true;
+        }
+
+        bool IsReasonableCombatAggressor(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance = nullptr)
+        {
+            if (outDistance) {
+                *outDistance = -1.0f;
+            }
+            if (!IsCombatSupportedAggressor(actor, player)) {
+                return false;
+            }
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+            if (IsDownByHealthThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct())) {
+                return false;
+            }
+            auto* playerCell = player->GetParentCell();
+            auto* actorCell = actor->GetParentCell();
+            if (playerCell && actorCell != playerCell) {
+                return false;
+            }
+            auto* playerWs = player->GetWorldspace();
+            if (playerWs && actor->GetWorldspace() != playerWs) {
+                return false;
+            }
+            const auto pp = player->GetPosition();
+            const auto ap = actor->GetPosition();
+            const float dx = ap.x - pp.x;
+            const float dy = ap.y - pp.y;
+            const float dz = ap.z - pp.z;
+            const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (outDistance) {
+                *outDistance = dist;
+            }
+            if (maxDist > 0.0f && dist > maxDist) {
+                return false;
+            }
+            if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
+                return true;
+            }
+            auto* currentTarget = GetCurrentTarget(actor);
+            if (currentTarget == player) {
+                return true;
+            }
+            if (currentTarget && TFD::TeammateManager::IsActiveFollowerActor(currentTarget)) {
+                return true;
+            }
+            return false;
+        }
+
+        RE::ActorHandle g_lastAggressor;
+
         float ScoreSpeakerCandidate(const ActorInfo& info)
         {
             float score = 0.0f;
@@ -711,6 +785,15 @@ namespace TFD::Actor
         return targetSp.get();
     }
 
+    RE::Actor* GetCurrentTarget(RE::Actor* actor)
+    {
+        if (!actor) {
+            return nullptr;
+        }
+        auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+        return targetSp.get();
+    }
+
     RE::Actor* ResolveSpeakerCandidate(const Snapshot& snapshot, std::int32_t coalitionID)
     {
         auto* coalition = FindCoalition(snapshot, coalitionID);
@@ -883,6 +966,78 @@ namespace TFD::Actor
     bool IsConflictResolved(const Snapshot& snapshot)
     {
         return snapshot.conflictResolved;
+    }
+
+    bool IsDownByHealthThreshold(RE::Actor* actor, float thresholdPct)
+    {
+        if (!actor || actor->IsDisabled() || actor->IsDead()) {
+            return true;
+        }
+        return GetHealthPct(actor) <= std::clamp(thresholdPct, 2.0f, 95.0f);
+    }
+
+    RE::Actor* FindBestAggressor(float radius, RE::Actor* player)
+    {
+        player = player ? player : RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return nullptr;
+        }
+
+        auto snapshot = BuildSnapshot((std::max)(radius, 1600.0f), false);
+        RE::Actor* best = nullptr;
+        float bestScore = std::numeric_limits<float>::max();
+        for (const auto& info : snapshot.actors) {
+            auto* actor = info.get();
+            float dist = -1.0f;
+            if (!IsReasonableCombatAggressor(actor, player, radius, &dist)) {
+                continue;
+            }
+            float score = dist;
+            auto* target = GetCurrentTarget(snapshot, actor);
+            if (target == player) {
+                score -= 3000.0f;
+            } else if (target && TFD::TeammateManager::IsActiveFollowerActor(target)) {
+                score -= 1200.0f;
+            }
+            if (actor->IsHostileToActor(player)) {
+                score -= 400.0f;
+            }
+            if (actor->IsInCombat()) {
+                score -= 150.0f;
+            }
+            if (score < bestScore) {
+                bestScore = score;
+                best = actor;
+            }
+        }
+        if (best) {
+            g_lastAggressor = best->GetHandle();
+        }
+        return best;
+    }
+
+    RE::Actor* ResolveAggressor(float radius, RE::Actor* player)
+    {
+        player = player ? player : RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return nullptr;
+        }
+        radius = radius > 0.0f ? radius : (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+
+        auto resolveIfReasonable = [&](RE::Actor* actor) -> RE::Actor* {
+            float dist = -1.0f;
+            return IsReasonableCombatAggressor(actor, player, radius, &dist) ? actor : nullptr;
+        };
+
+        if (g_lastAggressor) {
+            if (auto actor = g_lastAggressor.get().get()) {
+                if (auto* resolved = resolveIfReasonable(actor->As<RE::Actor>()); resolved) {
+                    return resolved;
+                }
+            }
+        }
+
+        return FindBestAggressor(radius, player);
     }
 }
 

@@ -1,6 +1,10 @@
 ﻿#include "TFDTransition.h"
 #include "TFDBleedout.h"
 #include "TFDActor.h"
+#include "TFDFlowController.h"
+#include "TFDLeftForDead.h"
+#include "TFDRecovery.h"
+#include "TFDRescue.h"
 
 #include "EditorIdCache.h"
 #include "TFDHostilityController.h"
@@ -42,6 +46,15 @@ namespace TFD::Transition
 		{
 			RE::Actor* standing{ nullptr };
 			RE::Actor* downed{ nullptr };
+		};
+
+		struct NoMarkerFallbackCandidates
+		{
+			RE::Actor* savior{ nullptr };
+			RE::Actor* standingFollower{ nullptr };
+			RE::Actor* downedFollower{ nullptr };
+			RE::TESObjectREFR* cachedRescueDestination{ nullptr };
+			RE::AlchemyItem* recoveryPotion{ nullptr };
 		};
 
 		bool g_pendingFadeIn = false;
@@ -105,13 +118,6 @@ namespace TFD::Transition
 			return {};
 		}
 
-		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID)
-		{
-			if (formID == 0) {
-				return nullptr;
-			}
-			return RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
-		}
 
 		static bool SendBridgeModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f)
 		{
@@ -148,7 +154,8 @@ namespace TFD::Transition
 					if (!outSender && senderFormID != 0) {
 						outSender = RE::TESForm::LookupByID(senderFormID);
 					}
-				} else if (senderFormID != 0) {
+				}
+				else if (senderFormID != 0) {
 					outSender = RE::TESForm::LookupByID(senderFormID);
 				}
 
@@ -160,7 +167,7 @@ namespace TFD::Transition
 
 				SKSE::ModCallbackEvent ev{ name.c_str(), sarg.c_str(), narg, outSender };
 				src->SendEvent(&ev);
-			});
+				});
 
 			return true;
 		}
@@ -349,7 +356,8 @@ namespace TFD::Transition
 						bestStandingDist = dist;
 						result.standing = actor;
 					}
-				} else if (dist < bestDownedDist) {
+				}
+				else if (dist < bestDownedDist) {
 					bestDownedDist = dist;
 					result.downed = actor;
 				}
@@ -400,7 +408,7 @@ namespace TFD::Transition
 				}
 				auto* potion = obj.As<RE::AlchemyItem>();
 				return potion && potion->IsMedicine() && !potion->IsPoison() && !potion->IsFood();
-			}, true);
+				}, true);
 
 			for (const auto& [item, invData] : inv) {
 				const auto& [count, entry] = invData;
@@ -498,7 +506,8 @@ namespace TFD::Transition
 			if (len < 1.0f) {
 				dx = -std::sin(player->GetAngleZ());
 				dy = -std::cos(player->GetAngleZ());
-			} else {
+			}
+			else {
 				dx /= len;
 				dy /= len;
 			}
@@ -543,7 +552,8 @@ namespace TFD::Transition
 					if (ref->GetWorldspace() != player->GetWorldspace()) {
 						return;
 					}
-				} else if (refCell != playerCell) {
+				}
+				else if (refCell != playerCell) {
 					return;
 				}
 				auto* refLoc = TFD::Location::GetLocationFromRef(ref);
@@ -574,7 +584,7 @@ namespace TFD::Transition
 					bestRef = ref;
 					bestAngle = ComputeYawFromVector(refPos.x - crowdCenter.x, refPos.y - crowdCenter.y);
 				}
-			};
+				};
 
 			if (auto* weTravel = ResolveWETravelRefType()) {
 				std::vector<RE::BGSLocation*> chain;
@@ -601,7 +611,7 @@ namespace TFD::Transition
 				}
 				considerRef(ref, heading ? 2 : 3);
 				return RE::BSContainer::ForEachResult::kContinue;
-			});
+				});
 
 			if (bestRef) {
 				state.destination = bestRef->GetHandle();
@@ -619,128 +629,35 @@ namespace TFD::Transition
 				GetBranchName(state.branch), state.fallbackPos.x, state.fallbackPos.y, state.fallbackPos.z);
 		}
 
-		static void ApplyLeftForDeadWakeState(RE::Actor* actor, bool followerStyle)
+		static TFD::LeftForDead::State BuildLeftForDeadStateFromFallback()
 		{
-			if (!actor) {
-				return;
-			}
-			actor->NotifyAnimationGraph("BleedoutStop");
-			actor->NotifyAnimationGraph("GetUpStart");
-			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
-			const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
-			const float safePct = std::clamp(threshPct + (followerStyle ? 0.14f : 0.12f), followerStyle ? 0.34f : 0.32f, 0.85f);
-			const float targetHp = (std::max)(followerStyle ? 32.0f : 45.0f, hpMax * safePct);
-			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
-			if (hpNow < targetHp) {
-				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, targetHp - hpNow);
-			}
-			const float staminaMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kStamina));
-			const float staminaTarget = (std::max)(20.0f, staminaMax * (followerStyle ? 0.28f : 0.35f));
-			const float staminaNow = actor->GetActorValue(RE::ActorValue::kStamina);
-			if (staminaNow < staminaTarget) {
-				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kStamina, staminaTarget - staminaNow);
-			}
-			if (actor->IsInCombat()) {
-				actor->StopCombat();
-			}
-			actor->DrawWeaponMagicHands(false);
+			TFD::LeftForDead::State state{};
+			state.branch = g_fallback.branch;
+			state.follower = g_fallback.follower;
+			state.destination = g_fallback.destination;
+			state.fallbackPos = g_fallback.fallbackPos;
+			state.hasFallbackPos = g_fallback.hasFallbackPos;
+			state.angleZ = g_fallback.angleZ;
+			return state;
 		}
 
-		static void MoveFollowerNearPlayerForLeftForDead(const RuntimeHandlers& handlers, RE::Actor* follower)
+		static TFD::LeftForDead::Handlers BuildLeftForDeadHandlers(const RuntimeHandlers& handlers)
 		{
-			auto* player = ResolvePlayer(handlers);
-			if (!player || !follower) {
-				return;
-			}
-			const bool interior = player->GetParentCell() ? player->GetParentCell()->IsInteriorCell() : false;
-			const float offset = interior ? 128.0f : 220.0f;
-			const float yaw = player->GetAngleZ();
-			RE::NiPoint3 pos = player->GetPosition();
-			pos.x += std::cos(yaw) * offset;
-			pos.y -= std::sin(yaw) * offset;
-			if (!follower->IsDead()) {
-				follower->MoveTo(player);
-			}
-			follower->SetPosition(pos, true);
-			ApplyFallbackFacing(follower, yaw);
-			if (!follower->IsDead()) {
-				ApplyLeftForDeadWakeState(follower, true);
-				SetFollowerHold(follower);
-			}
+			auto handlersCopy = handlers;
+			return {
+				.applyFacing = [](RE::Actor* actor, float angleZ) { ApplyFallbackFacing(actor, angleZ); },
+				.setFollowerHold = [](RE::Actor* actor) { SetFollowerHold(actor); },
+				.maintainCalmWindow = [handlersCopy]() { MaintainCalmWindow(handlersCopy); },
+				.beginCooldown = [](int seconds) { BeginLeftForDeadCooldown(seconds); },
+				.setAggroKickNeeded = [](bool value) { g_leftForDeadNeedsAggroKick = value; }
+			};
 		}
 
 		static void ExecuteLeftForDeadWake(const char* reason, const RuntimeHandlers& handlers)
 		{
-			auto* player = ResolvePlayer(handlers);
-			if (!player) {
-				return;
-			}
-			if (g_fallback.destination) {
-				auto refSp = g_fallback.destination.get();
-				if (auto* dest = refSp.get()) {
-					player->MoveTo(dest);
-				}
-			} else if (g_fallback.hasFallbackPos) {
-				player->SetPosition(g_fallback.fallbackPos, true);
-			}
-			ApplyFallbackFacing(player, g_fallback.angleZ);
-			ApplyLeftForDeadWakeState(player, false);
-			if (g_fallback.branch == FallbackBranch::LeftForDeadWithFollower && g_fallback.follower) {
-				auto followerSp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
-				if (auto* follower = followerSp.get()) {
-					MoveFollowerNearPlayerForLeftForDead(handlers, follower);
-				}
-			}
-			MaintainCalmWindow(handlers);
-			g_leftForDeadNeedsAggroKick = false;
-			BeginLeftForDeadCooldown(5);
-			if (handlers.setGraceSeconds) {
-				handlers.setGraceSeconds(5);
-			}
-			if (handlers.setRescueStateValue) {
-				handlers.setRescueStateValue(0);
-			}
-			if (handlers.refreshPostDefeatGlobals) {
-				handlers.refreshPostDefeatGlobals();
-			}
-			if (handlers.updatePreCombatState) {
-				handlers.updatePreCombatState();
-			}
-			spdlog::info("[TFD][Transition] left-for-dead complete branch={} reason={}", GetBranchName(g_fallback.branch), reason ? reason : "unknown");
+			TFD::LeftForDead::ExecuteWake(BuildLeftForDeadStateFromFallback(), reason, handlers, BuildLeftForDeadHandlers(handlers));
 		}
 
-		static RE::TESObjectREFR* ResolveBestRescueDestination(RE::BGSLocation* safeLoc)
-		{
-			if (!safeLoc) {
-				return nullptr;
-			}
-
-			TFD::Location::ApprovedBed bed{};
-			if (TFD::Location::GetBestApprovedBedForLocation(safeLoc, bed)) {
-				if (auto* ref = LookupRefByFormID(bed.bedRefId)) {
-					return ref;
-				}
-			}
-
-			TFD::Location::SafeCheckpoint cp{};
-			if (TFD::Location::GetLastSafeCheckpointForLocation(safeLoc, cp)) {
-				if (auto* ref = LookupRefByFormID(cp.insideEntranceRefId)) {
-					return ref;
-				}
-				if (auto* ref = LookupRefByFormID(cp.centerMarkerRefId)) {
-					return ref;
-				}
-				if (auto* ref = LookupRefByFormID(cp.entryDoorRefId)) {
-					return ref;
-				}
-			}
-
-			if (auto* ref = TFD::Location::ResolvePreferredRescueDestination(safeLoc, true)) {
-				return ref;
-			}
-
-			return nullptr;
-		}
 
 		static void AdvanceGameHoursSoft(float hours)
 		{
@@ -819,7 +736,7 @@ namespace TFD::Transition
 				spdlog::info(
 					"[TFD][Transition] post-recovery aggro kick actor={:08X} drawWeapon={} immediate={} reason={}"
 					, actor->GetFormID(), drawWeapon ? 1 : 0, kickedNow ? 1 : 0, reason ? reason : "unknown");
-			};
+				};
 
 			if (primary) {
 				queueOne(primary, true);
@@ -857,7 +774,8 @@ namespace TFD::Transition
 			if (g_allyHoldFollower) {
 				auto sp = RE::Actor::LookupByHandle(g_allyHoldFollower.native_handle());
 				followerToRestore = sp.get();
-			} else if (g_fallback.follower) {
+			}
+			else if (g_fallback.follower) {
 				auto sp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
 				followerToRestore = sp.get();
 			}
@@ -1180,7 +1098,8 @@ namespace TFD::Transition
 				actor->EvaluatePackage(true, true);
 				++applied;
 			}
-		} else {
+		}
+		else {
 			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
 			for (const auto& info : snapshot.actors) {
 				auto* actor = info.get();
@@ -1223,7 +1142,7 @@ namespace TFD::Transition
 			if (current < target) {
 				player->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, av, target - current);
 			}
-		};
+			};
 
 		const float threshPct = std::clamp(TFD::Settings::GetDefeatThresholdPct() / 100.0f, 0.05f, 0.95f);
 		const float safeHealthPct = std::clamp(threshPct + 0.12f, 0.58f, 1.00f);
@@ -1282,33 +1201,52 @@ namespace TFD::Transition
 		LockCurrentBleedCrowdSnapshot(handlers, preferredSpeaker);
 
 		const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
-		auto* savior = ResolveBestHumanoidSavior(handlers, followerRadius);
+		NoMarkerFallbackCandidates candidates{};
+		candidates.savior = ResolveBestHumanoidSavior(handlers, followerRadius);
 		auto followers = ResolveFollowerCandidates(handlers, followerRadius);
-		if (savior) {
-			if (auto* rescueDest = ResolveCachedRescueDestinationForFallback(handlers)) {
-				g_fallback.branch = FallbackBranch::RescueCached;
-				g_fallback.follower = savior->GetHandle();
-				g_fallback.destination = rescueDest->GetHandle();
-			} else {
-				g_fallback.branch = FallbackBranch::RecoveryFollower;
-				g_fallback.follower = savior->GetHandle();
-			}
-		} else if (followers.standing) {
-			g_fallback.branch = FallbackBranch::RecoveryFollower;
-			g_fallback.follower = followers.standing->GetHandle();
-		} else if (followers.downed) {
-			g_fallback.branch = FallbackBranch::LeftForDeadWithFollower;
-			g_fallback.follower = followers.downed->GetHandle();
-			ResolveLeftForDeadDestination(handlers, g_fallback);
-		} else if (auto* potion = ResolveRecoveryPotionCandidate()) {
-			g_fallback.branch = FallbackBranch::RecoveryPotion;
-			g_fallback.potionFormId = potion->GetFormID();
-		} else if (auto* rescueDest = ResolveCachedRescueDestinationForFallback(handlers)) {
+		candidates.standingFollower = followers.standing;
+		candidates.downedFollower = followers.downed;
+		candidates.cachedRescueDestination = ResolveCachedRescueDestinationForFallback(handlers);
+		candidates.recoveryPotion = ResolveRecoveryPotionCandidate();
+
+		const TFD::FlowController::NonCaptiveFallbackInput input{
+			.hasSavior = candidates.savior != nullptr,
+			.hasStandingFollower = candidates.standingFollower != nullptr,
+			.hasDownedFollower = candidates.downedFollower != nullptr,
+			.hasRecoveryPotion = candidates.recoveryPotion != nullptr,
+			.hasCachedRescueDestination = candidates.cachedRescueDestination != nullptr
+		};
+		const auto resolution = TFD::FlowController::EvaluateNonCaptiveFallback(input);
+
+		switch (resolution) {
+		case TFD::FlowController::NonCaptiveFallbackResolution::RescueCached:
 			g_fallback.branch = FallbackBranch::RescueCached;
-			g_fallback.destination = rescueDest->GetHandle();
-		} else {
+			g_fallback.follower = candidates.savior ? candidates.savior->GetHandle() : RE::ActorHandle{};
+			g_fallback.destination = candidates.cachedRescueDestination ? candidates.cachedRescueDestination->GetHandle() : RE::ObjectRefHandle{};
+			break;
+		case TFD::FlowController::NonCaptiveFallbackResolution::RecoveryFollower: {
+			g_fallback.branch = FallbackBranch::RecoveryFollower;
+			RE::Actor* follower = candidates.savior ? candidates.savior : candidates.standingFollower;
+			g_fallback.follower = follower ? follower->GetHandle() : RE::ActorHandle{};
+			break;
+		}
+		case TFD::FlowController::NonCaptiveFallbackResolution::RecoveryPotion:
+			g_fallback.branch = FallbackBranch::RecoveryPotion;
+			g_fallback.potionFormId = candidates.recoveryPotion ? candidates.recoveryPotion->GetFormID() : 0u;
+			break;
+		case TFD::FlowController::NonCaptiveFallbackResolution::LeftForDeadWithFollower:
+			g_fallback.branch = FallbackBranch::LeftForDeadWithFollower;
+			g_fallback.follower = candidates.downedFollower ? candidates.downedFollower->GetHandle() : RE::ActorHandle{};
+			ResolveLeftForDeadDestination(handlers, g_fallback);
+			break;
+		case TFD::FlowController::NonCaptiveFallbackResolution::LeftForDeadSolo:
 			g_fallback.branch = FallbackBranch::LeftForDeadSolo;
 			ResolveLeftForDeadDestination(handlers, g_fallback);
+			break;
+		case TFD::FlowController::NonCaptiveFallbackResolution::None:
+		default:
+			g_fallback.branch = FallbackBranch::None;
+			break;
 		}
 
 		RE::FormID followerId = 0;
@@ -1325,15 +1263,22 @@ namespace TFD::Transition
 				destId = dest->GetFormID();
 			}
 		}
-		spdlog::info("[TFD][Transition] no-marker fallback resolved branch={} follower={:08X} potion={:08X} dest={:08X} crowdLocked={}",
+		spdlog::info("[TFD][Transition] no-marker fallback resolved branch={} policy={} follower={:08X} potion={:08X} dest={:08X} crowdLocked={} savior={} standingFollower={} downedFollower={} rescueDest={} recoveryPotion={}",
 			GetBranchName(g_fallback.branch),
+			TFD::FlowController::ToString(resolution),
 			followerId,
 			g_fallback.potionFormId,
 			destId,
-			g_lockedFallbackCrowdIds.size());
+			g_lockedFallbackCrowdIds.size(),
+			candidates.savior ? 1 : 0,
+			candidates.standingFollower ? 1 : 0,
+			candidates.downedFollower ? 1 : 0,
+			candidates.cachedRescueDestination ? 1 : 0,
+			candidates.recoveryPotion ? 1 : 0);
 
 		return g_fallback.branch;
 	}
+
 
 	void ArmObservedLeftForDeadFallback(RE::Actor* follower, const RuntimeHandlers& handlers)
 	{
@@ -1436,6 +1381,92 @@ namespace TFD::Transition
 		return true;
 	}
 
+	void FinalizePostDefeatRecoveryWindow(const RuntimeHandlers& handlers, int graceSeconds, int rescueStateValue)
+	{
+		MaintainCalmWindow(handlers);
+		g_leftForDeadNeedsAggroKick = false;
+		BeginLeftForDeadCooldown(graceSeconds);
+		if (handlers.setGraceSeconds) {
+			handlers.setGraceSeconds(graceSeconds);
+		}
+		if (handlers.setRescueStateValue) {
+			handlers.setRescueStateValue(rescueStateValue);
+		}
+		if (handlers.refreshPostDefeatGlobals) {
+			handlers.refreshPostDefeatGlobals();
+		}
+		if (handlers.updatePreCombatState) {
+			handlers.updatePreCombatState();
+		}
+	}
+
+	static TFD::Rescue::State BuildRescueStateFromFallback()
+	{
+		TFD::Rescue::State state{};
+		state.branch = g_fallback.branch;
+		state.follower = g_fallback.follower;
+		state.destination = g_fallback.destination;
+		return state;
+	}
+
+	static TFD::Rescue::Handlers BuildRescueHandlers(const RuntimeHandlers& handlers)
+	{
+		auto handlersCopy = handlers;
+		return {
+			.getPlayer = [handlersCopy]() { return ResolvePlayer(handlersCopy); },
+			.recoverPlayerForTransition = [handlersCopy]() { RecoverPlayerForTransition(handlersCopy); },
+			.finalizePostDefeatRecoveryWindow = [handlersCopy](int graceSeconds, int rescueStateValue) {
+				FinalizePostDefeatRecoveryWindow(handlersCopy, graceSeconds, rescueStateValue);
+			},
+			.assignPlayerSavior = [](RE::Actor* follower) {
+				if (!follower) {
+					return;
+				}
+				SendPlayerSaviorAssign(follower);
+				follower->EvaluatePackage(false, true);
+				follower->EvaluatePackage(true, true);
+			}
+		};
+	}
+
+	static TFD::Recovery::State BuildRecoveryStateFromFallback()
+	{
+		TFD::Recovery::State state{};
+		state.branch = g_fallback.branch;
+		state.follower = g_fallback.follower;
+		state.potionFormId = g_fallback.potionFormId;
+		return state;
+	}
+
+	static TFD::Recovery::Handlers BuildRecoveryHandlers(const RuntimeHandlers& handlers)
+	{
+		auto handlersCopy = handlers;
+		return {
+			.clearPlayerSavior = [](RE::TESForm* sender, const char* why) { ClearPlayerSavior(sender, why); },
+			.recoverPlayerForTransition = [handlersCopy]() { RecoverPlayerForTransition(handlersCopy); },
+			.setFollowerHold = [](RE::Actor* follower) { SetFollowerHold(follower); },
+			.finalizePostDefeatRecoveryWindow = [handlersCopy](int graceSeconds, int rescueStateValue) {
+				FinalizePostDefeatRecoveryWindow(handlersCopy, graceSeconds, rescueStateValue);
+			}
+		};
+	}
+
+	void ExecuteResolvedRecoverBranch(const char* reason, const RuntimeHandlers& handlers)
+	{
+		TFD::Recovery::ExecuteResolvedBranch(
+			BuildRecoveryStateFromFallback(),
+			reason,
+			BuildRecoveryHandlers(handlers),
+			[&](const char* why) {
+				auto followerSp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
+				auto* follower = followerSp.get();
+				g_fallback.branch = follower ? FallbackBranch::LeftForDeadWithFollower : FallbackBranch::LeftForDeadSolo;
+				ResolveLeftForDeadDestination(handlers, g_fallback);
+				ExecuteLeftForDeadWake(why ? why : "recovery_follower_degraded_lfd", handlers);
+			},
+			[](FallbackBranch branch) { return GetBranchName(branch); });
+	}
+
 	bool BeginRescueTransition(const char* reason, const RuntimeHandlers& handlers)
 	{
 		if (handlers.setRescueStateValue) {
@@ -1445,77 +1476,11 @@ namespace TFD::Transition
 			Kind::Rescue,
 			reason,
 			[&](const char* why) {
-				auto* player = ResolvePlayer(handlers);
-				if (!player) {
-					return false;
-				}
-
-				RE::BGSLocation* safeLoc = nullptr;
-				RE::TESObjectREFR* dest = nullptr;
-
-				if (g_fallback.branch == FallbackBranch::RescueCached && g_fallback.destination) {
-					auto destSp = g_fallback.destination.get();
-					dest = destSp.get();
-					safeLoc = TFD::Location::GetLocationFromRef(dest);
-				}
-
-				if (!dest) {
-					safeLoc = TFD::Location::ResolveRescueTargetLocationFromRef(player);
-					dest = safeLoc ? ResolveBestRescueDestination(safeLoc) : nullptr;
-
-					if ((!safeLoc || !dest)) {
-						auto* fallbackLoc = TFD::Location::GetMostRecentCachedSafeLocation();
-						if (fallbackLoc) {
-							auto* fallbackDest = ResolveBestRescueDestination(fallbackLoc);
-							if (fallbackDest) {
-								spdlog::info("[TFD][Transition] rescue fallback to recent cache reason={} currentLoc={:08X} fallbackLoc={:08X}",
-									why ? why : "unknown",
-									safeLoc ? safeLoc->GetFormID() : 0,
-									fallbackLoc->GetFormID());
-								safeLoc = fallbackLoc;
-								dest = fallbackDest;
-							}
-						}
-					}
-				}
-
-				if (!dest) {
-					spdlog::info("[TFD][Transition] rescue unavailable reason={} cause=no_destination", why ? why : "unknown");
-					return false;
-				}
-
-				player->MoveTo(dest);
-				std::this_thread::sleep_for(std::chrono::milliseconds(120));
-				RecoverPlayerForTransition(handlers);
-				MaintainCalmWindow(handlers);
-				g_leftForDeadNeedsAggroKick = false;
-				const int grace = (g_fallback.branch == FallbackBranch::RescueCached) ? 1 : 4;
-				BeginLeftForDeadCooldown(grace);
-				if (handlers.setGraceSeconds) {
-					handlers.setGraceSeconds(grace);
-				}
-				if (handlers.setRescueStateValue) {
-					handlers.setRescueStateValue(1);
-				}
-				if (handlers.refreshPostDefeatGlobals) {
-					handlers.refreshPostDefeatGlobals();
-				}
-				if (handlers.updatePreCombatState) {
-					handlers.updatePreCombatState();
-				}
-				if (g_fallback.follower) {
-					auto followerSp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
-					if (auto* follower = followerSp.get()) {
-						SendPlayerSaviorAssign(follower);
-						follower->EvaluatePackage(false, true);
-						follower->EvaluatePackage(true, true);
-						spdlog::info("[TFD][Transition] rescue savior assigned {:08X}", follower->GetFormID());
-					}
-				}
-
-				spdlog::info("[TFD][Transition] rescue complete reason={} safeLoc={:08X} dest={:08X} branch={}",
-					why ? why : "unknown", safeLoc ? safeLoc->GetFormID() : 0u, dest->GetFormID(), GetBranchName(g_fallback.branch));
-				return true;
+				return TFD::Rescue::ExecuteResolvedBranch(
+					BuildRescueStateFromFallback(),
+					why,
+					BuildRescueHandlers(handlers),
+					[](FallbackBranch branch) { return GetBranchName(branch); });
 			});
 	}
 
@@ -1528,192 +1493,91 @@ namespace TFD::Transition
 			Kind::Recover,
 			reason,
 			[&](const char* why) {
-				ClearPlayerSavior(nullptr, "recover_transition");
-				if (g_fallback.branch == FallbackBranch::RecoveryFollower) {
-					auto followerSp = RE::Actor::LookupByHandle(g_fallback.follower.native_handle());
-					auto* follower = followerSp.get();
-					if (!follower || follower->IsDead() || (follower->AsActorState() && follower->AsActorState()->IsBleedingOut())) {
-						g_fallback.branch = follower ? FallbackBranch::LeftForDeadWithFollower : FallbackBranch::LeftForDeadSolo;
-						ResolveLeftForDeadDestination(handlers, g_fallback);
-						ExecuteLeftForDeadWake(why ? why : "recovery_follower_degraded_lfd", handlers);
-						return;
-					}
-					RecoverPlayerForTransition(handlers);
-					SetFollowerHold(follower);
-					MaintainCalmWindow(handlers);
-					g_leftForDeadNeedsAggroKick = false;
-					BeginLeftForDeadCooldown(3);
-					if (handlers.setGraceSeconds) {
-						handlers.setGraceSeconds(3);
-					}
-					if (handlers.setRescueStateValue) {
-						handlers.setRescueStateValue(0);
-					}
-					if (handlers.refreshPostDefeatGlobals) {
-						handlers.refreshPostDefeatGlobals();
-					}
-					if (handlers.updatePreCombatState) {
-						handlers.updatePreCombatState();
-					}
-					spdlog::info("[TFD][Transition] recover complete branch={} reason={} follower={:08X}",
-						GetBranchName(g_fallback.branch), why ? why : "unknown", follower->GetFormID());
-					return;
-				}
-
-				if (g_fallback.branch == FallbackBranch::RecoveryPotion) {
-					RecoverPlayerForTransition(handlers);
-					MaintainCalmWindow(handlers);
-					g_leftForDeadNeedsAggroKick = false;
-					BeginLeftForDeadCooldown(3);
-					if (handlers.setGraceSeconds) {
-						handlers.setGraceSeconds(3);
-					}
-					if (handlers.setRescueStateValue) {
-						handlers.setRescueStateValue(0);
-					}
-					if (handlers.refreshPostDefeatGlobals) {
-						handlers.refreshPostDefeatGlobals();
-					}
-					if (handlers.updatePreCombatState) {
-						handlers.updatePreCombatState();
-					}
-					spdlog::info("[TFD][Transition] recover complete branch={} reason={} potion={:08X}",
-						GetBranchName(g_fallback.branch), why ? why : "unknown", g_fallback.potionFormId);
-					return;
-				}
-
-				if (g_fallback.branch == FallbackBranch::LeftForDeadSolo || g_fallback.branch == FallbackBranch::LeftForDeadWithFollower) {
-					ExecuteLeftForDeadWake(why, handlers);
-					return;
-				}
-
-				RecoverPlayerForTransition(handlers);
-				MaintainCalmWindow(handlers);
-				g_leftForDeadNeedsAggroKick = false;
-				BeginLeftForDeadCooldown(3);
-				if (handlers.setGraceSeconds) {
-					handlers.setGraceSeconds(3);
-				}
-				if (handlers.setRescueStateValue) {
-					handlers.setRescueStateValue(0);
-				}
-				if (handlers.refreshPostDefeatGlobals) {
-					handlers.refreshPostDefeatGlobals();
-				}
-				if (handlers.updatePreCombatState) {
-					handlers.updatePreCombatState();
-				}
-				spdlog::info("[TFD][Transition] recover complete branch={} reason={}", GetBranchName(g_fallback.branch), why ? why : "unknown");
+				ExecuteResolvedRecoverBranch(why, handlers);
 			});
 	}
 }
-
 // Consolidated from former TFDDefeatTransitionGlue staging module
 namespace TFD::Transition::DefeatGlue
 {
-    namespace
-    {
-        TFD::Bleedout::Builders::NonCaptiveChoiceProvider g_nonCaptiveChoice{};
-        TFD::Bleedout::Builders::BlackoutProvider g_blackout{};
-        TFD::Bleedout::Builders::TransitionRuntimeProvider g_transitionRuntime{};
-        TFD::Bleedout::Builders::TransitionCaptiveProvider g_transitionCaptive{};
-        RuntimeProviders g_runtime{};
-    }
+	namespace
+	{
+		TFD::Bleedout::Builders::NonCaptiveChoiceProvider g_nonCaptiveChoice{};
+		TFD::Bleedout::Builders::BlackoutProvider g_blackout{};
+		TFD::Bleedout::Builders::TransitionRuntimeProvider g_transitionRuntime{};
+		TFD::Bleedout::Builders::TransitionCaptiveProvider g_transitionCaptive{};
+		RuntimeProviders g_runtime{};
+	}
 
-    void InstallProviders(
-        TFD::Bleedout::Builders::NonCaptiveChoiceProvider nonCaptiveChoice,
-        TFD::Bleedout::Builders::BlackoutProvider blackout,
-        TFD::Bleedout::Builders::TransitionRuntimeProvider transitionRuntime,
-        TFD::Bleedout::Builders::TransitionCaptiveProvider transitionCaptive,
-        RuntimeProviders runtime)
-    {
-        g_nonCaptiveChoice = std::move(nonCaptiveChoice);
-        g_blackout = std::move(blackout);
-        g_transitionRuntime = std::move(transitionRuntime);
-        g_transitionCaptive = std::move(transitionCaptive);
-        g_runtime = std::move(runtime);
+	void InstallProviders(
+		TFD::Bleedout::Builders::NonCaptiveChoiceProvider nonCaptiveChoice,
+		TFD::Bleedout::Builders::BlackoutProvider blackout,
+		TFD::Bleedout::Builders::TransitionRuntimeProvider transitionRuntime,
+		TFD::Bleedout::Builders::TransitionCaptiveProvider transitionCaptive,
+		RuntimeProviders runtime)
+	{
+		g_nonCaptiveChoice = std::move(nonCaptiveChoice);
+		g_blackout = std::move(blackout);
+		g_transitionRuntime = std::move(transitionRuntime);
+		g_transitionCaptive = std::move(transitionCaptive);
+		g_runtime = std::move(runtime);
 
-        auto nonCaptiveForward = g_nonCaptiveChoice;
-        nonCaptiveForward.beginResolvedNoMarkerFallback = [](const char* reason) {
-            return BeginResolvedNoMarkerFallback(reason);
-        };
-        TFD::Bleedout::Builders::InstallNonCaptiveChoiceProvider(std::move(nonCaptiveForward));
-        TFD::Bleedout::Builders::InstallBlackoutProvider(g_blackout);
-        TFD::Bleedout::Builders::InstallTransitionRuntimeProvider(g_transitionRuntime);
-        TFD::Bleedout::Builders::InstallTransitionCaptiveProvider(g_transitionCaptive);
-    }
+		auto nonCaptiveForward = g_nonCaptiveChoice;
+		nonCaptiveForward.beginResolvedNoMarkerFallback = [](const char* reason) {
+			return BeginResolvedNoMarkerFallback(reason);
+			};
+		TFD::Bleedout::Builders::InstallNonCaptiveChoiceProvider(std::move(nonCaptiveForward));
+		TFD::Bleedout::Builders::InstallBlackoutProvider(g_blackout);
+		TFD::Bleedout::Builders::InstallTransitionRuntimeProvider(g_transitionRuntime);
+		TFD::Bleedout::Builders::InstallTransitionCaptiveProvider(g_transitionCaptive);
+	}
 
-    void Reset()
-    {
-        g_nonCaptiveChoice = {};
-        g_blackout = {};
-        g_transitionRuntime = {};
-        g_transitionCaptive = {};
-        g_runtime = {};
-    }
+	void Reset()
+	{
+		g_nonCaptiveChoice = {};
+		g_blackout = {};
+		g_transitionRuntime = {};
+		g_transitionCaptive = {};
+		g_runtime = {};
+	}
 
-    TFD::Transition::RuntimeHandlers BuildTransitionRuntimeHandlers()
-    {
-        return TFD::Bleedout::Builders::BuildTransitionRuntimeHandlers();
-    }
+	TFD::Transition::RuntimeHandlers BuildTransitionRuntimeHandlers()
+	{
+		return TFD::Bleedout::Builders::BuildTransitionRuntimeHandlers();
+	}
 
-    TFD::Transition::CaptiveHandlers BuildTransitionCaptiveHandlers()
-    {
-        return TFD::Bleedout::Builders::BuildTransitionCaptiveHandlers();
-    }
+	TFD::Transition::CaptiveHandlers BuildTransitionCaptiveHandlers()
+	{
+		return TFD::Bleedout::Builders::BuildTransitionCaptiveHandlers();
+	}
 
-    bool BeginResolvedNoMarkerFallback(const char* reason)
-    {
-        if (!g_runtime.tryBeginTerminalCommit ||
-            !g_runtime.clearCaptiveOrchestrationResidue ||
-            !g_runtime.getPlayer ||
-            !g_runtime.clearBridgeAliases ||
-            !g_runtime.setPlayerBleedImmune ||
-            !g_runtime.resetBleedRuntimeState ||
-            !g_runtime.clearLastAggressor ||
-            !g_runtime.updatePreCombatState) {
-            return false;
-        }
-
-        const auto why = reason ? reason : "noncaptive_fallback";
-        if (!g_runtime.tryBeginTerminalCommit(TFD::Bleedout::TerminalCommit::NonCaptiveFallback, why)) {
-            return false;
-        }
-
-        g_runtime.clearCaptiveOrchestrationResidue();
-
-        auto* player = g_runtime.getPlayer();
-        if (player && player->IsWeaponDrawn()) {
-            player->DrawWeaponMagicHands(false);
-        }
-
-        const auto branch = TFD::Transition::ResolveNoMarkerFallback(reason, BuildTransitionRuntimeHandlers());
-        if (branch == TFD::Transition::FallbackBranch::None) {
-            return false;
-        }
-
-        g_runtime.clearBridgeAliases(why);
-        g_runtime.setPlayerBleedImmune(false);
-        g_runtime.resetBleedRuntimeState();
-        if (player && !player->IsDead() && !player->IsDisabled()) {
-            player->NotifyAnimationGraph("BleedoutStart");
-        }
-        g_runtime.clearLastAggressor();
-        g_runtime.updatePreCombatState();
-
-        spdlog::info("[TFD][Transition] committed no-marker fallback branch={} reason={}",
-            TFD::Transition::GetBranchName(branch), why);
-
-        if (branch == TFD::Transition::FallbackBranch::RescueCached) {
-            if (!TFD::Transition::BeginRescueTransition(reason ? reason : "rescue_cached", BuildTransitionRuntimeHandlers())) {
-                TFD::Transition::ForceLeftForDeadSolo(BuildTransitionRuntimeHandlers());
-                TFD::Transition::BeginRecoverTransition("rescue_cached_fallback_left_for_dead", BuildTransitionRuntimeHandlers());
-            }
-            return true;
-        }
-
-        TFD::Transition::BeginRecoverTransition(reason ? reason : TFD::Transition::GetBranchName(branch), BuildTransitionRuntimeHandlers());
-        return true;
-    }
+	bool BeginResolvedNoMarkerFallback(const char* reason)
+	{
+		return TFD::FlowController::ExecuteResolvedNoMarkerFallback(reason, {
+			.tryBeginTerminalCommit = g_runtime.tryBeginTerminalCommit,
+			.clearCaptiveOrchestrationResidue = g_runtime.clearCaptiveOrchestrationResidue,
+			.getPlayer = g_runtime.getPlayer,
+			.clearBridgeAliases = g_runtime.clearBridgeAliases,
+			.setPlayerBleedImmune = g_runtime.setPlayerBleedImmune,
+			.resetBleedRuntimeState = g_runtime.resetBleedRuntimeState,
+			.clearLastAggressor = g_runtime.clearLastAggressor,
+			.updatePreCombatState = g_runtime.updatePreCombatState,
+			.resolveNoMarkerFallback = [](const char* why) {
+				return TFD::Transition::ResolveNoMarkerFallback(why, BuildTransitionRuntimeHandlers());
+			},
+			.getBranchName = [](TFD::Transition::FallbackBranch branch) {
+				return TFD::Transition::GetBranchName(branch);
+			},
+			.beginRescueTransition = [](const char* why) {
+				return TFD::Transition::BeginRescueTransition(why, BuildTransitionRuntimeHandlers());
+			},
+			.forceLeftForDeadSolo = []() {
+				TFD::Transition::ForceLeftForDeadSolo(BuildTransitionRuntimeHandlers());
+			},
+			.beginRecoverTransition = [](const char* why) {
+				TFD::Transition::BeginRecoverTransition(why, BuildTransitionRuntimeHandlers());
+			}
+			});
+	}
 }
 

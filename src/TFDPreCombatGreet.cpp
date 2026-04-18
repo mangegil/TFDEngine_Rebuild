@@ -1,4 +1,4 @@
-#include "TFDActor.h"
+﻿#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -44,8 +44,10 @@ namespace TFD::PreCombatGreet
         constexpr double kRecentActorSoftAgeSec = 12.0;
         constexpr double kStickyReopenRetrySec = 0.90;
         constexpr double kStickyTerminalSuppressSec = 0.75;
-        constexpr double kDialogueCloseResolveDelaySec = 0.60;
+        constexpr double kDialogueCloseResolveDelaySec = 1.20;
         constexpr double kNegotiationRefreshSec = 0.15;
+        constexpr double kPreCombatOutcomeGraceSec = 1.25;
+        constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -78,6 +80,8 @@ namespace TFD::PreCombatGreet
             bool dialogueClosePending{ false };
             double dialogueCloseResolveAtSec{ 0.0 };
             double nextNegotiationRefreshSec{ 0.0 };
+            double postCloseOutcomeGraceUntilSec{ 0.0 };
+            double nextPostCloseOutcomeLogSec{ 0.0 };
         };
 
         std::atomic_bool gInstalled{ false };
@@ -143,7 +147,7 @@ namespace TFD::PreCombatGreet
 
         bool IsPlayerDown()
         {
-            auto* player = RE::PlayerCharacter::GetSingleton();
+            RE::PlayerCharacter* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
                 return false;
             }
@@ -337,6 +341,57 @@ namespace TFD::PreCombatGreet
             pending.dialogueCloseResolveAtSec = 0.0;
         }
 
+        bool ShouldHoldForOutcomeAfterDialogueCloseLocked(RE::Actor* actor, Pending& pending, double nowSec)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            if (pending.action != TFD::InteractionRouter::Action::TrucePreCombat) {
+                return false;
+            }
+
+            if (pending.terminalChoiceCommitted || pending.payFollowupPending || pending.pleasureChoiceCommitted) {
+                return false;
+            }
+
+            if (nowSec >= pending.postCloseOutcomeGraceUntilSec) {
+                return false;
+            }
+
+            const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+            const auto actorFormID = actor->GetFormID();
+            const bool sameActor = snapshot.primaryActorFormID == 0 || snapshot.primaryActorFormID == actorFormID;
+            const bool flowStillPreCombat = snapshot.root == TFD::FlowController::RootFlow::PreCombat;
+            const bool flowPayFollowup = snapshot.sub == TFD::FlowController::SubFlow::PreCombatPayFollowup;
+            const bool extortionActive = TFD::Extortion::HasActive();
+
+            if (!sameActor) {
+                return false;
+            }
+
+            if (!flowStillPreCombat && !flowPayFollowup && !extortionActive) {
+                return false;
+            }
+
+            if (nowSec >= pending.nextPostCloseOutcomeLogSec) {
+                pending.nextPostCloseOutcomeLogSec = nowSec + 0.50;
+                spdlog::info(
+                    "[TFD][PreCombatGreet] hold close abort actor={:08X} action={} root={} sub={} extortion={} graceUntil={:.2f} now={:.2f}",
+                    actorFormID,
+                    TFD::InteractionRouter::ToString(pending.action),
+                    TFD::FlowController::Controller::ToString(snapshot.root),
+                    TFD::FlowController::Controller::ToString(snapshot.sub),
+                    extortionActive ? 1 : 0,
+                    pending.postCloseOutcomeGraceUntilSec,
+                    nowSec);
+            }
+
+            pending.dialogueClosePending = true;
+            pending.dialogueCloseResolveAtSec = std::min(pending.postCloseOutcomeGraceUntilSec, nowSec + kPreCombatOutcomeRetryDelaySec);
+            return true;
+        }
+
         void ArmDialogueClosePendingLocked(RE::Actor* actor, Pending& pending, double nowSec, const char* reason)
         {
             if (pending.dialogueClosePending) {
@@ -345,13 +400,23 @@ namespace TFD::PreCombatGreet
 
             pending.dialogueClosePending = true;
             pending.dialogueCloseResolveAtSec = nowSec + kDialogueCloseResolveDelaySec;
+            pending.nextNegotiationRefreshSec = nowSec;
+            if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat &&
+                !pending.terminalChoiceCommitted &&
+                !pending.payFollowupPending &&
+                !pending.pleasureChoiceCommitted &&
+                pending.postCloseOutcomeGraceUntilSec < nowSec) {
+                pending.postCloseOutcomeGraceUntilSec = nowSec + kPreCombatOutcomeGraceSec;
+                pending.nextPostCloseOutcomeLogSec = nowSec;
+            }
 
             spdlog::info(
-                "[TFD][PreCombatGreet] dialogue close armed actor={:08X} action={} resolveIn={:.2f}s reason={}",
+                "[TFD][PreCombatGreet] dialogue close armed actor={:08X} action={} resolveIn={:.2f}s reason={} graceUntil={:.2f}",
                 actor ? actor->GetFormID() : 0u,
                 TFD::InteractionRouter::ToString(pending.action),
                 kDialogueCloseResolveDelaySec,
-                reason ? reason : "unknown");
+                reason ? reason : "unknown",
+                pending.postCloseOutcomeGraceUntilSec);
         }
 
         void EnforceNegotiationState(RE::Actor* actor, Pending& pending, double nowSec)
@@ -494,7 +559,7 @@ namespace TFD::PreCombatGreet
             }
 
             try {
-                const auto actorId = static_cast<RE::FormID>(std::stoul(rawArg, nullptr, 10));
+                const auto actorId = static_cast<RE::FormID>(std::stoul(rawArg, nullptr, 0));
                 return RE::TESForm::LookupByID<RE::Actor>(actorId);
             }
             catch (...) {
@@ -537,6 +602,8 @@ namespace TFD::PreCombatGreet
             pending.stickySuppressTerminalUntilSec = 0.0;
             pending.nextStickyRetrySec = 0.0;
             pending.nextPreserveHandoffLogSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.nextPostCloseOutcomeLogSec = 0.0;
             ClearDialogueClosePendingLocked(pending);
             spdlog::info(
                 "[TFD][PreCombatGreet] terminal choice committed action={} reason={}",
@@ -553,6 +620,8 @@ namespace TFD::PreCombatGreet
             pending.stickySuppressTerminalUntilSec = 0.0;
             pending.nextStickyRetrySec = 0.0;
             pending.nextPreserveHandoffLogSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.nextPostCloseOutcomeLogSec = 0.0;
             ClearDialogueClosePendingLocked(pending);
             if (actor) {
                 CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pleasure");
@@ -608,7 +677,9 @@ namespace TFD::PreCombatGreet
                 return;
             }
 
-            if (outcome == TFD::FlowController::PreCombatOutcome::Pay ||
+            if (outcome == TFD::FlowController::PreCombatOutcome::RecruitEnemy ||
+                outcome == TFD::FlowController::PreCombatOutcome::Release ||
+                outcome == TFD::FlowController::PreCombatOutcome::Follow ||
                 outcome == TFD::FlowController::PreCombatOutcome::Cancel ||
                 outcome == TFD::FlowController::PreCombatOutcome::Failed) {
                 flow.CompleteTerminalContext(reason ? reason : "unknown");
@@ -735,6 +806,8 @@ namespace TFD::PreCombatGreet
             pending.nextStickyRetrySec = now;
             pending.stickySuppressTerminalUntilSec = now + kStickyTerminalSuppressSec;
             pending.nextPreserveHandoffLogSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.nextPostCloseOutcomeLogSec = 0.0;
             ClearDialogueClosePendingLocked(pending);
             CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pay_followup");
             spdlog::info(
@@ -782,6 +855,9 @@ namespace TFD::PreCombatGreet
                 }
                 pending.assignSent = false;
             }
+
+            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.nextPostCloseOutcomeLogSec = 0.0;
 
             if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
                 TFD::InteractionRouter::ClearInteractionStateValue();
@@ -929,6 +1005,21 @@ namespace TFD::PreCombatGreet
                     name == kPreCombatOutcomePleasureEvent) {
                     std::scoped_lock lk(gLock);
                     RE::Actor* pendingActor = actor ? actor : ResolveSinglePendingActorLocked();
+                    if (!pendingActor) {
+                        pendingActor = GetRecentActor(kRecentActorSoftAgeSec);
+                    }
+                    const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] outcome event={} arg={} sender={:08X} actor={:08X} pendingActor={:08X} pendingCount={} root={} sub={} primary={:08X}",
+                        rawName ? rawName : "unknown",
+                        ev->strArg.c_str(),
+                        ev->sender ? ev->sender->GetFormID() : 0u,
+                        actor ? actor->GetFormID() : 0u,
+                        pendingActor ? pendingActor->GetFormID() : 0u,
+                        static_cast<unsigned>(gPending.size()),
+                        TFD::FlowController::Controller::ToString(snapshot.root),
+                        TFD::FlowController::Controller::ToString(snapshot.sub),
+                        snapshot.primaryActorFormID);
                     Pending* matchedPending = ResolveTerminalPendingLocked(pendingActor);
                     if (matchedPending && ShouldSuppressTerminalEventLocked(*matchedPending, pendingActor, rawName)) {
                         return RE::BSEventNotifyControl::kContinue;
@@ -980,7 +1071,7 @@ namespace TFD::PreCombatGreet
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_release");
+                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Release, actorFormID, "mod_event_precombat_release");
                         shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeFollowEvent) {
@@ -996,7 +1087,7 @@ namespace TFD::PreCombatGreet
                                 rawName ? rawName : "TFDPreCombatOutcomeFollow",
                                 followDurationSec);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_follow");
+                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Follow, actorFormID, "mod_event_precombat_follow");
                         shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomePleasureEvent) {
@@ -1009,7 +1100,7 @@ namespace TFD::PreCombatGreet
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Cancel, actorFormID, "mod_event_precombat_recruit");
+                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit");
                         shouldClearInteractionState = true;
                     }
 
@@ -1173,6 +1264,11 @@ namespace TFD::PreCombatGreet
                         }
 
                         ClearDialogueClosePendingLocked(pending);
+
+                        if (ShouldHoldForOutcomeAfterDialogueCloseLocked(actor, pending, now)) {
+                            ++it;
+                            continue;
+                        }
 
                         if (TFD::PleasureRuntime::ShouldProtectPendingDialogue(actor)) {
                             CacheRecentActor(actor, 0.0, "pleasure_runtime_handoff");
@@ -1394,6 +1490,8 @@ namespace TFD::PreCombatGreet
         pending.dialogueClosePending = false;
         pending.dialogueCloseResolveAtSec = 0.0;
         pending.nextNegotiationRefreshSec = 0.0;
+        pending.postCloseOutcomeGraceUntilSec = 0.0;
+        pending.nextPostCloseOutcomeLogSec = 0.0;
 
         if (result.dialogueRequested) {
             if (!TFD::HostilityController::CanOpenDialogue(actor)) {
@@ -1513,12 +1611,12 @@ namespace TFD::PreCombatGreet
 
     RE::Actor* ResolveRecentAggressor(float radius, double maxAgeSec)
     {
-        auto* player = RE::PlayerCharacter::GetSingleton();
+        RE::PlayerCharacter* player = RE::PlayerCharacter::GetSingleton();
         if (!player) {
             return nullptr;
         }
 
-        auto* actor = GetRecentActor(maxAgeSec);
+        RE::Actor* actor = GetRecentActor(maxAgeSec);
         if (!actor || actor == player) {
             return nullptr;
         }
@@ -1529,13 +1627,15 @@ namespace TFD::PreCombatGreet
             return nullptr;
         }
 
-        auto* playerCell = player->GetParentCell();
-        auto* actorCell = actor->GetParentCell();
+        RE::TESObjectCELL* playerCell = player->GetParentCell();
+        RE::TESObjectCELL* actorCell = actor->GetParentCell();
         if (playerCell && actorCell != playerCell) {
             return nullptr;
         }
-        auto* playerWs = player->GetWorldspace();
-        if (playerWs && actor->GetWorldspace() != playerWs) {
+
+        RE::TESWorldSpace* playerWs = player->GetWorldspace();
+        RE::TESWorldSpace* actorWs = actor->GetWorldspace();
+        if (playerWs && actorWs != playerWs) {
             return nullptr;
         }
 
@@ -1549,19 +1649,15 @@ namespace TFD::PreCombatGreet
             return nullptr;
         }
 
-        if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
-            spdlog::info("[TFD][PreCombatGreet] using recent aggressor actor={:08X} dist={:.1f}", actor->GetFormID(), dist);
-            return actor;
+        if (!actor->IsHostileToActor(player) && !actor->IsInCombat()) {
+            return nullptr;
         }
 
-        auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
-        auto* currentTarget = targetSp.get();
-        if (currentTarget == player || (currentTarget && currentTarget->IsPlayerTeammate())) {
-            spdlog::info("[TFD][PreCombatGreet] using recent aggressor actor={:08X} dist={:.1f} reason=current_target", actor->GetFormID(), dist);
-            return actor;
-        }
-
-        return nullptr;
+        spdlog::info(
+            "[TFD][PreCombatGreet] using recent aggressor actor={:08X} dist={:.1f}",
+            static_cast<std::uint32_t>(actor->GetFormID()),
+            static_cast<double>(dist));
+        return actor;
     }
 
     RE::Actor* ResolveRecentAggressorAndCache(float radius, RE::ActorHandle& cacheHandle, double maxAgeSec)

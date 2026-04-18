@@ -9,6 +9,7 @@
 #include <array>
 
 #include "TFDHostilityController.h"
+#include "TFDFlowController.h"
 
 namespace RE
 {
@@ -187,6 +188,8 @@ namespace TFD::Bleedout
 		std::function<std::vector<RE::Actor*>()> collectStandingFollowersFromSnapshot;
 		std::function<std::vector<RE::Actor*>()> collectStandingEnemiesFromSnapshot;
 		std::function<bool()> hadValidObservedEnemy;
+		std::function<std::uint32_t()> resolveBleedFlowActorFormID;
+		std::function<bool(const TFD::FlowController::ObservedDefeatInput&, const char*)> applyObservedDefeatResolution;
 		std::function<void()> enterObservedBattleWin;
 		std::function<void(const char*)> enterObservedLeftForDead;
 		std::function<RE::Actor*(float, float, RE::Actor*)> findBestSpeaker;
@@ -739,6 +742,8 @@ namespace TFD::Bleedout::DefeatGlue
 		std::function<std::vector<RE::Actor*>()> collectStandingFollowersFromSnapshot;
 		std::function<std::vector<RE::Actor*>()> collectStandingEnemiesFromSnapshot;
 		std::function<bool()> hadValidObservedEnemy;
+		std::function<std::uint32_t()> resolveBleedFlowActorFormID;
+		std::function<bool(const TFD::FlowController::ObservedDefeatInput&, const char*)> applyObservedDefeatResolution;
 		std::function<void()> enterObservedBattleWin;
 		std::function<void(const char*)> enterObservedLeftForDead;
 		std::function<RE::Actor*(float, float, RE::Actor*)> findBestSpeaker;

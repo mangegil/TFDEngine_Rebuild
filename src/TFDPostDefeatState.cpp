@@ -1,0 +1,260 @@
+#include "TFDPostDefeatState.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
+#include <RE/Skyrim.h>
+#include <spdlog/spdlog.h>
+
+#include "TFDFlowController.h"
+#include "TFDLocation.h"
+#include "TFDSettings.h"
+#include "TFDTeammateManager.h"
+#include "TFDTransition.h"
+#include "TFDVictory.h"
+
+namespace TFD::PostDefeatState
+{
+    namespace
+    {
+        RE::TESGlobal* g_defeatStateGlobal = nullptr;
+        RE::TESGlobal* g_hostileStateGlobal = nullptr;
+        RE::TESGlobal* g_enemyFactionStateGlobal = nullptr;
+        RE::TESGlobal* g_enemyRaceStateGlobal = nullptr;
+        RE::TESGlobal* g_recoveryStateGlobal = nullptr;
+        RE::TESGlobal* g_leftForDeadStateGlobal = nullptr;
+        bool g_loggedDefeatStateGlobal = false;
+        bool g_loggedHostileStateGlobal = false;
+        bool g_loggedEnemyFactionStateGlobal = false;
+        bool g_loggedEnemyRaceStateGlobal = false;
+        bool g_loggedRecoveryStateGlobal = false;
+        bool g_loggedLeftForDeadStateGlobal = false;
+
+        void ResolveGlobals()
+        {
+            if (!g_defeatStateGlobal) {
+                g_defeatStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDefeatState");
+                if (g_defeatStateGlobal && !g_loggedDefeatStateGlobal) {
+                    g_loggedDefeatStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDDefeatState resolved {:08X}", g_defeatStateGlobal->GetFormID());
+                }
+            }
+            if (!g_hostileStateGlobal) {
+                g_hostileStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDHostileState");
+                if (g_hostileStateGlobal && !g_loggedHostileStateGlobal) {
+                    g_loggedHostileStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDHostileState resolved {:08X}", g_hostileStateGlobal->GetFormID());
+                }
+            }
+            if (!g_enemyFactionStateGlobal) {
+                g_enemyFactionStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyFactionState");
+                if (g_enemyFactionStateGlobal && !g_loggedEnemyFactionStateGlobal) {
+                    g_loggedEnemyFactionStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDEnemyFactionState resolved {:08X}", g_enemyFactionStateGlobal->GetFormID());
+                }
+            }
+            if (!g_enemyRaceStateGlobal) {
+                g_enemyRaceStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyRaceState");
+                if (g_enemyRaceStateGlobal && !g_loggedEnemyRaceStateGlobal) {
+                    g_loggedEnemyRaceStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDEnemyRaceState resolved {:08X}", g_enemyRaceStateGlobal->GetFormID());
+                }
+            }
+            if (!g_recoveryStateGlobal) {
+                g_recoveryStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRecoveryState");
+                if (g_recoveryStateGlobal && !g_loggedRecoveryStateGlobal) {
+                    g_loggedRecoveryStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDRecoveryState resolved {:08X}", g_recoveryStateGlobal->GetFormID());
+                }
+            }
+            if (!g_leftForDeadStateGlobal) {
+                g_leftForDeadStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDLeftForDeadState");
+                if (g_leftForDeadStateGlobal && !g_loggedLeftForDeadStateGlobal) {
+                    g_loggedLeftForDeadStateGlobal = true;
+                    spdlog::info("[TFD][PostDefeatState] TFDLeftForDeadState resolved {:08X}", g_leftForDeadStateGlobal->GetFormID());
+                }
+            }
+        }
+
+        void SetGlobalInt(RE::TESGlobal* global, int value)
+        {
+            if (global) {
+                global->value = static_cast<float>(value);
+            }
+        }
+
+        bool ComputePlayerBleedOutState(RE::Actor* player)
+        {
+            if (!player || player->IsDead() || player->IsDisabled()) {
+                return false;
+            }
+
+            const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
+            const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float pct = (hpNow / hpMax) * 100.0f;
+            const float thresh = TFD::Settings::GetDefeatThresholdPct();
+            return pct <= thresh;
+        }
+
+        int ComputeDefeatState(RE::Actor* player, bool combatContext)
+        {
+            if (!player || !combatContext) {
+                return 0;
+            }
+            return ComputePlayerBleedOutState(player) ? 2 : 1;
+        }
+
+        int ComputeHostileState(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+        {
+            if (!player || ComputePlayerBleedOutState(player)) {
+                return 0;
+            }
+
+            const int count = static_cast<int>(enemies.size());
+            if (count <= 0) {
+                return 0;
+            }
+            if (count == 1) {
+                return 1;
+            }
+            return 2;
+        }
+
+        bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+        {
+            if (!actor || !editorID || !*editorID) {
+                return false;
+            }
+            auto* form = RE::TESForm::LookupByEditorID(editorID);
+            auto* keyword = form ? form->As<RE::BGSKeyword>() : nullptr;
+            return keyword && actor->HasKeyword(keyword);
+        }
+
+        std::uint32_t ComputeEnemyRaceKey(RE::Actor* actor)
+        {
+            if (!actor) {
+                return 0;
+            }
+            if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC")) {
+                return 1;
+            }
+            if (auto* race = actor->GetRace()) {
+                return race->GetFormID();
+            }
+            return 0;
+        }
+
+        int ComputeEnemyRaceState(const std::vector<RE::Actor*>& enemies)
+        {
+            if (enemies.empty()) {
+                return 0;
+            }
+            if (enemies.size() == 1) {
+                return 1;
+            }
+            std::uint32_t firstKey = 0;
+            for (auto* enemy : enemies) {
+                const auto key = ComputeEnemyRaceKey(enemy);
+                if (key == 0) {
+                    continue;
+                }
+                if (firstKey == 0) {
+                    firstKey = key;
+                    continue;
+                }
+                if (key != firstKey) {
+                    return 2;
+                }
+            }
+            return 1;
+        }
+
+        int ComputeEnemyFactionState(const std::vector<RE::Actor*>& enemies)
+        {
+            if (enemies.empty()) {
+                return 0;
+            }
+            if (enemies.size() == 1) {
+                return 1;
+            }
+            for (std::size_t i = 0; i < enemies.size(); ++i) {
+                auto* lhs = enemies[i];
+                if (!lhs) {
+                    continue;
+                }
+                for (std::size_t j = i + 1; j < enemies.size(); ++j) {
+                    auto* rhs = enemies[j];
+                    if (!rhs) {
+                        continue;
+                    }
+                    if (lhs->IsHostileToActor(rhs) || rhs->IsHostileToActor(lhs)) {
+                        return 2;
+                    }
+                }
+            }
+            return 1;
+        }
+
+        int ComputeRecoveryState()
+        {
+            return TFD::Transition::HasRecoveryPotionAvailable() ? 1 : 0;
+        }
+
+        int ComputeLeftForDeadState(RE::Actor* player)
+        {
+            (void)player;
+            const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
+            auto followers = TFD::TeammateManager::ResolveFollowerCandidates(followerRadius);
+            const bool hasLivingFollower = (followers.standing != nullptr);
+            const bool hasRescueMarker = (TFD::Location::ResolveMostRecentCachedRescueDestination(true) != nullptr) ||
+                (TFD::Location::ResolveMostRecentCachedRescueDestination(false) != nullptr);
+            const bool hasRescueFactor = hasLivingFollower && hasRescueMarker;
+            const bool hasRecoveryFactor = TFD::Transition::HasRecoveryPotionAvailable();
+            return (hasRescueFactor || hasRecoveryFactor) ? 0 : 1;
+        }
+    }
+
+    RefreshResult Refresh(const RefreshInput& input)
+    {
+        ResolveGlobals();
+
+        RefreshResult result{};
+        result.routerCombatContextActive = input.routerCombatContext;
+
+        if (input.onlySuppressedDialogueEnemies) {
+            TFD::Victory::ResetObservedContext();
+            result.routerCombatContextActive = false;
+            spdlog::info(
+                "[TFD][PostDefeatState] cleared transient hostile globals because only suppressed dialogue-phase enemies remain count={}",
+                input.suppressedEnemyCount);
+        }
+
+        if (input.pleasurePassiveLock) {
+            result.routerCombatContextActive = false;
+            SetGlobalInt(g_defeatStateGlobal, 0);
+            TFD::Victory::ResetObservedContext();
+            TFD::Victory::SetStateValue(0);
+            SetGlobalInt(g_hostileStateGlobal, 0);
+            SetGlobalInt(g_enemyFactionStateGlobal, 0);
+            SetGlobalInt(g_enemyRaceStateGlobal, 0);
+            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+            SetGlobalInt(g_leftForDeadStateGlobal, 0);
+            return result;
+        }
+
+        SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
+        TFD::Victory::RefreshObservedState(TFD::Victory::ObservedContext{
+            .hasPlayer = (input.player != nullptr),
+            .playerDown = ComputePlayerBleedOutState(input.player),
+            .combatContext = input.victoryContext,
+            .hasEnemies = !input.enemies.empty()
+        });
+        SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies));
+        SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
+        SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));
+        SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+        SetGlobalInt(g_leftForDeadStateGlobal, ComputeLeftForDeadState(input.player));
+        return result;
+    }
+}

@@ -2539,7 +2539,23 @@ namespace TFD::Bleedout
 			}
 		}
 		if (state.bleedBattleObservePending) *state.bleedBattleObservePending = false;
-		if (handlers.hadValidObservedEnemy && handlers.hadValidObservedEnemy() && !followers.empty()) {
+		const bool hadValidObservedEnemy = handlers.hadValidObservedEnemy && handlers.hadValidObservedEnemy();
+		TFD::FlowController::ObservedDefeatInput input{};
+		input.conflictResolved = true;
+		input.hadValidObservedEnemy = hadValidObservedEnemy;
+		input.hasStandingPlayerSide = false;
+		input.hasStandingTeammate = !followers.empty();
+		input.hasStandingHostileCoalition = false;
+		if (handlers.resolveBleedFlowActorFormID) {
+			input.actorFormID = handlers.resolveBleedFlowActorFormID();
+		}
+		const char* resolutionReason = hadValidObservedEnemy && !followers.empty() ? "battle_observe_win" : "battle_observe_no_survivor";
+		if (handlers.applyObservedDefeatResolution) {
+			if (handlers.applyObservedDefeatResolution(input, resolutionReason)) {
+				return;
+			}
+		}
+		if (hadValidObservedEnemy && !followers.empty()) {
 			if (handlers.enterObservedBattleWin) handlers.enterObservedBattleWin();
 		}
 		else {
@@ -2554,22 +2570,70 @@ namespace TFD::Bleedout
 		if (state.minHp && *state.minHp > 0.0f && handlers.clampHealth) handlers.clampHealth(player, *state.minHp);
 		auto followers = handlers.collectStandingFollowersFromSnapshot ? handlers.collectStandingFollowersFromSnapshot() : std::vector<RE::Actor*>{};
 		auto enemies = handlers.collectStandingEnemiesFromSnapshot ? handlers.collectStandingEnemiesFromSnapshot() : std::vector<RE::Actor*>{};
-		if (followers.empty()) {
-			if (handlers.enterObservedLeftForDead) handlers.enterObservedLeftForDead("battle_observe_loss");
-			return;
-		}
-		if (enemies.empty()) {
+		const bool hasStandingTeammate = !followers.empty();
+		const bool hasStandingHostileCoalition = !enemies.empty();
+		const bool hadValidObservedEnemy = handlers.hadValidObservedEnemy && handlers.hadValidObservedEnemy();
+
+		if (hasStandingHostileCoalition) {
+			if (state.bleedBattleObserveActiveEmptyEnemyTicks) *state.bleedBattleObserveActiveEmptyEnemyTicks = 0;
+		} else {
 			if (state.bleedBattleObserveActiveEmptyEnemyTicks) ++(*state.bleedBattleObserveActiveEmptyEnemyTicks);
 			if (state.bleedBattleObserveActiveEmptyEnemyTicks && *state.bleedBattleObserveActiveEmptyEnemyTicks < 8) return;
-			if (handlers.hadValidObservedEnemy && handlers.hadValidObservedEnemy() && !followers.empty()) {
-				if (handlers.enterObservedBattleWin) handlers.enterObservedBattleWin();
-			}
-			else {
-				if (handlers.enterObservedLeftForDead) handlers.enterObservedLeftForDead("battle_observe_no_survivor");
-			}
+		}
+
+		const bool terminalObservedState = !hasStandingTeammate || !hasStandingHostileCoalition;
+		if (!terminalObservedState) {
 			return;
 		}
-		if (state.bleedBattleObserveActiveEmptyEnemyTicks) *state.bleedBattleObserveActiveEmptyEnemyTicks = 0;
+
+		TFD::FlowController::ObservedDefeatInput input{};
+		input.conflictResolved = true;
+		input.hadValidObservedEnemy = hadValidObservedEnemy;
+		input.hasStandingPlayerSide = false;
+		input.hasStandingTeammate = hasStandingTeammate;
+		input.hasStandingHostileCoalition = hasStandingHostileCoalition;
+		if (handlers.resolveCaptiveMarkerForOutcome) {
+			input.hasCaptiveMarker = handlers.resolveCaptiveMarkerForOutcome();
+		}
+		if (handlers.resolveBleedFlowActorFormID) {
+			input.actorFormID = handlers.resolveBleedFlowActorFormID();
+		}
+		RE::Actor* observedAggressor = nullptr;
+		if (handlers.resolveAggressor) {
+			observedAggressor = handlers.resolveAggressor();
+		}
+		if (input.actorFormID == 0 && observedAggressor) {
+			input.actorFormID = observedAggressor->GetFormID();
+		}
+		if (input.hasStandingHostileCoalition && !input.hasCaptiveMarker && handlers.canUseCaptiveFallbackHeuristic && observedAggressor) {
+			float fallbackDistance = -1.0f;
+			input.canUseCaptiveFallback = handlers.canUseCaptiveFallbackHeuristic(player, observedAggressor, false, &fallbackDistance);
+		}
+
+		const char* resolutionReason = nullptr;
+		if (!hasStandingTeammate && hasStandingHostileCoalition) {
+			resolutionReason = "battle_observe_loss";
+		} else if (!hasStandingHostileCoalition && hadValidObservedEnemy && hasStandingTeammate) {
+			resolutionReason = "battle_observe_win";
+		} else {
+			resolutionReason = "battle_observe_no_survivor";
+		}
+
+		if (handlers.applyObservedDefeatResolution) {
+			if (handlers.applyObservedDefeatResolution(input, resolutionReason)) {
+				return;
+			}
+		}
+
+		if (!hasStandingTeammate) {
+			if (handlers.enterObservedLeftForDead) handlers.enterObservedLeftForDead(resolutionReason);
+			return;
+		}
+		if (!hasStandingHostileCoalition && hadValidObservedEnemy) {
+			if (handlers.enterObservedBattleWin) handlers.enterObservedBattleWin();
+			return;
+		}
+		if (handlers.enterObservedLeftForDead) handlers.enterObservedLeftForDead(resolutionReason);
 	}
 
 	bool HandleRuntimePendingEscapeBreak(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers)
@@ -3678,6 +3742,8 @@ namespace TFD::Bleedout::DefeatGlue
 		handlers.collectStandingFollowersFromSnapshot = []() { return CollectStandingFollowersFromSnapshot(); };
 		handlers.collectStandingEnemiesFromSnapshot = []() { return CollectStandingEnemiesFromSnapshot(); };
 		handlers.hadValidObservedEnemy = []() { return HadValidObservedEnemy(); };
+		handlers.resolveBleedFlowActorFormID = g_provider.resolveBleedFlowActorFormID;
+		handlers.applyObservedDefeatResolution = g_provider.applyObservedDefeatResolution;
 		handlers.enterObservedBattleWin = []() { TFD::FlowController::HandleObservedBattleWin("battle_observe_win"); };
 		handlers.enterObservedLeftForDead = [](const char* reason) { TFD::FlowController::HandleObservedLeftForDead(reason ? reason : "battle_observe_loss"); };
 		handlers.findBestSpeaker = g_provider.findBestSpeaker;

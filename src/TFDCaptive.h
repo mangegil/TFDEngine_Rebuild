@@ -60,6 +60,14 @@ namespace TFD::Captive
 		std::function<void(bool)> setGraceActive;
 	};
 
+	struct RuntimeTickHandlers
+	{
+		std::function<bool()> isDialogueOpen;
+		std::function<bool()> getPrevDialogueOpen;
+		std::function<void(bool)> setPrevDialogueOpen;
+		EscapeTickHandlers escape;
+	};
+
 	PhaseValue PhaseFromRaw(std::uint32_t raw);
 	std::uint32_t GetPhaseRaw(bool stateActive, PhaseValue phase);
 	const char* GetPhaseName(bool stateActive, PhaseValue phase);
@@ -111,6 +119,7 @@ namespace TFD::Captive
 	bool NormalizeInvalidCaptivePair();
 	bool TickCaptiveEscapePhase(RE::Actor* player, const EscapeTickHandlers& handlers);
 	bool TickEscapeActivePhase(RE::Actor* player, const EscapeTickHandlers& handlers);
+	bool TickRuntime(RE::Actor* player, bool captiveBleedOverlay, const RuntimeTickHandlers& handlers);
 	bool TriggerPlayerAggressionEscape(RE::Actor* actor, const char* reason);
 
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);

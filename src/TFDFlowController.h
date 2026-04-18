@@ -11,6 +11,17 @@ namespace RE
     class TESForm;
 }
 
+
+namespace TFD::Bleedout
+{
+    enum class TerminalCommit : std::uint8_t;
+}
+
+namespace TFD::Transition
+{
+    enum class FallbackBranch : std::uint32_t;
+}
+
 namespace TFD::FlowController
 {
     enum class RootFlow : std::uint8_t
@@ -43,6 +54,7 @@ namespace TFD::FlowController
     {
         None = 0,
 
+        PreCombatPayFollowup,
         PreCombatPleasure,
         PreCombatAfterPleasure,
         InCombatPleasure,
@@ -70,6 +82,9 @@ namespace TFD::FlowController
         Fight,
         Captive,
         JoinEnemy,
+        RecruitEnemy,
+        Release,
+        Follow,
         Cancel,
         Failed
     };
@@ -204,9 +219,20 @@ namespace TFD::FlowController
         Captive
     };
 
+    enum class NonCaptiveFallbackResolution : std::uint8_t
+    {
+        None = 0,
+        RecoveryFollower,
+        RecoveryPotion,
+        RescueCached,
+        LeftForDeadSolo,
+        LeftForDeadWithFollower
+    };
+
     struct ObservedDefeatInput
     {
         bool conflictResolved{ false };
+        bool hadValidObservedEnemy{ false };
         bool hasStandingPlayerSide{ false };
         bool hasStandingTeammate{ false };
         bool hasStandingHostileCoalition{ false };
@@ -214,6 +240,33 @@ namespace TFD::FlowController
         bool canUseCaptiveFallback{ false };
         bool forceCaptive{ false };
         std::uint32_t actorFormID{ 0 };
+    };
+
+    struct NonCaptiveFallbackInput
+    {
+        bool hasSavior{ false };
+        bool hasStandingFollower{ false };
+        bool hasDownedFollower{ false };
+        bool hasRecoveryPotion{ false };
+        bool hasCachedRescueDestination{ false };
+    };
+
+
+    struct NonCaptiveFallbackExecutionHandlers
+    {
+        std::function<bool(TFD::Bleedout::TerminalCommit, const char*)> tryBeginTerminalCommit;
+        std::function<void()> clearCaptiveOrchestrationResidue;
+        std::function<RE::Actor*()> getPlayer;
+        std::function<void(const char*)> clearBridgeAliases;
+        std::function<void(bool)> setPlayerBleedImmune;
+        std::function<void()> resetBleedRuntimeState;
+        std::function<void()> clearLastAggressor;
+        std::function<void()> updatePreCombatState;
+        std::function<TFD::Transition::FallbackBranch(const char*)> resolveNoMarkerFallback;
+        std::function<const char*(TFD::Transition::FallbackBranch)> getBranchName;
+        std::function<bool(const char*)> beginRescueTransition;
+        std::function<void()> forceLeftForDeadSolo;
+        std::function<void(const char*)> beginRecoverTransition;
     };
 
     struct BattleObserverRuntimeProviders
@@ -246,9 +299,12 @@ namespace TFD::FlowController
 	void ResetDefeatLifecycleProviders();
 
     ObservedDefeatResolution EvaluateObservedDefeatResolution(const ObservedDefeatInput& input);
+    NonCaptiveFallbackResolution EvaluateNonCaptiveFallback(const NonCaptiveFallbackInput& input);
     bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason);
+    bool ExecuteResolvedNoMarkerFallback(const char* reason, const NonCaptiveFallbackExecutionHandlers& handlers);
     void HandleObservedBattleWin(const char* reason = nullptr);
     void HandleObservedLeftForDead(const char* reason = nullptr);
+    const char* ToString(NonCaptiveFallbackResolution value);
 
     bool QueueBridgeModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f);
 

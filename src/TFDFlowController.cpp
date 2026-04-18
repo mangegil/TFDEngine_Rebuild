@@ -445,6 +445,10 @@ void InstallRuntime()
             return ObservedDefeatResolution::ContinueObserve;
         }
 
+        if (!input.hasStandingHostileCoalition && input.hasStandingTeammate && !input.hadValidObservedEnemy) {
+            return ObservedDefeatResolution::LeftForDead;
+        }
+
         if (input.hasStandingPlayerSide || input.hasStandingTeammate) {
             return ObservedDefeatResolution::NonCaptiveChoice;
         }
@@ -456,11 +460,108 @@ void InstallRuntime()
         return ObservedDefeatResolution::LeftForDead;
     }
 
+    NonCaptiveFallbackResolution EvaluateNonCaptiveFallback(const NonCaptiveFallbackInput& input)
+    {
+        if (input.hasSavior) {
+            return input.hasCachedRescueDestination ? NonCaptiveFallbackResolution::RescueCached : NonCaptiveFallbackResolution::RecoveryFollower;
+        }
+
+        if (input.hasStandingFollower) {
+            return NonCaptiveFallbackResolution::RecoveryFollower;
+        }
+
+        if (input.hasDownedFollower) {
+            return NonCaptiveFallbackResolution::LeftForDeadWithFollower;
+        }
+
+        if (input.hasRecoveryPotion) {
+            return NonCaptiveFallbackResolution::RecoveryPotion;
+        }
+
+        if (input.hasCachedRescueDestination) {
+            return NonCaptiveFallbackResolution::RescueCached;
+        }
+
+        return NonCaptiveFallbackResolution::LeftForDeadSolo;
+    }
+
+
+    bool ExecuteResolvedNoMarkerFallback(const char* reason, const NonCaptiveFallbackExecutionHandlers& handlers)
+    {
+        if (!handlers.tryBeginTerminalCommit ||
+            !handlers.clearCaptiveOrchestrationResidue ||
+            !handlers.getPlayer ||
+            !handlers.clearBridgeAliases ||
+            !handlers.setPlayerBleedImmune ||
+            !handlers.resetBleedRuntimeState ||
+            !handlers.clearLastAggressor ||
+            !handlers.updatePreCombatState ||
+            !handlers.resolveNoMarkerFallback ||
+            !handlers.getBranchName ||
+            !handlers.beginRescueTransition ||
+            !handlers.forceLeftForDeadSolo ||
+            !handlers.beginRecoverTransition) {
+            return false;
+        }
+
+        const auto* why = reason ? reason : "noncaptive_fallback";
+        if (!handlers.tryBeginTerminalCommit(TFD::Bleedout::TerminalCommit::NonCaptiveFallback, why)) {
+            return false;
+        }
+
+        handlers.clearCaptiveOrchestrationResidue();
+
+        auto* player = handlers.getPlayer();
+        if (player && player->IsWeaponDrawn()) {
+            player->DrawWeaponMagicHands(false);
+        }
+
+        const auto branch = handlers.resolveNoMarkerFallback(why);
+        if (branch == TFD::Transition::FallbackBranch::None) {
+            return false;
+        }
+
+        handlers.clearBridgeAliases(why);
+        handlers.setPlayerBleedImmune(false);
+        handlers.resetBleedRuntimeState();
+        if (player && !player->IsDead() && !player->IsDisabled()) {
+            player->NotifyAnimationGraph("BleedoutStart");
+        }
+        handlers.clearLastAggressor();
+        handlers.updatePreCombatState();
+
+        spdlog::info("[TFD][Flow] committed no-marker fallback branch={} reason={}",
+            handlers.getBranchName(branch), why);
+
+        if (branch == TFD::Transition::FallbackBranch::RescueCached) {
+            if (!handlers.beginRescueTransition(reason ? reason : "rescue_cached")) {
+                handlers.forceLeftForDeadSolo();
+                handlers.beginRecoverTransition("rescue_cached_fallback_left_for_dead");
+            }
+            return true;
+        }
+
+        handlers.beginRecoverTransition(reason ? reason : handlers.getBranchName(branch));
+        return true;
+    }
+
     bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason)
     {
         const auto resolution = EvaluateObservedDefeatResolution(input);
         const std::string reasonText = reason.empty() ? std::string{"observed_defeat_resolution"} : std::string{reason};
         const auto* why = reasonText.c_str();
+        spdlog::info(
+            "[TFD][Flow] observed defeat input reason={} resolved={} hadEnemy={} playerSide={} teammate={} hostile={} marker={} fallback={} forceCaptive={} actor={:08X}",
+            why,
+            input.conflictResolved ? 1 : 0,
+            input.hadValidObservedEnemy ? 1 : 0,
+            input.hasStandingPlayerSide ? 1 : 0,
+            input.hasStandingTeammate ? 1 : 0,
+            input.hasStandingHostileCoalition ? 1 : 0,
+            input.hasCaptiveMarker ? 1 : 0,
+            input.canUseCaptiveFallback ? 1 : 0,
+            input.forceCaptive ? 1 : 0,
+            input.actorFormID);
         switch (resolution) {
         case ObservedDefeatResolution::ContinueObserve:
             spdlog::info("[TFD][Flow] observed defeat decision=continue reason={}", why);
@@ -563,6 +664,21 @@ void InstallRuntime()
 
         const std::string_view name{ eventName };
         const std::string_view arg = strArg ? std::string_view{ strArg } : std::string_view{};
+
+        if (name.rfind("TFDPreCombatOutcome", 0) == 0) {
+            const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+            auto* actor = ResolveActorFromEventArg(arg);
+            spdlog::info(
+                "[TFD][Flow] precombat outcome callback event={} arg={} actor={:08X} sender={:08X} root={} sub={} primary={:08X} numArg={:.2f}",
+                eventName,
+                strArg ? strArg : "",
+                actor ? actor->GetFormID() : 0u,
+                sender ? sender->GetFormID() : 0u,
+                Controller::ToString(snapshot.root),
+                Controller::ToString(snapshot.sub),
+                snapshot.primaryActorFormID,
+                static_cast<double>(numArg));
+        }
 
         (void)TFD::PleasureRuntime::HandleModEvent(eventName, strArg ? strArg : "", numArg, sender);
 
@@ -1374,7 +1490,13 @@ void InstallRuntime()
         bool handled = false;
         switch (outcome) {
         case PreCombatOutcome::Pay:
-            handled = EnterTerminalContextLocked(RootFlow::PreCombat, SubFlow::None, actorFormID, reason);
+            _snapshot.contextRoot = RootFlow::PreCombat;
+            _snapshot.gate = DecisionGate::None;
+            _snapshot.captiveMode = CaptiveMode::None;
+            _snapshot.sub = SubFlow::PreCombatPayFollowup;
+            _snapshot.terminalResolved = false;
+            SetPrimaryActorLocked(actorFormID);
+            handled = true;
             break;
         case PreCombatOutcome::Pleasure:
             handled = EnterTerminalContextLocked(RootFlow::PreCombat, SubFlow::PreCombatPleasure, actorFormID, reason);
@@ -1388,6 +1510,14 @@ void InstallRuntime()
             break;
         case PreCombatOutcome::JoinEnemy:
             handled = BeginCaptiveLocked(actorFormID, CaptiveMode::JoinedEnemy, reason);
+            break;
+        case PreCombatOutcome::RecruitEnemy:
+        case PreCombatOutcome::Release:
+        case PreCombatOutcome::Follow:
+            if (_snapshot.sub != SubFlow::PreCombatPayFollowup) {
+                return RejectLocked("ResolvePreCombatOutcome", reason);
+            }
+            handled = EnterTerminalContextLocked(RootFlow::PreCombat, SubFlow::None, actorFormID, reason);
             break;
         case PreCombatOutcome::Cancel:
         case PreCombatOutcome::Failed:
@@ -1926,6 +2056,7 @@ void InstallRuntime()
     {
         switch (value) {
         case SubFlow::None: return "None";
+        case SubFlow::PreCombatPayFollowup: return "PreCombatPayFollowup";
         case SubFlow::PreCombatPleasure: return "PreCombatPleasure";
         case SubFlow::PreCombatAfterPleasure: return "PreCombatAfterPleasure";
         case SubFlow::InCombatPleasure: return "InCombatPleasure";
@@ -1955,6 +2086,9 @@ void InstallRuntime()
         case PreCombatOutcome::Fight: return "Fight";
         case PreCombatOutcome::Captive: return "Captive";
         case PreCombatOutcome::JoinEnemy: return "JoinEnemy";
+        case PreCombatOutcome::RecruitEnemy: return "RecruitEnemy";
+        case PreCombatOutcome::Release: return "Release";
+        case PreCombatOutcome::Follow: return "Follow";
         case PreCombatOutcome::Cancel: return "Cancel";
         case PreCombatOutcome::Failed: return "Failed";
         default: return "UnknownPreCombatOutcome";
@@ -1971,6 +2105,19 @@ void InstallRuntime()
         case BleedoutOutcome::Cancel: return "Cancel";
         case BleedoutOutcome::Failed: return "Failed";
         default: return "UnknownBleedoutOutcome";
+        }
+    }
+
+    const char* ToString(NonCaptiveFallbackResolution value)
+    {
+        switch (value) {
+        case NonCaptiveFallbackResolution::None: return "None";
+        case NonCaptiveFallbackResolution::RecoveryFollower: return "RecoveryFollower";
+        case NonCaptiveFallbackResolution::RecoveryPotion: return "RecoveryPotion";
+        case NonCaptiveFallbackResolution::RescueCached: return "RescueCached";
+        case NonCaptiveFallbackResolution::LeftForDeadSolo: return "LeftForDeadSolo";
+        case NonCaptiveFallbackResolution::LeftForDeadWithFollower: return "LeftForDeadWithFollower";
+        default: return "UnknownNonCaptiveFallbackResolution";
         }
     }
 
