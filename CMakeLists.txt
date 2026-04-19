@@ -37,6 +37,8 @@ add_library(TFDEngine SHARED
     src/TFDVictory.cpp
     src/TFDPostDefeatState.cpp
     src/TFDDefeatBridge.cpp
+    src/TFDDefeatRuntimeProviders.cpp
+    src/TFDDefeatLifecycleBootstrap.cpp
     src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
     src/TFDPreCombatGreet.cpp

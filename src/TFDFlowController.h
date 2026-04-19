@@ -31,7 +31,10 @@ namespace TFD::FlowController
         InCombat,
         Bleedout,
         Captive,
-        Victory
+        Victory,
+        Rescue,
+        Recovery,
+        LeftForDead
     };
 
     enum class DecisionGate : std::uint8_t
@@ -380,6 +383,9 @@ namespace TFD::FlowController
         bool IsJoinedEnemyMode() const;
         bool IsBleedDecisionActive() const;
         bool IsCombatOrBleedRootActive() const;
+        bool IsRescueRootActive() const;
+        bool IsRecoveryRootActive() const;
+        bool IsLeftForDeadRootActive() const;
         bool IsCaptiveEscapeContextActive() const;
         bool IsPleasureSubFlowActive() const;
         bool IsAfterPleasureSubFlowActive() const;

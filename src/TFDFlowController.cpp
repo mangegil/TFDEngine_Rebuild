@@ -233,6 +233,48 @@ namespace
 namespace TFD::FlowController
 {
 
+    namespace
+    {
+        RootFlow ProjectExternalRootFlow(const Snapshot& snapshot)
+        {
+            if (snapshot.root != RootFlow::None) {
+                return snapshot.root;
+            }
+
+            if (!TFD::Transition::IsRecoveryActive()) {
+                return RootFlow::None;
+            }
+
+            switch (TFD::Transition::GetCurrentFallbackBranch()) {
+            case TFD::Transition::FallbackBranch::RescueCached:
+                return RootFlow::Rescue;
+            case TFD::Transition::FallbackBranch::RecoveryFollower:
+            case TFD::Transition::FallbackBranch::RecoveryPotion:
+                return RootFlow::Recovery;
+            case TFD::Transition::FallbackBranch::LeftForDeadSolo:
+            case TFD::Transition::FallbackBranch::LeftForDeadWithFollower:
+                return RootFlow::LeftForDead;
+            case TFD::Transition::FallbackBranch::None:
+            default:
+                break;
+            }
+
+            return RootFlow::None;
+        }
+
+        Snapshot ProjectExternalSnapshot(Snapshot snapshot)
+        {
+            const auto projectedRoot = ProjectExternalRootFlow(snapshot);
+            if (projectedRoot != RootFlow::None && snapshot.root == RootFlow::None) {
+                snapshot.root = projectedRoot;
+                if (snapshot.contextRoot == RootFlow::None) {
+                    snapshot.contextRoot = projectedRoot;
+                }
+            }
+            return snapshot;
+        }
+    }
+
 void InstallRuntime()
     {
         g_flowRuntimeInstalled = true;
@@ -1169,7 +1211,10 @@ void InstallRuntime()
 
     bool IsPreCombatBlocked()
     {
-        if (TFD::Transition::IsRecoveryActive()) {
+        const auto snapshot = Controller::GetSingleton().GetSnapshot();
+        if (snapshot.root == RootFlow::Rescue ||
+            snapshot.root == RootFlow::Recovery ||
+            snapshot.root == RootFlow::LeftForDead) {
             return true;
         }
 
@@ -1271,7 +1316,7 @@ void InstallRuntime()
     Snapshot Controller::GetSnapshot() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot;
+        return ProjectExternalSnapshot(_snapshot);
     }
 
     bool Controller::RequestPreCombat(std::uint32_t actorFormID, std::string_view reason)
@@ -1761,25 +1806,35 @@ void InstallRuntime()
     bool Controller::CanStartPreCombat() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root == RootFlow::None && _snapshot.sub == SubFlow::None && !_snapshot.terminalResolved;
+        const auto snapshot = ProjectExternalSnapshot(_snapshot);
+        return snapshot.root == RootFlow::None && snapshot.sub == SubFlow::None && !snapshot.terminalResolved;
     }
 
     bool Controller::CanStartInCombatTruce() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root == RootFlow::InCombat && !_snapshot.terminalResolved;
+        const auto snapshot = ProjectExternalSnapshot(_snapshot);
+        return snapshot.root == RootFlow::InCombat && !snapshot.terminalResolved;
     }
 
     bool Controller::CanEnterCaptive() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root != RootFlow::Victory;
+        const auto root = ProjectExternalRootFlow(_snapshot);
+        return root != RootFlow::Victory &&
+            root != RootFlow::Rescue &&
+            root != RootFlow::Recovery &&
+            root != RootFlow::LeftForDead;
     }
 
     bool Controller::CanEnterVictory() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root != RootFlow::Captive;
+        const auto root = ProjectExternalRootFlow(_snapshot);
+        return root != RootFlow::Captive &&
+            root != RootFlow::Rescue &&
+            root != RootFlow::Recovery &&
+            root != RootFlow::LeftForDead;
     }
 
     bool Controller::IsCaptiveContext() const
@@ -1804,6 +1859,24 @@ void InstallRuntime()
     {
         std::scoped_lock lk(_lock);
         return _snapshot.root == RootFlow::InCombat || _snapshot.root == RootFlow::Bleedout;
+    }
+
+    bool Controller::IsRescueRootActive() const
+    {
+        std::scoped_lock lk(_lock);
+        return ProjectExternalRootFlow(_snapshot) == RootFlow::Rescue;
+    }
+
+    bool Controller::IsRecoveryRootActive() const
+    {
+        std::scoped_lock lk(_lock);
+        return ProjectExternalRootFlow(_snapshot) == RootFlow::Recovery;
+    }
+
+    bool Controller::IsLeftForDeadRootActive() const
+    {
+        std::scoped_lock lk(_lock);
+        return ProjectExternalRootFlow(_snapshot) == RootFlow::LeftForDead;
     }
 
     bool Controller::IsCaptiveEscapeContextActive() const
@@ -2026,6 +2099,9 @@ void InstallRuntime()
         case RootFlow::Bleedout: return "Bleedout";
         case RootFlow::Captive: return "Captive";
         case RootFlow::Victory: return "Victory";
+        case RootFlow::Rescue: return "Rescue";
+        case RootFlow::Recovery: return "Recovery";
+        case RootFlow::LeftForDead: return "LeftForDead";
         default: return "UnknownRootFlow";
         }
     }

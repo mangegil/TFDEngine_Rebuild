@@ -34,6 +34,8 @@
 #include "TFDVictory.h"
 #include "TFDPostDefeatState.h"
 #include "TFDDefeatBridge.h"
+#include "TFDDefeatRuntimeProviders.h"
+#include "TFDDefeatLifecycleBootstrap.h"
 #include "TFDCaptiveDoorController.h"
 #include "TFDHostilityController.h"
 
@@ -2644,18 +2646,47 @@ else {
 		}
 	}
 
-	// Defeat lifecycle / install / shutdown / queued progress / load state
-	void Install()
-	{
-		if (g_installed.exchange(true, std::memory_order_acq_rel)) return;
-		g_running.store(true, std::memory_order_release);
-		g_loadTransition.store(false, std::memory_order_release);
-		TFD::Captive::ResetForLoad();
-		ClearCaptiveOrchestrationResidue(false);
-		SetPlayerBleedImmune(false);
-		ResetBleedRuntimeState();
-		TFD::FlowController::Controller::GetSingleton().ResetRuntime("defeat_install");
-		TFD::Bleedout::InstallDefeatLifecycleProviders(TFD::Bleedout::DefeatLifecycleProviders{
+		static TFD::DefeatRuntimeProviders::InstallHooks BuildDefeatRuntimeProviderHooks()
+		{
+			TFD::DefeatRuntimeProviders::InstallHooks hooks{};
+			hooks.teammateHasAllyBleedLock = [](RE::Actor* actor) {
+				auto it = g_bleedLocks.find(actor ? actor->GetFormID() : 0u);
+				return actor && it != g_bleedLocks.end() && it->second.kind == BleedLockKind::Ally;
+			};
+			hooks.teammateIsBleedingOutActor = [](RE::Actor* actor) { return IsActorBleedingOut(actor); };
+			hooks.teammateIsDialogueCapableDefeatedEnemy = [](RE::Actor* actor) { return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor); };
+			hooks.teammateGetDefeatedEnemyRemainingSeconds = [](RE::Actor* actor) { return TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor); };
+			hooks.teammateSuppressDefeatedReentry = [](RE::Actor* actor, double seconds, const char* reason) { TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, seconds, reason); };
+			hooks.teammateReleaseBleedLock = [](RE::Actor* actor, const char* reason, bool playGetUp) { ReleaseBleedLock(actor, reason, playGetUp); };
+			hooks.teammateRestoreActorHealthToSafePct = [](RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason) { RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, minSafePct, maxSafePct, minAbsHp, reason); };
+			hooks.teammateResolvePendingDefeatedDialogueTarget = []() -> RE::Actor* { return ResolvePendingDefeatedDialogueTargetInternal(); };
+			hooks.teammateClearPendingDefeatedDialogueTarget = []() { ClearPendingDefeatedDialogueTargetInternal(); };
+			hooks.teammateSetPendingDefeatedDialogueTarget = [](RE::Actor* actor) { TFD::TeammateManager::SetPendingDefeatedDialogueTarget(actor); };
+			hooks.teammateReviveDownedAlly = [](RE::Actor* actor, float targetHealthPct) { return TFD::TeammateManager::ReviveDownedAlly(actor, targetHealthPct); };
+			hooks.hostilityStartBleedTruceSessionForSpeaker = [](RE::Actor* player, RE::Actor* speaker, const char* reason) {
+				return TFD::Bleedout::StartTruceSessionForSpeaker(player, speaker, reason, TFD::Bleedout::RuntimeHost::BuildStateRefs(), TFD::Bleedout::RuntimeHost::BuildHandlers());
+			};
+			hooks.hostilityReleaseBleedTruceSession = [](TFD::Tame::ReleaseReason reason) { TFD::Bleedout::ReleaseTruceSession(reason); };
+			hooks.tameIsCreatureDefeatedEnemy = [](RE::Actor* actor) { return TFD::Actor::Ops::IsCreatureDefeatedEnemy(actor); };
+			hooks.tameGetDefeatedEnemyRemainingSeconds = [](RE::Actor* actor) { return TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor); };
+			hooks.tameSuppressDefeatedReentry = [](RE::Actor* actor, double seconds, const char* reason) { TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, seconds, reason); };
+			hooks.tameReleaseBleedLock = [](RE::Actor* actor, const char* reason, bool playGetUp) { ReleaseBleedLock(actor, reason, playGetUp); };
+			hooks.tameRestoreActorHealthToSafePct = [](RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason) { RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, minSafePct, maxSafePct, minAbsHp, reason); };
+			hooks.tameReleaseBleedNoSpeakerTameSession = [](const char* reason) { TFD::Bleedout::ReleaseNoSpeakerTameSession(reason); };
+			hooks.tameTryEnsureBleedNoSpeakerTameSession = [](const std::vector<RE::Actor*>& actors, const char* reason) {
+				auto* player = Player();
+				if (!player) {
+					return false;
+				}
+				return TFD::Bleedout::TryEnsureNoSpeakerTameSession(actors, player, reason, TFD::Bleedout::RuntimeHost::BuildHandlers());
+			};
+			return hooks;
+		}
+
+
+		static TFD::Bleedout::DefeatLifecycleProviders BuildBleedoutDefeatLifecycleProviders()
+		{
+			return TFD::Bleedout::DefeatLifecycleProviders{
 			TFD::Bleedout::Builders::PendingSystemEventProvider{
 				[](const char* r) { ClearBleedDialogueOutcome(r); },
 				[](const char* r) { TFD::Bleedout::ClearSystemEventOutcomeWindow(r); },
@@ -2806,9 +2837,12 @@ else {
 				[](RE::Actor* actor) { return IsStandingAllyThresholdActor(actor); },
 				[](RE::Actor* actor) { return IsStandingEnemyThresholdActor(actor); }
 			}
-			});
+			};
+		}
 
-		TFD::FlowController::InstallDefeatLifecycleProviders(TFD::FlowController::DefeatLifecycleProviders{
+		static TFD::FlowController::DefeatLifecycleProviders BuildFlowControllerDefeatLifecycleProviders()
+		{
+			return TFD::FlowController::DefeatLifecycleProviders{
 			TFD::FlowController::PassiveRuntimeProviders{
 				[]() { return g_inBleedState.load(std::memory_order_acquire); },
 				[]() { return TFD::Actor::Ops::HasAnyReleaseFollowGrace(); },
@@ -2845,47 +2879,31 @@ else {
 				[](const char* reason) { TFD::Transition::BeginRecoverTransition(reason ? reason : "battle_observe_loss", BuildTransitionRuntimeHandlers()); },
 				[]() -> const char* { return TFD::Transition::GetCurrentFallbackBranchName(); }
 			}
-			});
+			};
+		}
 
-		TFD::TeammateManager::RuntimeProviders teammateRuntimeProviders{};
-		teammateRuntimeProviders.hasAllyBleedLock = [](RE::Actor* actor) {
-			auto it = g_bleedLocks.find(actor ? actor->GetFormID() : 0u);
-			return actor && it != g_bleedLocks.end() && it->second.kind == BleedLockKind::Ally;
-			};
-		teammateRuntimeProviders.isBleedingOutActor = [](RE::Actor* actor) { return IsActorBleedingOut(actor); };
-		teammateRuntimeProviders.isDialogueCapableDefeatedEnemy = [](RE::Actor* actor) { return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor); };
-		teammateRuntimeProviders.getDefeatedEnemyRemainingSeconds = [](RE::Actor* actor) { return TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor); };
-		teammateRuntimeProviders.suppressDefeatedReentry = [](RE::Actor* actor, double seconds, const char* reason) { TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, seconds, reason); };
-		teammateRuntimeProviders.releaseBleedLock = [](RE::Actor* actor, const char* reason, bool playGetUp) { ReleaseBleedLock(actor, reason, playGetUp); };
-		teammateRuntimeProviders.restoreActorHealthToSafePct = [](RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason) { RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, minSafePct, maxSafePct, minAbsHp, reason); };
-		teammateRuntimeProviders.resolvePendingDefeatedDialogueTarget = []() -> RE::Actor* { return ResolvePendingDefeatedDialogueTargetInternal(); };
-		teammateRuntimeProviders.clearPendingDefeatedDialogueTarget = []() { ClearPendingDefeatedDialogueTargetInternal(); };
-		teammateRuntimeProviders.setPendingDefeatedDialogueTarget = [](RE::Actor* actor) { TFD::TeammateManager::SetPendingDefeatedDialogueTarget(actor); };
-		teammateRuntimeProviders.reviveDownedAlly = [](RE::Actor* actor, float targetHealthPct) { return TFD::TeammateManager::ReviveDownedAlly(actor, targetHealthPct); };
-		TFD::TeammateManager::InstallRuntimeProviders(std::move(teammateRuntimeProviders));
-		TFD::HostilityController::InstallBleedTruceRuntimeProviders(TFD::HostilityController::BleedTruceRuntimeProviders{
-			[](RE::Actor* player, RE::Actor* speaker, const char* reason) {
-				return TFD::Bleedout::StartTruceSessionForSpeaker(player, speaker, reason, TFD::Bleedout::RuntimeHost::BuildStateRefs(), TFD::Bleedout::RuntimeHost::BuildHandlers());
-			},
-			[](TFD::Tame::ReleaseReason reason) {
-				TFD::Bleedout::ReleaseTruceSession(reason);
-			}
-			});
-		TFD::Tame::RuntimeProviders tameRuntimeProviders{};
-		tameRuntimeProviders.isCreatureDefeatedEnemy = [](RE::Actor* actor) { return TFD::Actor::Ops::IsCreatureDefeatedEnemy(actor); };
-		tameRuntimeProviders.getDefeatedEnemyRemainingSeconds = [](RE::Actor* actor) { return TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor); };
-		tameRuntimeProviders.suppressDefeatedReentry = [](RE::Actor* actor, double seconds, const char* reason) { TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, seconds, reason); };
-		tameRuntimeProviders.releaseBleedLock = [](RE::Actor* actor, const char* reason, bool playGetUp) { ReleaseBleedLock(actor, reason, playGetUp); };
-		tameRuntimeProviders.restoreActorHealthToSafePct = [](RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason) { RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, minSafePct, maxSafePct, minAbsHp, reason); };
-		tameRuntimeProviders.releaseBleedNoSpeakerTameSession = [](const char* reason) { TFD::Bleedout::ReleaseNoSpeakerTameSession(reason); };
-		tameRuntimeProviders.tryEnsureBleedNoSpeakerTameSession = [](const std::vector<RE::Actor*>& actors, const char* reason) {
-			auto* player = Player();
-			if (!player) {
-				return false;
-			}
-			return TFD::Bleedout::TryEnsureNoSpeakerTameSession(actors, player, reason, TFD::Bleedout::RuntimeHost::BuildHandlers());
-			};
-		TFD::Tame::InstallRuntimeProviders(std::move(tameRuntimeProviders));
+		static TFD::DefeatLifecycleBootstrap::InstallHooks BuildDefeatLifecycleBootstrapHooks()
+		{
+			TFD::DefeatLifecycleBootstrap::InstallHooks hooks{};
+			hooks.buildBleedoutProviders = []() { return BuildBleedoutDefeatLifecycleProviders(); };
+			hooks.buildFlowControllerProviders = []() { return BuildFlowControllerDefeatLifecycleProviders(); };
+			return hooks;
+		}
+
+	// Defeat lifecycle / install / shutdown / queued progress / load state
+	void Install()
+	{
+		if (g_installed.exchange(true, std::memory_order_acq_rel)) return;
+		g_running.store(true, std::memory_order_release);
+		g_loadTransition.store(false, std::memory_order_release);
+		TFD::Captive::ResetForLoad();
+		ClearCaptiveOrchestrationResidue(false);
+		SetPlayerBleedImmune(false);
+		ResetBleedRuntimeState();
+		TFD::FlowController::Controller::GetSingleton().ResetRuntime("defeat_install");
+		TFD::DefeatLifecycleBootstrap::Install(BuildDefeatLifecycleBootstrapHooks());
+
+		TFD::DefeatRuntimeProviders::Install(BuildDefeatRuntimeProviderHooks());
 		TFD::PleasureRuntime::Install();
 		g_lastRouterCombatContextActive = false;
 		ClearAllBleedLocks("install");

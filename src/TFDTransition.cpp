@@ -1,5 +1,6 @@
 ﻿#include "TFDTransition.h"
 #include "TFDBleedout.h"
+#include "TFDDefeatBridge.h"
 #include "TFDActor.h"
 #include "TFDFlowController.h"
 #include "TFDLeftForDead.h"
@@ -119,73 +120,6 @@ namespace TFD::Transition
 		}
 
 
-		static bool SendBridgeModEvent(const char* eventName, RE::TESForm* sender = nullptr, const char* strArg = "", float numArg = 0.0f)
-		{
-			if (!eventName || !eventName[0]) {
-				return false;
-			}
-
-			auto* task = SKSE::GetTaskInterface();
-			if (!task) {
-				spdlog::warn("[TFD][Transition] SendBridgeModEvent failed: no task interface event={}", eventName);
-				return false;
-			}
-
-			const std::string name{ eventName };
-			const std::string sarg{ strArg ? strArg : "" };
-			const float narg = numArg;
-
-			std::uint32_t actorHandle = 0;
-			RE::FormID senderFormID = 0;
-
-			if (sender) {
-				senderFormID = sender->GetFormID();
-				if (auto* actor = sender->As<RE::Actor>()) {
-					actorHandle = actor->GetHandle().native_handle();
-				}
-			}
-
-			task->AddTask([name, sarg, narg, actorHandle, senderFormID]() {
-				RE::TESForm* outSender = nullptr;
-
-				if (actorHandle != 0) {
-					auto actorSp = RE::Actor::LookupByHandle(actorHandle);
-					outSender = actorSp.get();
-					if (!outSender && senderFormID != 0) {
-						outSender = RE::TESForm::LookupByID(senderFormID);
-					}
-				}
-				else if (senderFormID != 0) {
-					outSender = RE::TESForm::LookupByID(senderFormID);
-				}
-
-				auto* src = SKSE::GetModCallbackEventSource();
-				if (!src) {
-					spdlog::warn("[TFD][Transition] Dispatch skipped: no callback source event={} sender={:08X}", name, senderFormID);
-					return;
-				}
-
-				SKSE::ModCallbackEvent ev{ name.c_str(), sarg.c_str(), narg, outSender };
-				src->SendEvent(&ev);
-				});
-
-			return true;
-		}
-
-		static void SendPlayerSaviorAssign(RE::Actor* actor)
-		{
-			if (!actor) {
-				return;
-			}
-			const bool queued = SendBridgeModEvent("TFDPlayerSaviorAssign", actor);
-			spdlog::info("[TFD][SaviorBridge] Assign actor={:08X} queued={}", actor->GetFormID(), queued);
-		}
-
-		static void ClearPlayerSavior(RE::TESForm* sender = nullptr, const char* reason = nullptr)
-		{
-			const bool queued = SendBridgeModEvent("TFDPlayerSaviorClear", sender);
-			spdlog::info("[TFD][SaviorBridge] Clear queued={} reason={}", queued, reason ? reason : "unknown");
-		}
 
 		static void ApplyFallbackFacing(RE::Actor* actor, float angleZ)
 		{
@@ -991,7 +925,7 @@ namespace TFD::Transition
 		g_allyHoldFollower.reset();
 		g_allyHoldActive = false;
 		g_lockedFallbackCrowdIds.clear();
-		ClearPlayerSavior(nullptr, "clear_no_marker_fallback");
+		TFD::DefeatBridge::ClearPlayerSavior(nullptr, "clear_no_marker_fallback");
 	}
 
 	void BeginLeftForDeadCooldown(int seconds)
@@ -1422,7 +1356,7 @@ namespace TFD::Transition
 				if (!follower) {
 					return;
 				}
-				SendPlayerSaviorAssign(follower);
+				TFD::DefeatBridge::AssignPlayerSavior(follower);
 				follower->EvaluatePackage(false, true);
 				follower->EvaluatePackage(true, true);
 			}
@@ -1442,7 +1376,7 @@ namespace TFD::Transition
 	{
 		auto handlersCopy = handlers;
 		return {
-			.clearPlayerSavior = [](RE::TESForm* sender, const char* why) { ClearPlayerSavior(sender, why); },
+			.clearPlayerSavior = [](RE::TESForm* sender, const char* why) { TFD::DefeatBridge::ClearPlayerSavior(sender, why); },
 			.recoverPlayerForTransition = [handlersCopy]() { RecoverPlayerForTransition(handlersCopy); },
 			.setFollowerHold = [](RE::Actor* follower) { SetFollowerHold(follower); },
 			.finalizePostDefeatRecoveryWindow = [handlersCopy](int graceSeconds, int rescueStateValue) {
