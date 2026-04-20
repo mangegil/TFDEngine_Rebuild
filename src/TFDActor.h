@@ -211,7 +211,7 @@ namespace TFD::Actor
 
     namespace Ops
     {
-        inline constexpr const char* kAllowListEditorId = "TFDHostileFactionAllowList";
+        inline constexpr const char* kAllowListEditorId = "TFDAllowedAggressorFactions";
 
         void Initialize();
         bool ApplyAggressorFactionContext(RE::Actor* aggressor);

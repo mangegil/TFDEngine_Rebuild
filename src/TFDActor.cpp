@@ -1577,11 +1577,13 @@ namespace TFD::Actor::Ops
 			bool resolved{ false };
 		};
 
+		static constexpr std::size_t kDefeatedEnemyAliasCount = 20;
+
 		struct DefeatedEnemyRegistryCache
 		{
 			RE::TESQuest* quest{ nullptr };
 			RE::TESFaction* faction{ nullptr };
-			std::array<RE::BGSRefAlias*, 10> enemyAliases{};
+			std::array<RE::BGSRefAlias*, kDefeatedEnemyAliasCount> enemyAliases{};
 			bool resolved{ false };
 		};
 
@@ -1834,10 +1836,10 @@ namespace TFD::Actor::Ops
 				return;
 			}
 			g_defeatedEnemyRegistry.resolved = true;
-			g_defeatedEnemyRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDDefeatedEnemyQuest");
+			g_defeatedEnemyRegistry.quest = RE::TESForm::LookupByEditorID<RE::TESQuest>("TFDVictoryQuest");
 			g_defeatedEnemyRegistry.faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDDefeatedFaction");
 			if (!g_defeatedEnemyRegistry.quest) {
-				spdlog::warn("[TFD][FactionManager] defeated enemy registry quest not found");
+				spdlog::warn("[TFD][FactionManager] victory registry quest not found editorId=TFDVictoryQuest");
 				return;
 			}
 

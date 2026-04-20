@@ -103,7 +103,7 @@ namespace TFD::PreCombatGreet
         bool gRecentActorInterior = false;
         double gRecentActorLastSoftAgeLogSec = 0.0;
 
-        void ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
+        bool ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
         void MarkTerminalChoiceCommittedLocked(Pending& pending, const char* reason);
 
         bool IsGraceEventName(std::string_view eventName)
@@ -666,15 +666,15 @@ namespace TFD::PreCombatGreet
             return true;
         }
 
-        void ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason)
+        bool ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason)
         {
             if (actorFormID == 0) {
-                return;
+                return false;
             }
 
             auto& flow = TFD::FlowController::Controller::GetSingleton();
             if (!flow.ResolvePreCombatOutcome(outcome, actorFormID, reason ? reason : "unknown")) {
-                return;
+                return false;
             }
 
             if (outcome == TFD::FlowController::PreCombatOutcome::RecruitEnemy ||
@@ -682,8 +682,10 @@ namespace TFD::PreCombatGreet
                 outcome == TFD::FlowController::PreCombatOutcome::Follow ||
                 outcome == TFD::FlowController::PreCombatOutcome::Cancel ||
                 outcome == TFD::FlowController::PreCombatOutcome::Failed) {
-                flow.CompleteTerminalContext(reason ? reason : "unknown");
+                return flow.CompleteTerminalContext(reason ? reason : "unknown");
             }
+
+            return true;
         }
 
         void QueuePreCombatCaptiveTransition(std::uint32_t actorFormID, const char* reason)
@@ -1056,9 +1058,12 @@ namespace TFD::PreCombatGreet
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive");
-                        QueuePreCombatCaptiveTransition(actorFormID, "precombat_captive");
-                        shouldClearInteractionState = true;
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive")) {
+                            QueuePreCombatCaptiveTransition(actorFormID, "precombat_captive");
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] captive outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
                     else if (name == kPreCombatOutcomeJoinEnemyEvent) {
                         if (matchedPending) {
