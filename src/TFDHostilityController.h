@@ -26,6 +26,7 @@ namespace TFD::HostilityController
         InvalidActor,
         PlayerAggression,
         PlayerArmed,
+        FightChoice,
         DialogueClosed,
         FlowHandoff,
         TooFar,

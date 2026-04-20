@@ -808,6 +808,10 @@ namespace TFD::PreCombatGreet
             auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
 
             if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+                if (snapshot.root == TFD::FlowController::RootFlow::InCombat) {
+                    return TFD::Tame::ReleaseReason::FightChoice;
+                }
+
                 if (pending.terminalChoiceCommitted || pending.payFollowupPending || pending.pleasureChoiceCommitted) {
                     return TFD::Tame::ReleaseReason::FlowHandoff;
                 }
@@ -1479,8 +1483,13 @@ namespace TFD::PreCombatGreet
                         }
 
                         auto releaseReason = ResolveDialogueClosedReleaseReasonLocked(pending);
-                        CacheRecentActor(actor, 0.0, releaseReason == TFD::Tame::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort");
-                        CleanupOne(actor, pending, kCooldownAfterDoneSec, releaseReason == TFD::Tame::ReleaseReason::FlowHandoff ? "dialogue_handoff" : "dialogue_closed_abort", releaseReason);
+                        const bool isHandoff = releaseReason == TFD::Tame::ReleaseReason::FlowHandoff;
+                        const bool isFightChoice = releaseReason == TFD::Tame::ReleaseReason::FightChoice;
+                        const char* cleanupReason =
+                            isHandoff ? "dialogue_handoff" :
+                            (isFightChoice ? "fight_choice_rehostile" : "dialogue_closed_abort");
+                        CacheRecentActor(actor, 0.0, cleanupReason);
+                        CleanupOne(actor, pending, kCooldownAfterDoneSec, cleanupReason, releaseReason);
                         it = gPending.erase(it);
                         continue;
                     }

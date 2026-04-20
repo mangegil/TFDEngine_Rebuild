@@ -1314,6 +1314,7 @@ namespace TFD::HostilityController
         {
             switch (reason) {
             case ReleaseReason::PlayerArmed:
+            case ReleaseReason::FightChoice:
             case ReleaseReason::TameBroken:
                 return true;
             default:
@@ -2702,7 +2703,8 @@ namespace TFD::HostilityController
                     player &&
                     (!suppressRehostile &&
                         (reason == ReleaseReason::DialogueClosed ||
-                        reason == ReleaseReason::PlayerArmed));
+                        reason == ReleaseReason::PlayerArmed ||
+                        reason == ReleaseReason::FightChoice));
 
                 const bool immediateInCombatRehostile =
                     releasedEntry.mode == Mode::TruceInCombat &&
@@ -2904,6 +2906,8 @@ namespace TFD::HostilityController
             return "PlayerAggression";
         case ReleaseReason::PlayerArmed:
             return "PlayerArmed";
+        case ReleaseReason::FightChoice:
+            return "FightChoice";
         case ReleaseReason::DialogueClosed:
             return "DialogueClosed";
         case ReleaseReason::FlowHandoff:
