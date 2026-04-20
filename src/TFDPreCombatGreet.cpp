@@ -50,6 +50,8 @@ namespace TFD::PreCombatGreet
         constexpr double kNegotiationRefreshSec = 0.15;
         constexpr double kPreCombatOutcomeGraceSec = 1.25;
         constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
+        constexpr unsigned kDialogueOpenRetryLimit = 3;
+        constexpr double kDialogueOpenRetryDelaySec = 0.35;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -61,6 +63,7 @@ namespace TFD::PreCombatGreet
         constexpr const char* kPreCombatOutcomeFollowEndEvent = "TFDPreCombatOutcomeFollowEnd";
         constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
         constexpr const char* kPreCombatTerminalPendingEvent = "TFDPreCombatTerminalPending";
+        constexpr const char* kPreCombatDialogueConfirmedEvent = "TFDPreCombatDialogueConfirmed";
 
         struct Pending
         {
@@ -85,6 +88,8 @@ namespace TFD::PreCombatGreet
             double nextNegotiationRefreshSec{ 0.0 };
             double postCloseOutcomeGraceUntilSec{ 0.0 };
             double nextPostCloseOutcomeLogSec{ 0.0 };
+            unsigned dialogueOpenRetryCount{ 0 };
+            double nextDialogueOpenRetrySec{ 0.0 };
         };
 
         std::atomic_bool gInstalled{ false };
@@ -749,6 +754,55 @@ namespace TFD::PreCombatGreet
                 TFD::InteractionRouter::DialogueOpen::Mode::PreCombatTruce;
         }
 
+        void ResetDialogueOpenRetryLocked(Pending& pending)
+        {
+            pending.dialogueOpenRetryCount = 0;
+            pending.nextDialogueOpenRetrySec = 0.0;
+        }
+
+        bool TryRetryDialogueOpenLocked(RE::Actor* actor, Pending& pending, double nowSec, const char* reason)
+        {
+            if (!actor || !pending.dialogueRequested || pending.dialogSeen) {
+                return false;
+            }
+            if (pending.action != TFD::InteractionRouter::Action::TrucePreCombat) {
+                return false;
+            }
+            if (pending.terminalChoiceCommitted || pending.payFollowupPending || pending.pleasureChoiceCommitted) {
+                return false;
+            }
+            if (IsDialogueOpenActiveForPreCombatLocked()) {
+                return true;
+            }
+            if (nowSec < pending.nextDialogueOpenRetrySec) {
+                return true;
+            }
+            if (pending.dialogueOpenRetryCount >= kDialogueOpenRetryLimit) {
+                return false;
+            }
+
+            ++pending.dialogueOpenRetryCount;
+            pending.nextDialogueOpenRetrySec = nowSec + kDialogueOpenRetryDelaySec;
+            pending.stickyReopenPending = false;
+            pending.nextStickyRetrySec = 0.0;
+            pending.stickySuppressTerminalUntilSec = 0.0;
+            ClearDialogueClosePendingLocked(pending);
+
+            EnforceNegotiationState(actor, pending, nowSec);
+            TFD::InteractionRouter::DialogueOpen::BeginPreCombatTruce(actor);
+            CacheRecentActor(actor, 0.0, reason ? reason : "dialogue_open_retry");
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] dialogue open retry actor={:08X} action={} retry={}/{} reason={}",
+                actor->GetFormID(),
+                TFD::InteractionRouter::ToString(pending.action),
+                pending.dialogueOpenRetryCount,
+                kDialogueOpenRetryLimit,
+                reason ? reason : "unknown");
+
+            return true;
+        }
+
         TFD::Tame::ReleaseReason ResolveDialogueClosedReleaseReasonLocked(const Pending& pending)
         {
             auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
@@ -783,6 +837,7 @@ namespace TFD::PreCombatGreet
             pending.nextStickyRetrySec = now + kStickyReopenRetrySec;
             pending.stickySuppressTerminalUntilSec = now + kStickyTerminalSuppressSec;
             pending.nextPreserveHandoffLogSec = 0.0;
+            ResetDialogueOpenRetryLocked(pending);
             CacheRecentActor(actor, 0.0, reason ? reason : "sticky_reopen");
 
             if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
@@ -814,6 +869,7 @@ namespace TFD::PreCombatGreet
             pending.postCloseOutcomeGraceUntilSec = 0.0;
             pending.nextPostCloseOutcomeLogSec = 0.0;
             ClearDialogueClosePendingLocked(pending);
+            ResetDialogueOpenRetryLocked(pending);
             CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pay_followup");
             spdlog::info(
                 "[TFD][PreCombatGreet] pay followup armed actor={:08X} action={} reason={}",
@@ -1012,6 +1068,13 @@ namespace TFD::PreCombatGreet
                             pendingActor = GetRecentActorLockedNoLock(kRecentActorSoftAgeSec);
                         }
                         Pending* matchedPending = ResolveTerminalPendingLocked(pendingActor);
+                        if (matchedPending && matchedPending->dialogueRequested && !matchedPending->dialogSeen) {
+                            spdlog::warn(
+                                "[TFD][PreCombatGreet] terminal pending rejected event={} actor={:08X} reason=dialogue_not_confirmed",
+                                rawName ? rawName : "unknown",
+                                pendingActor ? pendingActor->GetFormID() : 0u);
+                            return RE::BSEventNotifyControl::kContinue;
+                        }
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
@@ -1025,6 +1088,41 @@ namespace TFD::PreCombatGreet
                         ev->strArg.c_str(),
                         actor ? actor->GetFormID() : 0u,
                         pendingActor ? pendingActor->GetFormID() : 0u,
+                        pendingCount);
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+
+                if (name == kPreCombatDialogueConfirmedEvent) {
+                    RE::Actor* confirmedActor = actor;
+                    bool accepted = false;
+                    unsigned pendingCount = 0;
+                    {
+                        std::scoped_lock lk(gLock);
+                        if (!confirmedActor) {
+                            confirmedActor = ResolveSinglePendingActorLocked();
+                        }
+                        if (!confirmedActor) {
+                            confirmedActor = GetRecentActorLockedNoLock(kRecentActorSoftAgeSec);
+                        }
+
+                        if (auto* matchedPending = FindPendingLocked(confirmedActor)) {
+                            matchedPending->dialogSeen = true;
+                            matchedPending->stickyReopenPending = false;
+                            matchedPending->nextStickyRetrySec = 0.0;
+                            matchedPending->stickySuppressTerminalUntilSec = 0.0;
+                            ResetDialogueOpenRetryLocked(*matchedPending);
+                            ClearDialogueClosePendingLocked(*matchedPending);
+                            accepted = true;
+                        }
+                        pendingCount = static_cast<unsigned>(gPending.size());
+                    }
+
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] dialogue confirmed event={} arg={} actor={:08X} accepted={} pendingCount={}",
+                        rawName ? rawName : "unknown",
+                        ev->strArg.c_str(),
+                        confirmedActor ? confirmedActor->GetFormID() : 0u,
+                        accepted ? 1 : 0,
                         pendingCount);
                     return RE::BSEventNotifyControl::kContinue;
                 }
@@ -1073,6 +1171,13 @@ namespace TFD::PreCombatGreet
                     }
 
                     Pending* matchedPending = ResolveTerminalPendingLocked(pendingActor);
+                    if (matchedPending && matchedPending->dialogueRequested && !matchedPending->dialogSeen) {
+                        spdlog::warn(
+                            "[TFD][PreCombatGreet] outcome event rejected event={} actor={:08X} reason=dialogue_not_confirmed",
+                            rawName ? rawName : "unknown",
+                            actorFormID);
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
                     if (matchedPending && ShouldSuppressTerminalEventLocked(*matchedPending, pendingActor, rawName)) {
                         return RE::BSEventNotifyControl::kContinue;
                     }
@@ -1308,24 +1413,40 @@ namespace TFD::PreCombatGreet
                         continue;
                     }
 
-                    if (dialogueOpen || IsDialogueOpenActiveForPreCombatLocked()) {
+                    const bool nativeDialogueOpenPending = IsDialogueOpenActiveForPreCombatLocked();
+
+                    if (dialogueOpen) {
                         pending.dialogSeen = true;
                         pending.stickyReopenPending = false;
                         pending.nextStickyRetrySec = 0.0;
                         pending.stickySuppressTerminalUntilSec = 0.0;
+                        ResetDialogueOpenRetryLocked(pending);
                         ClearDialogueClosePendingLocked(pending);
                         ++it;
                         continue;
                     }
 
+                    if (nativeDialogueOpenPending) {
+                        EnforceNegotiationState(actor, pending, now);
+                        ++it;
+                        continue;
+                    }
+
                     if (pending.stickyReopenPending && !pending.terminalChoiceCommitted && now >= pending.nextStickyRetrySec) {
-                        if (IsDialogueOpenActiveForPreCombatLocked()) {
-                            pending.nextStickyRetrySec = now + kStickyReopenRetrySec;
+                        BeginStickyReopenLocked(actor, pending, "sticky_watchdog");
+                        ++it;
+                        continue;
+                    }
+
+                    if (!pending.dialogSeen) {
+                        if (TryRetryDialogueOpenLocked(actor, pending, now, "dialogue_open_timeout")) {
                             ++it;
                             continue;
                         }
-                        BeginStickyReopenLocked(actor, pending, "sticky_watchdog");
-                        ++it;
+
+                        CacheRecentActor(actor, 0.0, "dialogue_open_failed");
+                        CleanupOne(actor, pending, kCooldownAfterFailSec, "dialogue_open_failed", TFD::Tame::ReleaseReason::DialogueClosed);
+                        it = gPending.erase(it);
                         continue;
                     }
 
@@ -1572,6 +1693,8 @@ namespace TFD::PreCombatGreet
         pending.nextNegotiationRefreshSec = 0.0;
         pending.postCloseOutcomeGraceUntilSec = 0.0;
         pending.nextPostCloseOutcomeLogSec = 0.0;
+        pending.dialogueOpenRetryCount = 0;
+        pending.nextDialogueOpenRetrySec = 0.0;
 
         if (result.dialogueRequested) {
             if (!TFD::HostilityController::CanOpenDialogue(actor)) {

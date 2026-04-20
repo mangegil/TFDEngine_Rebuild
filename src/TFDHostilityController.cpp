@@ -2521,6 +2521,89 @@ namespace TFD::HostilityController
         return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor);
     }
 
+    std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget)
+    {
+        std::vector<RE::Actor*> actors;
+        if (!primaryTarget) {
+            return actors;
+        }
+
+        const auto primaryTargetId = primaryTarget->GetFormID();
+        if (primaryTargetId == 0) {
+            return actors;
+        }
+
+        RE::FormID sessionId = 0;
+        auto entryIt = g_entries.find(primaryTargetId);
+        if (entryIt != g_entries.end() && IsTruceMode(entryIt->second.mode)) {
+            sessionId = entryIt->second.sessionId;
+        }
+
+        if (sessionId == 0) {
+            for (const auto& [candidateSessionId, session] : g_sessions) {
+                if (session.finished || !IsTruceMode(session.primaryMode)) {
+                    continue;
+                }
+                if (session.primaryTargetId == primaryTargetId) {
+                    sessionId = candidateSessionId;
+                    break;
+                }
+            }
+        }
+
+        if (sessionId == 0) {
+            return actors;
+        }
+
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end()) {
+            return actors;
+        }
+
+        const auto& session = sessionIt->second;
+        if (session.finished || !IsTruceMode(session.primaryMode)) {
+            return actors;
+        }
+
+        auto addUnique = [&](RE::FormID actorId) {
+            if (actorId == 0) {
+                return;
+            }
+            auto* actor = Runtime::ResolveActor(actorId);
+            if (!IsActorStillValid(actor)) {
+                return;
+            }
+            if (std::find(actors.begin(), actors.end(), actor) != actors.end()) {
+                return;
+            }
+            actors.push_back(actor);
+        };
+
+        addUnique(session.primaryTargetId);
+
+        std::vector<RE::FormID> crowdIds;
+        crowdIds.reserve(g_entries.size());
+        for (const auto& [actorId, entry] : g_entries) {
+            if (entry.sessionId != sessionId) {
+                continue;
+            }
+            if (!IsTruceMode(entry.mode)) {
+                continue;
+            }
+            if (actorId == session.primaryTargetId) {
+                continue;
+            }
+            crowdIds.push_back(actorId);
+        }
+        std::sort(crowdIds.begin(), crowdIds.end());
+
+        for (const auto actorId : crowdIds) {
+            addUnique(actorId);
+        }
+
+        return actors;
+    }
+
     bool CanStartTruce(RE::Actor* actor)
     {
         if (!actor) {

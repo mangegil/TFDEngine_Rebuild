@@ -117,6 +117,7 @@ namespace TFD::HostilityController
     bool IsSuppressed(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
+    [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
 
     bool CanStartTruce(RE::Actor* actor);
     bool HasSpentTruce(RE::Actor* actor);

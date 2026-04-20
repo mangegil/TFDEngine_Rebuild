@@ -1,6 +1,7 @@
 #include "TFDPayModel.h"
 
 #include "TFDActor.h"
+#include "TFDHostilityController.h"
 #include "TFDLocation.h"
 
 #include <algorithm>
@@ -345,42 +346,73 @@ namespace TFD::PayModel
             return std::min(total, kEncounterGoldCap);
         }
 
-        std::vector<RE::Actor*> ResolveEncounterActors(RE::Actor* speaker)
+        std::vector<RE::Actor*> ResolveEncounterActors(RE::Actor* speaker, PayContext context)
         {
             std::vector<RE::Actor*> out;
+            std::unordered_set<std::uint32_t> seen;
+
+            auto addUnique = [&](RE::Actor* actor) {
+                if (!actor) {
+                    return;
+                }
+
+                const auto id = actor->GetFormID();
+                if (id == 0) {
+                    return;
+                }
+
+                auto [_, inserted] = seen.insert(id);
+                if (!inserted) {
+                    return;
+                }
+
+                out.push_back(actor);
+            };
+
             if (!speaker) {
                 return out;
             }
 
+            addUnique(speaker);
+
+            if (context == PayContext::PreCombat || context == PayContext::InCombat) {
+                bool hasTruceContext = false;
+
+                auto activeTruceActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
+                if (!activeTruceActors.empty()) {
+                    hasTruceContext = true;
+                    for (auto* actor : activeTruceActors) {
+                        addUnique(actor);
+                    }
+                }
+
+                auto aliasTruceActors = TFD::Actor::Ops::CollectTruceActorsForSpeaker(speaker);
+                if (!aliasTruceActors.empty()) {
+                    hasTruceContext = true;
+                    for (auto* actor : aliasTruceActors) {
+                        addUnique(actor);
+                    }
+                }
+
+                if (hasTruceContext) {
+                    spdlog::info(
+                        "[TFD][PayModel] truce scoped actors speaker={:08X} context={} actors={}",
+                        speaker->GetFormID(),
+                        static_cast<int>(context),
+                        static_cast<unsigned>(out.size()));
+                    return out;
+                }
+            }
+
             auto snapshot = TFD::Actor::BuildSnapshot(kScanRadius, true);
             const auto* info = TFD::Actor::FindActorInfo(snapshot, speaker);
-
-            out.push_back(speaker);
-
             if (!info || info->coalitionID < 0) {
                 return out;
             }
 
             auto crowd = TFD::Actor::ResolveCrowdCandidates(snapshot, info->coalitionID);
-            std::unordered_set<std::uint32_t> seen;
-            seen.insert(speaker->GetFormID());
-
             for (auto* actor : crowd) {
-                if (!actor) {
-                    continue;
-                }
-
-                const auto id = actor->GetFormID();
-                if (id == 0) {
-                    continue;
-                }
-
-                auto [_, inserted] = seen.insert(id);
-                if (!inserted) {
-                    continue;
-                }
-
-                out.push_back(actor);
+                addUnique(actor);
             }
 
             return out;
@@ -793,7 +825,7 @@ namespace TFD::PayModel
         }
 
         auto* player = RE::PlayerCharacter::GetSingleton();
-        auto actors = ResolveEncounterActors(speaker);
+        auto actors = ResolveEncounterActors(speaker, context);
 
         quote.context = context;
         quote.speakerFormID = speaker->GetFormID();

@@ -220,6 +220,7 @@ namespace TFD::Actor
         bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs);
 
         std::vector<RE::Actor*> CollectTruceActors();
+        std::vector<RE::Actor*> CollectTruceActorsForSpeaker(RE::Actor* speaker);
         bool HasAnyReleaseFollowGrace();
         bool HasReleaseFollowGrace(RE::Actor* actor);
         void ApplyReleaseFollowGraceToSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason = nullptr);

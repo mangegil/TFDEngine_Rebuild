@@ -2218,10 +2218,8 @@ namespace TFD::Actor::Ops
 		static std::vector<RE::Actor*> CollectTruceActorsInternal(RE::Actor* speaker)
 		{
 			ResolveTruceQuestRegistry();
+
 			std::vector<RE::Actor*> actors = CollectCoalitionActorsForSpeaker(speaker);
-			if (!actors.empty()) {
-				return actors;
-			}
 			auto addUnique = [&](RE::Actor* actor) {
 				if (!actor || actor->IsDead() || actor->IsDisabled() || actor == Player()) {
 					return;
@@ -2233,12 +2231,16 @@ namespace TFD::Actor::Ops
 				}
 				actors.push_back(actor);
 			};
+
+			// Truce aliases are the authoritative visible crowd during dialogue.
+			// Merge them even when the snapshot already returned the speaker only.
 			for (auto* alias : g_truceQuestRegistry.truceAliases) {
 				if (!alias) {
 					continue;
 				}
 				addUnique(alias->GetActorReference());
 			}
+
 			return actors;
 		}
 
@@ -2449,6 +2451,12 @@ namespace TFD::Actor::Ops
 	{
 		Initialize();
 		return CollectTruceActorsInternal(nullptr);
+	}
+
+	std::vector<RE::Actor*> CollectTruceActorsForSpeaker(RE::Actor* speaker)
+	{
+		Initialize();
+		return CollectTruceActorsInternal(speaker);
 	}
 
 	bool HasAnyReleaseFollowGrace()
