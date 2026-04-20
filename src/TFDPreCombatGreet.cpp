@@ -1,4 +1,4 @@
-﻿#include "TFDActor.h"
+#include "TFDActor.h"
 
 #include "TFDPreCombatGreet.h"
 
@@ -33,6 +33,8 @@
 
 namespace TFD::PreCombatGreet
 {
+    RE::Actor* GetRecentActorLockedNoLock(double maxAgeSec);
+
     namespace
     {
         using Clock = std::chrono::steady_clock;
@@ -58,6 +60,7 @@ namespace TFD::PreCombatGreet
         constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
         constexpr const char* kPreCombatOutcomeFollowEndEvent = "TFDPreCombatOutcomeFollowEnd";
         constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
+        constexpr const char* kPreCombatTerminalPendingEvent = "TFDPreCombatTerminalPending";
 
         struct Pending
         {
@@ -522,8 +525,8 @@ namespace TFD::PreCombatGreet
 
         Pending* ResolveTerminalPendingLocked(RE::Actor* actor)
         {
-            if (auto* pending = FindPendingLocked(actor)) {
-                return pending;
+            if (actor) {
+                return FindPendingLocked(actor);
             }
 
             if (gPending.size() != 1) {
@@ -997,6 +1000,35 @@ namespace TFD::PreCombatGreet
 
                 auto* actor = ResolvePleasureEventActor(ev);
 
+                if (name == kPreCombatTerminalPendingEvent) {
+                    RE::Actor* pendingActor = actor;
+                    unsigned pendingCount = 0;
+                    {
+                        std::scoped_lock lk(gLock);
+                        if (!pendingActor) {
+                            pendingActor = ResolveSinglePendingActorLocked();
+                        }
+                        if (!pendingActor) {
+                            pendingActor = GetRecentActorLockedNoLock(kRecentActorSoftAgeSec);
+                        }
+                        Pending* matchedPending = ResolveTerminalPendingLocked(pendingActor);
+                        if (matchedPending) {
+                            MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+                        }
+                        pendingCount = static_cast<unsigned>(gPending.size());
+                    }
+
+                    TFD::Extortion::HandlePreCombatTerminalPendingEvent(pendingActor ? pendingActor : actor, rawName);
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] terminal pending event={} arg={} actor={:08X} pendingActor={:08X} pendingCount={}",
+                        rawName ? rawName : "unknown",
+                        ev->strArg.c_str(),
+                        actor ? actor->GetFormID() : 0u,
+                        pendingActor ? pendingActor->GetFormID() : 0u,
+                        pendingCount);
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+
                 if (name == kPreCombatOutcomePayEvent ||
                     name == kPreCombatOutcomeFightEvent ||
                     name == kPreCombatOutcomeCaptiveEvent ||
@@ -1008,7 +1040,7 @@ namespace TFD::PreCombatGreet
                     std::scoped_lock lk(gLock);
                     RE::Actor* pendingActor = actor ? actor : ResolveSinglePendingActorLocked();
                     if (!pendingActor) {
-                        pendingActor = GetRecentActor(kRecentActorSoftAgeSec);
+                        pendingActor = GetRecentActorLockedNoLock(kRecentActorSoftAgeSec);
                     }
                     const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
                     spdlog::info(
@@ -1022,37 +1054,61 @@ namespace TFD::PreCombatGreet
                         TFD::FlowController::Controller::ToString(snapshot.root),
                         TFD::FlowController::Controller::ToString(snapshot.sub),
                         snapshot.primaryActorFormID);
+                    const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
+                    if (actorFormID == 0) {
+                        spdlog::warn(
+                            "[TFD][PreCombatGreet] outcome event rejected event={} reason=no_actor",
+                            rawName ? rawName : "unknown");
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+                    if (snapshot.root == TFD::FlowController::RootFlow::PreCombat &&
+                        snapshot.primaryActorFormID != 0 &&
+                        snapshot.primaryActorFormID != actorFormID) {
+                        spdlog::warn(
+                            "[TFD][PreCombatGreet] outcome event rejected event={} actor={:08X} primary={:08X} reason=owner_mismatch",
+                            rawName ? rawName : "unknown",
+                            actorFormID,
+                            snapshot.primaryActorFormID);
+                        return RE::BSEventNotifyControl::kContinue;
+                    }
+
                     Pending* matchedPending = ResolveTerminalPendingLocked(pendingActor);
                     if (matchedPending && ShouldSuppressTerminalEventLocked(*matchedPending, pendingActor, rawName)) {
                         return RE::BSEventNotifyControl::kContinue;
                     }
                     TFD::Extortion::HandlePreCombatOutcomeEvent(rawName, pendingActor ? pendingActor : actor);
-                    const auto actorFormID = ResolveFlowActorFormIDLocked(pendingActor ? pendingActor : actor);
                     bool shouldClearInteractionState = false;
                     if (name == kPreCombatOutcomePayEvent) {
                         bool startedExtortion = false;
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay");
-                        if (matchedPending && pendingActor) {
-                            ArmPreCombatPayFollowupLocked(pendingActor, *matchedPending, rawName);
-                        }
-                        if (pendingActor) {
-                            startedExtortion = TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
-                            if (startedExtortion) {
-                                CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
+                        const bool resolved = ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay");
+                        if (resolved) {
+                            if (matchedPending && pendingActor) {
+                                ArmPreCombatPayFollowupLocked(pendingActor, *matchedPending, rawName);
                             }
+                            if (pendingActor) {
+                                startedExtortion = TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
+                                if (startedExtortion) {
+                                    CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
+                                }
+                            }
+                            spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] pay outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
-                        spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
-                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomeFightEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight");
-                        shouldClearInteractionState = true;
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight")) {
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] fight outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
                     else if (name == kPreCombatOutcomeCaptiveEvent) {
                         if (matchedPending) {
@@ -1069,44 +1125,58 @@ namespace TFD::PreCombatGreet
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy");
-                        shouldClearInteractionState = true;
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy")) {
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] join enemy outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
                     else if (name == kPreCombatOutcomeReleaseEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Release, actorFormID, "mod_event_precombat_release");
-                        shouldClearInteractionState = true;
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Release, actorFormID, "mod_event_precombat_release")) {
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] release outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
                     else if (name == kPreCombatOutcomeFollowEvent) {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        if (pendingActor) {
-                            CacheRecentActor(pendingActor, 0.0, rawName);
-                            const double followDurationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 60.0;
-                            TFD::Actor::Ops::ApplyReleaseFollowGraceToSpeakerAndCrowd(pendingActor, followDurationSec, "precombat_follow");
-                            spdlog::info("[TFD][PreCombatGreet] follow choice committed action=TrucePreCombat actor={:08X} reason={} duration={:.2f}",
-                                actorFormID,
-                                rawName ? rawName : "TFDPreCombatOutcomeFollow",
-                                followDurationSec);
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Follow, actorFormID, "mod_event_precombat_follow")) {
+                            if (pendingActor) {
+                                CacheRecentActor(pendingActor, 0.0, rawName);
+                                const double followDurationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 60.0;
+                                TFD::Actor::Ops::ApplyReleaseFollowGraceToSpeakerAndCrowd(pendingActor, followDurationSec, "precombat_follow");
+                                spdlog::info("[TFD][PreCombatGreet] follow choice committed action=TrucePreCombat actor={:08X} reason={} duration={:.2f}",
+                                    actorFormID,
+                                    rawName ? rawName : "TFDPreCombatOutcomeFollow",
+                                    followDurationSec);
+                            }
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] follow outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Follow, actorFormID, "mod_event_precombat_follow");
-                        shouldClearInteractionState = true;
                     }
                     else if (name == kPreCombatOutcomePleasureEvent) {
                         if (matchedPending) {
                             MarkPleasureChoiceCommittedLocked(*matchedPending, pendingActor, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pleasure, actorFormID, "mod_event_precombat_pleasure");
+                        if (!ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pleasure, actorFormID, "mod_event_precombat_pleasure")) {
+                            spdlog::warn("[TFD][PreCombatGreet] pleasure outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
                     else {
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit");
-                        shouldClearInteractionState = true;
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit")) {
+                            shouldClearInteractionState = true;
+                        } else {
+                            spdlog::warn("[TFD][PreCombatGreet] recruit outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
                     }
 
                     if (shouldClearInteractionState) {
@@ -1445,6 +1515,15 @@ namespace TFD::PreCombatGreet
             return true;
         }
 
+        if (!gPending.empty()) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForActor blocked actor={:08X} reason=precombat_owner_busy pendingOwner={:08X} pendingCount={}",
+                actor ? actor->GetFormID() : 0u,
+                ResolveSinglePendingActorFormIDLocked(),
+                static_cast<unsigned>(gPending.size()));
+            return false;
+        }
+
         const bool isCaptivePhase = false;
         const auto result = TFD::InteractionRouter::HandleHotkeyPress(
             player,
@@ -1477,10 +1556,6 @@ namespace TFD::PreCombatGreet
             return false;
         }
 
-        if (!gPending.empty()) {
-            ClearAllPendingLocked();
-        }
-
         Pending pending{};
         pending.truceSessionId = result.sessionId;
         pending.action = result.action;
@@ -1505,6 +1580,21 @@ namespace TFD::PreCombatGreet
             }
         }
 
+        auto& flow = TFD::FlowController::Controller::GetSingleton();
+        const bool flowAccepted = flow.BeginPreCombat(actor->GetFormID(), "precombat_begin");
+        const bool gateAccepted = flowAccepted && (!result.dialogueRequested ||
+            flow.BeginTruceDecision(actor->GetFormID(), "precombat_dialogue_begin"));
+
+        if (!flowAccepted || !gateAccepted) {
+            TFD::HostilityController::ReleaseSession(result.sessionId, TFD::Tame::ReleaseReason::Generic);
+            spdlog::warn(
+                "[TFD][PreCombatGreet] BeginForActor rejected by flow actor={:08X} flowAccepted={} gateAccepted={}",
+                actor->GetFormID(),
+                flowAccepted ? 1 : 0,
+                gateAccepted ? 1 : 0);
+            return false;
+        }
+
         if (result.dialogueRequested) {
             (void)TFD::PayModel::PrimeEncounterQuote(actor, TFD::PayModel::PayContext::PreCombat);
             const bool payPublished = TFD::PayModel::PublishSharedGold(actor, TFD::PayModel::PayContext::PreCombat, "precombat_dialogue_begin");
@@ -1514,14 +1604,6 @@ namespace TFD::PreCombatGreet
                 payPublished ? 1 : 0,
                 TFD::PayModel::GetCachedEncounterQuote(actor, TFD::PayModel::PayContext::PreCombat));
             CacheRecentActor(actor, 0.0, "begin");
-        }
-
-        auto& flow = TFD::FlowController::Controller::GetSingleton();
-        if (result.action == TFD::InteractionRouter::Action::TrucePreCombat) {
-            (void)flow.BeginPreCombat(actor->GetFormID(), "precombat_begin");
-            if (result.dialogueRequested) {
-                (void)flow.BeginTruceDecision(actor->GetFormID(), "precombat_dialogue_begin");
-            }
         }
 
         gPending.emplace(handle, pending);
@@ -1674,10 +1756,8 @@ namespace TFD::PreCombatGreet
         return actor;
     }
 
-    RE::Actor* GetRecentActor(double maxAgeSec)
+    RE::Actor* GetRecentActorLockedNoLock(double maxAgeSec)
     {
-        std::scoped_lock lk(gLock);
-
         if (gRecentActorHandle == 0) {
             return nullptr;
         }
@@ -1714,6 +1794,12 @@ namespace TFD::PreCombatGreet
         }
 
         return actor;
+    }
+
+    RE::Actor* GetRecentActor(double maxAgeSec)
+    {
+        std::scoped_lock lk(gLock);
+        return GetRecentActorLockedNoLock(maxAgeSec);
     }
 
     void OnPreLoadGame()

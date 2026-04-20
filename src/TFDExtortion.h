@@ -18,6 +18,7 @@ namespace TFD::Extortion
 
     bool BeginPreCombat(RE::Actor* actor, const char* reason);
     void HandlePreCombatOutcomeEvent(const char* eventName, RE::Actor* actor);
+    void HandlePreCombatTerminalPendingEvent(RE::Actor* actor, const char* reason);
 
     bool HasActive();
     bool IsActive(RE::Actor* actor);

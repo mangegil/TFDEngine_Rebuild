@@ -20,6 +20,7 @@ namespace TFD::Extortion
 
         constexpr double kPreCombatWindowSec = 20.0;
         constexpr double kRetryDelaySec = 0.75;
+        constexpr double kCanonicalReopenDelaySec = 1.35;
         constexpr double kCloseGraceSec = 0.85;
         constexpr double kFollowupStableSec = 0.40;
         constexpr double kDuplicatePayProtectSec = 1.20;
@@ -193,6 +194,34 @@ namespace TFD::Extortion
         }
     }
 
+    void HandlePreCombatTerminalPendingEvent(RE::Actor* actor, const char* reason)
+    {
+        if (!actor) {
+            return;
+        }
+
+        bool cancelDialogue = false;
+        {
+            std::scoped_lock lk(gLock);
+            auto it = gPreCombat.find(GetHandleId(actor));
+            if (it == gPreCombat.end()) {
+                return;
+            }
+
+            it->second.terminalCommitted = true;
+            spdlog::info(
+                "[TFD][Extortion] terminal pending actor={:08X} reason={}",
+                actor->GetFormID(),
+                reason ? reason : "unknown");
+            gPreCombat.erase(it);
+            cancelDialogue = true;
+        }
+
+        if (cancelDialogue) {
+            TFD::InteractionRouter::DialogueOpen::Cancel();
+        }
+    }
+
     bool HasActive()
     {
         std::scoped_lock lk(gLock);
@@ -259,11 +288,12 @@ namespace TFD::Extortion
             }
 
             state.waitForInitialClose = false;
-            state.nextRetrySec = nowSec;
+            state.nextRetrySec = nowSec + kCanonicalReopenDelaySec;
             spdlog::info(
-                "[TFD][Extortion] root close latched actor={:08X} stableTicks={}",
+                "[TFD][Extortion] root close latched actor={:08X} stableTicks={} reopenDelay={:.2f}s",
                 actor->GetFormID(),
-                state.initialClosedStableTicks);
+                state.initialClosedStableTicks,
+                kCanonicalReopenDelaySec);
         }
 
         if (dialogueOpen) {

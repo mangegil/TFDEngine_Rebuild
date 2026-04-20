@@ -1,4 +1,4 @@
-﻿#include "TFDFlowController.h"
+#include "TFDFlowController.h"
 #include "TFDBleedout.h"
 #include "TFDBleedoutGreet.h"
 #include "TFDCaptive.h"
@@ -47,6 +47,12 @@ namespace
     constexpr const char* kInCombatOutcomeReleaseEvent = "TFDInCombatOutcomeRelease";
     constexpr const char* kInCombatOutcomeFollowEvent = "TFDInCombatOutcomeFollow";
     constexpr const char* kPleasureOutcomeReleaseEvent = "TFDPleasureOutcomeRelease";
+    constexpr const char* kCaptiveOutcomeWorkEvent = "TFDCaptiveOutcomeWork";
+    constexpr const char* kCaptiveOutcomeReturnEvent = "TFDCaptiveOutcomeReturn";
+    constexpr const char* kCaptiveOutcomeReleaseEvent = "TFDCaptiveOutcomeRelease";
+    constexpr const char* kCaptiveOutcomeEscapeEvent = "TFDCaptiveOutcomeEscape";
+    constexpr const char* kCaptiveOutcomePleasureEvent = "TFDCaptiveOutcomePleasure";
+    constexpr const char* kCaptiveOutcomeCancelEvent = "TFDCaptiveOutcomeCancel";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
     constexpr const char* kPassiveBreakCrimeEvent = "TFDPassiveBreakCrime";
     constexpr const char* kPassiveBreakPickpocketEvent = "TFDPassiveBreakPickpocket";
@@ -187,6 +193,22 @@ namespace
             return actor->GetFormID();
         }
         return 0;
+    }
+
+    static RE::FormID ResolveActorFormIDFromEventArgOrSender(const std::string_view& arg, RE::TESForm* sender)
+    {
+        if (const auto actorFormID = ResolveActorFormIDFromEventArg(arg); actorFormID != 0) {
+            return actorFormID;
+        }
+
+        if (sender) {
+            if (auto* actor = sender->As<RE::Actor>()) {
+                return actor->GetFormID();
+            }
+            return sender->GetFormID();
+        }
+
+        return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
     }
 
     static int ResolveSourceFlowFromEventArg(const std::string_view& arg)
@@ -367,15 +389,18 @@ void InstallRuntime()
 
         int captive = 0;
         if (_snapshot.root == RootFlow::Captive && _snapshot.captiveMode != CaptiveMode::JoinedEnemy) {
-            switch (_snapshot.sub) {
-            case SubFlow::EscapeAttempt:
-            case SubFlow::EscapeFailed:
-            case SubFlow::Recapture:
-                captive = 2;
-                break;
-            default:
-                captive = 1;
-                break;
+            captive = static_cast<int>(TFD::Captive::GetPhaseRaw());
+            if (captive <= 0) {
+                switch (_snapshot.sub) {
+                case SubFlow::EscapeAttempt:
+                case SubFlow::EscapeFailed:
+                case SubFlow::Recapture:
+                    captive = 2;
+                    break;
+                default:
+                    captive = 1;
+                    break;
+                }
             }
         }
 
@@ -697,6 +722,102 @@ void InstallRuntime()
         spdlog::info("[TFD][Flow] observed battle resolved -> left for dead reason={} branch={}", why, branch);
     }
 
+    bool EnsureCaptiveRootForOutcome(Controller& flow, std::uint32_t actorFormID, std::string_view reason)
+    {
+        if (flow.GetSnapshot().root == RootFlow::Captive) {
+            return true;
+        }
+
+        if (TFD::Captive::IsActive()) {
+            return flow.RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason.empty() ? std::string_view{ "mod_event_captive_recover" } : reason);
+        }
+
+        return false;
+    }
+
+    bool HandleCaptiveOutcomeModEvent(std::string_view name, std::string_view arg, RE::TESForm* sender)
+    {
+        if (name.rfind("TFDCaptiveOutcome", 0) != 0) {
+            return false;
+        }
+
+        auto& flow = TFD::FlowController::Controller::GetSingleton();
+        const auto actorFormID = ResolveActorFormIDFromEventArgOrSender(arg, sender);
+        const auto senderFormID = sender ? sender->GetFormID() : 0u;
+
+        bool ok = false;
+        const char* reason = "mod_event_captive";
+
+        if (name == kCaptiveOutcomeWorkEvent) {
+            reason = "mod_event_captive_work";
+            ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
+                flow.RequestResolveCaptiveOutcome(CaptiveOutcome::WorkForEnemy, actorFormID, reason);
+            if (ok) {
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::ReleasedWork);
+            }
+        } else if (name == kCaptiveOutcomeReturnEvent) {
+            reason = "mod_event_captive_return";
+            ok = flow.RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason);
+            if (ok) {
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    TFD::Captive::SyncPlayerAlias(player, reason);
+                }
+            }
+        } else if (name == kCaptiveOutcomeReleaseEvent) {
+            reason = "mod_event_captive_release";
+            ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
+                flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Release, actorFormID, reason);
+            TFD::Captive::SetRuntimeState(false, TFD::Captive::PhaseValue::None);
+            TFD::HostilityController::ClearAggressionClamp();
+            TFD::Actor::Ops::ClearAggressorFactionContext();
+            if (ok) {
+                (void)flow.RequestCompleteTerminalContext("mod_event_captive_release_complete");
+            } else {
+                flow.ResetRuntime("mod_event_captive_release_force_clear");
+            }
+        } else if (name == kCaptiveOutcomeCancelEvent) {
+            reason = "mod_event_captive_cancel";
+            ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
+                flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Cancel, actorFormID, reason);
+            TFD::Captive::SetRuntimeState(false, TFD::Captive::PhaseValue::None);
+            TFD::HostilityController::ClearAggressionClamp();
+            TFD::Actor::Ops::ClearAggressorFactionContext();
+            if (ok) {
+                (void)flow.RequestCompleteTerminalContext("mod_event_captive_cancel_complete");
+            } else {
+                flow.ResetRuntime("mod_event_captive_cancel_force_clear");
+            }
+        } else if (name == kCaptiveOutcomeEscapeEvent) {
+            reason = "mod_event_captive_escape";
+            ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
+                flow.RequestResolveCaptiveOutcome(CaptiveOutcome::EscapeStarted, actorFormID, reason);
+            if (ok) {
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Escape);
+                TFD::HostilityController::ClearAggressionClamp();
+                TFD::Actor::Ops::ClearAggressorFactionContext();
+            }
+        } else if (name == kCaptiveOutcomePleasureEvent) {
+            reason = "mod_event_captive_pleasure";
+            ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
+                flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason);
+            if (ok) {
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Scene);
+            }
+        } else {
+            return false;
+        }
+
+        spdlog::info(
+            "[TFD][Flow] captive outcome event={} actor={:08X} sender={:08X} ok={} reason={}",
+            std::string(name),
+            actorFormID,
+            senderFormID,
+            ok ? 1 : 0,
+            reason);
+        return true;
+    }
+
     bool HandleOutcomeModEvent(const char* eventName, const char* strArg, float numArg, RE::TESForm* sender)
     {
         if (!eventName || !eventName[0]) {
@@ -722,6 +843,10 @@ void InstallRuntime()
         }
 
         (void)TFD::PleasureRuntime::HandleModEvent(eventName, strArg ? strArg : "", numArg, sender);
+
+        if (HandleCaptiveOutcomeModEvent(name, arg, sender)) {
+            return true;
+        }
 
         if (name == kAfterPleasureEnterEvent) {
             auto* actor = ResolveActorFromEventArg(arg);
@@ -1404,6 +1529,9 @@ void InstallRuntime()
             _snapshot.sub != SubFlow::None || _snapshot.terminalResolved) {
             return RejectLocked("BeginPreCombat", reason);
         }
+        if (_snapshot.root == RootFlow::PreCombat && !GuardPreCombatOwnerLocked(actorFormID, "BeginPreCombat", reason)) {
+            return false;
+        }
         _combatActive = false;
         const bool ok = BeginRootLocked(RootFlow::PreCombat, actorFormID, reason);
         RefreshFlowGlobalsLocked();
@@ -1447,6 +1575,9 @@ void InstallRuntime()
         std::scoped_lock lk(_lock);
         if (_snapshot.root != RootFlow::PreCombat && _snapshot.root != RootFlow::InCombat) {
             return RejectLocked("BeginTruceDecision", reason);
+        }
+        if (_snapshot.root == RootFlow::PreCombat && !GuardPreCombatOwnerLocked(actorFormID, "BeginTruceDecision", reason)) {
+            return false;
         }
         _snapshot.gate = DecisionGate::Truce;
         SetPrimaryActorLocked(actorFormID);
@@ -1510,6 +1641,9 @@ void InstallRuntime()
         std::scoped_lock lk(_lock);
         if (_snapshot.root != RootFlow::PreCombat) {
             return RejectLocked("ResolvePreCombatOutcome", reason);
+        }
+        if (!GuardPreCombatOwnerLocked(actorFormID, "ResolvePreCombatOutcome", reason)) {
+            return false;
         }
 
         bool handled = false;
@@ -1941,6 +2075,9 @@ void InstallRuntime()
     {
         (void)reason;
         if (_snapshot.root == next) {
+            if (next == RootFlow::PreCombat && !GuardPreCombatOwnerLocked(actorFormID, "BeginRootLocked", reason)) {
+                return false;
+            }
             SetPrimaryActorLocked(actorFormID);
             return true;
         }
@@ -2020,6 +2157,39 @@ void InstallRuntime()
         _combatActive = false;
         RefreshFlowGlobalsLocked();
         LogFlowSnapshot("CompleteTerminalContextLocked", reason, _snapshot);
+        return true;
+    }
+
+    bool Controller::GuardPreCombatOwnerLocked(std::uint32_t actorFormID, std::string_view op, std::string_view reason) const
+    {
+        if (actorFormID == 0) {
+            spdlog::warn(
+                "[TFD][Flow] precombat owner reject op={} reason={} actor=00000000 primary={:08X} root={} gate={} sub={} token={}",
+                op.empty() ? "unknown" : std::string{ op },
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                _snapshot.primaryActorFormID,
+                ToString(_snapshot.root),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token);
+            return RejectLocked(op, reason);
+        }
+
+        const auto primary = _snapshot.primaryActorFormID;
+        if (primary != 0 && primary != actorFormID) {
+            spdlog::warn(
+                "[TFD][Flow] precombat owner reject op={} reason={} actor={:08X} primary={:08X} root={} gate={} sub={} token={}",
+                op.empty() ? "unknown" : std::string{ op },
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                actorFormID,
+                primary,
+                ToString(_snapshot.root),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token);
+            return RejectLocked(op, reason);
+        }
+
         return true;
     }
 

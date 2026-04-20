@@ -1,4 +1,4 @@
-﻿#include "TFDCaptive.h"
+#include "TFDCaptive.h"
 #include "TFDCaptiveGreet.h"
 #include "TFDActor.h"
 
@@ -234,6 +234,7 @@ namespace TFD::Captive
 		int g_confiscationAttemptCount = 0;
 		std::chrono::steady_clock::time_point g_confiscationNextAttempt{};
 		QuestRegistryCache g_registry{};
+		bool g_playerCaptiveAliasMissingLogged = false;
 		TFD::Captive::DoorController g_door{};
 		RE::ObjectRefHandle g_marker{};
 		RE::FormID g_cellFormID = 0;
@@ -439,6 +440,10 @@ namespace TFD::Captive
 				g_registry.lootTargetAlias = refAlias;
 				continue;
 			}
+			if (aliasName == "OwnerCaptor") {
+				g_registry.bossCaptorAliases[0] = refAlias;
+				continue;
+			}
 			if (aliasName.rfind("BossCaptor", 0) == 0 && aliasName.size() >= 11) {
 				try {
 					int slot = std::stoi(aliasName.substr(10));
@@ -482,6 +487,10 @@ namespace TFD::Captive
 			bossContainerCount,
 			containerCount,
 			g_registry.lootTargetAlias ? 1 : 0);
+
+		if (!g_registry.playerCaptiveAlias) {
+			spdlog::info("[TFD][Captive] PlayerCaptive alias not present in TFDCaptiveQuest; using ESP bridge aliases for captor/storage diagnostics");
+		}
 	}
 
 	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
@@ -512,8 +521,14 @@ namespace TFD::Captive
 	void SyncPlayerAlias(RE::Actor* actor, const char* reason)
 	{
 		ResolveQuestRegistry();
-		if (!g_registry.quest || !g_registry.playerCaptiveAlias) {
-			spdlog::warn("[TFD][Captive] player captive alias unavailable reason={}", reason ? reason : "unknown");
+		if (!g_registry.quest) {
+			return;
+		}
+		if (!g_registry.playerCaptiveAlias) {
+			if (!g_playerCaptiveAliasMissingLogged) {
+				g_playerCaptiveAliasMissingLogged = true;
+				spdlog::info("[TFD][Captive] player captive alias sync skipped: alias missing in ESP reason={}", reason ? reason : "unknown");
+			}
 			return;
 		}
 
