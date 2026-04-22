@@ -76,16 +76,27 @@ namespace TFD::InCombat
 
 		const auto why = reason ? reason : "incombat_truce_begin";
 		const bool began = flow.BeginInCombat(actorFormID, why);
-		if (dialogueRequested) {
-			(void)flow.BeginTruceDecision(actorFormID, "incombat_truce_dialogue_begin");
+		bool gateAccepted = true;
+		if (began && dialogueRequested) {
+			gateAccepted = flow.BeginTruceDecision(actorFormID, "incombat_truce_dialogue_begin");
+		}
+
+		if (!began || !gateAccepted) {
+			spdlog::warn("[TFD][InCombat] BeginTruce rejected actor={:08X} dialogueRequested={} began={} gateAccepted={}",
+				actorFormID,
+				dialogueRequested ? 1 : 0,
+				began ? 1 : 0,
+				gateAccepted ? 1 : 0);
+			return false;
 		}
 
 		SetStateLocked(dialogueRequested ? State::TruceDialogue : State::Observed, actorFormID);
-		spdlog::info("[TFD][InCombat] BeginTruce actor={:08X} dialogueRequested={} began={}",
+		spdlog::info("[TFD][InCombat] BeginTruce actor={:08X} dialogueRequested={} began={} gateAccepted={}",
 			actorFormID,
 			dialogueRequested ? 1 : 0,
-			began ? 1 : 0);
-		return began;
+			began ? 1 : 0,
+			gateAccepted ? 1 : 0);
+		return true;
 	}
 
 	void NoteAfterPleasure(std::uint32_t actorFormID, const char* reason)

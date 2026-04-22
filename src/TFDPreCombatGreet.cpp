@@ -52,6 +52,8 @@ namespace TFD::PreCombatGreet
         constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
         constexpr unsigned kDialogueOpenRetryLimit = 3;
         constexpr double kDialogueOpenRetryDelaySec = 0.35;
+        constexpr double kPostHandoffSettleBlockSec = 1.25;
+        constexpr double kHotkeyCooldownSec = 3.0;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -110,6 +112,10 @@ namespace TFD::PreCombatGreet
         RE::FormID gRecentActorWorldspaceFormID = 0;
         bool gRecentActorInterior = false;
         double gRecentActorLastSoftAgeLogSec = 0.0;
+        double gPostHandoffBlockUntilSec = 0.0;
+        RE::FormID gPostHandoffBlockActorFormID = 0;
+        double gHotkeyCooldownUntilSec = 0.0;
+        RE::FormID gHotkeyCooldownActorFormID = 0;
 
         bool ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
         void MarkTerminalChoiceCommittedLocked(Pending& pending, const char* reason);
@@ -250,6 +256,116 @@ namespace TFD::PreCombatGreet
             gRecentActorWorldspaceFormID = 0;
             gRecentActorInterior = false;
             gRecentActorLastSoftAgeLogSec = 0.0;
+        }
+
+        void ClearPostHandoffBlockLocked(const char* reason)
+        {
+            if (gPostHandoffBlockUntilSec <= 0.0 && gPostHandoffBlockActorFormID == 0) {
+                return;
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] post handoff block cleared actor={:08X} reason={}",
+                gPostHandoffBlockActorFormID,
+                reason ? reason : "unknown");
+
+            gPostHandoffBlockUntilSec = 0.0;
+            gPostHandoffBlockActorFormID = 0;
+        }
+
+        void ArmPostHandoffBlockLocked(RE::Actor* actor, double durationSec, const char* reason)
+        {
+            if (durationSec <= 0.0) {
+                return;
+            }
+
+            const double now = NowSec();
+            gPostHandoffBlockUntilSec = now + durationSec;
+            gPostHandoffBlockActorFormID = actor ? actor->GetFormID() : 0u;
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] post handoff block armed actor={:08X} duration={:.2f}s reason={}",
+                gPostHandoffBlockActorFormID,
+                durationSec,
+                reason ? reason : "unknown");
+        }
+
+        void ClearHotkeyCooldownLocked(const char* reason)
+        {
+            if (gHotkeyCooldownUntilSec <= 0.0 && gHotkeyCooldownActorFormID == 0) {
+                return;
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] hotkey cooldown cleared actor={:08X} reason={}",
+                gHotkeyCooldownActorFormID,
+                reason ? reason : "unknown");
+
+            gHotkeyCooldownUntilSec = 0.0;
+            gHotkeyCooldownActorFormID = 0;
+        }
+
+        void ArmHotkeyCooldownLocked(RE::Actor* actor, double durationSec, const char* reason)
+        {
+            if (durationSec <= 0.0) {
+                return;
+            }
+
+            const double now = NowSec();
+            gHotkeyCooldownUntilSec = now + durationSec;
+            gHotkeyCooldownActorFormID = actor ? actor->GetFormID() : 0u;
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] hotkey cooldown armed actor={:08X} duration={:.2f}s reason={}",
+                gHotkeyCooldownActorFormID,
+                durationSec,
+                reason ? reason : "unknown");
+        }
+
+        bool IsHotkeyCooldownActiveLocked(double nowSec, double* outRemainingSec = nullptr)
+        {
+            if (gHotkeyCooldownUntilSec <= 0.0) {
+                if (outRemainingSec) {
+                    *outRemainingSec = 0.0;
+                }
+                return false;
+            }
+
+            if (nowSec >= gHotkeyCooldownUntilSec) {
+                ClearHotkeyCooldownLocked("expired");
+                if (outRemainingSec) {
+                    *outRemainingSec = 0.0;
+                }
+                return false;
+            }
+
+            if (outRemainingSec) {
+                *outRemainingSec = gHotkeyCooldownUntilSec - nowSec;
+            }
+            return true;
+        }
+
+        bool IsPostHandoffBlockActiveLocked(double nowSec, double* outRemainingSec = nullptr)
+        {
+            if (gPostHandoffBlockUntilSec <= 0.0) {
+                if (outRemainingSec) {
+                    *outRemainingSec = 0.0;
+                }
+                return false;
+            }
+
+            if (nowSec >= gPostHandoffBlockUntilSec) {
+                ClearPostHandoffBlockLocked("expired");
+                if (outRemainingSec) {
+                    *outRemainingSec = 0.0;
+                }
+                return false;
+            }
+
+            if (outRemainingSec) {
+                *outRemainingSec = gPostHandoffBlockUntilSec - nowSec;
+            }
+            return true;
         }
 
         bool HasStickyPendingLocked()
@@ -728,12 +844,13 @@ namespace TFD::PreCombatGreet
                     spdlog::info("[TFD][PreCombatGreet] captive transition started actor={:08X} source={}",
                         actorFormID,
                         why);
-                } else {
+                }
+                else {
                     spdlog::warn("[TFD][PreCombatGreet] captive transition failed actor={:08X} source={}",
                         actorFormID,
                         why);
                 }
-            });
+                });
         }
 
         bool ShouldStickyReopenLocked(const Pending& pending)
@@ -926,6 +1043,10 @@ namespace TFD::PreCombatGreet
 
             if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
                 TFD::InteractionRouter::ClearInteractionStateValue();
+                if (releaseReason == TFD::Tame::ReleaseReason::FlowHandoff) {
+                    ArmPostHandoffBlockLocked(actor, kPostHandoffSettleBlockSec, reason ? reason : "dialogue_handoff");
+                    ArmHotkeyCooldownLocked(actor, kHotkeyCooldownSec, reason ? reason : "dialogue_handoff");
+                }
             }
 
             if (actor) {
@@ -1205,7 +1326,8 @@ namespace TFD::PreCombatGreet
                             }
                             spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] pay outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1215,7 +1337,8 @@ namespace TFD::PreCombatGreet
                         }
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Fight, actorFormID, "mod_event_precombat_fight")) {
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] fight outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1226,7 +1349,8 @@ namespace TFD::PreCombatGreet
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Captive, actorFormID, "mod_event_precombat_captive")) {
                             QueuePreCombatCaptiveTransition(actorFormID, "precombat_captive");
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] captive outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1236,7 +1360,8 @@ namespace TFD::PreCombatGreet
                         }
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy")) {
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] join enemy outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1246,7 +1371,8 @@ namespace TFD::PreCombatGreet
                         }
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Release, actorFormID, "mod_event_precombat_release")) {
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] release outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1265,7 +1391,8 @@ namespace TFD::PreCombatGreet
                                     followDurationSec);
                             }
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] follow outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1283,7 +1410,8 @@ namespace TFD::PreCombatGreet
                         }
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit")) {
                             shouldClearInteractionState = true;
-                        } else {
+                        }
+                        else {
                             spdlog::warn("[TFD][PreCombatGreet] recruit outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
@@ -1582,6 +1710,8 @@ namespace TFD::PreCombatGreet
             ClearAllPendingLocked();
             gCooldownUntil.clear();
             ClearRecentActor("shutdown");
+            ClearPostHandoffBlockLocked("shutdown");
+            ClearHotkeyCooldownLocked("shutdown");
         }
 
         TFD::Extortion::Shutdown();
@@ -1598,6 +1728,8 @@ namespace TFD::PreCombatGreet
             std::scoped_lock lk(gLock);
             ClearAllPendingLocked();
             ClearRecentActor("suspend");
+            ClearPostHandoffBlockLocked("suspend");
+            ClearHotkeyCooldownLocked("suspend");
         }
     }
 
@@ -1631,6 +1763,26 @@ namespace TFD::PreCombatGreet
         const double now = NowSec();
 
         std::scoped_lock lk(gLock);
+
+        double hotkeyCooldownRemainingSec = 0.0;
+        if (IsHotkeyCooldownActiveLocked(now, &hotkeyCooldownRemainingSec)) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForActor blocked actor={:08X} reason=hotkey_cooldown sourceActor={:08X} remaining={:.2f}s",
+                actor ? actor->GetFormID() : 0u,
+                gHotkeyCooldownActorFormID,
+                hotkeyCooldownRemainingSec);
+            return false;
+        }
+
+        double postHandoffRemainingSec = 0.0;
+        if (IsPostHandoffBlockActiveLocked(now, &postHandoffRemainingSec)) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForActor blocked actor={:08X} reason=post_handoff_settle sourceActor={:08X} remaining={:.2f}s",
+                actor ? actor->GetFormID() : 0u,
+                gPostHandoffBlockActorFormID,
+                postHandoffRemainingSec);
+            return false;
+        }
 
         auto cooldownIt = gCooldownUntil.find(handle);
         if (cooldownIt != gCooldownUntil.end() && now < cooldownIt->second) {

@@ -1352,6 +1352,7 @@ namespace TFD::InteractionRouter
             constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
             constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
             constexpr auto kDefaultTimeout = std::chrono::milliseconds(2500);
+            constexpr auto kInCombatTimeout = std::chrono::milliseconds(12000);
             constexpr auto kPreCombatTimeout = std::chrono::milliseconds(12000);
             constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
             constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
@@ -1359,6 +1360,8 @@ namespace TFD::InteractionRouter
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
             constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
+            constexpr float kInCombatForceGreetMaxDistance = 420.0f;
+            constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
 
             struct PendingState
             {
@@ -1456,7 +1459,7 @@ namespace TFD::InteractionRouter
                 return dx * dx + dy * dy + dz * dz;
             }
 
-            bool IsPreCombatForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            bool IsForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker, float maxDistanceSq)
             {
                 if (!player || !speaker) {
                     return false;
@@ -1464,7 +1467,17 @@ namespace TFD::InteractionRouter
                 if (!speaker->Is3DLoaded()) {
                     return false;
                 }
-                return DistanceSquared(player, speaker) <= kPreCombatForceGreetMaxDistanceSq;
+                return DistanceSquared(player, speaker) <= maxDistanceSq;
+            }
+
+            bool IsPreCombatForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                return IsForceGreetRangeReady(player, speaker, kPreCombatForceGreetMaxDistanceSq);
+            }
+
+            bool IsInCombatForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                return IsForceGreetRangeReady(player, speaker, kInCombatForceGreetMaxDistanceSq);
             }
 
             std::uint32_t PendingSpeakerFormID()
@@ -1547,7 +1560,9 @@ namespace TFD::InteractionRouter
                     kBleedoutTimeout :
                     (mode == Mode::AfterPleasure ?
                         kAfterPleasureTimeout :
-                        (mode == Mode::PreCombatTruce ? kPreCombatTimeout : kDefaultTimeout));
+                        (mode == Mode::PreCombatTruce ?
+                            kPreCombatTimeout :
+                            (mode == Mode::InCombatTruce ? kInCombatTimeout : kDefaultTimeout)));
                 g_pending.speaker = speaker->GetHandle();
                 g_pending.mode = mode;
                 g_pending.active = true;
@@ -1662,7 +1677,16 @@ namespace TFD::InteractionRouter
                 return;
             }
 
-            if (g_pending.mode == Mode::PreCombatTruce && !g_pending.requestIssued && !IsPreCombatForceGreetRangeReady(player, speaker)) {
+            const bool needsPreCombatRangeGate =
+                g_pending.mode == Mode::PreCombatTruce &&
+                !g_pending.requestIssued &&
+                !IsPreCombatForceGreetRangeReady(player, speaker);
+            const bool needsInCombatRangeGate =
+                g_pending.mode == Mode::InCombatTruce &&
+                !g_pending.requestIssued &&
+                !IsInCombatForceGreetRangeReady(player, speaker);
+
+            if (needsPreCombatRangeGate || needsInCombatRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(false);
 
@@ -1670,12 +1694,15 @@ namespace TFD::InteractionRouter
                     (now - g_pending.lastRangeGateLog) >= kPreCombatRangeGateLogInterval) {
                     g_pending.lastRangeGateLog = now;
                     const float dist = std::sqrt(DistanceSquared(player, speaker));
+                    const float maxDist = needsInCombatRangeGate ?
+                        kInCombatForceGreetMaxDistance :
+                        kPreCombatForceGreetMaxDistance;
                     spdlog::info(
                         "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} max={:.1f}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         dist,
-                        kPreCombatForceGreetMaxDistance);
+                        maxDist);
                 }
 
                 return;
@@ -1708,7 +1735,9 @@ namespace TFD::InteractionRouter
                 return;
             }
 
-            const bool forceGreet = g_pending.mode == Mode::PreCombatTruce;
+            const bool forceGreet =
+                g_pending.mode == Mode::PreCombatTruce ||
+                g_pending.mode == Mode::InCombatTruce;
             const bool ok = speaker->SetDialogueWithPlayer(true, forceGreet, nullptr);
             ++g_pending.attempts;
             const bool firstIssued = ok && !g_pending.requestIssued;
