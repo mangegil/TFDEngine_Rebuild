@@ -119,6 +119,8 @@ namespace TFD::PreCombatGreet
 
         bool ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome outcome, std::uint32_t actorFormID, const char* reason);
         void MarkTerminalChoiceCommittedLocked(Pending& pending, const char* reason);
+        void ResetDialogueOpenRetryLocked(Pending& pending);
+        void CancelPreCombatDialogueOpenLocked(RE::Actor* actor, Pending& pending, const char* reason);
 
         bool IsGraceEventName(std::string_view eventName)
         {
@@ -728,6 +730,7 @@ namespace TFD::PreCombatGreet
             pending.nextPreserveHandoffLogSec = 0.0;
             pending.postCloseOutcomeGraceUntilSec = 0.0;
             pending.nextPostCloseOutcomeLogSec = 0.0;
+            ResetDialogueOpenRetryLocked(pending);
             ClearDialogueClosePendingLocked(pending);
             spdlog::info(
                 "[TFD][PreCombatGreet] terminal choice committed action={} reason={}",
@@ -746,6 +749,7 @@ namespace TFD::PreCombatGreet
             pending.nextPreserveHandoffLogSec = 0.0;
             pending.postCloseOutcomeGraceUntilSec = 0.0;
             pending.nextPostCloseOutcomeLogSec = 0.0;
+            ResetDialogueOpenRetryLocked(pending);
             ClearDialogueClosePendingLocked(pending);
             if (actor) {
                 CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pleasure");
@@ -877,6 +881,28 @@ namespace TFD::PreCombatGreet
             pending.nextDialogueOpenRetrySec = 0.0;
         }
 
+        void CancelPreCombatDialogueOpenLocked(RE::Actor* actor, Pending& pending, const char* reason)
+        {
+            pending.dialogSeen = true;
+            pending.stickyReopenPending = false;
+            pending.nextStickyRetrySec = 0.0;
+            pending.stickySuppressTerminalUntilSec = 0.0;
+            pending.nextPreserveHandoffLogSec = 0.0;
+            ResetDialogueOpenRetryLocked(pending);
+            ClearDialogueClosePendingLocked(pending);
+
+            if (!IsDialogueOpenActiveForPreCombatLocked()) {
+                return;
+            }
+
+            TFD::InteractionRouter::DialogueOpen::Cancel();
+            spdlog::info(
+                "[TFD][PreCombatGreet] cancel precombat dialogue open actor={:08X} action={} reason={}",
+                actor ? actor->GetFormID() : 0u,
+                TFD::InteractionRouter::ToString(pending.action),
+                reason ? reason : "unknown");
+        }
+
         bool TryRetryDialogueOpenLocked(RE::Actor* actor, Pending& pending, double nowSec, const char* reason)
         {
             if (!actor || !pending.dialogueRequested || pending.dialogSeen) {
@@ -989,8 +1015,8 @@ namespace TFD::PreCombatGreet
             pending.nextPreserveHandoffLogSec = 0.0;
             pending.postCloseOutcomeGraceUntilSec = 0.0;
             pending.nextPostCloseOutcomeLogSec = 0.0;
-            ClearDialogueClosePendingLocked(pending);
             ResetDialogueOpenRetryLocked(pending);
+            ClearDialogueClosePendingLocked(pending);
             CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pay_followup");
             spdlog::info(
                 "[TFD][PreCombatGreet] pay followup armed actor={:08X} action={} reason={}",
@@ -1202,6 +1228,7 @@ namespace TFD::PreCombatGreet
                         }
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+                            CancelPreCombatDialogueOpenLocked(pendingActor ? pendingActor : actor, *matchedPending, "terminal_pending");
                         }
                         pendingCount = static_cast<unsigned>(gPending.size());
                     }
@@ -1546,6 +1573,12 @@ namespace TFD::PreCombatGreet
                     }
 
                     const bool nativeDialogueOpenPending = IsDialogueOpenActiveForPreCombatLocked();
+
+                    if (pending.terminalChoiceCommitted && nativeDialogueOpenPending) {
+                        CancelPreCombatDialogueOpenLocked(actor, pending, "terminal_choice_committed");
+                        ++it;
+                        continue;
+                    }
 
                     if (dialogueOpen) {
                         pending.dialogSeen = true;

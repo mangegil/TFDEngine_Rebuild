@@ -1358,7 +1358,8 @@ namespace TFD::InteractionRouter
             constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
             constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
-            constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
+            constexpr auto kPreCombatApproachNudgeInterval = std::chrono::milliseconds(350);
+            constexpr float kPreCombatForceGreetMaxDistance = 160.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
             constexpr float kInCombatForceGreetMaxDistance = 420.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
@@ -1379,6 +1380,7 @@ namespace TFD::InteractionRouter
                 Clock::time_point lastPackageRefresh{};
                 Clock::time_point lastHardReset{};
                 Clock::time_point lastRangeGateLog{};
+                Clock::time_point lastApproachNudge{};
             };
 
             PendingState g_pending{};
@@ -1435,9 +1437,23 @@ namespace TFD::InteractionRouter
                 }
             }
 
+            bool PendingCountsAsDialogueStateLocked()
+            {
+                if (!g_pending.active) {
+                    return false;
+                }
+
+                switch (g_pending.mode) {
+                case Mode::PreCombatTruce:
+                    return g_pending.requestIssued;
+                default:
+                    return true;
+                }
+            }
+
             void SyncDialogueStateLocked(bool dialogueOpen)
             {
-                SetDialogueStateValue((g_pending.active || dialogueOpen) ? 1 : 0);
+                SetDialogueStateValue((dialogueOpen || PendingCountsAsDialogueStateLocked()) ? 1 : 0);
             }
 
             bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
@@ -1502,6 +1518,7 @@ namespace TFD::InteractionRouter
                 g_pending.lastPackageRefresh = {};
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
+                g_pending.lastApproachNudge = {};
             }
 
             void CancelLocked(const char* reason)
@@ -1540,6 +1557,16 @@ namespace TFD::InteractionRouter
                 speaker->EvaluatePackage(true, true);
             }
 
+            bool NudgePreCombatApproach(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                if (!player || !speaker || speaker == player) {
+                    return false;
+                }
+
+                PrepareSpeakerForDialogue(player, speaker, false);
+                return speaker->SetDialogueWithPlayer(true, false, nullptr);
+            }
+
             void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
             {
                 std::scoped_lock lk(g_pending.lock);
@@ -1576,6 +1603,7 @@ namespace TFD::InteractionRouter
                 g_pending.lastPackageRefresh = {};
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
+                g_pending.lastApproachNudge = {};
                 SyncDialogueStateLocked(IsDialogueOpen());
 
                 spdlog::info(
@@ -1689,6 +1717,20 @@ namespace TFD::InteractionRouter
             if (needsPreCombatRangeGate || needsInCombatRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(false);
+
+                if (needsPreCombatRangeGate &&
+                    (g_pending.lastApproachNudge.time_since_epoch().count() == 0 ||
+                        (now - g_pending.lastApproachNudge) >= kPreCombatApproachNudgeInterval)) {
+                    g_pending.lastApproachNudge = now;
+                    const bool approachOk = NudgePreCombatApproach(player, speaker);
+                    spdlog::info(
+                        "[TFD][DialogueOpen] approach nudge mode={} speaker={:08X} ok={} dist={:.1f} targetDist={:.1f}",
+                        ModeName(g_pending.mode),
+                        speaker->GetFormID(),
+                        approachOk ? 1 : 0,
+                        std::sqrt(DistanceSquared(player, speaker)),
+                        kPreCombatForceGreetMaxDistance);
+                }
 
                 if (g_pending.lastRangeGateLog.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastRangeGateLog) >= kPreCombatRangeGateLogInterval) {

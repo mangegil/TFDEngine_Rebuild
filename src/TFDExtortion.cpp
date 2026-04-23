@@ -23,7 +23,9 @@ namespace TFD::Extortion
         constexpr double kCanonicalReopenDelaySec = 1.35;
         constexpr double kCloseGraceSec = 0.85;
         constexpr double kFollowupStableSec = 0.40;
+        constexpr double kFollowupOutcomeSettleSec = 1.50;
         constexpr double kDuplicatePayProtectSec = 1.20;
+        constexpr double kTerminalBarrierSec = 3.00;
         constexpr std::uint32_t kInitialCloseStableTicksNeeded = 1;
         constexpr std::uint32_t kMaxRetries = 1;
 
@@ -39,12 +41,15 @@ namespace TFD::Extortion
             double nextRetrySec{ 0.0 };
             double closeGraceUntilSec{ 0.0 };
             double followupSeenAtSec{ 0.0 };
+            double followupClosedAtSec{ 0.0 };
+            double followupOutcomeSettleUntilSec{ 0.0 };
             double duplicatePayProtectUntilSec{ 0.0 };
             double expiresSec{ 0.0 };
         };
 
         std::mutex gLock;
         std::unordered_map<std::uint32_t, PreCombatState> gPreCombat;
+        std::unordered_map<std::uint32_t, double> gTerminalBarrierUntil;
         Clock::time_point gT0 = Clock::now();
 
         double NowSec()
@@ -79,12 +84,62 @@ namespace TFD::Extortion
                 reason ? reason : "unknown");
             gPreCombat.erase(it);
         }
+
+        bool IsTerminalBarrierActiveLocked(std::uint32_t handle, double nowSec, double* outRemainingSec = nullptr)
+        {
+            if (outRemainingSec) {
+                *outRemainingSec = 0.0;
+            }
+
+            if (handle == 0) {
+                return false;
+            }
+
+            auto it = gTerminalBarrierUntil.find(handle);
+            if (it == gTerminalBarrierUntil.end()) {
+                return false;
+            }
+
+            if (nowSec >= it->second) {
+                gTerminalBarrierUntil.erase(it);
+                return false;
+            }
+
+            if (outRemainingSec) {
+                *outRemainingSec = it->second - nowSec;
+            }
+            return true;
+        }
+
+        void ArmTerminalBarrierLocked(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return;
+            }
+
+            const auto handle = GetHandleId(actor);
+            if (handle == 0) {
+                return;
+            }
+
+            const auto nowSec = NowSec();
+            const auto untilSec = nowSec + kTerminalBarrierSec;
+            const auto [it, inserted] = gTerminalBarrierUntil.insert_or_assign(handle, untilSec);
+            (void)it;
+            spdlog::info(
+                "[TFD][Extortion] terminal barrier armed actor={:08X} reason={} duration={:.2f}s state={}",
+                actor->GetFormID(),
+                reason ? reason : "unknown",
+                kTerminalBarrierSec,
+                inserted ? "new" : "refresh");
+        }
     }
 
     void Install()
     {
         std::scoped_lock lk(gLock);
         gPreCombat.clear();
+        gTerminalBarrierUntil.clear();
         spdlog::info("[TFD][Extortion] Install");
     }
 
@@ -92,19 +147,22 @@ namespace TFD::Extortion
     {
         std::scoped_lock lk(gLock);
         gPreCombat.clear();
+        gTerminalBarrierUntil.clear();
         spdlog::info("[TFD][Extortion] Shutdown");
     }
 
     void CancelAll(const char* reason)
     {
         std::scoped_lock lk(gLock);
-        if (!gPreCombat.empty()) {
+        if (!gPreCombat.empty() || !gTerminalBarrierUntil.empty()) {
             spdlog::info(
-                "[TFD][Extortion] CancelAll count={} reason={}",
+                "[TFD][Extortion] CancelAll count={} barriers={} reason={}",
                 gPreCombat.size(),
+                gTerminalBarrierUntil.size(),
                 reason ? reason : "unknown");
         }
         gPreCombat.clear();
+        gTerminalBarrierUntil.clear();
     }
 
     void OnPreLoadGame()
@@ -126,6 +184,17 @@ namespace TFD::Extortion
         std::scoped_lock lk(gLock);
         const auto handle = GetHandleId(actor);
         const auto nowSec = NowSec();
+
+        double barrierRemainingSec = 0.0;
+        if (IsTerminalBarrierActiveLocked(handle, nowSec, &barrierRemainingSec)) {
+            spdlog::info(
+                "[TFD][Extortion] begin blocked actor={:08X} reason={} barrierRemaining={:.2f}s",
+                actor->GetFormID(),
+                reason ? reason : "unknown",
+                barrierRemainingSec);
+            return false;
+        }
+
         auto it = gPreCombat.find(handle);
         if (it != gPreCombat.end() && it->second.active) {
             it->second.expiresSec = std::max(it->second.expiresSec, nowSec + kPreCombatWindowSec);
@@ -150,6 +219,8 @@ namespace TFD::Extortion
         state.nextRetrySec = 0.0;
         state.closeGraceUntilSec = 0.0;
         state.followupSeenAtSec = 0.0;
+        state.followupClosedAtSec = 0.0;
+        state.followupOutcomeSettleUntilSec = 0.0;
         state.duplicatePayProtectUntilSec = 0.0;
         state.expiresSec = nowSec + kPreCombatWindowSec;
 
@@ -172,21 +243,19 @@ namespace TFD::Extortion
             return;
         }
 
-        bool cancelDialogue = false;
+        bool cancelDialogue = true;
         {
             std::scoped_lock lk(gLock);
+            ArmTerminalBarrierLocked(actor, eventName);
             auto it = gPreCombat.find(GetHandleId(actor));
-            if (it == gPreCombat.end()) {
-                return;
+            if (it != gPreCombat.end()) {
+                it->second.terminalCommitted = true;
+                spdlog::info(
+                    "[TFD][Extortion] terminal outcome actor={:08X} event={}",
+                    actor->GetFormID(),
+                    eventName);
+                gPreCombat.erase(it);
             }
-
-            it->second.terminalCommitted = true;
-            spdlog::info(
-                "[TFD][Extortion] terminal outcome actor={:08X} event={}",
-                actor->GetFormID(),
-                eventName);
-            gPreCombat.erase(it);
-            cancelDialogue = true;
         }
 
         if (cancelDialogue) {
@@ -200,21 +269,19 @@ namespace TFD::Extortion
             return;
         }
 
-        bool cancelDialogue = false;
+        bool cancelDialogue = true;
         {
             std::scoped_lock lk(gLock);
+            ArmTerminalBarrierLocked(actor, reason);
             auto it = gPreCombat.find(GetHandleId(actor));
-            if (it == gPreCombat.end()) {
-                return;
+            if (it != gPreCombat.end()) {
+                it->second.terminalCommitted = true;
+                spdlog::info(
+                    "[TFD][Extortion] terminal pending actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+                gPreCombat.erase(it);
             }
-
-            it->second.terminalCommitted = true;
-            spdlog::info(
-                "[TFD][Extortion] terminal pending actor={:08X} reason={}",
-                actor->GetFormID(),
-                reason ? reason : "unknown");
-            gPreCombat.erase(it);
-            cancelDialogue = true;
         }
 
         if (cancelDialogue) {
@@ -255,6 +322,19 @@ namespace TFD::Extortion
         }
 
         auto& state = it->second;
+
+        double barrierRemainingSec = 0.0;
+        if (IsTerminalBarrierActiveLocked(GetHandleId(actor), nowSec, &barrierRemainingSec)) {
+            spdlog::info(
+                "[TFD][Extortion] tick blocked actor={:08X} reason=terminal_barrier remaining={:.2f}s menuSeen={} retries={}",
+                actor->GetFormID(),
+                barrierRemainingSec,
+                state.menuSeen ? 1 : 0,
+                state.retryCount);
+            gPreCombat.erase(it);
+            return TickResult::NotActive;
+        }
+
         if (nowSec >= state.expiresSec) {
             spdlog::info(
                 "[TFD][Extortion] expired actor={:08X} menuSeen={} retries={}",
@@ -306,6 +386,8 @@ namespace TFD::Extortion
             if (state.followupSeenAtSec <= 0.0) {
                 state.followupSeenAtSec = nowSec;
             }
+            state.followupClosedAtSec = 0.0;
+            state.followupOutcomeSettleUntilSec = 0.0;
             state.closeGraceUntilSec = 0.0;
             return TickResult::Consumed;
         }
@@ -364,12 +446,27 @@ namespace TFD::Extortion
             return TickResult::Consumed;
         }
 
+        if (state.followupClosedAtSec <= 0.0) {
+            state.followupClosedAtSec = nowSec;
+            state.followupOutcomeSettleUntilSec = nowSec + kFollowupOutcomeSettleSec;
+            spdlog::info(
+                "[TFD][Extortion] followup settle armed actor={:08X} settle={:.2f}s",
+                actor->GetFormID(),
+                kFollowupOutcomeSettleSec);
+            return TickResult::Consumed;
+        }
+
+        if (nowSec < state.followupOutcomeSettleUntilSec) {
+            return TickResult::Consumed;
+        }
+
         if (state.closeGraceUntilSec <= 0.0) {
             state.closeGraceUntilSec = nowSec + kCloseGraceSec;
             spdlog::info(
-                "[TFD][Extortion] close grace armed actor={:08X} grace={:.2f}s",
+                "[TFD][Extortion] close grace armed actor={:08X} grace={:.2f}s settleFor={:.2f}s",
                 actor->GetFormID(),
-                kCloseGraceSec);
+                kCloseGraceSec,
+                nowSec - state.followupClosedAtSec);
             return TickResult::Consumed;
         }
 
@@ -378,9 +475,10 @@ namespace TFD::Extortion
         }
 
         spdlog::info(
-            "[TFD][Extortion] close grace expired actor={:08X} stableFor={:.2f}s",
+            "[TFD][Extortion] close grace expired actor={:08X} stableFor={:.2f}s settleFor={:.2f}s",
             actor->GetFormID(),
-            nowSec - state.followupSeenAtSec);
+            nowSec - state.followupSeenAtSec,
+            nowSec - state.followupClosedAtSec);
         gPreCombat.erase(it);
         return TickResult::AllowAbort;
     }
