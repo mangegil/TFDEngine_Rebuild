@@ -1349,7 +1349,7 @@ namespace TFD::InteractionRouter
 
             constexpr auto kInitialDelay = std::chrono::milliseconds(90);
             constexpr auto kRetryDelay = std::chrono::milliseconds(180);
-            constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(350);
+            constexpr auto kPackageRefreshDelay = std::chrono::milliseconds(750);
             constexpr auto kHardResetDelay = std::chrono::milliseconds(650);
             constexpr auto kDefaultTimeout = std::chrono::milliseconds(2500);
             constexpr auto kInCombatTimeout = std::chrono::milliseconds(12000);
@@ -1358,10 +1358,10 @@ namespace TFD::InteractionRouter
             constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
             constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
-            constexpr auto kPreCombatApproachNudgeInterval = std::chrono::milliseconds(350);
+            constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
             constexpr float kPreCombatForceGreetMaxDistance = 160.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
-            constexpr float kInCombatForceGreetMaxDistance = 420.0f;
+            constexpr float kInCombatForceGreetMaxDistance = 160.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
 
             struct PendingState
@@ -1380,7 +1380,7 @@ namespace TFD::InteractionRouter
                 Clock::time_point lastPackageRefresh{};
                 Clock::time_point lastHardReset{};
                 Clock::time_point lastRangeGateLog{};
-                Clock::time_point lastApproachNudge{};
+                Clock::time_point lastApproachRefresh{};
             };
 
             PendingState g_pending{};
@@ -1443,12 +1443,12 @@ namespace TFD::InteractionRouter
                     return false;
                 }
 
-                switch (g_pending.mode) {
-                case Mode::PreCombatTruce:
-                    return g_pending.requestIssued;
-                default:
-                    return true;
-                }
+                // Native owns the dialogue-open window. While a truce forcegreet is
+                // pending, keep TFDDialogueState = In so ESP dialogue conditions are
+                // already valid when SetDialogueWithPlayer commits. The state is
+                // cleared by CancelLocked/ResetLocked after timeout, abort, or flow
+                // cleanup.
+                return true;
             }
 
             void SyncDialogueStateLocked(bool dialogueOpen)
@@ -1518,7 +1518,7 @@ namespace TFD::InteractionRouter
                 g_pending.lastPackageRefresh = {};
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
-                g_pending.lastApproachNudge = {};
+                g_pending.lastApproachRefresh = {};
             }
 
             void CancelLocked(const char* reason)
@@ -1535,6 +1535,11 @@ namespace TFD::InteractionRouter
                 }
                 ResetLocked();
                 SyncDialogueStateLocked(IsDialogueOpen());
+            }
+
+            bool IsTruceMode(Mode mode)
+            {
+                return mode == Mode::PreCombatTruce || mode == Mode::InCombatTruce;
             }
 
             void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
@@ -1557,14 +1562,43 @@ namespace TFD::InteractionRouter
                 speaker->EvaluatePackage(true, true);
             }
 
-            bool NudgePreCombatApproach(RE::PlayerCharacter* player, RE::Actor* speaker)
+            void RefreshApproachPackage(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
                 if (!player || !speaker || speaker == player) {
-                    return false;
+                    return;
                 }
 
-                PrepareSpeakerForDialogue(player, speaker, false);
-                return speaker->SetDialogueWithPlayer(true, false, nullptr);
+                if (!speaker->IsAIEnabled()) {
+                    speaker->EnableAI(true);
+                }
+
+                speaker->AllowPCDialogue(true);
+
+                if (speaker->IsInCombat()) {
+                    speaker->StopCombat();
+                }
+
+                // ESP owns the approach AI package through the active Speaker alias.
+                // Native only nudges package evaluation; it must not inject or
+                // overwrite actor packages here.
+                speaker->EvaluatePackage(false, true);
+            }
+
+            void PrepareSpeakerForNativeDialogueOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                if (!player || !speaker) {
+                    return;
+                }
+
+                if (!speaker->IsAIEnabled()) {
+                    speaker->EnableAI(true);
+                }
+
+                speaker->AllowPCDialogue(true);
+
+                if (speaker->IsInCombat()) {
+                    speaker->StopCombat();
+                }
             }
 
             void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
@@ -1603,7 +1637,14 @@ namespace TFD::InteractionRouter
                 g_pending.lastPackageRefresh = {};
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
-                g_pending.lastApproachNudge = {};
+                g_pending.lastApproachRefresh = {};
+
+                if (IsTruceMode(mode)) {
+                    if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                        RefreshApproachPackage(player, speaker);
+                    }
+                }
+
                 SyncDialogueStateLocked(IsDialogueOpen());
 
                 spdlog::info(
@@ -1666,6 +1707,7 @@ namespace TFD::InteractionRouter
 
             if (dialogueOpen) {
                 const auto completedMode = g_pending.mode;
+                const auto completedSpeaker = PendingSpeakerFormID();
                 g_pending.succeeded = true;
                 g_pending.active = false;
                 g_pending.mode = Mode::None;
@@ -1673,7 +1715,7 @@ namespace TFD::InteractionRouter
                 spdlog::info(
                     "[TFD][DialogueOpen] success mode={} speaker={:08X} attempts={} requestIssued={}",
                     ModeName(completedMode),
-                    PendingSpeakerFormID(),
+                    completedSpeaker,
                     g_pending.attempts,
                     g_pending.requestIssued ? 1 : 0);
                 return;
@@ -1716,20 +1758,21 @@ namespace TFD::InteractionRouter
 
             if (needsPreCombatRangeGate || needsInCombatRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
-                SyncDialogueStateLocked(false);
+                SyncDialogueStateLocked(dialogueOpen);
 
-                if (needsPreCombatRangeGate &&
-                    (g_pending.lastApproachNudge.time_since_epoch().count() == 0 ||
-                        (now - g_pending.lastApproachNudge) >= kPreCombatApproachNudgeInterval)) {
-                    g_pending.lastApproachNudge = now;
-                    const bool approachOk = NudgePreCombatApproach(player, speaker);
+                if (g_pending.lastApproachRefresh.time_since_epoch().count() == 0 ||
+                    (now - g_pending.lastApproachRefresh) >= kApproachRefreshInterval) {
+                    g_pending.lastApproachRefresh = now;
+                    RefreshApproachPackage(player, speaker);
+                    const float targetDist = needsInCombatRangeGate ?
+                        kInCombatForceGreetMaxDistance :
+                        kPreCombatForceGreetMaxDistance;
                     spdlog::info(
-                        "[TFD][DialogueOpen] approach nudge mode={} speaker={:08X} ok={} dist={:.1f} targetDist={:.1f}",
+                        "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
-                        approachOk ? 1 : 0,
                         std::sqrt(DistanceSquared(player, speaker)),
-                        kPreCombatForceGreetMaxDistance);
+                        targetDist);
                 }
 
                 if (g_pending.lastRangeGateLog.time_since_epoch().count() == 0 ||
@@ -1750,7 +1793,9 @@ namespace TFD::InteractionRouter
                 return;
             }
 
+            const bool truceMode = IsTruceMode(g_pending.mode);
             const bool shouldHardReset =
+                !truceMode &&
                 !g_pending.requestIssued &&
                 (g_pending.lastHardReset.time_since_epoch().count() == 0 ||
                     g_pending.attempts == 0 ||
@@ -1769,7 +1814,12 @@ namespace TFD::InteractionRouter
             else if (!g_pending.requestIssued &&
                 (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay)) {
-                PrepareSpeakerForDialogue(player, speaker, false);
+                if (truceMode) {
+                    PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                }
+                else {
+                    PrepareSpeakerForDialogue(player, speaker, false);
+                }
                 g_pending.lastPackageRefresh = now;
             }
 
@@ -1780,6 +1830,12 @@ namespace TFD::InteractionRouter
             const bool forceGreet =
                 g_pending.mode == Mode::PreCombatTruce ||
                 g_pending.mode == Mode::InCombatTruce;
+
+            if (forceGreet) {
+                PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                SetDialogueStateValue(1);
+            }
+
             const bool ok = speaker->SetDialogueWithPlayer(true, forceGreet, nullptr);
             ++g_pending.attempts;
             const bool firstIssued = ok && !g_pending.requestIssued;
