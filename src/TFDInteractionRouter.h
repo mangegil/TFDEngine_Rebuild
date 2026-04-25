@@ -174,7 +174,8 @@ namespace TFD::InteractionRouter
             InCombatTruce = 3,
             PreCombatTruce = 4,
             AfterPleasure = 5,
-            Rescue = 6
+            Rescue = 6,
+            PreCombatFollowup = 7
         };
 
         void Install();
@@ -183,15 +184,20 @@ namespace TFD::InteractionRouter
         void BeginCaptiveMarker(RE::Actor* speaker);
         void BeginInCombatTruce(RE::Actor* speaker);
         void BeginPreCombatTruce(RE::Actor* speaker);
+        void BeginPreCombatFollowup(RE::Actor* speaker);
         void BeginAfterPleasure(RE::Actor* speaker);
         void BeginRescue(RE::Actor* speaker);
 
         void Tick();
 
         void Cancel();
+        bool ForceCloseDialogueMenu(const char* reason = nullptr);
         bool IsActive();
         bool DidSucceed();
         Mode GetMode();
+
+        void ArmTemporaryDialogueCooldown(RE::Actor* speaker, double durationSec, const char* reason = nullptr);
+        bool IsTemporaryDialogueCooldownActive(RE::Actor* speaker);
     }
 
     const char* ToString(Action value);

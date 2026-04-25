@@ -11,6 +11,7 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDInteractionRouter.h"
+#include "TFDHostilityController.h"
 
 namespace TFD::Extortion
 {
@@ -18,12 +19,14 @@ namespace TFD::Extortion
     {
         using Clock = std::chrono::steady_clock;
 
-        constexpr double kPreCombatWindowSec = 20.0;
+        constexpr double kPreCombatWindowSec = 30.0;
         constexpr double kRetryDelaySec = 0.75;
         constexpr double kCanonicalReopenDelaySec = 1.35;
-        constexpr double kCloseGraceSec = 0.85;
+        constexpr double kSingleSpeakerCanonicalReopenDelaySec = 3.50;
         constexpr double kFollowupStableSec = 0.40;
-        constexpr double kFollowupOutcomeSettleSec = 1.50;
+        constexpr double kPayFollowupTerminalWaitSec = 14.00;
+        constexpr double kPayFollowupPassiveRefreshSec = 0.35;
+        constexpr double kPayFollowupHoldLogSec = 1.50;
         constexpr double kDuplicatePayProtectSec = 1.20;
         constexpr double kTerminalBarrierSec = 3.00;
         constexpr std::uint32_t kInitialCloseStableTicksNeeded = 1;
@@ -38,11 +41,15 @@ namespace TFD::Extortion
             bool initialCloseLatched{ false };
             std::uint32_t initialClosedStableTicks{ 0 };
             std::uint32_t retryCount{ 0 };
+            std::uint32_t truceMemberCount{ 0 };
+            bool singleSpeakerSession{ false };
             double nextRetrySec{ 0.0 };
             double closeGraceUntilSec{ 0.0 };
             double followupSeenAtSec{ 0.0 };
             double followupClosedAtSec{ 0.0 };
-            double followupOutcomeSettleUntilSec{ 0.0 };
+            double terminalOutcomeWaitUntilSec{ 0.0 };
+            double nextPassiveRefreshSec{ 0.0 };
+            double nextOutcomeWaitLogSec{ 0.0 };
             double duplicatePayProtectUntilSec{ 0.0 };
             double expiresSec{ 0.0 };
         };
@@ -140,7 +147,7 @@ namespace TFD::Extortion
         std::scoped_lock lk(gLock);
         gPreCombat.clear();
         gTerminalBarrierUntil.clear();
-        spdlog::info("[TFD][Extortion] Install");
+        spdlog::info("[TFD][Extortion] Install terminal_wait_v3 soft_followup_all active");
     }
 
     void Shutdown()
@@ -181,6 +188,18 @@ namespace TFD::Extortion
             return false;
         }
 
+        if (TFD::InteractionRouter::DialogueOpen::IsTemporaryDialogueCooldownActive(actor)) {
+            spdlog::info(
+                "[TFD][Extortion] begin blocked actor={:08X} reason={} state=temporary_dialogue_cooldown",
+                actor->GetFormID(),
+                reason ? reason : "unknown");
+            return false;
+        }
+
+        const auto truceMembers = TFD::HostilityController::CollectActiveTruceActors(actor);
+        const auto truceMemberCount = static_cast<std::uint32_t>(truceMembers.size());
+        const bool singleSpeakerSession = truceMemberCount <= 1;
+
         std::scoped_lock lk(gLock);
         const auto handle = GetHandleId(actor);
         const auto nowSec = NowSec();
@@ -199,12 +218,19 @@ namespace TFD::Extortion
         if (it != gPreCombat.end() && it->second.active) {
             it->second.expiresSec = std::max(it->second.expiresSec, nowSec + kPreCombatWindowSec);
             it->second.closeGraceUntilSec = 0.0;
+            it->second.terminalOutcomeWaitUntilSec = 0.0;
+            it->second.nextPassiveRefreshSec = 0.0;
+            it->second.nextOutcomeWaitLogSec = 0.0;
             it->second.duplicatePayProtectUntilSec = std::max(it->second.duplicatePayProtectUntilSec, nowSec + kDuplicatePayProtectSec);
+            it->second.truceMemberCount = truceMemberCount;
+            it->second.singleSpeakerSession = singleSpeakerSession;
             spdlog::info(
-                "[TFD][Extortion] begin ignored actor={:08X} reason={} state=already_active protect={:.2f}s",
+                "[TFD][Extortion] begin ignored actor={:08X} reason={} state=already_active protect={:.2f}s members={} single={}",
                 actor->GetFormID(),
                 reason ? reason : "unknown",
-                kDuplicatePayProtectSec);
+                kDuplicatePayProtectSec,
+                truceMemberCount,
+                singleSpeakerSession ? 1 : 0);
             return false;
         }
 
@@ -216,19 +242,25 @@ namespace TFD::Extortion
         state.initialCloseLatched = false;
         state.initialClosedStableTicks = 0;
         state.retryCount = 0;
+        state.truceMemberCount = truceMemberCount;
+        state.singleSpeakerSession = singleSpeakerSession;
         state.nextRetrySec = 0.0;
         state.closeGraceUntilSec = 0.0;
         state.followupSeenAtSec = 0.0;
         state.followupClosedAtSec = 0.0;
-        state.followupOutcomeSettleUntilSec = 0.0;
+        state.terminalOutcomeWaitUntilSec = 0.0;
+        state.nextPassiveRefreshSec = 0.0;
+        state.nextOutcomeWaitLogSec = 0.0;
         state.duplicatePayProtectUntilSec = 0.0;
         state.expiresSec = nowSec + kPreCombatWindowSec;
 
         spdlog::info(
-            "[TFD][Extortion] begin precombat actor={:08X} reason={} window={:.1f}s",
+            "[TFD][Extortion] begin precombat actor={:08X} reason={} window={:.1f}s members={} single={}",
             actor->GetFormID(),
             reason ? reason : "unknown",
-            kPreCombatWindowSec);
+            kPreCombatWindowSec,
+            truceMemberCount,
+            singleSpeakerSession ? 1 : 0);
         return true;
     }
 
@@ -323,6 +355,16 @@ namespace TFD::Extortion
 
         auto& state = it->second;
 
+        if (TFD::InteractionRouter::DialogueOpen::IsTemporaryDialogueCooldownActive(actor)) {
+            spdlog::info(
+                "[TFD][Extortion] tick stopped actor={:08X} reason=temporary_dialogue_cooldown menuSeen={} retries={}",
+                actor->GetFormID(),
+                state.menuSeen ? 1 : 0,
+                state.retryCount);
+            gPreCombat.erase(it);
+            return TickResult::NotActive;
+        }
+
         double barrierRemainingSec = 0.0;
         if (IsTerminalBarrierActiveLocked(GetHandleId(actor), nowSec, &barrierRemainingSec)) {
             spdlog::info(
@@ -337,10 +379,13 @@ namespace TFD::Extortion
 
         if (nowSec >= state.expiresSec) {
             spdlog::info(
-                "[TFD][Extortion] expired actor={:08X} menuSeen={} retries={}",
+                "[TFD][Extortion] expired actor={:08X} menuSeen={} retries={} followupClosed={} closedFor={:.2f}s terminalWaitUntil={:.2f}",
                 actor->GetFormID(),
                 state.menuSeen ? 1 : 0,
-                state.retryCount);
+                state.retryCount,
+                state.followupClosedAtSec > 0.0 ? 1 : 0,
+                state.followupClosedAtSec > 0.0 ? nowSec - state.followupClosedAtSec : 0.0,
+                state.terminalOutcomeWaitUntilSec);
             gPreCombat.erase(it);
             return TickResult::AllowAbort;
         }
@@ -368,12 +413,15 @@ namespace TFD::Extortion
             }
 
             state.waitForInitialClose = false;
-            state.nextRetrySec = nowSec + kCanonicalReopenDelaySec;
+            const double reopenDelaySec = state.singleSpeakerSession ? kSingleSpeakerCanonicalReopenDelaySec : kCanonicalReopenDelaySec;
+            state.nextRetrySec = nowSec + reopenDelaySec;
             spdlog::info(
-                "[TFD][Extortion] root close latched actor={:08X} stableTicks={} reopenDelay={:.2f}s",
+                "[TFD][Extortion] root close latched actor={:08X} stableTicks={} reopenDelay={:.2f}s members={} single={}",
                 actor->GetFormID(),
                 state.initialClosedStableTicks,
-                kCanonicalReopenDelaySec);
+                reopenDelaySec,
+                state.truceMemberCount,
+                state.singleSpeakerSession ? 1 : 0);
         }
 
         if (dialogueOpen) {
@@ -387,7 +435,9 @@ namespace TFD::Extortion
                 state.followupSeenAtSec = nowSec;
             }
             state.followupClosedAtSec = 0.0;
-            state.followupOutcomeSettleUntilSec = 0.0;
+            state.terminalOutcomeWaitUntilSec = 0.0;
+            state.nextPassiveRefreshSec = 0.0;
+            state.nextOutcomeWaitLogSec = 0.0;
             state.closeGraceUntilSec = 0.0;
             return TickResult::Consumed;
         }
@@ -408,22 +458,22 @@ namespace TFD::Extortion
                     TFD::InteractionRouter::DialogueOpen::Cancel();
                 }
 
-                TFD::InteractionRouter::DialogueOpen::BeginPreCombatTruce(actor);
-                if (canonical) {
-                    spdlog::info(
-                        "[TFD][Extortion] canonical reopen actor={:08X} retry={}/{} delay={:.2f}s",
-                        actor->GetFormID(),
-                        state.retryCount,
-                        kMaxRetries + 1,
-                        kRetryDelaySec);
-                } else {
-                    spdlog::info(
-                        "[TFD][Extortion] reopen followup actor={:08X} retry={}/{} delay={:.2f}s",
-                        actor->GetFormID(),
-                        state.retryCount,
-                        kMaxRetries + 1,
-                        kRetryDelaySec);
-                }
+                // Pay followup must not reopen through the root PreCombatTruce
+                // forcegreet path. Even when crowd members exist, the crowd is already
+                // tracked through the truce bridge; reopening the root forcegreet can
+                // fire the root greeting fragment again and keep the CK package alive
+                // during the Recruit outcome window. Use the soft followup route for
+                // every Pay followup retry.
+                TFD::InteractionRouter::DialogueOpen::BeginPreCombatFollowup(actor);
+                spdlog::info(
+                    "[TFD][Extortion] soft followup all actor={:08X} retry={}/{} delay={:.2f}s members={} single={} canonical={}",
+                    actor->GetFormID(),
+                    state.retryCount,
+                    kMaxRetries + 1,
+                    kRetryDelaySec,
+                    state.truceMemberCount,
+                    state.singleSpeakerSession ? 1 : 0,
+                    canonical ? 1 : 0);
                 return TickResult::Consumed;
             }
 
@@ -448,38 +498,45 @@ namespace TFD::Extortion
 
         if (state.followupClosedAtSec <= 0.0) {
             state.followupClosedAtSec = nowSec;
-            state.followupOutcomeSettleUntilSec = nowSec + kFollowupOutcomeSettleSec;
+            state.terminalOutcomeWaitUntilSec = nowSec + kPayFollowupTerminalWaitSec;
+            state.expiresSec = std::max(state.expiresSec, state.terminalOutcomeWaitUntilSec);
+            state.nextPassiveRefreshSec = 0.0;
+            state.nextOutcomeWaitLogSec = nowSec;
             spdlog::info(
-                "[TFD][Extortion] followup settle armed actor={:08X} settle={:.2f}s",
+                "[TFD][Extortion] terminal outcome wait armed actor={:08X} wait={:.2f}s expiresIn={:.2f}s members={} single={}",
                 actor->GetFormID(),
-                kFollowupOutcomeSettleSec);
+                kPayFollowupTerminalWaitSec,
+                state.expiresSec - nowSec,
+                state.truceMemberCount,
+                state.singleSpeakerSession ? 1 : 0);
             return TickResult::Consumed;
         }
 
-        if (nowSec < state.followupOutcomeSettleUntilSec) {
-            return TickResult::Consumed;
+        // Once Pay followup has actually opened, a closed DialogueMenu is no
+        // longer a reliable abort signal. Papyrus TIF chains can submit
+        // Recruit/Release/Join/Follow a few seconds after the menu vanishes,
+        // especially after the player already owns a teammate. Keep the native
+        // truce alive until a terminal pending/outcome event arrives or until
+        // the explicit Pay followup window expires. This prevents
+        // DialogueClosed -> rehostile from racing ahead of RecruitPending.
+        if (nowSec >= state.nextPassiveRefreshSec) {
+            actor->StopCombat();
+            actor->StopAlarmOnActor();
+            actor->EvaluatePackage(false, true);
+            state.nextPassiveRefreshSec = nowSec + kPayFollowupPassiveRefreshSec;
         }
 
-        if (state.closeGraceUntilSec <= 0.0) {
-            state.closeGraceUntilSec = nowSec + kCloseGraceSec;
+        if (nowSec >= state.nextOutcomeWaitLogSec) {
+            state.nextOutcomeWaitLogSec = nowSec + kPayFollowupHoldLogSec;
             spdlog::info(
-                "[TFD][Extortion] close grace armed actor={:08X} grace={:.2f}s settleFor={:.2f}s",
+                "[TFD][Extortion] terminal outcome wait holding actor={:08X} closedFor={:.2f}s expiresIn={:.2f}s members={} single={}",
                 actor->GetFormID(),
-                kCloseGraceSec,
-                nowSec - state.followupClosedAtSec);
-            return TickResult::Consumed;
+                nowSec - state.followupClosedAtSec,
+                std::max(0.0, state.expiresSec - nowSec),
+                state.truceMemberCount,
+                state.singleSpeakerSession ? 1 : 0);
         }
 
-        if (nowSec < state.closeGraceUntilSec) {
-            return TickResult::Consumed;
-        }
-
-        spdlog::info(
-            "[TFD][Extortion] close grace expired actor={:08X} stableFor={:.2f}s settleFor={:.2f}s",
-            actor->GetFormID(),
-            nowSec - state.followupSeenAtSec,
-            nowSec - state.followupClosedAtSec);
-        gPreCombat.erase(it);
-        return TickResult::AllowAbort;
+        return TickResult::Consumed;
     }
 }

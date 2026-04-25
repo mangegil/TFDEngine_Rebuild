@@ -827,6 +827,29 @@ void InstallRuntime()
         const std::string_view name{ eventName };
         const std::string_view arg = strArg ? std::string_view{ strArg } : std::string_view{};
 
+        if (name == "TFDPreCombatRootGreetRejected") {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const double cooldownSec = numArg > 0.0f ? static_cast<double>(numArg) : 5.0;
+
+            if (actor) {
+                TFD::InteractionRouter::DialogueOpen::ArmTemporaryDialogueCooldown(
+                    actor,
+                    cooldownSec,
+                    "TFDPreCombatRootGreetRejected");
+            }
+
+            // Root-greet reentry rejection must not hide DialogueMenu.
+            // During PreCombat Pay -> Recruit/Follow/Release followup, the active
+            // DialogueMenu can already be the valid followup menu. Forcing kHide
+            // here causes the reopen-then-close symptom and can leave Skyrim's
+            // camera/mouse input in a bad menu-transition state.
+            spdlog::info(
+                "[TFD][Flow] root greet rejected event actor={:08X} cooldown={:.2f}s forceClose=0 policy=cooldown_only",
+                actor ? actor->GetFormID() : 0u,
+                cooldownSec);
+            return true;
+        }
+
         if (name.rfind("TFDPreCombatOutcome", 0) == 0) {
             const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
             auto* actor = ResolveActorFromEventArg(arg);

@@ -18,6 +18,7 @@
 #include <cmath>
 #include <mutex>
 #include <limits>
+#include <unordered_map>
 
 namespace TFD::InteractionRouter
 {
@@ -1386,6 +1387,7 @@ namespace TFD::InteractionRouter
             PendingState g_pending{};
             RE::TESGlobal* g_dialogueStateGlobal = nullptr;
             bool g_loggedDialogueStateMissing = false;
+            std::unordered_map<RE::FormID, Clock::time_point> g_temporaryDialogueCooldownUntil{};
 
             const char* ModeName(Mode mode)
             {
@@ -1398,6 +1400,8 @@ namespace TFD::InteractionRouter
                     return "InCombatTruce";
                 case Mode::PreCombatTruce:
                     return "PreCombatTruce";
+                case Mode::PreCombatFollowup:
+                    return "PreCombatFollowup";
                 case Mode::AfterPleasure:
                     return "AfterPleasure";
                 case Mode::Rescue:
@@ -1503,6 +1507,53 @@ namespace TFD::InteractionRouter
                 return actor ? actor->GetFormID() : 0u;
             }
 
+            bool IsTemporaryDialogueCooldownActiveLocked(RE::Actor* speaker, Clock::time_point now, double* outRemainingSec = nullptr)
+            {
+                if (outRemainingSec) {
+                    *outRemainingSec = 0.0;
+                }
+
+                if (!speaker) {
+                    return false;
+                }
+
+                const auto formID = speaker->GetFormID();
+                auto it = g_temporaryDialogueCooldownUntil.find(formID);
+                if (it == g_temporaryDialogueCooldownUntil.end()) {
+                    return false;
+                }
+
+                if (now >= it->second) {
+                    g_temporaryDialogueCooldownUntil.erase(it);
+                    return false;
+                }
+
+                if (outRemainingSec) {
+                    *outRemainingSec = std::chrono::duration<double>(it->second - now).count();
+                }
+                return true;
+            }
+
+            void ArmTemporaryDialogueCooldownLocked(RE::Actor* speaker, double durationSec, const char* reason)
+            {
+                if (!speaker || durationSec <= 0.0) {
+                    return;
+                }
+
+                const auto now = Clock::now();
+                const auto until = now + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(durationSec));
+                const auto formID = speaker->GetFormID();
+                const auto [it, inserted] = g_temporaryDialogueCooldownUntil.insert_or_assign(formID, until);
+                (void)it;
+
+                spdlog::info(
+                    "[TFD][DialogueOpen] temporary cooldown armed speaker={:08X} duration={:.2f}s reason={} state={}",
+                    formID,
+                    durationSec,
+                    reason ? reason : "unknown",
+                    inserted ? "new" : "refresh");
+            }
+
             void ResetLocked()
             {
                 g_pending.speaker = {};
@@ -1604,6 +1655,21 @@ namespace TFD::InteractionRouter
             void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
             {
                 std::scoped_lock lk(g_pending.lock);
+
+                const auto now = Clock::now();
+                double cooldownRemainingSec = 0.0;
+                if (speaker && IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
+                    CancelLocked("temporary_dialogue_cooldown");
+                    SyncDialogueStateLocked(IsDialogueOpen());
+                    spdlog::info(
+                        "[TFD][DialogueOpen] begin blocked mode={} reason={} speaker={:08X} cooldownRemaining={:.2f}s",
+                        ModeName(mode),
+                        reason ? reason : "unknown",
+                        speaker->GetFormID(),
+                        cooldownRemainingSec);
+                    return;
+                }
+
                 ResetLocked();
 
                 if (!speaker || speaker->IsDead() || speaker->IsDisabled()) {
@@ -1616,12 +1682,11 @@ namespace TFD::InteractionRouter
                     return;
                 }
 
-                const auto now = Clock::now();
                 const auto timeout = mode == Mode::Bleedout ?
                     kBleedoutTimeout :
                     (mode == Mode::AfterPleasure ?
                         kAfterPleasureTimeout :
-                        (mode == Mode::PreCombatTruce ?
+                        (mode == Mode::PreCombatTruce || mode == Mode::PreCombatFollowup ?
                             kPreCombatTimeout :
                             (mode == Mode::InCombatTruce ? kInCombatTimeout : kDefaultTimeout)));
                 g_pending.speaker = speaker->GetHandle();
@@ -1686,6 +1751,11 @@ namespace TFD::InteractionRouter
             BeginCommon(speaker, Mode::PreCombatTruce, "precombat_truce");
         }
 
+        void BeginPreCombatFollowup(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::PreCombatFollowup, "precombat_followup");
+        }
+
         void BeginAfterPleasure(RE::Actor* speaker)
         {
             BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
@@ -1725,6 +1795,17 @@ namespace TFD::InteractionRouter
             auto speakerSp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
             auto* speaker = speakerSp.get();
             const auto now = Clock::now();
+
+            double cooldownRemainingSec = 0.0;
+            if (IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
+                spdlog::info(
+                    "[TFD][DialogueOpen] pending cancelled by temporary cooldown mode={} speaker={:08X} remaining={:.2f}s",
+                    ModeName(g_pending.mode),
+                    speaker ? speaker->GetFormID() : 0u,
+                    cooldownRemainingSec);
+                CancelLocked("temporary_dialogue_cooldown");
+                return;
+            }
 
             if (!CanAttemptOpen(player, speaker)) {
                 CancelLocked("invalid_target");
@@ -1873,6 +1954,40 @@ namespace TFD::InteractionRouter
             CancelLocked("api_cancel");
         }
 
+        bool ForceCloseDialogueMenu(const char* reason)
+        {
+            const char* useReason = reason && reason[0] ? reason : "force_close_dialogue";
+
+            bool wasOpen = false;
+            {
+                std::scoped_lock lk(g_pending.lock);
+                wasOpen = IsDialogueOpen();
+                CancelLocked(useReason);
+            }
+
+            bool hideQueued = false;
+            auto* queue = RE::UIMessageQueue::GetSingleton();
+            auto* strings = RE::InterfaceStrings::GetSingleton();
+            if (queue && strings) {
+                queue->AddMessage(strings->dialogueMenu, RE::UI_MESSAGE_TYPE::kHide, nullptr);
+                queue->ProcessCommands();
+                hideQueued = true;
+            }
+
+            {
+                std::scoped_lock lk(g_pending.lock);
+                SyncDialogueStateLocked(IsDialogueOpen());
+            }
+
+            spdlog::info(
+                "[TFD][DialogueOpen] force close dialogue reason={} wasOpen={} hideQueued={}",
+                useReason,
+                wasOpen ? 1 : 0,
+                hideQueued ? 1 : 0);
+
+            return wasOpen || hideQueued;
+        }
+
         bool IsActive()
         {
             std::scoped_lock lk(g_pending.lock);
@@ -1891,6 +2006,31 @@ namespace TFD::InteractionRouter
         {
             std::scoped_lock lk(g_pending.lock);
             return g_pending.active ? g_pending.mode : Mode::None;
+        }
+
+        void ArmTemporaryDialogueCooldown(RE::Actor* speaker, double durationSec, const char* reason)
+        {
+            if (!speaker || durationSec <= 0.0) {
+                return;
+            }
+
+            std::scoped_lock lk(g_pending.lock);
+            ArmTemporaryDialogueCooldownLocked(speaker, durationSec, reason);
+
+            auto pendingSpeakerSp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
+            auto* pendingSpeaker = pendingSpeakerSp.get();
+            if (pendingSpeaker && pendingSpeaker == speaker) {
+                CancelLocked(reason ? reason : "temporary_dialogue_cooldown_armed");
+            }
+            else {
+                SyncDialogueStateLocked(IsDialogueOpen());
+            }
+        }
+
+        bool IsTemporaryDialogueCooldownActive(RE::Actor* speaker)
+        {
+            std::scoped_lock lk(g_pending.lock);
+            return IsTemporaryDialogueCooldownActiveLocked(speaker, Clock::now(), nullptr);
         }
     }
 }
