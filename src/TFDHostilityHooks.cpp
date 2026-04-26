@@ -9,6 +9,7 @@
 
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
+#include "TFDTeammateManager.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDBleedout.h"
 #include "TFDFlowController.h"
@@ -56,6 +57,47 @@ namespace TFD::HostilityHooks
                     return true;
                 }
                 return !TFD::DefeatMonitor::IsThresholdCombatTargetValid(actor);
+            }
+
+            static bool IsPlayerSideActor(RE::Actor* actor, RE::PlayerCharacter* player)
+            {
+                if (!actor || !player) {
+                    return false;
+                }
+
+                return actor == player ||
+                    actor->IsPlayerTeammate() ||
+                    TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                    TFD::Tame::IsCompanion(actor);
+            }
+
+            static bool IsPlayerSideCombatConflict(RE::Actor* actor, RE::Actor* target, RE::PlayerCharacter* player)
+            {
+                if (!actor || !target || !player) {
+                    return false;
+                }
+
+                return IsPlayerSideActor(actor, player) && IsPlayerSideActor(target, player);
+            }
+
+            static void CalmPlayerSideCombatActor(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->ClearCachedFactionFightReactions();
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                }
+
+                if (actor->IsInCombat()) {
+                    actor->StopCombat();
+                }
+
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
             }
 
             static bool ShouldPreservePlayerBleedTarget(RE::Character*, RE::Actor*)
@@ -111,7 +153,25 @@ namespace TFD::HostilityHooks
                 auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
                 auto* target = targetSp.get();
                 auto* player = RE::PlayerCharacter::GetSingleton();
-                if (player && target == player) {
+                if (player && target && IsPlayerSideCombatConflict(actor, target, player)) {
+                    const auto actorId = actor->GetFormID();
+                    const auto targetId = target->GetFormID();
+                    const bool actorTeammate = actor->IsPlayerTeammate();
+                    const bool actorFollower = TFD::TeammateManager::IsActiveFollowerActor(actor);
+                    const bool actorTame = TFD::Tame::IsCompanion(actor);
+
+                    CalmPlayerSideCombatActor(actor);
+                    spdlog::info(
+                        "[TFD][HostilityHooks] cleared player-side combat target actor={:08X} target={:08X} actorTeammate={} actorFollower={} actorTame={} reason=player_side_conflict",
+                        actorId,
+                        targetId,
+                        actorTeammate ? 1 : 0,
+                        actorFollower ? 1 : 0,
+                        actorTame ? 1 : 0);
+                    return;
+                }
+
+                if (player && target == player && !IsPlayerSideActor(actor, player)) {
                     TFD::Bleedout::DefeatGlue::NoteEnemyTargetingPlayer(actor);
                 }
 
@@ -120,7 +180,7 @@ namespace TFD::HostilityHooks
                 }
 
                 RE::Actor* replacement = nullptr;
-                if (actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) {
+                if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::Tame::IsCompanion(actor)) {
                     replacement = TFD::Bleedout::DefeatGlue::ResolveBleedFollowerAggroTarget(actor);
                 }
                 if (!replacement) {
@@ -131,7 +191,7 @@ namespace TFD::HostilityHooks
                     if (!actor->IsAIEnabled()) {
                         actor->EnableAI(true);
                     }
-                    if ((actor->IsPlayerTeammate() || TFD::Tame::IsCompanion(actor)) && !actor->IsWeaponDrawn()) {
+                    if ((actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::Tame::IsCompanion(actor)) && !actor->IsWeaponDrawn()) {
                         actor->DrawWeaponMagicHands(true);
                     }
                     actor->SetBeenAttacked(true);
@@ -218,7 +278,12 @@ namespace TFD::HostilityHooks
                 }
 
                 auto* player = RE::PlayerCharacter::GetSingleton();
-                if (viewer && target && player && target == player) {
+                if (viewer && target && player && IsPlayerSideCombatConflict(viewer, target, player)) {
+                    detectVal = -1000;
+                    return nullptr;
+                }
+
+                if (viewer && target && player && target == player && !IsPlayerSideActor(viewer, player)) {
                     TFD::Bleedout::DefeatGlue::NoteEnemyTargetingPlayer(viewer);
                 }
 

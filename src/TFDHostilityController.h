@@ -89,6 +89,7 @@ namespace TFD::HostilityController
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
         bool suppressBridgeEvents{ false };
+        std::vector<RE::FormID> dialogueAssignedActorIds{};
         bool finished{ false };
     };
 
@@ -119,6 +120,7 @@ namespace TFD::HostilityController
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
     [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
+    [[nodiscard]] std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget);
 
     bool CanStartTruce(RE::Actor* actor);
     bool HasSpentTruce(RE::Actor* actor);

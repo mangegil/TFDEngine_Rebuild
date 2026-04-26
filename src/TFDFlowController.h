@@ -349,6 +349,7 @@ namespace TFD::FlowController
         bool RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCompleteAfterPleasure(std::string_view reason);
         bool RequestCompleteTerminalContext(std::string_view reason);
+        bool RequestAbortPreCombat(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason);
 
@@ -369,6 +370,7 @@ namespace TFD::FlowController
         bool BeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool CompleteAfterPleasure(std::string_view reason);
         bool CompleteTerminalContext(std::string_view reason);
+        bool AbortPreCombat(std::uint32_t actorFormID, std::string_view reason);
 
         void NotifyCombatStarted(std::uint32_t actorFormID, std::string_view reason);
         void NotifyCombatEnded(std::string_view reason);

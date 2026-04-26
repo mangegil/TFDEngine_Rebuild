@@ -373,36 +373,31 @@ namespace TFD::PayModel
                 return out;
             }
 
-            addUnique(speaker);
-
             if (context == PayContext::PreCombat || context == PayContext::InCombat) {
-                bool hasTruceContext = false;
-
-                auto activeTruceActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
-                if (!activeTruceActors.empty()) {
-                    hasTruceContext = true;
-                    for (auto* actor : activeTruceActors) {
-                        addUnique(actor);
-                    }
+                const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
+                for (auto* actor : dialogueTruceActors) {
+                    addUnique(actor);
                 }
 
-                auto aliasTruceActors = TFD::Actor::Ops::CollectTruceActorsForSpeaker(speaker);
-                if (!aliasTruceActors.empty()) {
-                    hasTruceContext = true;
-                    for (auto* actor : aliasTruceActors) {
-                        addUnique(actor);
-                    }
-                }
-
-                if (hasTruceContext) {
+                if (!out.empty()) {
                     spdlog::info(
-                        "[TFD][PayModel] truce scoped actors speaker={:08X} context={} actors={}",
+                        "[TFD][PayModel] dialogue assigned truce actors speaker={:08X} context={} actors={}",
                         speaker->GetFormID(),
                         static_cast<int>(context),
                         static_cast<unsigned>(out.size()));
                     return out;
                 }
+
+                addUnique(speaker);
+                spdlog::info(
+                    "[TFD][PayModel] dialogue assigned fallback speaker-only speaker={:08X} context={} actors={}",
+                    speaker->GetFormID(),
+                    static_cast<int>(context),
+                    static_cast<unsigned>(out.size()));
+                return out;
             }
+
+            addUnique(speaker);
 
             auto snapshot = TFD::Actor::BuildSnapshot(kScanRadius, true);
             const auto* info = TFD::Actor::FindActorInfo(snapshot, speaker);
@@ -417,6 +412,7 @@ namespace TFD::PayModel
 
             return out;
         }
+
     }
 
     void Install()

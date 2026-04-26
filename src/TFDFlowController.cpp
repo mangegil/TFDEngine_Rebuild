@@ -1517,6 +1517,11 @@ void InstallRuntime()
         return CompleteTerminalContext(reason);
     }
 
+    bool Controller::RequestAbortPreCombat(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return AbortPreCombat(actorFormID, reason);
+    }
+
     bool Controller::RequestCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason)
     {
         return BeginCaptiveFromModEvent(actorFormID, reason);
@@ -1893,6 +1898,84 @@ void InstallRuntime()
     {
         std::scoped_lock lk(_lock);
         return CompleteTerminalContextLocked(reason);
+    }
+
+    bool Controller::AbortPreCombat(std::uint32_t actorFormID, std::string_view reason)
+    {
+        std::scoped_lock lk(_lock);
+
+        if (_snapshot.root != RootFlow::PreCombat) {
+            spdlog::info(
+                "[TFD][Flow] abort precombat ignored reason={} actor={:08X} root={} ctx={} gate={} sub={} token={} primary={:08X} terminal={}",
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                actorFormID,
+                ToString(_snapshot.root),
+                ToString(_snapshot.contextRoot),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token,
+                _snapshot.primaryActorFormID,
+                _snapshot.terminalResolved ? 1 : 0);
+            return false;
+        }
+
+        if (_snapshot.terminalResolved) {
+            spdlog::info(
+                "[TFD][Flow] abort precombat ignored reason={} actor={:08X} root={} ctx={} gate={} sub={} token={} primary={:08X} terminal=1",
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                actorFormID,
+                ToString(_snapshot.root),
+                ToString(_snapshot.contextRoot),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token,
+                _snapshot.primaryActorFormID);
+            return false;
+        }
+
+        const auto primary = _snapshot.primaryActorFormID;
+        if (actorFormID == 0) {
+            spdlog::warn(
+                "[TFD][Flow] abort precombat reject reason={} actor=00000000 primary={:08X} root={} gate={} sub={} token={}",
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                primary,
+                ToString(_snapshot.root),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token);
+            return false;
+        }
+
+        if (primary != 0 && primary != actorFormID) {
+            spdlog::warn(
+                "[TFD][Flow] abort precombat owner reject reason={} actor={:08X} primary={:08X} root={} gate={} sub={} token={}",
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                actorFormID,
+                primary,
+                ToString(_snapshot.root),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.token);
+            return false;
+        }
+
+        const auto before = _snapshot;
+        ClearAllLocked();
+        _combatActive = false;
+        RefreshFlowGlobalsLocked();
+
+        spdlog::info(
+            "[TFD][Flow] AbortPreCombat reason={} actor={:08X} oldRoot={} oldCtx={} oldGate={} oldSub={} oldToken={} oldPrimary={:08X}",
+            reason.empty() ? std::string{ "-" } : std::string{ reason },
+            actorFormID,
+            ToString(before.root),
+            ToString(before.contextRoot),
+            ToString(before.gate),
+            ToString(before.sub),
+            before.token,
+            before.primaryActorFormID);
+        LogFlowSnapshot("AbortPreCombat", reason, _snapshot, actorFormID);
+        return true;
     }
 
     void Controller::NotifyCombatStarted(std::uint32_t actorFormID, std::string_view reason)

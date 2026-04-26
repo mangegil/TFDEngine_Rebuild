@@ -56,6 +56,9 @@ namespace TFD::PreCombatGreet
         constexpr double kPostHandoffSettleBlockSec = 1.25;
         constexpr double kHotkeyCooldownSec = 3.0;
         constexpr double kRecruitedDialogueCooldownSec = 5.0;
+        constexpr double kPostRecruitSettleDurationSec = 3.00;
+        constexpr double kPostRecruitSettleIntervalSec = 0.35;
+        constexpr double kStaleRecruitCombatStateSuppressSec = 8.00;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -98,6 +101,15 @@ namespace TFD::PreCombatGreet
             double nextDialogueOpenRetrySec{ 0.0 };
         };
 
+        struct PostRecruitSettleEntry
+        {
+            RE::ActorHandle actor{};
+            double untilSec{ 0.0 };
+            double nextSweepSec{ 0.0 };
+            unsigned sweepCount{ 0 };
+            bool teammateSeen{ false };
+        };
+
         std::atomic_bool gInstalled{ false };
         std::atomic_bool gSuspended{ false };
         std::atomic_bool gRunning{ false };
@@ -107,6 +119,8 @@ namespace TFD::PreCombatGreet
         std::mutex gLock;
         std::unordered_map<std::uint32_t, Pending> gPending;
         std::unordered_map<std::uint32_t, double> gCooldownUntil;
+        std::unordered_map<RE::FormID, PostRecruitSettleEntry> gPostRecruitSettle;
+        std::unordered_map<RE::FormID, double> gStaleRecruitHostilityUntil;
         Clock::time_point gT0 = Clock::now();
 
         std::uint32_t gRecentActorHandle = 0;
@@ -264,6 +278,69 @@ namespace TFD::PreCombatGreet
             gRecentActorWorldspaceFormID = 0;
             gRecentActorInterior = false;
             gRecentActorLastSoftAgeLogSec = 0.0;
+        }
+
+        RE::Actor* ResolveCurrentCombatTargetForDiag(RE::Actor* actor)
+        {
+            if (!actor) {
+                return nullptr;
+            }
+
+            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            return targetSp.get();
+        }
+
+        bool IsPlayerSideActorForDiag(RE::Actor* actor, RE::PlayerCharacter* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+            if (actor == player) {
+                return true;
+            }
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor);
+        }
+
+        void LogPlayerEnteredCombatRecentClearLocked(RE::PlayerCharacter* player)
+        {
+            if (gRecentActorHandle == 0) {
+                return;
+            }
+
+            auto recentSp = RE::Actor::LookupByHandle(gRecentActorHandle);
+            RE::Actor* recentActor = recentSp.get();
+
+            auto* recentTarget = ResolveCurrentCombatTargetForDiag(recentActor);
+            auto* playerTarget = ResolveCurrentCombatTargetForDiag(player);
+            const bool recentIsTeammate = recentActor && recentActor->IsPlayerTeammate();
+            const bool recentIsFollower = recentActor && TFD::TeammateManager::IsActiveFollowerActor(recentActor);
+            const bool recentIsTameCompanion = recentActor && TFD::Tame::IsCompanion(recentActor);
+            const bool recentHostileToPlayer = recentActor && player && recentActor->IsHostileToActor(player);
+            const bool recentInCombat = recentActor && recentActor->IsInCombat();
+            const bool recentTargetPlayer = recentTarget && player && recentTarget->GetFormID() == player->GetFormID();
+            const bool recentTargetPlayerSide = IsPlayerSideActorForDiag(recentTarget, player);
+            const double now = NowSec();
+            const bool postHandoffActive = gPostHandoffBlockUntilSec > now;
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] player entered combat diagnostic recentHandle={:08X} recent={:08X} recentTeammate={} recentFollower={} recentTameCompanion={} recentHostileToPlayer={} recentInCombat={} recentTarget={:08X} recentTargetPlayer={} recentTargetPlayerSide={} playerTarget={:08X} postHandoffActor={:08X} postHandoffActive={} pendingCount={} extortionActive={}",
+                gRecentActorHandle,
+                recentActor ? recentActor->GetFormID() : 0u,
+                recentIsTeammate ? 1 : 0,
+                recentIsFollower ? 1 : 0,
+                recentIsTameCompanion ? 1 : 0,
+                recentHostileToPlayer ? 1 : 0,
+                recentInCombat ? 1 : 0,
+                recentTarget ? recentTarget->GetFormID() : 0u,
+                recentTargetPlayer ? 1 : 0,
+                recentTargetPlayerSide ? 1 : 0,
+                playerTarget ? playerTarget->GetFormID() : 0u,
+                gPostHandoffBlockActorFormID,
+                postHandoffActive ? 1 : 0,
+                static_cast<unsigned>(gPending.size()),
+                TFD::Extortion::HasActive() ? 1 : 0);
         }
 
         void ClearPostHandoffBlockLocked(const char* reason)
@@ -467,45 +544,19 @@ namespace TFD::PreCombatGreet
             SendBridgeEvent("TFDPreCombatClearAll", nullptr);
         }
 
-        bool ContainsActorFormID(const std::vector<RE::Actor*>& actors, RE::FormID formID)
-        {
-            if (formID == 0) {
-                return true;
-            }
-
-            for (auto* actor : actors) {
-                if (actor && actor->GetFormID() == formID) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
         void ArmRecruitDialogueCooldownForGroup(RE::Actor* primaryActor, const char* reason)
         {
             if (!primaryActor) {
                 return;
             }
 
-            std::vector<RE::Actor*> actors{};
-            actors.reserve(12);
-            if (!primaryActor->IsDead() && !primaryActor->IsDisabled()) {
+            std::vector<RE::Actor*> actors = TFD::HostilityController::CollectDialogueTruceActors(primaryActor);
+            if (actors.empty() && !primaryActor->IsDead() && !primaryActor->IsDisabled()) {
                 actors.push_back(primaryActor);
             }
 
-            const auto truceActors = TFD::HostilityController::CollectActiveTruceActors(primaryActor);
-            for (auto* actor : truceActors) {
-                if (!actor || actor->IsDead() || actor->IsDisabled()) {
-                    continue;
-                }
-                if (ContainsActorFormID(actors, actor->GetFormID())) {
-                    continue;
-                }
-                actors.push_back(actor);
-            }
-
             for (auto* actor : actors) {
-                if (!actor) {
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
                     continue;
                 }
 
@@ -519,13 +570,353 @@ namespace TFD::PreCombatGreet
             }
 
             spdlog::info(
-                "[TFD][PreCombatGreet] recruit dialogue cooldown group actor={:08X} count={} duration={:.2f}s reason={}",
+                "[TFD][PreCombatGreet] recruit dialogue cooldown group actor={:08X} count={} duration={:.2f}s reason={} source=dialogue_participants",
                 primaryActor->GetFormID(),
                 static_cast<unsigned>(actors.size()),
                 kRecruitedDialogueCooldownSec,
                 reason ? reason : "unknown");
         }
 
+
+        bool IsPostRecruitSettleTeammateLike(RE::Actor* actor)
+        {
+            return actor &&
+                (actor->IsPlayerTeammate() ||
+                    TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                    TFD::Tame::IsCompanion(actor));
+        }
+
+        void PruneStaleRecruitHostilityLocked(double nowSec)
+        {
+            for (auto it = gStaleRecruitHostilityUntil.begin(); it != gStaleRecruitHostilityUntil.end();) {
+                if (nowSec >= it->second) {
+                    it = gStaleRecruitHostilityUntil.erase(it);
+                    continue;
+                }
+                ++it;
+            }
+        }
+
+        void TrackStaleRecruitHostilityLocked(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                return;
+            }
+
+            const double now = NowSec();
+            PruneStaleRecruitHostilityLocked(now);
+
+            const double until = now + kStaleRecruitCombatStateSuppressSec;
+            auto it = gStaleRecruitHostilityUntil.find(actorId);
+            const bool firstTrack = it == gStaleRecruitHostilityUntil.end() || now >= it->second;
+            if (it == gStaleRecruitHostilityUntil.end()) {
+                gStaleRecruitHostilityUntil.emplace(actorId, until);
+            } else {
+                it->second = std::max(it->second, until);
+            }
+
+            if (firstTrack) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet] stale recruit hostility tracked actor={:08X} duration={:.2f}s reason={}",
+                    actorId,
+                    kStaleRecruitCombatStateSuppressSec,
+                    reason ? reason : "unknown");
+            }
+        }
+
+        bool IsTrackedStaleRecruitHostilityLocked(RE::Actor* actor, double nowSec)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            PruneStaleRecruitHostilityLocked(nowSec);
+
+            const auto it = gStaleRecruitHostilityUntil.find(actor->GetFormID());
+            return it != gStaleRecruitHostilityUntil.end() && nowSec < it->second;
+        }
+
+        bool TrySuppressStaleRecruitPlayerCombatLocked(RE::PlayerCharacter* player, const char* source)
+        {
+            if (!player || !player->IsInCombat() || gRecentActorHandle == 0) {
+                return false;
+            }
+
+            auto recentSp = RE::Actor::LookupByHandle(gRecentActorHandle);
+            RE::Actor* recentActor = recentSp.get();
+            if (!recentActor || recentActor == player || recentActor->IsDead() || recentActor->IsDisabled()) {
+                return false;
+            }
+
+            const double now = NowSec();
+            if (!IsTrackedStaleRecruitHostilityLocked(recentActor, now)) {
+                return false;
+            }
+
+            const bool teammateLike = IsPostRecruitSettleTeammateLike(recentActor);
+            if (!teammateLike) {
+                return false;
+            }
+
+            auto* recentTarget = ResolveCurrentCombatTargetForDiag(recentActor);
+            auto* playerTarget = ResolveCurrentCombatTargetForDiag(player);
+            const bool recentTargetPlayerSide = IsPlayerSideActorForDiag(recentTarget, player);
+            const bool recentInCombat = recentActor->IsInCombat();
+            const bool recentHostileToPlayer = recentActor->IsHostileToActor(player);
+            const bool playerInCombatBefore = player->IsInCombat();
+
+            // Narrow guard for the observed post-recruit stale faction case:
+            // recruited actor is now player-side, has no combat target, is not
+            // in combat, but the player is still marked in combat with no target.
+            if (recentInCombat || recentTargetPlayerSide || playerTarget) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet] stale recruit player combat suppress skipped actor={:08X} recentInCombat={} recentTarget={:08X} recentTargetPlayerSide={} playerTarget={:08X} source={}",
+                    recentActor->GetFormID(),
+                    recentInCombat ? 1 : 0,
+                    recentTarget ? recentTarget->GetFormID() : 0u,
+                    recentTargetPlayerSide ? 1 : 0,
+                    playerTarget ? playerTarget->GetFormID() : 0u,
+                    source ? source : "unknown");
+                return false;
+            }
+
+            recentActor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+            player->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->ClearCachedFactionFightReactions();
+                process->StopCombatAndAlarmOnActor(recentActor, false);
+                process->StopCombatAndAlarmOnActor(player, false);
+            }
+
+            recentActor->StopCombat();
+            recentActor->StopAlarmOnActor();
+            player->StopCombat();
+
+            recentActor->EvaluatePackage(false, true);
+            recentActor->EvaluatePackage(true, true);
+            recentActor->UpdateCombat();
+            player->UpdateCombat();
+
+            const bool playerInCombatAfter = player->IsInCombat();
+            auto* recentTargetAfter = ResolveCurrentCombatTargetForDiag(recentActor);
+            auto* playerTargetAfter = ResolveCurrentCombatTargetForDiag(player);
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] stale recruit player combat suppressed actor={:08X} teammate={} follower={} tame={} hostileToPlayer={} playerInCombatBefore={} playerInCombatAfter={} recentTargetBefore={:08X} playerTargetBefore={:08X} recentTargetAfter={:08X} playerTargetAfter={:08X} source={}",
+                recentActor->GetFormID(),
+                recentActor->IsPlayerTeammate() ? 1 : 0,
+                TFD::TeammateManager::IsActiveFollowerActor(recentActor) ? 1 : 0,
+                TFD::Tame::IsCompanion(recentActor) ? 1 : 0,
+                recentHostileToPlayer ? 1 : 0,
+                playerInCombatBefore ? 1 : 0,
+                playerInCombatAfter ? 1 : 0,
+                recentTarget ? recentTarget->GetFormID() : 0u,
+                playerTarget ? playerTarget->GetFormID() : 0u,
+                recentTargetAfter ? recentTargetAfter->GetFormID() : 0u,
+                playerTargetAfter ? playerTargetAfter->GetFormID() : 0u,
+                source ? source : "unknown");
+
+            return !playerInCombatAfter;
+        }
+
+        void ClearPostRecruitSettleLocked(const char* reason)
+        {
+            if (gPostRecruitSettle.empty()) {
+                return;
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] post recruit settle cleared count={} reason={}",
+                static_cast<unsigned>(gPostRecruitSettle.size()),
+                reason ? reason : "unknown");
+            gPostRecruitSettle.clear();
+        }
+
+        void ArmPostRecruitSettleForGroup(RE::Actor* primaryActor, const char* reason)
+        {
+            if (!primaryActor) {
+                return;
+            }
+
+            std::vector<RE::Actor*> actors = TFD::HostilityController::CollectDialogueTruceActors(primaryActor);
+            if (actors.empty() && !primaryActor->IsDead() && !primaryActor->IsDisabled()) {
+                actors.push_back(primaryActor);
+            }
+
+            const double now = NowSec();
+            unsigned armedCount = 0;
+            for (auto* actor : actors) {
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                    continue;
+                }
+
+                const auto actorId = actor->GetFormID();
+                if (actorId == 0) {
+                    continue;
+                }
+
+                auto& entry = gPostRecruitSettle[actorId];
+                entry.actor = actor->GetHandle();
+                entry.untilSec = std::max(entry.untilSec, now + kPostRecruitSettleDurationSec);
+                entry.nextSweepSec = now;
+                entry.teammateSeen = entry.teammateSeen || IsPostRecruitSettleTeammateLike(actor);
+                ++armedCount;
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] post recruit settle armed actor={:08X} count={} duration={:.2f}s reason={} source=dialogue_participants",
+                primaryActor->GetFormID(),
+                armedCount,
+                kPostRecruitSettleDurationSec,
+                reason ? reason : "unknown");
+        }
+
+        bool ApplyPostRecruitSettleSweep(
+            RE::Actor* actor,
+            RE::PlayerCharacter* player,
+            unsigned sweepCount,
+            const char* reason)
+        {
+            if (!actor || !player || actor == player) {
+                return true;
+            }
+            if (actor->IsDead() || actor->IsDisabled()) {
+                return true;
+            }
+            if (!actor->Is3DLoaded()) {
+                return true;
+            }
+
+            const bool teammateLike = IsPostRecruitSettleTeammateLike(actor);
+            if (!teammateLike) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet] post recruit settle wait actor={:08X} sweep={} reason=not_teammate_yet source={}",
+                    actor->GetFormID(),
+                    sweepCount,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            auto* targetBefore = ResolveCurrentCombatTargetForDiag(actor);
+            const bool targetWasPlayerSide = IsPlayerSideActorForDiag(targetBefore, player);
+            const bool hostileBefore = actor->IsHostileToActor(player);
+            const bool inCombatBefore = actor->IsInCombat();
+            bool changed = false;
+
+            if (targetWasPlayerSide) {
+                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                changed = true;
+            }
+
+            if (hostileBefore || inCombatBefore || targetWasPlayerSide) {
+                actor->StopCombat();
+                actor->StopAlarmOnActor();
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                    process->ClearCachedFactionFightReactions();
+                }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                actor->UpdateCombat();
+                player->UpdateCombat();
+                changed = true;
+            }
+
+            auto* targetAfter = ResolveCurrentCombatTargetForDiag(actor);
+            const bool targetAfterPlayerSide = IsPlayerSideActorForDiag(targetAfter, player);
+            const bool hostileAfter = actor->IsHostileToActor(player);
+            const bool inCombatAfter = actor->IsInCombat();
+            const bool staleFactionOnly = teammateLike && hostileAfter && !inCombatAfter && !targetAfterPlayerSide;
+            if (staleFactionOnly) {
+                TrackStaleRecruitHostilityLocked(actor, "post_recruit_settle_stale_faction_only");
+            }
+            const bool settled = (!hostileAfter || staleFactionOnly) && !inCombatAfter && !targetAfterPlayerSide;
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] post recruit settle sweep actor={:08X} sweep={} teammate={} follower={} tame={} hostileBefore={} hostileAfter={} staleFactionOnly={} inCombatBefore={} inCombatAfter={} targetBefore={:08X} targetBeforePlayerSide={} targetAfter={:08X} targetAfterPlayerSide={} changed={} settled={} reason={}",
+                actor->GetFormID(),
+                sweepCount,
+                actor->IsPlayerTeammate() ? 1 : 0,
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ? 1 : 0,
+                TFD::Tame::IsCompanion(actor) ? 1 : 0,
+                hostileBefore ? 1 : 0,
+                hostileAfter ? 1 : 0,
+                staleFactionOnly ? 1 : 0,
+                inCombatBefore ? 1 : 0,
+                inCombatAfter ? 1 : 0,
+                targetBefore ? targetBefore->GetFormID() : 0u,
+                targetWasPlayerSide ? 1 : 0,
+                targetAfter ? targetAfter->GetFormID() : 0u,
+                targetAfterPlayerSide ? 1 : 0,
+                changed ? 1 : 0,
+                settled ? 1 : 0,
+                reason ? reason : "unknown");
+
+            return settled;
+        }
+
+
+        void ProcessPostRecruitSettleLocked(double nowSec)
+        {
+            if (gPostRecruitSettle.empty()) {
+                return;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return;
+            }
+
+            for (auto it = gPostRecruitSettle.begin(); it != gPostRecruitSettle.end();) {
+                auto& entry = it->second;
+                if (nowSec >= entry.untilSec) {
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] post recruit settle expired actor={:08X} sweeps={} teammateSeen={}",
+                        it->first,
+                        entry.sweepCount,
+                        entry.teammateSeen ? 1 : 0);
+                    it = gPostRecruitSettle.erase(it);
+                    continue;
+                }
+
+                if (nowSec < entry.nextSweepSec) {
+                    ++it;
+                    continue;
+                }
+
+                auto actorSp = entry.actor.get();
+                auto* actor = actorSp.get();
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] post recruit settle removed actor={:08X} reason=invalid",
+                        it->first);
+                    it = gPostRecruitSettle.erase(it);
+                    continue;
+                }
+
+                ++entry.sweepCount;
+                entry.nextSweepSec = nowSec + kPostRecruitSettleIntervalSec;
+                entry.teammateSeen = entry.teammateSeen || IsPostRecruitSettleTeammateLike(actor);
+
+                const bool settled = ApplyPostRecruitSettleSweep(actor, player, entry.sweepCount, "post_recruit_settle");
+                if (settled && entry.teammateSeen && entry.sweepCount >= 2) {
+                    spdlog::info(
+                        "[TFD][PreCombatGreet] post recruit settle done actor={:08X} sweeps={}",
+                        actor->GetFormID(),
+                        entry.sweepCount);
+                    it = gPostRecruitSettle.erase(it);
+                    continue;
+                }
+
+                ++it;
+            }
+        }
         void ClearDialogueClosePendingLocked(Pending& pending)
         {
             pending.dialogueClosePending = false;
@@ -1192,6 +1583,11 @@ namespace TFD::PreCombatGreet
                     ArmPostHandoffBlockLocked(actor, kPostHandoffSettleBlockSec, reason ? reason : "dialogue_handoff");
                     ArmHotkeyCooldownLocked(actor, kHotkeyCooldownSec, reason ? reason : "dialogue_handoff");
                 }
+                else if (actor) {
+                    (void)TFD::FlowController::Controller::GetSingleton().RequestAbortPreCombat(
+                        actor->GetFormID(),
+                        reason ? reason : "precombat_cleanup");
+                }
             }
 
             if (actor) {
@@ -1243,6 +1639,7 @@ namespace TFD::PreCombatGreet
             }
 
             gPending.clear();
+            gStaleRecruitHostilityUntil.clear();
 
             if (hadPreCombatPending) {
                 TFD::InteractionRouter::ClearInteractionStateValue();
@@ -1356,6 +1753,7 @@ namespace TFD::PreCombatGreet
 
                     if (pendingActor) {
                         ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
+                        ArmPostRecruitSettleForGroup(pendingActor, rawName);
                     }
                     TFD::Extortion::HandlePreCombatTerminalPendingEvent(pendingActor ? pendingActor : actor, rawName);
                     spdlog::info(
@@ -1596,6 +1994,7 @@ namespace TFD::PreCombatGreet
                     else {
                         if (pendingActor) {
                             ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
+                            ArmPostRecruitSettleForGroup(pendingActor, rawName);
                         }
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
@@ -1639,7 +2038,10 @@ namespace TFD::PreCombatGreet
             if (auto* player = RE::PlayerCharacter::GetSingleton(); player && player->IsInCombat()) {
                 std::scoped_lock lk(gLock);
                 if (gRecentActorHandle != 0 && !HasStickyPendingLocked() && !TFD::Extortion::HasActive()) {
-                    ClearRecentActor("player_entered_combat");
+                    if (!TrySuppressStaleRecruitPlayerCombatLocked(player, "tick_ui")) {
+                        LogPlayerEnteredCombatRecentClearLocked(player);
+                        ClearRecentActor("player_entered_combat");
+                    }
                 }
             }
 
@@ -1704,6 +2106,8 @@ namespace TFD::PreCombatGreet
             TFD::HostilityController::Update(now);
 
             std::scoped_lock lk(gLock);
+
+            ProcessPostRecruitSettleLocked(now);
 
             for (auto it = gPending.begin(); it != gPending.end();) {
                 auto sp = RE::Actor::LookupByHandle(it->first);
@@ -1910,6 +2314,7 @@ namespace TFD::PreCombatGreet
             ClearRecentActor("shutdown");
             ClearPostHandoffBlockLocked("shutdown");
             ClearHotkeyCooldownLocked("shutdown");
+            ClearPostRecruitSettleLocked("shutdown");
         }
 
         TFD::Extortion::Shutdown();
@@ -1928,6 +2333,7 @@ namespace TFD::PreCombatGreet
             ClearRecentActor("suspend");
             ClearPostHandoffBlockLocked("suspend");
             ClearHotkeyCooldownLocked("suspend");
+            ClearPostRecruitSettleLocked("suspend");
         }
     }
 
@@ -2250,8 +2656,11 @@ namespace TFD::PreCombatGreet
         auto* player = RE::PlayerCharacter::GetSingleton();
         if (player && player->IsInCombat()) {
             if (!HasStickyPendingLocked() && !TFD::Extortion::HasActive()) {
-                ClearRecentActor("player_entered_combat");
-                return nullptr;
+                if (!TrySuppressStaleRecruitPlayerCombatLocked(player, "recent_actor_lookup")) {
+                    LogPlayerEnteredCombatRecentClearLocked(player);
+                    ClearRecentActor("player_entered_combat");
+                    return nullptr;
+                }
             }
         }
 

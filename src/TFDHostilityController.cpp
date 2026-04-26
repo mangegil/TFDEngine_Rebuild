@@ -98,10 +98,10 @@ namespace
                                 return;
                             }
                             SweepOnce(radius, npcOnly);
-                        });
+                            });
                     }
                 }
-            }).detach();
+                }).detach();
 
             spdlog::info("[TFD][HostilityController] scheduled {} waves ({}ms) generation={}", waves, intervalMs, generation);
         }
@@ -463,6 +463,81 @@ namespace TFD::HostilityController
         std::unordered_map<RE::FormID, RehostileRequest> g_rehostileRequests;
         RE::FormID g_nextSessionId = 1;
 
+        namespace HostilityOverrideFactionInternal
+        {
+            inline bool g_triedResolve = false;
+            inline std::vector<RE::TESFaction*> g_factions{};
+
+            constexpr const char* k_editorIds[] = {
+                "TFDAfterPleasureFaction",
+                "TFDBleedOutFaction",
+                "TFDBleedoutFaction",
+                "TFDCaptiveFaction",
+                "TFDDefeatedFaction",
+                "TFDInCombatTruceFaction",
+                "TFDPacifyFaction",
+                "TFDPlayerFaction",
+                "TFDPreCombatTruceFaction",
+                "TFDSaviorFaction",
+                "TFDTeammateFaction",
+                "TFDTruceTeammateFaction",
+                "TFDWorkingCaptiveFaction"
+            };
+
+            void Resolve()
+            {
+                if (g_triedResolve) {
+                    return;
+                }
+
+                g_triedResolve = true;
+                g_factions.clear();
+
+                for (const auto* editorId : k_editorIds) {
+                    if (!editorId || editorId[0] == '\0') {
+                        continue;
+                    }
+
+                    auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>(editorId);
+                    if (!faction) {
+                        spdlog::warn(
+                            "[TFD][HostilityController] hostility override faction unresolved editorId='{}'",
+                            editorId);
+                        continue;
+                    }
+
+                    if (std::find(g_factions.begin(), g_factions.end(), faction) == g_factions.end()) {
+                        g_factions.push_back(faction);
+                    }
+                }
+
+                spdlog::info(
+                    "[TFD][HostilityController] hostility override factions resolved count={}",
+                    static_cast<unsigned int>(g_factions.size()));
+            }
+
+            bool HasOverrideFaction(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                Resolve();
+
+                for (auto* faction : g_factions) {
+                    if (!faction) {
+                        continue;
+                    }
+
+                    if (actor->IsInFaction(faction)) {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+        }
+
         const char* GetPrimaryAssignEventName(Mode mode)
         {
             switch (mode) {
@@ -692,11 +767,90 @@ namespace TFD::HostilityController
 
         bool IsDialogueCapableTruceEventActor(RE::Actor* actor)
         {
-            if (!actor) {
+            if (!IsActorStillValid(actor)) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
                 return false;
             }
 
             return TFD::Actor::Interaction::IsNegotiable(actor);
+        }
+
+        bool HasLineOfSightBetween(RE::Actor* from, RE::TESObjectREFR* to)
+        {
+            if (!from || !to) {
+                return false;
+            }
+
+            bool hasLOSData = false;
+            return from->HasLineOfSight(to, hasLOSData);
+        }
+
+        bool HasDialogueCrowdLineOfSight(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            if (player && (HasLineOfSightBetween(actor, player) || HasLineOfSightBetween(player, actor))) {
+                return true;
+            }
+
+            if (primaryTarget && (HasLineOfSightBetween(actor, primaryTarget) || HasLineOfSightBetween(primaryTarget, actor))) {
+                return true;
+            }
+
+            return false;
+        }
+
+        bool IsRecentOrCurrentTeammateLikeForDialogueCrowd(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor) ||
+                TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+        }
+
+        bool SharesSpeakerCrowdSide(RE::Actor* actor, RE::Actor* primaryTarget, RE::Actor* player);
+
+        bool IsEligibleDialogueCrowdActor(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!IsDialogueCapableTruceEventActor(actor) || !player || !primaryTarget) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == player->GetFormID() || actorId == primaryTarget->GetFormID()) {
+                return false;
+            }
+
+            if (IsRecentOrCurrentTeammateLikeForDialogueCrowd(actor)) {
+                spdlog::info(
+                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=teammate_like",
+                    actorId,
+                    primaryTarget->GetFormID());
+                return false;
+            }
+
+            if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                return false;
+            }
+
+            if (!HasDialogueCrowdLineOfSight(actor, player, primaryTarget)) {
+                spdlog::info(
+                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=no_los",
+                    actorId,
+                    primaryTarget->GetFormID());
+                return false;
+            }
+
+            return true;
         }
 
         bool ActorHasAnyExactFaction(RE::Actor* actor)
@@ -826,8 +980,13 @@ namespace TFD::HostilityController
             }
 
             auto* primaryTarget = ResolveActor(primaryTargetId);
-            if (primaryTargetId != 0) {
+            if (primaryTarget && IsDialogueCapableTruceEventActor(primaryTarget)) {
                 result.primaryIds.push_back(primaryTargetId);
+            }
+            else if (primaryTargetId != 0) {
+                spdlog::info(
+                    "TFDHostilityController: dialogue primary reject primary={:08X} reason=invalid_or_not_dialogue_capable",
+                    primaryTargetId);
             }
 
             result.crowdIds.reserve((std::min)(actorIds.size(), kCrowdAliasCap));
@@ -839,7 +998,7 @@ namespace TFD::HostilityController
                 if (std::find(result.crowdIds.begin(), result.crowdIds.end(), actorId) == result.crowdIds.end()) {
                     result.crowdIds.push_back(actorId);
                 }
-            };
+                };
 
             for (auto actorId : actorIds) {
                 if (result.crowdIds.size() >= kCrowdAliasCap) {
@@ -850,17 +1009,40 @@ namespace TFD::HostilityController
                 }
 
                 auto* actor = ResolveActor(actorId);
-                if (!actor) {
-                    continue;
-                }
-                if (!IsDialogueCapableTruceEventActor(actor)) {
-                    continue;
-                }
-                if (primaryTarget && !SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget)) {
                     continue;
                 }
 
                 addCrowdUnique(actorId);
+            }
+
+            return result;
+        }
+
+        std::vector<RE::FormID> BuildAssignedTruceDialogueIds(const TruceEventTargets& targets)
+        {
+            std::vector<RE::FormID> result;
+            result.reserve(targets.primaryIds.size() + targets.crowdIds.size());
+
+            auto addUnique = [&](RE::FormID actorId) {
+                if (actorId == 0) {
+                    return;
+                }
+                if (std::find(result.begin(), result.end(), actorId) != result.end()) {
+                    return;
+                }
+                auto* actor = ResolveActor(actorId);
+                if (!IsDialogueCapableTruceEventActor(actor)) {
+                    return;
+                }
+                result.push_back(actorId);
+                };
+
+            for (const auto actorId : targets.primaryIds) {
+                addUnique(actorId);
+            }
+            for (const auto actorId : targets.crowdIds) {
+                addUnique(actorId);
             }
 
             return result;
@@ -1169,6 +1351,14 @@ namespace TFD::HostilityController
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor)
         {
             if (!player || !actor) {
+                return false;
+            }
+
+            if (actor->GetFormID() == player->GetFormID()) {
+                return false;
+            }
+
+            if (HostilityOverrideFactionInternal::HasOverrideFaction(actor)) {
                 return false;
             }
 
@@ -1928,6 +2118,7 @@ namespace TFD::HostilityController
             session.temporaryTeammateApplied = false;
             session.dialogueRequested = allowDialogue;
             session.suppressBridgeEvents = suppressBridgeEvents;
+            session.dialogueAssignedActorIds.clear();
             session.finished = false;
 
             if (!AddOrRefreshEntry(
@@ -2154,12 +2345,18 @@ namespace TFD::HostilityController
                     sessionId,
                     ToString(mode),
                     targetId);
-            } else if (IsTruceMode(mode)) {
+            }
+            else if (IsTruceMode(mode)) {
                 const auto splitTargets = PartitionTruceEventTargets(applyIds, player, targetId);
+                const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
+                if (auto sessionIt = g_sessions.find(sessionId); sessionIt != g_sessions.end()) {
+                    sessionIt->second.dialogueAssignedActorIds = assignedDialogueIds;
+                }
+
                 const auto primarySent = SendModEventToActors(GetPrimaryAssignEventName(mode), splitTargets.primaryIds);
                 const auto crowdSent = SendModEventToActors(GetCrowdAssignEventName(mode), splitTargets.crowdIds);
                 spdlog::info(
-                    "TFDHostilityController: assign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} crowdSize={}",
+                    "TFDHostilityController: assign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} crowdSize={} assignedCount={}",
                     ToString(mode),
                     sessionId,
                     GetPrimaryAssignEventName(mode) ? GetPrimaryAssignEventName(mode) : "<none>",
@@ -2167,8 +2364,10 @@ namespace TFD::HostilityController
                     GetCrowdAssignEventName(mode) ? GetCrowdAssignEventName(mode) : "<none>",
                     static_cast<unsigned int>(crowdSent),
                     targetId,
-                    static_cast<unsigned int>(splitTargets.crowdIds.size()));
-            } else {
+                    static_cast<unsigned int>(splitTargets.crowdIds.size()),
+                    static_cast<unsigned int>(assignedDialogueIds.size()));
+            }
+            else {
                 const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
                 const auto sent = SendModEventToActors(GetPrimaryAssignEventName(mode), eventIds);
                 spdlog::info(
@@ -2578,7 +2777,7 @@ namespace TFD::HostilityController
                 return;
             }
             actors.push_back(actor);
-        };
+            };
 
         addUnique(session.primaryTargetId);
 
@@ -2599,6 +2798,98 @@ namespace TFD::HostilityController
         std::sort(crowdIds.begin(), crowdIds.end());
 
         for (const auto actorId : crowdIds) {
+            addUnique(actorId);
+        }
+
+        return actors;
+    }
+
+    std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget)
+    {
+        std::vector<RE::Actor*> actors;
+        if (!primaryTarget) {
+            return actors;
+        }
+
+        const auto primaryTargetId = primaryTarget->GetFormID();
+        if (primaryTargetId == 0) {
+            return actors;
+        }
+
+        RE::FormID sessionId = 0;
+        auto entryIt = g_entries.find(primaryTargetId);
+        if (entryIt != g_entries.end() && IsTruceMode(entryIt->second.mode)) {
+            sessionId = entryIt->second.sessionId;
+        }
+
+        if (sessionId == 0) {
+            for (const auto& [candidateSessionId, session] : g_sessions) {
+                if (session.finished || !IsTruceMode(session.primaryMode)) {
+                    continue;
+                }
+                if (session.primaryTargetId == primaryTargetId) {
+                    sessionId = candidateSessionId;
+                    break;
+                }
+            }
+        }
+
+        if (sessionId == 0) {
+            return actors;
+        }
+
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end()) {
+            return actors;
+        }
+
+        const auto& session = sessionIt->second;
+        if (session.finished || !IsTruceMode(session.primaryMode)) {
+            return actors;
+        }
+
+        auto addUnique = [&](RE::FormID actorId) {
+            if (actorId == 0) {
+                return;
+            }
+            auto* actor = Runtime::ResolveActor(actorId);
+            if (!IsActorStillValid(actor)) {
+                return;
+            }
+            if (std::find(actors.begin(), actors.end(), actor) != actors.end()) {
+                return;
+            }
+            actors.push_back(actor);
+            };
+
+        if (!session.dialogueAssignedActorIds.empty()) {
+            for (const auto actorId : session.dialogueAssignedActorIds) {
+                addUnique(actorId);
+            }
+
+            if (!actors.empty()) {
+                return actors;
+            }
+        }
+
+        std::vector<RE::FormID> actorIds;
+        actorIds.reserve(g_entries.size());
+        for (const auto& [actorId, entry] : g_entries) {
+            if (entry.sessionId != sessionId) {
+                continue;
+            }
+            if (!IsTruceMode(entry.mode)) {
+                continue;
+            }
+            actorIds.push_back(actorId);
+        }
+        std::sort(actorIds.begin(), actorIds.end());
+
+        auto* player = Runtime::ResolveActor(session.playerId);
+        const auto splitTargets = PartitionTruceEventTargets(actorIds, player, session.primaryTargetId);
+        const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
+
+        for (const auto actorId : assignedDialogueIds) {
             addUnique(actorId);
         }
 
@@ -2703,8 +2994,8 @@ namespace TFD::HostilityController
                     player &&
                     (!suppressRehostile &&
                         (reason == ReleaseReason::DialogueClosed ||
-                        reason == ReleaseReason::PlayerArmed ||
-                        reason == ReleaseReason::FightChoice));
+                            reason == ReleaseReason::PlayerArmed ||
+                            reason == ReleaseReason::FightChoice));
 
                 const bool immediateInCombatRehostile =
                     releasedEntry.mode == Mode::TruceInCombat &&
@@ -2755,7 +3046,8 @@ namespace TFD::HostilityController
                 ToString(reason),
                 ToString(primaryMode),
                 primaryTargetId);
-        } else if (IsTruceMode(primaryMode)) {
+        }
+        else if (IsTruceMode(primaryMode)) {
             const auto splitTargets = PartitionTruceEventTargets(actorIds, player, primaryTargetId);
             const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), splitTargets.primaryIds);
             const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), splitTargets.crowdIds);
@@ -2770,7 +3062,8 @@ namespace TFD::HostilityController
                 primaryTargetId,
                 ToString(primaryDisposition),
                 static_cast<unsigned int>(splitTargets.crowdIds.size()));
-        } else {
+        }
+        else {
             const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);
             const char* unassignEvent = (primaryMode == Mode::Tame && primaryDisposition == TameDisposition::Companion) ?
                 kCreatureTeammateUnassignEvent :
