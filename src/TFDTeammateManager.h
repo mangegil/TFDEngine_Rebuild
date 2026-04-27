@@ -36,6 +36,7 @@ namespace TFD::TeammateManager
     void Install();
     void Shutdown();
     void SyncNow();
+    bool RegisterOrRefreshTeammateNow(RE::Actor* actor, const char* reason = nullptr);
 
     std::size_t RestoreNow();
 

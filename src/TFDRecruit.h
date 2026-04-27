@@ -42,6 +42,8 @@ namespace TFD::Recruit
         bool evaluatePackage{ true };
         bool detailedLog{ false };
         bool throttleObserve{ true };
+        bool ensurePacifyAlliance{ true };
+        bool applyRuntimeProfile{ true };
     };
 
     struct CommitResult
@@ -54,6 +56,9 @@ namespace TFD::Recruit
         unsigned hostileFactionMatchesBefore{ 0 };
         unsigned hostileFactionMatchesAfter{ 0 };
         unsigned removedHostileFactions{ 0 };
+        unsigned ensuredStateFactions{ 0 };
+        bool playerFactionEnsured{ false };
+        bool runtimeProfileApplied{ false };
         bool combatCleared{ false };
     };
 
@@ -69,4 +74,9 @@ namespace TFD::Recruit
     CommitResult CommitRecruit(RE::Actor* actor, RE::PlayerCharacter* player, const CommitOptions& options);
     CommitResult CommitRecruit(RE::Actor* actor, const CommitOptions& options);
     unsigned CommitRecruitGroup(const std::vector<RE::Actor*>& actors, RE::PlayerCharacter* player, const CommitOptions& options);
+
+    void MarkRecruitCommitPending(RE::Actor* actor, double durationSec, SourceFlow sourceFlow, const char* reason);
+    void MarkRecruitCommitPendingGroup(const std::vector<RE::Actor*>& actors, double durationSec, SourceFlow sourceFlow, const char* reason);
+    bool IsRecruitCommitPending(RE::Actor* actor);
+    void ClearRecruitCommitPending(RE::Actor* actor, const char* reason);
 }

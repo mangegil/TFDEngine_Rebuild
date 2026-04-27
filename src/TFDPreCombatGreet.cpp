@@ -60,6 +60,7 @@ namespace TFD::PreCombatGreet
         constexpr double kPostRecruitSettleDurationSec = 3.00;
         constexpr double kPostRecruitSettleIntervalSec = 0.35;
         constexpr double kStaleRecruitCombatStateSuppressSec = 8.00;
+        constexpr double kRecruitCommitPendingGuardSec = 5.00;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -777,6 +778,101 @@ namespace TFD::PreCombatGreet
                 kPostRecruitSettleDurationSec,
                 reason ? reason : "unknown");
         }
+
+        std::vector<RE::Actor*> CollectPreCombatRecruitCommitActors(RE::Actor* primaryActor)
+        {
+            std::vector<RE::Actor*> actors;
+            if (!primaryActor) {
+                return actors;
+            }
+
+            actors = TFD::HostilityController::CollectDialogueTruceActors(primaryActor);
+            if (actors.empty()) {
+                actors.push_back(primaryActor);
+            }
+
+            if (std::find(actors.begin(), actors.end(), primaryActor) == actors.end()) {
+                actors.insert(actors.begin(), primaryActor);
+            }
+
+            actors.erase(
+                std::remove_if(
+                    actors.begin(),
+                    actors.end(),
+                    [](RE::Actor* actor) {
+                        return !actor || actor->IsDead() || actor->IsDisabled();
+                    }),
+                actors.end());
+
+            std::sort(actors.begin(), actors.end());
+            actors.erase(std::unique(actors.begin(), actors.end()), actors.end());
+            return actors;
+        }
+
+        unsigned CommitPreCombatRecruitGroup(RE::Actor* primaryActor, const char* reason)
+        {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!primaryActor || !player) {
+                return 0;
+            }
+
+            const auto actors = CollectPreCombatRecruitCommitActors(primaryActor);
+            if (actors.empty()) {
+                return 0;
+            }
+
+            TFD::Recruit::CommitOptions options{};
+            options.sourceFlow = TFD::Recruit::SourceFlow::PreCombat;
+            options.reason = reason ? reason : "precombat_outcome_recruit";
+            options.quarantineHostileFactions = true;
+            options.clearCombat = true;
+            options.evaluatePackage = true;
+            options.detailedLog = true;
+            options.throttleObserve = false;
+            options.ensurePacifyAlliance = true;
+            options.applyRuntimeProfile = true;
+
+            unsigned attempted = 0;
+            unsigned skipped = 0;
+            unsigned ensuredState = 0;
+            unsigned removed = 0;
+            unsigned rawClean = 0;
+            unsigned aliasRegistered = 0;
+
+            for (auto* actor : actors) {
+                const auto result = TFD::Recruit::CommitRecruit(actor, player, options);
+                if (!result.attempted || result.skipped) {
+                    ++skipped;
+                }
+                if (result.attempted) {
+                    ++attempted;
+                }
+                ensuredState += result.ensuredStateFactions;
+                removed += result.removedHostileFactions;
+                const bool commitClean = result.attempted && result.recruitLikeBefore && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+                if (commitClean) {
+                    ++rawClean;
+                    if (TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, reason ? reason : "precombat_recruit_commit_clean")) {
+                        ++aliasRegistered;
+                    }
+                }
+            }
+
+            spdlog::info(
+                "[TFD][PreCombatGreet] recruit commit group primary={:08X} actors={} attempted={} skipped={} ensuredState={} removed={} rawClean={} aliasRegistered={} reason={}",
+                primaryActor->GetFormID(),
+                static_cast<unsigned>(actors.size()),
+                attempted,
+                skipped,
+                ensuredState,
+                removed,
+                rawClean,
+                aliasRegistered,
+                reason ? reason : "unknown");
+
+            return attempted;
+        }
+
 
         bool ApplyPostRecruitSettleSweep(
             RE::Actor* actor,
@@ -1761,6 +1857,11 @@ namespace TFD::PreCombatGreet
                     if (pendingActor) {
                         ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
                         ArmPostRecruitSettleForGroup(pendingActor, rawName);
+                        TFD::Recruit::MarkRecruitCommitPendingGroup(
+                            CollectPreCombatRecruitCommitActors(pendingActor),
+                            kRecruitCommitPendingGuardSec,
+                            TFD::Recruit::SourceFlow::PreCombat,
+                            rawName);
                     }
                     TFD::Extortion::HandlePreCombatTerminalPendingEvent(pendingActor ? pendingActor : actor, rawName);
                     spdlog::info(
@@ -2002,11 +2103,25 @@ namespace TFD::PreCombatGreet
                         if (pendingActor) {
                             ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
                             ArmPostRecruitSettleForGroup(pendingActor, rawName);
+                            TFD::Recruit::MarkRecruitCommitPendingGroup(
+                                CollectPreCombatRecruitCommitActors(pendingActor),
+                                kRecruitCommitPendingGuardSec,
+                                TFD::Recruit::SourceFlow::PreCombat,
+                                rawName);
                         }
                         if (matchedPending) {
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
-                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit")) {
+
+                        const bool resolvedRecruit = ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit");
+                        if (resolvedRecruit) {
+                            if (pendingActor) {
+                                CommitPreCombatRecruitGroup(pendingActor, "mod_event_precombat_recruit_commit");
+                            }
+                            else {
+                                auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+                                CommitPreCombatRecruitGroup(actor, "mod_event_precombat_recruit_commit_fallback");
+                            }
                             shouldClearInteractionState = true;
                         }
                         else {

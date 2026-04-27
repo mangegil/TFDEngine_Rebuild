@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <iterator>
 #include <mutex>
 #include <string_view>
@@ -23,6 +24,12 @@ namespace
         RE::TESFaction* faction{ nullptr };
         bool hostileSource{ false };
         bool playerSideState{ false };
+    };
+
+    struct RecruitPendingEntry
+    {
+        double untilSec{ 0.0 };
+        TFD::Recruit::SourceFlow sourceFlow{ TFD::Recruit::SourceFlow::Unknown };
     };
 
     constexpr double kRecruitObserveThrottleSec = 3.00;
@@ -57,6 +64,7 @@ namespace
         "TFDTeammateFaction",
         "TFDTruceTeammateFaction",
         "TFDPacifyFaction",
+        "TFDPlayerFaction",
         "TFDPreCombatTruceFaction",
         "TFDInCombatTruceFaction",
         "TFDBleedOutFaction",
@@ -77,6 +85,9 @@ namespace
     std::unordered_map<RE::FormID, double> g_nextCommitLogSec;
     std::unordered_set<RE::FormID> g_committedCleanActors;
     std::unordered_set<RE::FormID> g_quarantineAttemptedActors;
+    std::unordered_set<RE::FormID> g_runtimeProfileAppliedActors;
+    std::unordered_set<RE::FormID> g_recruitSettleAttemptedActors;
+    std::unordered_map<RE::FormID, RecruitPendingEntry> g_recruitCommitPending;
 
     double NowSec()
     {
@@ -146,11 +157,6 @@ namespace
         return actor->GetFactionRank(faction, false);
     }
 
-    bool HasFactionAnyRank(RE::Actor* actor, RE::TESFaction* faction)
-    {
-        return GetExactFactionRank(actor, faction) > -2;
-    }
-
     bool HasActiveHostileFactionRank(std::int32_t rank)
     {
         // R8 showed BanditFaction rank changes from 0 to -1 after RemoveFromFaction().
@@ -171,12 +177,48 @@ namespace
         g_quarantineAttemptedActors.insert(actorId);
     }
 
+    bool HasRuntimeProfileBeenApplied(RE::FormID actorId)
+    {
+        std::scoped_lock lk(g_logLock);
+        return g_runtimeProfileAppliedActors.find(actorId) != g_runtimeProfileAppliedActors.end();
+    }
+
+    void MarkRuntimeProfileApplied(RE::FormID actorId)
+    {
+        std::scoped_lock lk(g_logLock);
+        g_runtimeProfileAppliedActors.insert(actorId);
+    }
+
+    bool HasRecruitSettleBeenAttempted(RE::FormID actorId)
+    {
+        std::scoped_lock lk(g_logLock);
+        return g_recruitSettleAttemptedActors.find(actorId) != g_recruitSettleAttemptedActors.end();
+    }
+
+    void MarkRecruitSettleAttempted(RE::FormID actorId)
+    {
+        std::scoped_lock lk(g_logLock);
+        g_recruitSettleAttemptedActors.insert(actorId);
+    }
+
+    bool IsPendingExpired(const RecruitPendingEntry& entry, double nowSec)
+    {
+        return entry.untilSec <= 0.0 || nowSec >= entry.untilSec;
+    }
+
+    bool NearlyEqual(float lhs, float rhs)
+    {
+        return std::fabs(lhs - rhs) <= 0.01f;
+    }
+
     struct FactionSummary
     {
         unsigned hostileMatches{ 0 };
         unsigned stateMatches{ 0 };
         bool tfdTeammate{ false };
         bool truceTeammate{ false };
+        bool tfdPacify{ false };
+        bool tfdPlayer{ false };
         bool currentFollower{ false };
         bool playerFollower{ false };
         bool potentialFollower{ false };
@@ -221,6 +263,12 @@ namespace
             }
             else if (id == "TFDTruceTeammateFaction") {
                 summary.truceTeammate = true;
+            }
+            else if (id == "TFDPacifyFaction") {
+                summary.tfdPacify = true;
+            }
+            else if (id == "TFDPlayerFaction") {
+                summary.tfdPlayer = true;
             }
             else if (id == "CurrentFollowerFaction") {
                 summary.currentFollower = true;
@@ -334,30 +382,180 @@ namespace
         }
     }
 
-    void EnsureTeammateFaction(RE::Actor* actor)
+    RE::TESFaction* FindFactionByEditorID(std::string_view editorID)
+    {
+        ResolveFactions();
+
+        for (const auto& entry : g_factions) {
+            if (!entry.faction || !entry.editorID) {
+                continue;
+            }
+            if (editorID == entry.editorID) {
+                return entry.faction;
+            }
+        }
+
+        return nullptr;
+    }
+
+    bool EnsureFactionActive(RE::Actor* actor, std::string_view editorID, const char* ownerLabel)
+    {
+        if (!actor) {
+            return false;
+        }
+
+        auto* faction = FindFactionByEditorID(editorID);
+        if (!faction) {
+            spdlog::warn(
+                "[TFD][Recruit] ensure faction failed actor={:08X} editorID={} owner={} reason=unresolved",
+                actor->GetFormID(),
+                editorID,
+                ownerLabel ? ownerLabel : "unknown");
+            return false;
+        }
+
+        const auto rankBefore = GetExactFactionRank(actor, faction);
+        if (rankBefore >= 0) {
+            return false;
+        }
+
+        actor->AddToFaction(faction, 0);
+        const auto rankAfter = GetExactFactionRank(actor, faction);
+
+        spdlog::info(
+            "[TFD][Recruit] ensure faction actor={:08X} editorID={} form={:08X} owner={} rankBefore={} rankAfter={}",
+            actor->GetFormID(),
+            editorID,
+            faction->GetFormID(),
+            ownerLabel ? ownerLabel : "unknown",
+            rankBefore,
+            rankAfter);
+
+        return rankAfter >= 0;
+    }
+
+    struct AllianceEnsureResult
+    {
+        unsigned actorFactions{ 0 };
+        bool playerFaction{ false };
+    };
+
+    AllianceEnsureResult EnsureRecruitAlliance(RE::Actor* actor, RE::PlayerCharacter* player)
+    {
+        AllianceEnsureResult result{};
+
+        if (actor) {
+            if (EnsureFactionActive(actor, "TFDTeammateFaction", "actor")) {
+                ++result.actorFactions;
+            }
+            if (EnsureFactionActive(actor, "TFDPacifyFaction", "actor")) {
+                ++result.actorFactions;
+            }
+        }
+
+        if (player) {
+            result.playerFaction = EnsureFactionActive(player, "TFDPlayerFaction", "player");
+        }
+
+        return result;
+    }
+
+    float GetActorValue(RE::Actor* actor, RE::ActorValue actorValue)
+    {
+        if (!actor) {
+            return 0.0f;
+        }
+
+        auto* owner = actor->AsActorValueOwner();
+        if (!owner) {
+            return 0.0f;
+        }
+
+        return owner->GetActorValue(actorValue);
+    }
+
+    void SetActorValue(RE::Actor* actor, RE::ActorValue actorValue, float value)
     {
         if (!actor) {
             return;
         }
 
-        ResolveFactions();
-        for (const auto& entry : g_factions) {
-            if (!entry.faction) {
-                continue;
-            }
-            const std::string_view id = entry.editorID ? entry.editorID : "";
-            if (id != "TFDTeammateFaction") {
-                continue;
-            }
-            if (!HasFactionAnyRank(actor, entry.faction)) {
-                actor->AddToFaction(entry.faction, 0);
-                spdlog::info(
-                    "[TFD][Recruit] ensure teammate faction actor={:08X} faction={:08X}",
-                    actor->GetFormID(),
-                    entry.faction->GetFormID());
-            }
+        auto* owner = actor->AsActorValueOwner();
+        if (!owner) {
             return;
         }
+
+        owner->SetActorValue(actorValue, value);
+    }
+
+    struct RuntimeProfileResult
+    {
+        bool changed{ false };
+        float aggressionBefore{ 0.0f };
+        float confidenceBefore{ 0.0f };
+        float assistanceBefore{ 0.0f };
+        float moralityBefore{ 0.0f };
+        float aggressionAfter{ 0.0f };
+        float confidenceAfter{ 0.0f };
+        float assistanceAfter{ 0.0f };
+        float moralityAfter{ 0.0f };
+    };
+
+    RuntimeProfileResult ApplyRecruitRuntimeProfile(RE::Actor* actor, bool detailedLog)
+    {
+        RuntimeProfileResult result{};
+        if (!actor) {
+            return result;
+        }
+
+        constexpr float kAggressionAggressive = 1.0f;
+        constexpr float kConfidenceBrave = 3.0f;
+        constexpr float kAssistanceFriendsAndAllies = 2.0f;
+        constexpr float kMoralityAnyCrime = 0.0f;
+
+        result.aggressionBefore = GetActorValue(actor, RE::ActorValue::kAggression);
+        result.confidenceBefore = GetActorValue(actor, RE::ActorValue::kConfidence);
+        result.assistanceBefore = GetActorValue(actor, RE::ActorValue::kAssistance);
+        result.moralityBefore = GetActorValue(actor, RE::ActorValue::kMorality);
+
+        const bool alreadyApplied = HasRuntimeProfileBeenApplied(actor->GetFormID());
+        const bool needsAggression = !NearlyEqual(result.aggressionBefore, kAggressionAggressive);
+        const bool needsConfidence = !NearlyEqual(result.confidenceBefore, kConfidenceBrave);
+        const bool needsAssistance = !NearlyEqual(result.assistanceBefore, kAssistanceFriendsAndAllies);
+        const bool needsMorality = !NearlyEqual(result.moralityBefore, kMoralityAnyCrime);
+
+        result.changed = needsAggression || needsConfidence || needsAssistance || needsMorality;
+
+        if (result.changed) {
+            SetActorValue(actor, RE::ActorValue::kAggression, kAggressionAggressive);
+            SetActorValue(actor, RE::ActorValue::kConfidence, kConfidenceBrave);
+            SetActorValue(actor, RE::ActorValue::kAssistance, kAssistanceFriendsAndAllies);
+            SetActorValue(actor, RE::ActorValue::kMorality, kMoralityAnyCrime);
+        }
+
+        result.aggressionAfter = GetActorValue(actor, RE::ActorValue::kAggression);
+        result.confidenceAfter = GetActorValue(actor, RE::ActorValue::kConfidence);
+        result.assistanceAfter = GetActorValue(actor, RE::ActorValue::kAssistance);
+        result.moralityAfter = GetActorValue(actor, RE::ActorValue::kMorality);
+
+        MarkRuntimeProfileApplied(actor->GetFormID());
+
+        if (result.changed || detailedLog || !alreadyApplied) {
+            spdlog::info(
+                "[TFD][Recruit] runtime profile actor={:08X} changed={} aggression={:.1f}->{:.1f} confidence={:.1f}->{:.1f} assistance={:.1f}->{:.1f} morality={:.1f}->{:.1f}",
+                actor->GetFormID(),
+                result.changed ? 1 : 0,
+                result.aggressionBefore,
+                result.aggressionAfter,
+                result.confidenceBefore,
+                result.confidenceAfter,
+                result.assistanceBefore,
+                result.assistanceAfter,
+                result.moralityBefore,
+                result.moralityAfter);
+        }
+
+        return result;
     }
 
     unsigned RemoveHostileSourceFactions(RE::Actor* actor)
@@ -534,7 +732,7 @@ namespace TFD::Recruit
         }
 
         spdlog::info(
-            "[TFD][Recruit] observe actor={:08X} name='{}' source={} reason={} rawHostile={} recruitLike={} playerTeammate={} tfdTeammate={} truceTeammate={} currentFollower={} playerFollower={} potentialFollower={} hostileFactions={} stateFactions={}",
+            "[TFD][Recruit] observe actor={:08X} name='{}' source={} reason={} rawHostile={} recruitLike={} playerTeammate={} tfdTeammate={} truceTeammate={} tfdPacify={} tfdPlayer={} currentFollower={} playerFollower={} potentialFollower={} hostileFactions={} stateFactions={}",
             actor->GetFormID(),
             actor->GetName() ? actor->GetName() : "",
             ToString(options.sourceFlow),
@@ -544,6 +742,8 @@ namespace TFD::Recruit
             actor->IsPlayerTeammate() ? 1 : 0,
             summary.tfdTeammate ? 1 : 0,
             summary.truceTeammate ? 1 : 0,
+            summary.tfdPacify ? 1 : 0,
+            summary.tfdPlayer ? 1 : 0,
             summary.currentFollower ? 1 : 0,
             summary.playerFollower ? 1 : 0,
             summary.potentialFollower ? 1 : 0,
@@ -566,6 +766,128 @@ namespace TFD::Recruit
     void ObserveRecruitState(RE::Actor* actor, const ObserveOptions& options)
     {
         ObserveRecruitState(actor, Player(), options);
+    }
+
+    void MarkRecruitCommitPending(RE::Actor* actor, double durationSec, SourceFlow sourceFlow, const char* reason)
+    {
+        if (!actor || actor->IsDead() || actor->IsDisabled()) {
+            return;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return;
+        }
+
+        const double safeDuration = std::clamp(durationSec, 0.50, 10.00);
+        const double now = NowSec();
+        const double until = now + safeDuration;
+        bool refreshed = false;
+        double oldUntil = 0.0;
+        double newUntil = until;
+
+        {
+            std::scoped_lock lk(g_logLock);
+            auto& entry = g_recruitCommitPending[actorId];
+            refreshed = entry.untilSec > now;
+            oldUntil = entry.untilSec;
+            entry.untilSec = std::max(entry.untilSec, until);
+            entry.sourceFlow = sourceFlow;
+            newUntil = entry.untilSec;
+        }
+
+        spdlog::info(
+            "[TFD][Recruit] pending {} actor={:08X} source={} reason={} duration={:.2f}s oldUntil={:.2f} newUntil={:.2f}",
+            refreshed ? "refresh" : "begin",
+            actorId,
+            ToString(sourceFlow),
+            reason ? reason : "unknown",
+            safeDuration,
+            oldUntil,
+            newUntil);
+    }
+
+    void MarkRecruitCommitPendingGroup(const std::vector<RE::Actor*>& actors, double durationSec, SourceFlow sourceFlow, const char* reason)
+    {
+        std::unordered_set<RE::FormID> seen;
+        unsigned count = 0;
+
+        for (auto* actor : actors) {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                continue;
+            }
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0 || !seen.insert(actorId).second) {
+                continue;
+            }
+            MarkRecruitCommitPending(actor, durationSec, sourceFlow, reason);
+            ++count;
+        }
+
+        if (count > 0) {
+            spdlog::info(
+                "[TFD][Recruit] pending group source={} reason={} count={} duration={:.2f}s",
+                ToString(sourceFlow),
+                reason ? reason : "unknown",
+                count,
+                std::clamp(durationSec, 0.50, 10.00));
+        }
+    }
+
+    bool IsRecruitCommitPending(RE::Actor* actor)
+    {
+        if (!actor || actor->IsDead() || actor->IsDisabled()) {
+            return false;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return false;
+        }
+
+        const double now = NowSec();
+
+        std::scoped_lock lk(g_logLock);
+        auto it = g_recruitCommitPending.find(actorId);
+        if (it == g_recruitCommitPending.end()) {
+            return false;
+        }
+
+        if (IsPendingExpired(it->second, now)) {
+            spdlog::info(
+                "[TFD][Recruit] pending expired actor={:08X} source={}",
+                actorId,
+                ToString(it->second.sourceFlow));
+            g_recruitCommitPending.erase(it);
+            return false;
+        }
+
+        return true;
+    }
+
+    void ClearRecruitCommitPending(RE::Actor* actor, const char* reason)
+    {
+        if (!actor) {
+            return;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return;
+        }
+
+        bool removed = false;
+        {
+            std::scoped_lock lk(g_logLock);
+            removed = g_recruitCommitPending.erase(actorId) > 0;
+        }
+
+        if (removed) {
+            spdlog::info(
+                "[TFD][Recruit] pending clear actor={:08X} reason={}",
+                actorId,
+                reason ? reason : "unknown");
+        }
     }
 
     CommitResult CommitRecruit(RE::Actor* actor, RE::PlayerCharacter* player, const CommitOptions& options)
@@ -610,19 +932,47 @@ namespace TFD::Recruit
 
         const auto actorId = actor->GetFormID();
         const bool quarantineAlreadyAttempted = HasQuarantineBeenAttempted(actorId);
+        const bool settleAlreadyAttempted = HasRecruitSettleBeenAttempted(actorId);
 
-        // If R8 already removed the active hostile faction, GetFactionRank may still
-        // expose a rank -1 removed/inherited trace. Do not keep clearing combat and
-        // evaluating packages on every teammate refresh when there is no active hostile
-        // source left to remove.
-        if (quarantineAlreadyAttempted && result.hostileFactionMatchesBefore == 0) {
+        if (options.ensurePacifyAlliance) {
+            const auto alliance = EnsureRecruitAlliance(actor, player);
+            result.ensuredStateFactions = alliance.actorFactions;
+            result.playerFactionEnsured = alliance.playerFaction;
+        }
+
+        if (options.applyRuntimeProfile) {
+            const auto profile = ApplyRecruitRuntimeProfile(actor, options.detailedLog);
+            result.runtimeProfileApplied = profile.changed;
+        }
+
+        if (options.quarantineHostileFactions && result.hostileFactionMatchesBefore > 0) {
+            result.removedHostileFactions = RemoveHostileSourceFactions(actor);
+        }
+
+        if (options.quarantineHostileFactions) {
+            MarkQuarantineAttempted(actorId);
+        }
+
+        const bool nothingNewToSettle =
+            quarantineAlreadyAttempted &&
+            settleAlreadyAttempted &&
+            result.hostileFactionMatchesBefore == 0 &&
+            result.removedHostileFactions == 0 &&
+            result.ensuredStateFactions == 0 &&
+            !result.playerFactionEnsured &&
+            !result.runtimeProfileApplied;
+
+        // R8B stops repeated quarantine. R9 still allows one post-profile settle pass,
+        // because pacify alliance and runtime actor values can affect raw hostility only
+        // after combat/cache/package refresh.
+        if (nothingNewToSettle) {
             result.skipped = true;
             result.hostileFactionMatchesAfter = result.hostileFactionMatchesBefore;
             result.rawHostileAfter = result.rawHostileBefore;
 
             if (ShouldLogCommit(actor, options.detailedLog, result)) {
                 spdlog::info(
-                    "[TFD][Recruit] commit skipped actor={:08X} source={} reason={} rawBefore={} hostileFactions={} reasonDetail=already_quarantined_no_active_hostile",
+                    "[TFD][Recruit] commit skipped actor={:08X} source={} reason={} rawBefore={} hostileFactions={} reasonDetail=already_settled_no_active_hostile",
                     actor->GetFormID(),
                     ToString(options.sourceFlow),
                     options.reason ? options.reason : "unknown",
@@ -633,23 +983,13 @@ namespace TFD::Recruit
             if (result.rawHostileAfter || options.detailedLog) {
                 ObserveRecruitState(actor, player, {
                     options.sourceFlow,
-                    options.reason ? options.reason : "already_quarantined_no_active_hostile",
+                    options.reason ? options.reason : "already_settled_no_active_hostile",
                     options.detailedLog || result.rawHostileAfter,
                     options.throttleObserve
                     });
             }
 
             return result;
-        }
-
-        EnsureTeammateFaction(actor);
-
-        if (options.quarantineHostileFactions && result.hostileFactionMatchesBefore > 0) {
-            result.removedHostileFactions = RemoveHostileSourceFactions(actor);
-        }
-
-        if (options.quarantineHostileFactions) {
-            MarkQuarantineAttempted(actorId);
         }
 
         if (options.clearCombat) {
@@ -659,18 +999,23 @@ namespace TFD::Recruit
             EvaluateRecruitPackage(actor);
         }
 
+        MarkRecruitSettleAttempted(actorId);
+
         const auto afterSummary = BuildFactionSummary(actor);
         result.hostileFactionMatchesAfter = afterSummary.hostileMatches;
         result.rawHostileAfter = actor->IsHostileToActor(player);
 
         if (!result.rawHostileAfter && result.hostileFactionMatchesAfter == 0) {
-            std::scoped_lock lk(g_logLock);
-            g_committedCleanActors.insert(actor->GetFormID());
+            {
+                std::scoped_lock lk(g_logLock);
+                g_committedCleanActors.insert(actor->GetFormID());
+            }
+            ClearRecruitCommitPending(actor, options.reason ? options.reason : "commit_clean");
         }
 
         if (ShouldLogCommit(actor, options.detailedLog, result)) {
             spdlog::info(
-                "[TFD][Recruit] commit actor={:08X} name='{}' source={} reason={} rawBefore={} rawAfter={} recruitLikeBefore={} hostileBefore={} hostileAfter={} removed={} combatCleared={} eval={} clean={}",
+                "[TFD][Recruit] commit actor={:08X} name='{}' source={} reason={} rawBefore={} rawAfter={} recruitLikeBefore={} hostileBefore={} hostileAfter={} removed={} ensuredState={} playerFaction={} runtimeProfile={} combatCleared={} eval={} clean={}",
                 actor->GetFormID(),
                 actor->GetName() ? actor->GetName() : "",
                 ToString(options.sourceFlow),
@@ -681,6 +1026,9 @@ namespace TFD::Recruit
                 result.hostileFactionMatchesBefore,
                 result.hostileFactionMatchesAfter,
                 result.removedHostileFactions,
+                result.ensuredStateFactions,
+                result.playerFactionEnsured ? 1 : 0,
+                result.runtimeProfileApplied ? 1 : 0,
                 result.combatCleared ? 1 : 0,
                 options.evaluatePackage ? 1 : 0,
                 (!result.rawHostileAfter && result.hostileFactionMatchesAfter == 0) ? 1 : 0);
