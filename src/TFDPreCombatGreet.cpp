@@ -24,6 +24,7 @@
 #include "TFDLocation.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
+#include "TFDRecruit.h"
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 #include "TFDPayModel.h"
@@ -835,6 +836,12 @@ namespace TFD::PreCombatGreet
             const bool staleFactionOnly = teammateLike && hostileAfter && !inCombatAfter && !targetAfterPlayerSide;
             if (staleFactionOnly) {
                 TrackStaleRecruitHostilityLocked(actor, "post_recruit_settle_stale_faction_only");
+                TFD::Recruit::ObserveRecruitState(actor, player, {
+                    TFD::Recruit::SourceFlow::PreCombat,
+                    "post_recruit_settle_stale_faction_only",
+                    true,
+                    false
+                    });
             }
             const bool settled = (!hostileAfter || staleFactionOnly) && !inCombatAfter && !targetAfterPlayerSide;
 

@@ -98,10 +98,10 @@ namespace
                                 return;
                             }
                             SweepOnce(radius, npcOnly);
-                        });
+                            });
                     }
                 }
-            }).detach();
+                }).detach();
 
             spdlog::info("[TFD][HostilityController] scheduled {} waves ({}ms) generation={}", waves, intervalMs, generation);
         }
@@ -998,7 +998,7 @@ namespace TFD::HostilityController
                 if (std::find(result.crowdIds.begin(), result.crowdIds.end(), actorId) == result.crowdIds.end()) {
                     result.crowdIds.push_back(actorId);
                 }
-            };
+                };
 
             for (auto actorId : actorIds) {
                 if (result.crowdIds.size() >= kCrowdAliasCap) {
@@ -1036,7 +1036,7 @@ namespace TFD::HostilityController
                     return;
                 }
                 result.push_back(actorId);
-            };
+                };
 
             for (const auto actorId : targets.primaryIds) {
                 addUnique(actorId);
@@ -1348,6 +1348,22 @@ namespace TFD::HostilityController
             return targetSp.get();
         }
 
+        bool IsPlayerSideForHostilityDecision(RE::Actor* player, RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            if (player && actor->GetFormID() == player->GetFormID()) {
+                return true;
+            }
+
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor) ||
+                TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+        }
+
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor)
         {
             if (!player || !actor) {
@@ -1359,6 +1375,10 @@ namespace TFD::HostilityController
             }
 
             if (HostilityOverrideFactionInternal::HasOverrideFaction(actor)) {
+                return false;
+            }
+
+            if (IsPlayerSideForHostilityDecision(player, actor)) {
                 return false;
             }
 
@@ -2345,7 +2365,8 @@ namespace TFD::HostilityController
                     sessionId,
                     ToString(mode),
                     targetId);
-            } else if (IsTruceMode(mode)) {
+            }
+            else if (IsTruceMode(mode)) {
                 const auto splitTargets = PartitionTruceEventTargets(applyIds, player, targetId);
                 const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
                 if (auto sessionIt = g_sessions.find(sessionId); sessionIt != g_sessions.end()) {
@@ -2365,7 +2386,8 @@ namespace TFD::HostilityController
                     targetId,
                     static_cast<unsigned int>(splitTargets.crowdIds.size()),
                     static_cast<unsigned int>(assignedDialogueIds.size()));
-            } else {
+            }
+            else {
                 const auto eventIds = SelectCrowdEventTargets(applyIds, player, targetId);
                 const auto sent = SendModEventToActors(GetPrimaryAssignEventName(mode), eventIds);
                 spdlog::info(
@@ -2775,7 +2797,7 @@ namespace TFD::HostilityController
                 return;
             }
             actors.push_back(actor);
-        };
+            };
 
         addUnique(session.primaryTargetId);
 
@@ -2858,7 +2880,7 @@ namespace TFD::HostilityController
                 return;
             }
             actors.push_back(actor);
-        };
+            };
 
         if (!session.dialogueAssignedActorIds.empty()) {
             for (const auto actorId : session.dialogueAssignedActorIds) {
@@ -2992,8 +3014,8 @@ namespace TFD::HostilityController
                     player &&
                     (!suppressRehostile &&
                         (reason == ReleaseReason::DialogueClosed ||
-                        reason == ReleaseReason::PlayerArmed ||
-                        reason == ReleaseReason::FightChoice));
+                            reason == ReleaseReason::PlayerArmed ||
+                            reason == ReleaseReason::FightChoice));
 
                 const bool immediateInCombatRehostile =
                     releasedEntry.mode == Mode::TruceInCombat &&
@@ -3044,7 +3066,8 @@ namespace TFD::HostilityController
                 ToString(reason),
                 ToString(primaryMode),
                 primaryTargetId);
-        } else if (IsTruceMode(primaryMode)) {
+        }
+        else if (IsTruceMode(primaryMode)) {
             const auto splitTargets = PartitionTruceEventTargets(actorIds, player, primaryTargetId);
             const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), splitTargets.primaryIds);
             const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), splitTargets.crowdIds);
@@ -3059,7 +3082,8 @@ namespace TFD::HostilityController
                 primaryTargetId,
                 ToString(primaryDisposition),
                 static_cast<unsigned int>(splitTargets.crowdIds.size()));
-        } else {
+        }
+        else {
             const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);
             const char* unassignEvent = (primaryMode == Mode::Tame && primaryDisposition == TameDisposition::Companion) ?
                 kCreatureTeammateUnassignEvent :

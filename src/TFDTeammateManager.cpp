@@ -27,6 +27,7 @@
 #include "TFDSettings.h"
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
+#include "TFDRecruit.h"
 
 namespace
 {
@@ -503,6 +504,27 @@ namespace
                     spdlog::info("[TFD][TeammateManager] add faction actor={:08X} faction={:08X} calm=1",
                         actor->GetFormID(),
                         g_registry.teammateFaction->GetFormID());
+
+                    TFD::Recruit::CommitOptions recruitOptions{};
+                    recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
+                    recruitOptions.reason = "teammate_faction_add";
+                    recruitOptions.quarantineHostileFactions = true;
+                    recruitOptions.clearCombat = true;
+                    recruitOptions.evaluatePackage = true;
+                    recruitOptions.detailedLog = true;
+                    recruitOptions.throttleObserve = false;
+                    TFD::Recruit::CommitRecruit(actor, Player(), recruitOptions);
+                }
+                else {
+                    TFD::Recruit::CommitOptions recruitOptions{};
+                    recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
+                    recruitOptions.reason = "teammate_faction_refresh";
+                    recruitOptions.quarantineHostileFactions = true;
+                    recruitOptions.clearCombat = true;
+                    recruitOptions.evaluatePackage = true;
+                    recruitOptions.detailedLog = false;
+                    recruitOptions.throttleObserve = true;
+                    TFD::Recruit::CommitRecruit(actor, Player(), recruitOptions);
                 }
             }
             else if (hasFaction) {

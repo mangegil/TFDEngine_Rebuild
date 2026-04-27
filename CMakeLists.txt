@@ -54,6 +54,7 @@ add_library(TFDEngine SHARED
     src/TFDFeedPopup.cpp
     src/TFDCaptiveDoorController.cpp
     src/TFDTeammateManager.cpp
+    src/TFDRecruit.cpp
     src/TFDFlowController.cpp
     src/TFDRelease.cpp
     src/TFDExtortion.cpp 
