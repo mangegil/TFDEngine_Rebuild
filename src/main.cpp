@@ -300,6 +300,7 @@ public:
             TFD::Location::ResetAmbientKidnapAvailabilityWatcher();
             TFD::Location::UpdateAmbientKidnapAvailability(true);
             FinalizeLoadAfterWorldReady();
+            TFD::TeammateManager::QueueHumanoidTeammateCatchupAfterLoad("loading_menu_closed");
         }
 
         return RE::BSEventNotifyControl::kContinue;

@@ -651,6 +651,17 @@ namespace TFD::HostilityController
         constexpr float kTruceActiveCombatRadius = 3500.0f;
         constexpr float kTrucePrimaryLinkRadius = 2400.0f;
 
+        // R28: Dialogue crowd is a participant list, not broad suppression.
+        // Normal acceptance requires the crowd actor to see the player.
+        // Fallback is intentionally narrow and only rescues hard engagement signals,
+        // never raw hostility or player-facing direction alone.
+        constexpr float kDialogueCrowdFallbackPlayerRadius = 1800.0f;
+        constexpr float kDialogueCrowdFallbackWeaponRadius = 1600.0f;
+        constexpr float kDialogueCrowdFallbackCombatRadius = 1800.0f;
+        constexpr float kDialogueCrowdFallbackFacingDot = 0.60f;
+        constexpr float kDialogueCrowdFallbackStrongFacingDot = 0.72f;
+        constexpr float kPreCombatDialoguePackScanRadius = 6000.0f;
+
         bool IsSessionSpaceCompatible(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget);
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
@@ -788,21 +799,107 @@ namespace TFD::HostilityController
             return from->HasLineOfSight(to, hasLOSData);
         }
 
-        bool HasDialogueCrowdLineOfSight(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        float FacingDotToRef(RE::Actor* from, RE::TESObjectREFR* to)
         {
-            if (!actor) {
+            if (!from || !to) {
+                return -1.0f;
+            }
+
+            const auto fromPos = from->GetPosition();
+            const auto toPos = to->GetPosition();
+
+            const float dx = toPos.x - fromPos.x;
+            const float dy = toPos.y - fromPos.y;
+            const float len = std::sqrt((dx * dx) + (dy * dy));
+            if (len <= 0.001f) {
+                return 1.0f;
+            }
+
+            const float yaw = from->GetAngleZ();
+            const float forwardX = std::sin(yaw);
+            const float forwardY = std::cos(yaw);
+            return ((dx / len) * forwardX) + ((dy / len) * forwardY);
+        }
+
+        bool HasDialogueCrowdEngagementFallback(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!actor || !player || !primaryTarget) {
                 return false;
             }
 
-            if (player && (HasLineOfSightBetween(actor, player) || HasLineOfSightBetween(player, actor))) {
-                return true;
+            if (!IsSessionSpaceCompatible(actor, player, primaryTarget)) {
+                return false;
             }
 
-            if (primaryTarget && (HasLineOfSightBetween(actor, primaryTarget) || HasLineOfSightBetween(primaryTarget, actor))) {
-                return true;
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
             }
 
-            return false;
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            if (distToPlayer > kDialogueCrowdFallbackPlayerRadius) {
+                return false;
+            }
+
+            auto* currentTarget = ResolveCurrentCombatTarget(actor);
+            const bool targetsPlayer = currentTarget && currentTarget->GetFormID() == player->GetFormID();
+            const bool rawHostileToPlayer = actor->IsHostileToActor(player);
+            const bool inCombat = actor->IsInCombat();
+            const bool weaponDrawn = actor->IsWeaponDrawn();
+            if (!targetsPlayer && !inCombat && !weaponDrawn) {
+                return false;
+            }
+
+            const float actorFacingPlayer = FacingDotToRef(actor, player);
+            const float playerFacingActor = FacingDotToRef(player, actor);
+
+            const bool actorTargetsPlayerClearly =
+                targetsPlayer &&
+                actorFacingPlayer >= kDialogueCrowdFallbackFacingDot;
+            const bool actorWeaponEngagedPlayer =
+                weaponDrawn &&
+                distToPlayer <= kDialogueCrowdFallbackWeaponRadius &&
+                actorFacingPlayer >= kDialogueCrowdFallbackStrongFacingDot;
+            const bool actorCombatEngagedPlayer =
+                inCombat &&
+                distToPlayer <= kDialogueCrowdFallbackCombatRadius &&
+                actorFacingPlayer >= kDialogueCrowdFallbackStrongFacingDot;
+
+            const bool accepted =
+                actorTargetsPlayerClearly ||
+                actorWeaponEngagedPlayer ||
+                actorCombatEngagedPlayer;
+
+            if (!accepted) {
+                return false;
+            }
+
+            spdlog::info(
+                "TFDHostilityController: dialogue crowd hard-engagement fallback accept actor={:08X} primary={:08X} distPlayer={:.1f} distPrimary={:.1f} targetsPlayer={} rawHostile={} inCombat={} weaponDrawn={} actorFacingPlayer={:.3f} playerFacingActor={:.3f}",
+                actor->GetFormID(),
+                primaryTarget->GetFormID(),
+                distToPlayer,
+                distToPrimary,
+                targetsPlayer ? 1 : 0,
+                rawHostileToPlayer ? 1 : 0,
+                inCombat ? 1 : 0,
+                weaponDrawn ? 1 : 0,
+                actorFacingPlayer,
+                playerFacingActor);
+
+            return true;
+        }
+
+        bool HasDialogueCrowdLineOfSight(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            (void)primaryTarget;
+            if (!actor || !player) {
+                return false;
+            }
+
+            // For dialogue/recruit crowd, the participant must be a witness/threat to the player.
+            // Player-facing LOS is not enough because it can pick actors behind walls or inside buildings.
+            return HasLineOfSightBetween(actor, player);
         }
 
         bool IsRecentOrCurrentTeammateLikeForDialogueCrowd(RE::Actor* actor)
@@ -842,11 +939,24 @@ namespace TFD::HostilityController
                 return false;
             }
 
-            if (!HasDialogueCrowdLineOfSight(actor, player, primaryTarget)) {
+            if (!IsSessionSpaceCompatible(actor, player, primaryTarget)) {
                 spdlog::info(
-                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=no_los",
+                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=space",
                     actorId,
                     primaryTarget->GetFormID());
+                return false;
+            }
+
+            if (!HasDialogueCrowdLineOfSight(actor, player, primaryTarget) &&
+                !HasDialogueCrowdEngagementFallback(actor, player, primaryTarget)) {
+                const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+                const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+                spdlog::info(
+                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=no_actor_los_or_hard_engagement distPlayer={:.1f} distPrimary={:.1f}",
+                    actorId,
+                    primaryTarget->GetFormID(),
+                    distToPlayer,
+                    distToPrimary);
                 return false;
             }
 
@@ -1108,6 +1218,7 @@ namespace TFD::HostilityController
         }
 
         std::vector<RE::FormID> BuildTruceInCombatMemberIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t& cellBubbleCount, std::size_t& truceClusterCount);
+        std::vector<RE::FormID> BuildPreCombatDialogueCrowdIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t& sameCellCount, std::size_t& sameWorldspaceCount);
 
         struct TruceCandidate
         {
@@ -1232,6 +1343,66 @@ namespace TFD::HostilityController
                 }
                 else {
                     ++truceClusterCount;
+                }
+            }
+            return result;
+        }
+
+        std::vector<RE::FormID> BuildPreCombatDialogueCrowdIds(
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            float scanRadius,
+            std::size_t& sameCellCount,
+            std::size_t& sameWorldspaceCount)
+        {
+            std::vector<TruceCandidate> candidates;
+            auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+            candidates.reserve(snapshot.actors.size());
+
+            auto* playerCell = player ? player->GetParentCell() : nullptr;
+            auto* primaryCell = primaryTarget ? primaryTarget->GetParentCell() : nullptr;
+
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget)) {
+                    continue;
+                }
+
+                TruceCandidate c;
+                c.actor = actor;
+                c.actorId = actor->GetFormID();
+                auto* combatTarget = info.getCurrentTarget();
+                c.targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+                c.distanceToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+                c.distanceToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+                candidates.push_back(c);
+            }
+
+            std::stable_sort(candidates.begin(), candidates.end(), [](const TruceCandidate& a, const TruceCandidate& b) {
+                if (a.targetingPlayer != b.targetingPlayer) {
+                    return a.targetingPlayer > b.targetingPlayer;
+                }
+                if (a.distanceToPlayer != b.distanceToPlayer) {
+                    return a.distanceToPlayer < b.distanceToPlayer;
+                }
+                if (a.distanceToPrimary != b.distanceToPrimary) {
+                    return a.distanceToPrimary < b.distanceToPrimary;
+                }
+                return a.actorId < b.actorId;
+                });
+
+            std::vector<RE::FormID> result;
+            result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
+            for (const auto& c : candidates) {
+                if (result.size() >= kCrowdAliasCap) {
+                    break;
+                }
+                result.push_back(c.actorId);
+                if (playerCell && primaryCell && c.actor && c.actor->GetParentCell() == playerCell && primaryCell == playerCell) {
+                    ++sameCellCount;
+                }
+                else {
+                    ++sameWorldspaceCount;
                 }
             }
             return result;
@@ -2191,7 +2362,36 @@ namespace TFD::HostilityController
                         false);
                 }
             }
-            else if (applyCellBubble) {
+            else if (mode == Mode::TrucePreCombat && allowDialogue) {
+                const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), kPreCombatDialoguePackScanRadius);
+                curatedTruceIds = BuildPreCombatDialogueCrowdIds(player, primaryTarget, scanRadius, cellBubbleCount, truceClusterCount);
+                for (auto actorId : curatedTruceIds) {
+                    auto* actor = ResolveActor(actorId);
+                    if (!actor) {
+                        continue;
+                    }
+                    const bool existedInSession = [&]() {
+                        auto it = g_entries.find(actorId);
+                        return it != g_entries.end() && it->second.sessionId == sessionId;
+                        }();
+                    if (existedInSession) {
+                        continue;
+                    }
+                    AddOrRefreshEntry(
+                        actor,
+                        mode,
+                        sessionId,
+                        targetId,
+                        nowSec,
+                        endTimeSec,
+                        allowDialogue,
+                        false,
+                        TameDisposition::None,
+                        0.0,
+                        false);
+                }
+            }
+            if (applyCellBubble && mode != Mode::TruceInCombat) {
                 const float scanRadius = GetCellBubbleRadius(cellBubbleRadius);
                 auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
                 for (const auto& info : snapshot.actors) {

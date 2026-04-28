@@ -490,6 +490,16 @@ namespace
             if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead()) {
                 return false;
             }
+
+            // R26: Papyrus can temporarily call SetPlayerTeammate(True) while a
+            // PreCombat recruit transaction is still pending. Do not let that
+            // temporary state enter the teammate alias as a natural follower,
+            // otherwise the alias package stack is built before TFDTeammateFaction
+            // exists and the final follow package can fail to take over.
+            if (TFD::Recruit::IsRecruitCommitPending(actor)) {
+                return false;
+            }
+
             if (IsTFDConvertedTeammate(actor)) {
                 return false;
             }
@@ -571,6 +581,33 @@ namespace
             }
 
             if (IsPermanentTFDConvertedTeammate(actor)) {
+                auto* player = Player();
+                auto* actorTarget = ResolveCombatTarget(actor);
+                auto* playerTarget = ResolveCombatTarget(player);
+                const bool actorTargetsPlayer = player && actorTarget == player;
+                const bool playerTargetsActor = playerTarget == actor;
+                const bool activeCombatConflict =
+                    actor->IsInCombat() ||
+                    actorTargetsPlayer ||
+                    playerTargetsActor ||
+                    TFD::Recruit::HasKnownHostileSourceFaction(actor);
+
+                // R29: Do not run the heavy recruit commit path on every teammate
+                // alias refresh for raw-only stale hostility. Some converted bandits
+                // keep returning IsHostileToActor(Player)=true with no combat target
+                // and no active hostile faction. Repeated StopCombat/UpdateCombat/
+                // EvaluatePackage calls interrupt the alias follow package and make
+                // the actor appear "stuck" at its old package. Only resettle when
+                // there is a real combat/faction conflict to clean up.
+                if (!activeCombatConflict) {
+                    if (TFD::Recruit::IsRawHostileToPlayer(actor, player)) {
+                        spdlog::info(
+                            "[TFD][TeammateManager] skip heavy alias resettle actor={:08X} reason=raw_only_no_target_no_known_hostile",
+                            actor->GetFormID());
+                    }
+                    return;
+                }
+
                 TFD::Recruit::CommitOptions recruitOptions{};
                 recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
                 recruitOptions.reason = "converted_teammate_alias_refresh";
@@ -581,7 +618,7 @@ namespace
                 recruitOptions.throttleObserve = true;
                 recruitOptions.ensurePacifyAlliance = true;
                 recruitOptions.applyRuntimeProfile = true;
-                TFD::Recruit::CommitRecruit(actor, Player(), recruitOptions);
+                TFD::Recruit::CommitRecruit(actor, player, recruitOptions);
                 return;
             }
 
@@ -677,6 +714,191 @@ namespace
             return queued;
         }
 
+        float DistanceToPlayer(RE::Actor* actor, RE::PlayerCharacter* player)
+        {
+            if (!actor || !player) {
+                return 0.0f;
+            }
+
+            const auto a = actor->GetPosition();
+            const auto b = player->GetPosition();
+            const float dx = a.x - b.x;
+            const float dy = a.y - b.y;
+            const float dz = a.z - b.z;
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+
+        std::vector<RE::Actor*> CollectRegisteredConvertedTeammatesUnsafe()
+        {
+            ResolveRegistry();
+
+            std::vector<RE::Actor*> out;
+            out.reserve(g_registry.teammateAliases.size());
+
+            auto* player = Player();
+            std::unordered_set<RE::FormID> seen;
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+
+                auto* actor = alias->GetActorReference();
+                if (!actor || actor == player || actor->IsDead() || actor->IsDisabled()) {
+                    continue;
+                }
+
+                if (!IsTFDConvertedTeammate(actor)) {
+                    continue;
+                }
+
+                if (!seen.insert(actor->GetFormID()).second) {
+                    continue;
+                }
+
+                out.push_back(actor);
+            }
+
+            return out;
+        }
+
+        std::size_t CatchupRegisteredHumanoidTeammatesAfterLoad(const char* reason, std::size_t attempt)
+        {
+            std::scoped_lock lock(g_syncLock);
+            ResolveRegistry();
+
+            auto* player = Player();
+            auto* playerCell = player ? player->GetParentCell() : nullptr;
+            if (!player || !playerCell) {
+                return 0;
+            }
+
+            auto actors = CollectRegisteredConvertedTeammatesUnsafe();
+            if (actors.empty()) {
+                return 0;
+            }
+
+            constexpr float kEvaluateDistance = 2500.0f;
+            constexpr float kHardFarDistance = 12000.0f;
+            constexpr float kWrongCellFarDistance = 6000.0f;
+            constexpr float kMoveOffsetBase = 768.0f;
+            constexpr float kMoveOffsetStep = 160.0f;
+            constexpr float kMoveBackOffset = -768.0f;
+
+            std::size_t touched = 0;
+            for (std::size_t i = 0; i < actors.size(); ++i) {
+                auto* actor = actors[i];
+                if (!actor || actor == player || actor->IsDead() || actor->IsDisabled()) {
+                    continue;
+                }
+
+                auto* actorCell = actor->GetParentCell();
+                const bool wrongCell = actorCell && actorCell != playerCell;
+                const bool unloaded = !actor->Is3DLoaded();
+                const float dist = DistanceToPlayer(actor, player);
+                const bool far = dist > kHardFarDistance;
+                const bool wrongCellFar = wrongCell && dist > kWrongCellFarDistance;
+
+                bool moved = false;
+                bool evaluated = false;
+                bool assigned = false;
+
+                // R30: do not rubber-band followers during ordinary running.
+                // Move only on the final post-loading pass, and only if the actor
+                // is still unloaded, in a different cell and far away, or extremely far.
+                const bool allowEmergencyMove = attempt >= 3;
+                const bool shouldMove = allowEmergencyMove && (unloaded || far || wrongCellFar);
+
+
+                if (actor->IsInCombat()) {
+                    actor->StopCombat();
+                }
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                }
+                if (actor->IsWeaponDrawn()) {
+                    actor->DrawWeaponMagicHands(false);
+                }
+
+                if (shouldMove) {
+                    actor->MoveTo(player);
+                    auto pos = player->GetPosition();
+                    const float side = (i % 2 == 0) ? 1.0f : -1.0f;
+                    pos.x += side * (kMoveOffsetBase + static_cast<float>(i) * kMoveOffsetStep);
+                    pos.y += kMoveBackOffset;
+                    actor->SetPosition(pos, true);
+                    moved = true;
+                }
+
+                TFD::Recruit::CommitOptions options{};
+                options.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
+                options.reason = reason ? reason : "post_load_humanoid_catchup";
+                options.quarantineHostileFactions = true;
+                options.clearCombat = true;
+                options.evaluatePackage = false;
+                options.detailedLog = false;
+                options.throttleObserve = true;
+                options.ensurePacifyAlliance = true;
+                options.applyRuntimeProfile = true;
+                TFD::Recruit::CommitRecruit(actor, player, options);
+
+                assigned = QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "post_load_humanoid_catchup");
+
+                if (moved || dist > kEvaluateDistance || !actor->Is3DLoaded()) {
+                    actor->EvaluatePackage();
+                    evaluated = true;
+                }
+
+                spdlog::info(
+                    "[TFD][TeammateManager] humanoid post-load catchup actor={:08X} reason={} attempt={} moved={} assigned={} evaluated={} wrongCell={} unloaded={} dist={:.1f}",
+                    actor->GetFormID(),
+                    reason ? reason : "post_load_humanoid_catchup",
+                    attempt,
+                    moved ? 1 : 0,
+                    assigned ? 1 : 0,
+                    evaluated ? 1 : 0,
+                    wrongCell ? 1 : 0,
+                    unloaded ? 1 : 0,
+                    dist);
+
+                ++touched;
+            }
+
+            return touched;
+        }
+
+        void QueueHumanoidTeammateCatchupAfterLoad(const char* reason)
+        {
+            const std::string reasonText = reason && reason[0] ? reason : "post_load_humanoid_catchup";
+
+            std::thread([reasonText]() {
+                constexpr std::array delays{
+                    std::chrono::milliseconds(1500),
+                    std::chrono::milliseconds(4500),
+                    std::chrono::milliseconds(9000)
+                };
+
+                for (std::size_t i = 0; i < delays.size(); ++i) {
+                    std::this_thread::sleep_for(delays[i]);
+
+                    auto* task = SKSE::GetTaskInterface();
+                    if (!task) {
+                        continue;
+                    }
+
+                    task->AddTask([reasonText, attempt = i + 1]() {
+                        const auto count = CatchupRegisteredHumanoidTeammatesAfterLoad(reasonText.c_str(), attempt);
+                        if (count > 0) {
+                            spdlog::info(
+                                "[TFD][TeammateManager] humanoid post-load catchup pass reason={} attempt={} count={}",
+                                reasonText,
+                                attempt,
+                                count);
+                        }
+                    });
+                }
+            }).detach();
+        }
+
         bool RegisterOrRefreshAliasForActor(RE::Actor* actor, const char* reason)
         {
             std::scoped_lock lock(g_syncLock);
@@ -691,10 +913,13 @@ namespace
             }
 
             if (!IsValidTeammate(actor)) {
+                const bool pendingRecruit = TFD::Recruit::IsRecruitCommitPending(actor);
                 spdlog::warn(
-                    "[TFD][TeammateManager] register now rejected actor={:08X} reason={} detail=not_valid_teammate",
+                    "[TFD][TeammateManager] register now rejected actor={:08X} reason={} detail={} pendingRecruit={}",
                     actor->GetFormID(),
-                    reason ? reason : "unknown");
+                    reason ? reason : "unknown",
+                    pendingRecruit ? "recruit_commit_pending_no_alias_pre_marker" : "not_valid_teammate",
+                    pendingRecruit ? 1 : 0);
                 return false;
             }
 
@@ -779,9 +1004,6 @@ namespace
 
             auto desired = CollectNearbyPlayerTeammates(8000.0f);
 
-            const int teammateState = ComputeTeammateStateValue(desired);
-            WriteTeammateState(teammateState);
-
             if (!g_registry.quest) {
                 return;
             }
@@ -842,9 +1064,24 @@ namespace
                     actor ? actor->GetFormID() : 0u,
                     actor && actor->GetName() ? actor->GetName() : "");
             }
+            std::vector<RE::Actor*> registeredStateActors;
+            registeredStateActors.reserve(g_registry.teammateAliases.size());
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+                auto* actor = alias->GetActorReference();
+                if (!actor || !IsValidTeammate(actor)) {
+                    continue;
+                }
+                registeredStateActors.push_back(actor);
+            }
+            WriteTeammateState(ComputeTeammateStateValue(registeredStateActors));
+
         }
 
         void TickUI()
+
         {
             SyncAliasesImpl();
             g_tickPending.store(false, std::memory_order_release);
@@ -993,6 +1230,12 @@ namespace TFD::TeammateManager
     {
         return AliasInternal::RegisterOrRefreshAliasForActor(actor, reason);
     }
+    void QueueHumanoidTeammateCatchupAfterLoad(const char* reason)
+    {
+        AliasInternal::QueueHumanoidTeammateCatchupAfterLoad(reason);
+    }
+
+
     std::size_t RestoreNow()
     {
         return RestoreInternal::RestorePass().restored;

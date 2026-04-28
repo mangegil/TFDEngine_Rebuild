@@ -194,6 +194,41 @@ namespace TFD::InteractionRouter
             return nx * fx + ny * fy;
         }
 
+        float GetFacingDot2D(RE::Actor* from, RE::TESObjectREFR* to)
+        {
+            if (!from || !to) {
+                return -1.0f;
+            }
+
+            const auto fromPos = from->GetPosition();
+            const auto toPos = to->GetPosition();
+
+            const float dx = toPos.x - fromPos.x;
+            const float dy = toPos.y - fromPos.y;
+            const float d2 = dx * dx + dy * dy;
+            if (d2 <= 1.0f) {
+                return 1.0f;
+            }
+
+            const float len = std::sqrt(d2);
+            const float ang = from->GetAngleZ();
+            const float fx = std::sin(ang);
+            const float fy = std::cos(ang);
+            const float nx = dx / len;
+            const float ny = dy / len;
+            return nx * fx + ny * fy;
+        }
+
+        bool HasLineOfSightBetween(RE::Actor* from, RE::TESObjectREFR* to)
+        {
+            if (!from || !to) {
+                return false;
+            }
+
+            bool hasLOSData = false;
+            return from->HasLineOfSight(to, hasLOSData);
+        }
+
         bool IsActorCloseAndFront(RE::Actor* actor, RE::PlayerCharacter* player, float maxDist)
         {
             if (!actor || !player) {
@@ -309,6 +344,19 @@ namespace TFD::InteractionRouter
                     return -1.0e30f;
                 }
                 if (info.dist > 3500.0f) {
+                    return -1.0e30f;
+                }
+
+                const bool actorLOSPlayer = HasLineOfSightBetween(actor, player);
+                if (!actorLOSPlayer) {
+                    spdlog::info(
+                        "[TFD][Router] reject precombat target={:08X} reason=no_actor_los_to_player dist={:.1f} hostileToPlayer={} weaponDrawn={} actorFacingPlayer={:.3f} playerFacingActor={:.3f}",
+                        actor->GetFormID(),
+                        info.dist,
+                        info.hostileToPlayer ? 1 : 0,
+                        weaponDrawn ? 1 : 0,
+                        GetFacingDot2D(actor, player),
+                        dot);
                     return -1.0e30f;
                 }
 
@@ -911,8 +959,15 @@ namespace TFD::InteractionRouter
                 currentTargetFormID = currentTarget ? currentTarget->GetFormID() : 0u;
             }
 
+            const bool hostileToPlayer = bestTarget->IsHostileToActor(player);
+            const bool actorLOSPlayer = HasLineOfSightBetween(bestTarget, player);
+            const bool playerLOSActor = HasLineOfSightBetween(player, bestTarget);
+            const float playerFacingActorDot = GetActorFrontDot2D(bestTarget, player);
+            const float actorFacingPlayerDot = GetFacingDot2D(bestTarget, player);
+            const bool weaponDrawn = bestTarget->IsWeaponDrawn();
+
             spdlog::info(
-                "[TFD][Router] primary pick target={:08X} action={} score={:.1f} dist={:.1f} inCombat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
+                "[TFD][Router] primary pick target={:08X} action={} score={:.1f} dist={:.1f} inCombat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X} hostileToPlayer={} weaponDrawn={} losActorPlayer={} losPlayerActor={} actorFacingPlayer={:.3f} playerFacingActor={:.3f}",
                 bestTarget->GetFormID(),
                 ToString(chosenAction),
                 bestScore,
@@ -920,7 +975,13 @@ namespace TFD::InteractionRouter
                 actorInCombat ? 1 : 0,
                 targetPlayer ? 1 : 0,
                 targetPlayerSide ? 1 : 0,
-                currentTargetFormID);
+                currentTargetFormID,
+                hostileToPlayer ? 1 : 0,
+                weaponDrawn ? 1 : 0,
+                actorLOSPlayer ? 1 : 0,
+                playerLOSActor ? 1 : 0,
+                actorFacingPlayerDot,
+                playerFacingActorDot);
             result.target = bestTarget;
             result.action = chosenAction;
             result.interactionState = InteractionStateForAction(chosenAction);

@@ -57,8 +57,9 @@ namespace TFD::PreCombatGreet
         constexpr double kPostHandoffSettleBlockSec = 1.25;
         constexpr double kHotkeyCooldownSec = 3.0;
         constexpr double kRecruitedDialogueCooldownSec = 5.0;
-        constexpr double kPostRecruitSettleDurationSec = 3.00;
+        constexpr double kPostRecruitSettleDurationSec = 12.00;
         constexpr double kPostRecruitSettleIntervalSec = 0.35;
+        constexpr unsigned kPostRecruitSettleRequiredCleanSweeps = 3;
         constexpr double kStaleRecruitCombatStateSuppressSec = 8.00;
         constexpr double kRecruitCommitPendingGuardSec = 5.00;
 
@@ -109,6 +110,7 @@ namespace TFD::PreCombatGreet
             double untilSec{ 0.0 };
             double nextSweepSec{ 0.0 };
             unsigned sweepCount{ 0 };
+            unsigned cleanSweepCount{ 0 };
             bool teammateSeen{ false };
         };
 
@@ -779,6 +781,38 @@ namespace TFD::PreCombatGreet
                 reason ? reason : "unknown");
         }
 
+        bool CanMergePendingRecruitActor(RE::Actor* primaryActor, RE::Actor* pendingActor)
+        {
+            if (!primaryActor || !pendingActor || pendingActor->IsDead() || pendingActor->IsDisabled()) {
+                return false;
+            }
+
+            if (primaryActor == pendingActor) {
+                return true;
+            }
+
+            auto* primaryCell = primaryActor->GetParentCell();
+            auto* pendingCell = pendingActor->GetParentCell();
+            if (primaryCell && pendingCell != primaryCell) {
+                return false;
+            }
+
+            auto* primaryWorldspace = primaryActor->GetWorldspace();
+            auto* pendingWorldspace = pendingActor->GetWorldspace();
+            if (primaryWorldspace && pendingWorldspace != primaryWorldspace) {
+                return false;
+            }
+
+            constexpr float kMaxPendingRecruitMergeDistance = 3500.0f;
+            const auto primaryPos = primaryActor->GetPosition();
+            const auto pendingPos = pendingActor->GetPosition();
+            const float dx = primaryPos.x - pendingPos.x;
+            const float dy = primaryPos.y - pendingPos.y;
+            const float dz = primaryPos.z - pendingPos.z;
+            const float distSq = (dx * dx) + (dy * dy) + (dz * dz);
+            return distSq <= (kMaxPendingRecruitMergeDistance * kMaxPendingRecruitMergeDistance);
+        }
+
         std::vector<RE::Actor*> CollectPreCombatRecruitCommitActors(RE::Actor* primaryActor)
         {
             std::vector<RE::Actor*> actors;
@@ -787,6 +821,17 @@ namespace TFD::PreCombatGreet
             }
 
             actors = TFD::HostilityController::CollectDialogueTruceActors(primaryActor);
+
+            const auto pendingActors = TFD::Recruit::CollectRecruitCommitPendingActors(
+                TFD::Recruit::SourceFlow::PreCombat,
+                false);
+            for (auto* pendingActor : pendingActors) {
+                if (CanMergePendingRecruitActor(primaryActor, pendingActor) &&
+                    std::find(actors.begin(), actors.end(), pendingActor) == actors.end()) {
+                    actors.push_back(pendingActor);
+                }
+            }
+
             if (actors.empty()) {
                 actors.push_back(primaryActor);
             }
@@ -849,7 +894,7 @@ namespace TFD::PreCombatGreet
                 }
                 ensuredState += result.ensuredStateFactions;
                 removed += result.removedHostileFactions;
-                const bool commitClean = result.attempted && result.recruitLikeBefore && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+                const bool commitClean = result.attempted && !result.skipped && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
                 if (commitClean) {
                     ++rawClean;
                     if (TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, reason ? reason : "precombat_recruit_commit_clean")) {
@@ -904,14 +949,24 @@ namespace TFD::PreCombatGreet
             const bool targetWasPlayerSide = IsPlayerSideActorForDiag(targetBefore, player);
             const bool hostileBefore = actor->IsHostileToActor(player);
             const bool inCombatBefore = actor->IsInCombat();
+            const bool rawOnlyBefore = hostileBefore && !inCombatBefore && !targetBefore;
             bool changed = false;
+            bool rawOnlyDeferred = false;
 
             if (targetWasPlayerSide) {
                 actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
                 changed = true;
             }
 
-            if (hostileBefore || inCombatBefore || targetWasPlayerSide) {
+            // R29: If a converted teammate only has the stale raw hostility bit
+            // but no combat target and no combat state, do not hammer StopCombat /
+            // UpdateCombat forever. The first sweep may still try to settle it;
+            // later sweeps let the teammate package run so the actor can leave its
+            // old patrol/sandbox behavior.
+            if (rawOnlyBefore && sweepCount > 1 && !targetWasPlayerSide) {
+                rawOnlyDeferred = true;
+            }
+            else if (hostileBefore || inCombatBefore || targetWasPlayerSide) {
                 actor->StopCombat();
                 actor->StopAlarmOnActor();
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
@@ -939,10 +994,16 @@ namespace TFD::PreCombatGreet
                     false
                     });
             }
-            const bool settled = (!hostileAfter || staleFactionOnly) && !inCombatAfter && !targetAfterPlayerSide;
+            const bool settled = (!hostileAfter && !inCombatAfter && !targetAfterPlayerSide) || rawOnlyDeferred;
+            const bool stableClean = rawOnlyDeferred ||
+                (settled &&
+                    !changed &&
+                    !hostileBefore &&
+                    !inCombatBefore &&
+                    !targetWasPlayerSide);
 
             spdlog::info(
-                "[TFD][PreCombatGreet] post recruit settle sweep actor={:08X} sweep={} teammate={} follower={} tame={} hostileBefore={} hostileAfter={} staleFactionOnly={} inCombatBefore={} inCombatAfter={} targetBefore={:08X} targetBeforePlayerSide={} targetAfter={:08X} targetAfterPlayerSide={} changed={} settled={} reason={}",
+                "[TFD][PreCombatGreet] post recruit settle sweep actor={:08X} sweep={} teammate={} follower={} tame={} hostileBefore={} hostileAfter={} staleFactionOnly={} rawOnlyDeferred={} inCombatBefore={} inCombatAfter={} targetBefore={:08X} targetBeforePlayerSide={} targetAfter={:08X} targetAfterPlayerSide={} changed={} settled={} stableClean={} reason={}",
                 actor->GetFormID(),
                 sweepCount,
                 actor->IsPlayerTeammate() ? 1 : 0,
@@ -951,6 +1012,7 @@ namespace TFD::PreCombatGreet
                 hostileBefore ? 1 : 0,
                 hostileAfter ? 1 : 0,
                 staleFactionOnly ? 1 : 0,
+                rawOnlyDeferred ? 1 : 0,
                 inCombatBefore ? 1 : 0,
                 inCombatAfter ? 1 : 0,
                 targetBefore ? targetBefore->GetFormID() : 0u,
@@ -959,9 +1021,10 @@ namespace TFD::PreCombatGreet
                 targetAfterPlayerSide ? 1 : 0,
                 changed ? 1 : 0,
                 settled ? 1 : 0,
+                stableClean ? 1 : 0,
                 reason ? reason : "unknown");
 
-            return settled;
+            return stableClean;
         }
 
 
@@ -980,9 +1043,10 @@ namespace TFD::PreCombatGreet
                 auto& entry = it->second;
                 if (nowSec >= entry.untilSec) {
                     spdlog::info(
-                        "[TFD][PreCombatGreet] post recruit settle expired actor={:08X} sweeps={} teammateSeen={}",
+                        "[TFD][PreCombatGreet] post recruit settle expired actor={:08X} sweeps={} cleanSweeps={} teammateSeen={}",
                         it->first,
                         entry.sweepCount,
+                        entry.cleanSweepCount,
                         entry.teammateSeen ? 1 : 0);
                     it = gPostRecruitSettle.erase(it);
                     continue;
@@ -1007,12 +1071,20 @@ namespace TFD::PreCombatGreet
                 entry.nextSweepSec = nowSec + kPostRecruitSettleIntervalSec;
                 entry.teammateSeen = entry.teammateSeen || IsPostRecruitSettleTeammateLike(actor);
 
-                const bool settled = ApplyPostRecruitSettleSweep(actor, player, entry.sweepCount, "post_recruit_settle");
-                if (settled && entry.teammateSeen && entry.sweepCount >= 2) {
+                const bool stableClean = ApplyPostRecruitSettleSweep(actor, player, entry.sweepCount, "post_recruit_settle");
+                if (stableClean) {
+                    ++entry.cleanSweepCount;
+                }
+                else {
+                    entry.cleanSweepCount = 0;
+                }
+
+                if (entry.teammateSeen && entry.cleanSweepCount >= kPostRecruitSettleRequiredCleanSweeps) {
                     spdlog::info(
-                        "[TFD][PreCombatGreet] post recruit settle done actor={:08X} sweeps={}",
+                        "[TFD][PreCombatGreet] post recruit settle done actor={:08X} sweeps={} cleanSweeps={}",
                         actor->GetFormID(),
-                        entry.sweepCount);
+                        entry.sweepCount,
+                        entry.cleanSweepCount);
                     it = gPostRecruitSettle.erase(it);
                     continue;
                 }
@@ -1856,7 +1928,6 @@ namespace TFD::PreCombatGreet
 
                     if (pendingActor) {
                         ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
-                        ArmPostRecruitSettleForGroup(pendingActor, rawName);
                         TFD::Recruit::MarkRecruitCommitPendingGroup(
                             CollectPreCombatRecruitCommitActors(pendingActor),
                             kRecruitCommitPendingGuardSec,
@@ -2102,7 +2173,6 @@ namespace TFD::PreCombatGreet
                     else {
                         if (pendingActor) {
                             ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
-                            ArmPostRecruitSettleForGroup(pendingActor, rawName);
                             TFD::Recruit::MarkRecruitCommitPendingGroup(
                                 CollectPreCombatRecruitCommitActors(pendingActor),
                                 kRecruitCommitPendingGuardSec,
@@ -2117,10 +2187,12 @@ namespace TFD::PreCombatGreet
                         if (resolvedRecruit) {
                             if (pendingActor) {
                                 CommitPreCombatRecruitGroup(pendingActor, "mod_event_precombat_recruit_commit");
+                                ArmPostRecruitSettleForGroup(pendingActor, "mod_event_precombat_recruit_settle_after_commit");
                             }
                             else {
-                                auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
-                                CommitPreCombatRecruitGroup(actor, "mod_event_precombat_recruit_commit_fallback");
+                                auto* fallbackActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+                                CommitPreCombatRecruitGroup(fallbackActor, "mod_event_precombat_recruit_commit_fallback");
+                                ArmPostRecruitSettleForGroup(fallbackActor, "mod_event_precombat_recruit_settle_after_commit_fallback");
                             }
                             shouldClearInteractionState = true;
                         }

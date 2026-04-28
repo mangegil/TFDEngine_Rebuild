@@ -1610,6 +1610,7 @@ namespace TFD::Actor::Ops
 		static RE::TESGlobal* g_joinEnemyStateGlobal = nullptr;
 		static RE::TESFaction* g_releaseFollowHelperFaction = nullptr;
 		static RE::TESFaction* g_dialogueHelperFaction = nullptr;
+		static RE::TESFaction* g_permanentTeammateFaction = nullptr;
 
 		static void ResolveJoinEnemyStateGlobal()
 		{
@@ -1731,6 +1732,21 @@ namespace TFD::Actor::Ops
 					spdlog::warn("[TFD][FactionManager] dialogue helper faction not found editorId=TFDPacifyFaction");
 				}
 			}
+			if (!g_permanentTeammateFaction) {
+				g_permanentTeammateFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTeammateFaction");
+				if (!g_permanentTeammateFaction) {
+					spdlog::warn("[TFD][FactionManager] permanent teammate faction not found editorId=TFDTeammateFaction");
+				}
+			}
+		}
+
+		static bool ActorHasPermanentTeammateFaction(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			ResolveReleaseFollowHelperFaction();
+			return g_permanentTeammateFaction && GetExactFactionRank(actor, g_permanentTeammateFaction) >= 0;
 		}
 
 		static bool ActorHasActiveDialoguePhaseFaction(RE::Actor* actor)
@@ -2286,11 +2302,22 @@ namespace TFD::Actor::Ops
 				return;
 			}
 			ResolveReleaseFollowHelperFaction();
+
+			const bool keepPacifyForPermanentTeammate = ActorHasPermanentTeammateFaction(actor);
+
 			if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
 				actor->RemoveFromFaction(g_releaseFollowHelperFaction);
 			}
-			if (g_dialogueHelperFaction && actor->IsInFaction(g_dialogueHelperFaction) && !ActorHasActiveDialoguePhaseFaction(actor)) {
-				actor->RemoveFromFaction(g_dialogueHelperFaction);
+			if (g_dialogueHelperFaction && actor->IsInFaction(g_dialogueHelperFaction)) {
+				if (keepPacifyForPermanentTeammate) {
+					spdlog::info(
+						"[TFD][FactionManager] grace keep pacify actor={:08X} reason={} guard=permanent_teammate",
+						actor->GetFormID(),
+						reason ? reason : "unknown");
+				}
+				else if (!ActorHasActiveDialoguePhaseFaction(actor)) {
+					actor->RemoveFromFaction(g_dialogueHelperFaction);
+				}
 			}
 			g_releaseFollowGraceEntries.erase(actor->GetFormID());
 			spdlog::info("[TFD][FactionManager] grace removed actor={:08X} reason={}", actor->GetFormID(), reason ? reason : "unknown");

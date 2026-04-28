@@ -601,6 +601,8 @@ namespace
         auto* playerTarget = ResolveCurrentCombatTarget(player);
         const bool actorTargetWasPlayer = actorTarget == player;
         const bool playerTargetWasActor = playerTarget == actor;
+        const bool actorRawHostileToPlayer = actor->IsHostileToActor(player);
+        const bool clearPlayerSideAlarm = playerTargetWasActor || actorTargetWasPlayer || actorRawHostileToPlayer;
 
         if (actorTargetWasPlayer || actorTarget) {
             actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
@@ -614,7 +616,7 @@ namespace
         if (auto* process = RE::ProcessLists::GetSingleton()) {
             process->ClearCachedFactionFightReactions();
             process->StopCombatAndAlarmOnActor(actor, false);
-            if (playerTargetWasActor) {
+            if (clearPlayerSideAlarm) {
                 process->StopCombatAndAlarmOnActor(player, false);
             }
             changed = true;
@@ -625,14 +627,18 @@ namespace
             changed = true;
         }
         actor->StopAlarmOnActor();
+        actor->SetBeenAttacked(false);
+        changed = true;
 
-        if (playerTargetWasActor || actorTargetWasPlayer) {
+        if (clearPlayerSideAlarm) {
             player->StopCombat();
+            player->StopAlarmOnActor();
+            player->SetBeenAttacked(false);
             changed = true;
         }
 
         actor->UpdateCombat();
-        if (playerTargetWasActor) {
+        if (clearPlayerSideAlarm || actor->IsHostileToActor(player)) {
             player->UpdateCombat();
         }
 
@@ -834,6 +840,64 @@ namespace TFD::Recruit
         }
     }
 
+    std::vector<RE::Actor*> CollectRecruitCommitPendingActors(SourceFlow sourceFlow, bool includeUnknownSource)
+    {
+        std::vector<RE::FormID> actorIds;
+        const double now = NowSec();
+
+        {
+            std::scoped_lock lk(g_logLock);
+
+            for (auto it = g_recruitCommitPending.begin(); it != g_recruitCommitPending.end();) {
+                if (IsPendingExpired(it->second, now)) {
+                    spdlog::info(
+                        "[TFD][Recruit] pending expired actor={:08X} source={} reason=collect",
+                        it->first,
+                        ToString(it->second.sourceFlow));
+                    it = g_recruitCommitPending.erase(it);
+                    continue;
+                }
+
+                const bool sourceMatches =
+                    it->second.sourceFlow == sourceFlow ||
+                    (includeUnknownSource && it->second.sourceFlow == SourceFlow::Unknown);
+                if (sourceMatches) {
+                    actorIds.push_back(it->first);
+                }
+
+                ++it;
+            }
+        }
+
+        std::vector<RE::Actor*> actors;
+        actors.reserve(actorIds.size());
+        std::unordered_set<RE::FormID> seen;
+        seen.reserve(actorIds.size());
+
+        for (const auto actorId : actorIds) {
+            if (actorId == 0 || !seen.insert(actorId).second) {
+                continue;
+            }
+
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                continue;
+            }
+
+            actors.push_back(actor);
+        }
+
+        if (!actors.empty()) {
+            spdlog::info(
+                "[TFD][Recruit] pending collect source={} count={} includeUnknown={}",
+                ToString(sourceFlow),
+                static_cast<unsigned>(actors.size()),
+                includeUnknownSource ? 1 : 0);
+        }
+
+        return actors;
+    }
+
     bool IsRecruitCommitPending(RE::Actor* actor)
     {
         if (!actor || actor->IsDead() || actor->IsDisabled()) {
@@ -910,22 +974,25 @@ namespace TFD::Recruit
 
         const auto beforeSummary = BuildFactionSummary(actor);
         result.recruitLikeBefore = IsRecruitLikeFromSummary(actor, beforeSummary);
+        result.pendingCommitBefore = IsRecruitCommitPending(actor);
         result.rawHostileBefore = actor->IsHostileToActor(player);
         result.hostileFactionMatchesBefore = beforeSummary.hostileMatches;
 
         // CommitRecruit must only convert actors that are already in a player-side
-        // recruit state. This prevents accidental pacification of unrelated enemies
-        // merely because they have a known hostile faction.
-        if (!result.recruitLikeBefore) {
+        // recruit state or were captured by the native pending recruit participant
+        // guard. This prevents accidental pacification of unrelated enemies merely
+        // because they have a known hostile faction.
+        if (!result.recruitLikeBefore && !result.pendingCommitBefore) {
             result.skipped = true;
             if (ShouldLogCommit(actor, options.detailedLog, result)) {
                 spdlog::info(
-                    "[TFD][Recruit] commit skipped actor={:08X} source={} reason={} rawBefore={} hostileFactions={} reasonDetail=not_recruit_like",
+                    "[TFD][Recruit] commit skipped actor={:08X} source={} reason={} rawBefore={} hostileFactions={} pending={} reasonDetail=not_recruit_like",
                     actor->GetFormID(),
                     ToString(options.sourceFlow),
                     options.reason ? options.reason : "unknown",
                     result.rawHostileBefore ? 1 : 0,
-                    result.hostileFactionMatchesBefore);
+                    result.hostileFactionMatchesBefore,
+                    result.pendingCommitBefore ? 1 : 0);
             }
             return result;
         }
@@ -953,6 +1020,12 @@ namespace TFD::Recruit
             MarkQuarantineAttempted(actorId);
         }
 
+        const bool staleRawHostilityNeedsSettle =
+            result.rawHostileBefore &&
+            result.hostileFactionMatchesBefore == 0 &&
+            beforeSummary.stateMatches > 0 &&
+            (beforeSummary.tfdTeammate || beforeSummary.truceTeammate || beforeSummary.tfdPacify);
+
         const bool nothingNewToSettle =
             quarantineAlreadyAttempted &&
             settleAlreadyAttempted &&
@@ -960,7 +1033,17 @@ namespace TFD::Recruit
             result.removedHostileFactions == 0 &&
             result.ensuredStateFactions == 0 &&
             !result.playerFactionEnsured &&
-            !result.runtimeProfileApplied;
+            !result.runtimeProfileApplied &&
+            !staleRawHostilityNeedsSettle;
+
+        if (staleRawHostilityNeedsSettle) {
+            spdlog::info(
+                "[TFD][Recruit] stale raw settle actor={:08X} source={} reason={} stateFactions={} detail=no_active_hostile_faction",
+                actor->GetFormID(),
+                ToString(options.sourceFlow),
+                options.reason ? options.reason : "unknown",
+                beforeSummary.stateMatches);
+        }
 
         // R8B stops repeated quarantine. R9 still allows one post-profile settle pass,
         // because pacify alliance and runtime actor values can affect raw hostility only
@@ -1015,7 +1098,7 @@ namespace TFD::Recruit
 
         if (ShouldLogCommit(actor, options.detailedLog, result)) {
             spdlog::info(
-                "[TFD][Recruit] commit actor={:08X} name='{}' source={} reason={} rawBefore={} rawAfter={} recruitLikeBefore={} hostileBefore={} hostileAfter={} removed={} ensuredState={} playerFaction={} runtimeProfile={} combatCleared={} eval={} clean={}",
+                "[TFD][Recruit] commit actor={:08X} name='{}' source={} reason={} rawBefore={} rawAfter={} recruitLikeBefore={} pendingCommit={} hostileBefore={} hostileAfter={} removed={} ensuredState={} playerFaction={} runtimeProfile={} combatCleared={} eval={} clean={}",
                 actor->GetFormID(),
                 actor->GetName() ? actor->GetName() : "",
                 ToString(options.sourceFlow),
@@ -1023,6 +1106,7 @@ namespace TFD::Recruit
                 result.rawHostileBefore ? 1 : 0,
                 result.rawHostileAfter ? 1 : 0,
                 result.recruitLikeBefore ? 1 : 0,
+                result.pendingCommitBefore ? 1 : 0,
                 result.hostileFactionMatchesBefore,
                 result.hostileFactionMatchesAfter,
                 result.removedHostileFactions,

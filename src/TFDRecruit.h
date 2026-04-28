@@ -51,6 +51,7 @@ namespace TFD::Recruit
         bool attempted{ false };
         bool skipped{ false };
         bool recruitLikeBefore{ false };
+        bool pendingCommitBefore{ false };
         bool rawHostileBefore{ false };
         bool rawHostileAfter{ false };
         unsigned hostileFactionMatchesBefore{ 0 };
@@ -77,6 +78,7 @@ namespace TFD::Recruit
 
     void MarkRecruitCommitPending(RE::Actor* actor, double durationSec, SourceFlow sourceFlow, const char* reason);
     void MarkRecruitCommitPendingGroup(const std::vector<RE::Actor*>& actors, double durationSec, SourceFlow sourceFlow, const char* reason);
+    std::vector<RE::Actor*> CollectRecruitCommitPendingActors(SourceFlow sourceFlow, bool includeUnknownSource = false);
     bool IsRecruitCommitPending(RE::Actor* actor);
     void ClearRecruitCommitPending(RE::Actor* actor, const char* reason);
 }
