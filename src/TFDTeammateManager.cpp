@@ -20,6 +20,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -354,6 +355,11 @@ namespace
         inline std::thread g_worker{};
         inline std::mutex g_syncLock{};
 
+        inline std::unordered_set<RE::FormID> g_knownConvertedTeammates{};
+        inline std::unordered_map<RE::FormID, std::uint32_t> g_invalidAliasStrikes{};
+
+        constexpr std::uint32_t kConvertedAliasInvalidGraceTicks = 12;
+
         RE::PlayerCharacter* Player()
         {
             return RE::PlayerCharacter::GetSingleton();
@@ -466,6 +472,63 @@ namespace
         {
             ResolveRegistry();
             return actor && g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction);
+        }
+
+        bool HasAnyTFDTeammateFactionNow(RE::Actor* actor)
+        {
+            return IsTFDConvertedTeammate(actor);
+        }
+
+        void RememberConvertedTeammate(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player()) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            const bool inserted = g_knownConvertedTeammates.insert(actorId).second;
+            if (inserted) {
+                spdlog::info(
+                    "[TFD][TeammateManager] remember converted teammate actor={:08X} reason={}",
+                    actorId,
+                    reason ? reason : "unknown");
+            }
+        }
+
+        void ForgetConvertedTeammate(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            g_knownConvertedTeammates.erase(actorId);
+            g_invalidAliasStrikes.erase(actorId);
+            spdlog::info(
+                "[TFD][TeammateManager] forget converted teammate actor={:08X} reason={}",
+                actorId,
+                reason ? reason : "unknown");
+        }
+
+        bool WasKnownConvertedTeammate(RE::Actor* actor)
+        {
+            return actor && g_knownConvertedTeammates.find(actor->GetFormID()) != g_knownConvertedTeammates.end();
+        }
+
+        void ResetInvalidAliasStrike(RE::Actor* actor)
+        {
+            if (!actor) {
+                return;
+            }
+            g_invalidAliasStrikes.erase(actor->GetFormID());
+        }
+
+        std::int32_t FactionRank(RE::Actor* actor, RE::TESFaction* faction)
+        {
+            if (!actor || !faction) {
+                return -2;
+            }
+            return actor->GetFactionRank(faction, false);
         }
 
         bool HasPlayerHostility(RE::Actor* actor)
@@ -728,6 +791,109 @@ namespace
             return std::sqrt(dx * dx + dy * dy + dz * dz);
         }
 
+        void LogInvalidAliasDiagnostic(RE::BGSRefAlias* alias, RE::Actor* actor, const char* action, const char* reason, std::uint32_t strikes)
+        {
+            ResolveRegistry();
+            auto* player = Player();
+            auto* actorTarget = ResolveCombatTarget(actor);
+            auto* playerTarget = ResolveCombatTarget(player);
+
+            const bool hasActor = actor != nullptr;
+            const bool dead = actor && actor->IsDead();
+            const bool disabled = actor && actor->IsDisabled();
+            const bool loaded = actor && actor->Is3DLoaded();
+            const bool playerTeammate = actor && actor->IsPlayerTeammate();
+            const bool currentFollower = actor && g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction);
+            const bool playerFollower = actor && g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction);
+            const bool pendingRecruit = actor && TFD::Recruit::IsRecruitCommitPending(actor);
+            const bool inCombat = actor && actor->IsInCombat();
+            const bool rawHostile = actor && TFD::Recruit::IsRawHostileToPlayer(actor, player);
+            const bool knownConverted = actor && WasKnownConvertedTeammate(actor);
+            const bool nowConverted = actor && HasAnyTFDTeammateFactionNow(actor);
+            const bool knownHostileFaction = actor && TFD::Recruit::HasKnownHostileSourceFaction(actor);
+            const float dist = (actor && player) ? DistanceToPlayer(actor, player) : 0.0f;
+
+            spdlog::info(
+                "[TFD][TeammateManager] invalid alias diag alias='{}' actor={:08X} action={} reason={} strikes={} maxGrace={} hasActor={} dead={} disabled={} loaded={} tfdRank={} truceRank={} knownConverted={} nowConverted={} playerTeammate={} currentFollower={} playerFollower={} pendingRecruit={} inCombat={} actorTarget={:08X} playerTarget={:08X} rawHostile={} hostileFaction={} dist={:.1f}",
+                alias ? alias->aliasName.c_str() : "",
+                actor ? actor->GetFormID() : 0u,
+                action ? action : "unknown",
+                reason ? reason : "unknown",
+                strikes,
+                kConvertedAliasInvalidGraceTicks,
+                hasActor ? 1 : 0,
+                dead ? 1 : 0,
+                disabled ? 1 : 0,
+                loaded ? 1 : 0,
+                FactionRank(actor, g_registry.teammateFaction),
+                FactionRank(actor, g_registry.truceTeammateFaction),
+                knownConverted ? 1 : 0,
+                nowConverted ? 1 : 0,
+                playerTeammate ? 1 : 0,
+                currentFollower ? 1 : 0,
+                playerFollower ? 1 : 0,
+                pendingRecruit ? 1 : 0,
+                inCombat ? 1 : 0,
+                actorTarget ? actorTarget->GetFormID() : 0u,
+                playerTarget ? playerTarget->GetFormID() : 0u,
+                rawHostile ? 1 : 0,
+                knownHostileFaction ? 1 : 0,
+                dist);
+        }
+
+        bool IsKnownConvertedAliasActor(RE::Actor* actor)
+        {
+            if (!actor || actor == Player()) {
+                return false;
+            }
+
+            if (HasAnyTFDTeammateFactionNow(actor)) {
+                RememberConvertedTeammate(actor, "known_alias_current_marker");
+                return true;
+            }
+
+            return WasKnownConvertedTeammate(actor);
+        }
+
+        bool IsHardInvalidConvertedAliasActor(RE::Actor* actor)
+        {
+            if (!actor || actor == Player()) {
+                return true;
+            }
+            return actor->IsDead() || actor->IsDisabled();
+        }
+
+        bool ShouldPreserveInvalidConvertedAlias(RE::BGSRefAlias* alias, RE::Actor* actor, const char* reason)
+        {
+            if (!IsKnownConvertedAliasActor(actor)) {
+                LogInvalidAliasDiagnostic(alias, actor, "clear_not_converted", reason, 0);
+                return false;
+            }
+
+            if (IsHardInvalidConvertedAliasActor(actor)) {
+                LogInvalidAliasDiagnostic(alias, actor, "clear_hard_invalid", reason, 0);
+                ForgetConvertedTeammate(actor, "hard_invalid_alias_clear");
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            const std::uint32_t strikes = ++g_invalidAliasStrikes[actorId];
+            const bool preserve = strikes <= kConvertedAliasInvalidGraceTicks;
+
+            LogInvalidAliasDiagnostic(alias, actor, preserve ? "preserve_converted_alias" : "clear_grace_expired", reason, strikes);
+
+            if (!preserve) {
+                g_invalidAliasStrikes.erase(actorId);
+                return false;
+            }
+
+            QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "preserve_invalid_converted_alias");
+            if (actor->Is3DLoaded()) {
+                actor->EvaluatePackage();
+            }
+            return true;
+        }
+
         std::vector<RE::Actor*> CollectRegisteredConvertedTeammatesUnsafe()
         {
             ResolveRegistry();
@@ -750,6 +916,9 @@ namespace
                 if (!IsTFDConvertedTeammate(actor)) {
                     continue;
                 }
+
+                RememberConvertedTeammate(actor, "collect_registered_converted");
+                ResetInvalidAliasStrike(actor);
 
                 if (!seen.insert(actor->GetFormID()).second) {
                     continue;
@@ -923,6 +1092,11 @@ namespace
                 return false;
             }
 
+            if (IsTFDConvertedTeammate(actor)) {
+                RememberConvertedTeammate(actor, reason ? reason : "register_now_valid_converted");
+                ResetInvalidAliasStrike(actor);
+            }
+
             RE::BGSRefAlias* emptyAlias = nullptr;
             RE::BGSRefAlias* recyclableAlias = nullptr;
             RE::Actor* recyclableActor = nullptr;
@@ -934,6 +1108,10 @@ namespace
 
                 auto* current = alias->GetActorReference();
                 if (SameActor(current, actor)) {
+                    if (IsTFDConvertedTeammate(actor)) {
+                        RememberConvertedTeammate(actor, reason ? reason : "register_now_refresh_converted");
+                        ResetInvalidAliasStrike(actor);
+                    }
                     SyncTeammateFaction(actor, true);
                     QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
                     if (actor->Is3DLoaded()) {
@@ -955,6 +1133,9 @@ namespace
                 }
 
                 if (!recyclableAlias && !IsValidTeammate(current) && !TFD::Recruit::IsRecruitCommitPending(current)) {
+                    if (IsKnownConvertedAliasActor(current) && !IsHardInvalidConvertedAliasActor(current)) {
+                        continue;
+                    }
                     recyclableAlias = alias;
                     recyclableActor = current;
                 }
@@ -981,6 +1162,10 @@ namespace
             }
 
             WriteAlias(targetAlias, actor);
+            if (IsTFDConvertedTeammate(actor)) {
+                RememberConvertedTeammate(actor, reason ? reason : "register_now_fill_converted");
+                ResetInvalidAliasStrike(actor);
+            }
             SyncTeammateFaction(actor, true);
             QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_assign");
             if (actor->Is3DLoaded()) {
@@ -1034,11 +1219,20 @@ namespace
                         continue;
                     }
 
+                    if (ShouldPreserveInvalidConvertedAlias(alias, current, "sync_alias_invalid")) {
+                        continue;
+                    }
+
                     spdlog::info("[TFD][TeammateManager] clear alias='{}' actor={:08X} reason=invalid",
                         alias->aliasName.c_str(), current->GetFormID());
                     SyncTeammateFaction(current, false);
                     WriteAlias(alias, nullptr);
                     continue;
+                }
+
+                if (IsTFDConvertedTeammate(current)) {
+                    RememberConvertedTeammate(current, "sync_alias_valid_converted");
+                    ResetInvalidAliasStrike(current);
                 }
 
                 SyncTeammateFaction(current, true);
@@ -1055,9 +1249,16 @@ namespace
                 if (current && IsValidTeammate(current)) {
                     continue;
                 }
+                if (current && IsKnownConvertedAliasActor(current) && !IsHardInvalidConvertedAliasActor(current)) {
+                    continue;
+                }
                 auto* actor = remaining.front();
                 remaining.erase(remaining.begin());
                 WriteAlias(alias, actor);
+                if (IsTFDConvertedTeammate(actor)) {
+                    RememberConvertedTeammate(actor, "sync_fill_converted");
+                    ResetInvalidAliasStrike(actor);
+                }
                 SyncTeammateFaction(actor, true);
                 spdlog::info("[TFD][TeammateManager] fill alias='{}' actor={:08X} name='{}'",
                     alias->aliasName.c_str(),
