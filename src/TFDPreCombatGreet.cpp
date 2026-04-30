@@ -49,7 +49,7 @@ namespace TFD::PreCombatGreet
         constexpr double kStickyTerminalSuppressSec = 0.75;
         constexpr double kDialogueCloseResolveDelaySec = 1.20;
         constexpr double kNegotiationRefreshSec = 0.15;
-        constexpr double kPreCombatOutcomeGraceSec = 1.25;
+        constexpr double kPreCombatOutcomeGraceSec = 3.50;
         constexpr double kTerminalPendingOutcomeGraceSec = 6.00;
         constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
         constexpr unsigned kDialogueOpenRetryLimit = 3;
@@ -1246,6 +1246,46 @@ namespace TFD::PreCombatGreet
             }
 
             if (!actor->IsHostileToActor(player)) {
+                return false;
+            }
+
+            return true;
+        }
+
+        bool IsPleasureCycleCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+
+            if (actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+
+            if (actor->GetFormID() == player->GetFormID()) {
+                return false;
+            }
+
+            if (actor->IsPlayerTeammate() ||
+                TFD::Recruit::IsRecruitLike(actor) ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::Tame::IsCompanion(actor)) {
+                return false;
+            }
+
+            if (TFD::FlowController::IsPreCombatBlocked()) {
+                return false;
+            }
+
+            if (TFD::Transition::IsRecoveryActive()) {
+                return false;
+            }
+
+            if (IsPlayerDown()) {
                 return false;
             }
 
@@ -2534,6 +2574,131 @@ namespace TFD::PreCombatGreet
     bool IsSuspended()
     {
         return gSuspended.load(std::memory_order_acquire);
+    }
+
+    bool BeginForPleasureCycleActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+
+        if (outAction) {
+            *outAction = TFD::InteractionRouter::Action::None;
+        }
+
+        if (TFD::Transition::IsRecoveryActive()) {
+            return false;
+        }
+
+        if (!IsPleasureCycleCandidate(actor, player)) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor blocked actor={:08X} reason=invalid_candidate",
+                actor ? actor->GetFormID() : 0u);
+            return false;
+        }
+
+        if (TFD::Extortion::IsActive(actor)) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor blocked actor={:08X} reason=extortion_active",
+                actor ? actor->GetFormID() : 0u);
+            return false;
+        }
+
+        const auto handle = GetHandleId(actor);
+        const double now = NowSec();
+
+        std::scoped_lock lk(gLock);
+
+        auto existingIt = gPending.find(handle);
+        if (existingIt != gPending.end()) {
+            if (outAction) {
+                *outAction = existingIt->second.action;
+            }
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor reused pending actor={:08X} action={}",
+                actor->GetFormID(),
+                TFD::InteractionRouter::ToString(existingIt->second.action));
+            return true;
+        }
+
+        if (!gPending.empty()) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor blocked actor={:08X} reason=precombat_owner_busy pendingOwner={:08X} pendingCount={}",
+                actor ? actor->GetFormID() : 0u,
+                ResolveSinglePendingActorFormIDLocked(),
+                static_cast<unsigned>(gPending.size()));
+            return false;
+        }
+
+        auto sessionId = TFD::HostilityController::BeginTrucePreCombatSession(player, actor, now);
+        if (!sessionId || *sessionId == 0) {
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor blocked actor={:08X} reason=session_failed",
+                actor ? actor->GetFormID() : 0u);
+            return false;
+        }
+
+        Pending pending{};
+        pending.truceSessionId = *sessionId;
+        pending.action = TFD::InteractionRouter::Action::TrucePreCombat;
+        pending.expiresSec = now + kManualWindowSec;
+        pending.dialogueRequested = true;
+        pending.dialogSeen = false;
+        pending.assignSent = false;
+        pending.stickyReopenPending = false;
+        pending.terminalChoiceCommitted = false;
+        pending.payFollowupPending = false;
+        pending.terminalPendingBarrier = false;
+        pending.pleasureChoiceCommitted = false;
+        pending.nextStickyRetrySec = 0.0;
+        pending.stickySuppressTerminalUntilSec = 0.0;
+        pending.dialogueClosePending = false;
+        pending.dialogueCloseResolveAtSec = 0.0;
+        pending.nextNegotiationRefreshSec = 0.0;
+        pending.postCloseOutcomeGraceUntilSec = 0.0;
+        pending.nextPostCloseOutcomeLogSec = 0.0;
+        pending.dialogueOpenRetryCount = 0;
+        pending.nextDialogueOpenRetrySec = 0.0;
+
+        if (!TFD::HostilityController::CanOpenDialogue(actor)) {
+            TFD::HostilityController::ReleaseSession(*sessionId, TFD::Tame::ReleaseReason::Generic);
+            spdlog::info(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor blocked actor={:08X} reason=cannot_open_dialogue",
+                actor ? actor->GetFormID() : 0u);
+            return false;
+        }
+
+        auto& flow = TFD::FlowController::Controller::GetSingleton();
+        const bool flowAccepted = flow.BeginPreCombat(actor->GetFormID(), "pleasure_cycle_precombat_begin");
+        const bool gateAccepted = flowAccepted && flow.BeginTruceDecision(actor->GetFormID(), "pleasure_cycle_precombat_dialogue_begin");
+
+        if (!flowAccepted || !gateAccepted) {
+            TFD::HostilityController::ReleaseSession(*sessionId, TFD::Tame::ReleaseReason::Generic);
+            spdlog::warn(
+                "[TFD][PreCombatGreet] BeginForPleasureCycleActor rejected by flow actor={:08X} flowAccepted={} gateAccepted={}",
+                actor->GetFormID(),
+                flowAccepted ? 1 : 0,
+                gateAccepted ? 1 : 0);
+            return false;
+        }
+
+        (void)TFD::PayModel::PrimeEncounterQuote(actor, TFD::PayModel::PayContext::PreCombat);
+        const bool payPublished = TFD::PayModel::PublishSharedGold(actor, TFD::PayModel::PayContext::PreCombat, "pleasure_cycle_precombat_dialogue_begin");
+        CacheRecentActor(actor, 0.0, "pleasure_cycle_precombat_begin");
+
+        gPending.emplace(handle, pending);
+        TFD::InteractionRouter::DialogueOpen::BeginPreCombatTruce(actor);
+
+        if (outAction) {
+            *outAction = TFD::InteractionRouter::Action::TrucePreCombat;
+        }
+
+        spdlog::info(
+            "[TFD][PreCombatGreet] BeginForPleasureCycleActor actor={:08X} action=TrucePreCombat session={} dialogueRequested=1 payPublished={} gold={}",
+            actor->GetFormID(),
+            *sessionId,
+            payPublished ? 1 : 0,
+            TFD::PayModel::GetCachedEncounterQuote(actor, TFD::PayModel::PayContext::PreCombat));
+
+        return true;
     }
 
     bool BeginForActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction)

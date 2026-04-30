@@ -33,6 +33,7 @@ namespace TFD::PreCombatGreet
 	bool IsSuspended();
 
 	bool BeginForActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction = nullptr);
+	bool BeginForPleasureCycleActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction = nullptr);
 	void CancelAll();
 
 	void OnPreLoadGame();

@@ -1012,7 +1012,8 @@ namespace
 
                 assigned = QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "post_load_humanoid_catchup");
 
-                if (moved || dist > kEvaluateDistance || !actor->Is3DLoaded()) {
+                const bool shouldEvaluateForPackageRepair = moved || wrongCell || dist > kEvaluateDistance || !actor->Is3DLoaded();
+                if (shouldEvaluateForPackageRepair) {
                     actor->EvaluatePackage();
                     evaluated = true;
                 }
@@ -1349,7 +1350,7 @@ namespace TFD::TeammateManager::BridgeInternal
                 continue;
             }
             auto* actor = alias->GetActorReference();
-            if (!actor || actor->IsDisabled()) {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
                 continue;
             }
             out.push_back(actor);

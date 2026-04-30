@@ -3,6 +3,7 @@
 
 #include "TFDTame.h"
 #include "TFDTeammateManager.h"
+#include "TFDRecruit.h"
 
 #include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
@@ -10,6 +11,7 @@
 #include "TFDBleedout.h"
 
 #include <RE/Skyrim.h>
+#include <RE/A/ActorValues.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
@@ -660,11 +662,13 @@ namespace TFD::HostilityController
         constexpr float kDialogueCrowdFallbackCombatRadius = 1800.0f;
         constexpr float kDialogueCrowdFallbackFacingDot = 0.60f;
         constexpr float kDialogueCrowdFallbackStrongFacingDot = 0.72f;
+        constexpr float kDialogueCrowdPrimaryPackLinkRadius = 800.0f;
         constexpr float kPreCombatDialoguePackScanRadius = 6000.0f;
 
         bool IsSessionSpaceCompatible(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget);
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
+        bool SharesSpeakerCrowdSide(RE::Actor* actor, RE::Actor* primaryTarget, RE::Actor* player);
         bool IsActorStillValid(RE::Actor* actor);
         void PulseGlobalDetection(const char* reason);
         bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
@@ -890,6 +894,40 @@ namespace TFD::HostilityController
             return true;
         }
 
+        bool HasDialogueCrowdPrimaryPackFallback(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!actor || !player || !primaryTarget) {
+                return false;
+            }
+
+            if (!IsSessionSpaceCompatible(actor, player, primaryTarget)) {
+                return false;
+            }
+
+            if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                return false;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            if (distToPrimary > kDialogueCrowdPrimaryPackLinkRadius) {
+                return false;
+            }
+
+            spdlog::info(
+                "TFDHostilityController: dialogue crowd primary-pack fallback accept actor={:08X} primary={:08X} distPlayer={:.1f} distPrimary={:.1f}",
+                actor->GetFormID(),
+                primaryTarget->GetFormID(),
+                distToPlayer,
+                distToPrimary);
+
+            return true;
+        }
+
         bool HasDialogueCrowdLineOfSight(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
         {
             (void)primaryTarget;
@@ -909,6 +947,7 @@ namespace TFD::HostilityController
             }
 
             return actor->IsPlayerTeammate() ||
+                TFD::Recruit::IsRecruitLike(actor) ||
                 TFD::TeammateManager::IsActiveFollowerActor(actor) ||
                 TFD::Tame::IsCompanion(actor) ||
                 TFD::Actor::Ops::HasReleaseFollowGrace(actor);
@@ -948,11 +987,12 @@ namespace TFD::HostilityController
             }
 
             if (!HasDialogueCrowdLineOfSight(actor, player, primaryTarget) &&
-                !HasDialogueCrowdEngagementFallback(actor, player, primaryTarget)) {
+                !HasDialogueCrowdEngagementFallback(actor, player, primaryTarget) &&
+                !HasDialogueCrowdPrimaryPackFallback(actor, player, primaryTarget)) {
                 const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
                 const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
                 spdlog::info(
-                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=no_actor_los_or_hard_engagement distPlayer={:.1f} distPrimary={:.1f}",
+                    "TFDHostilityController: dialogue crowd reject actor={:08X} primary={:08X} reason=no_los_hard_engagement_or_pack_link distPlayer={:.1f} distPrimary={:.1f}",
                     actorId,
                     primaryTarget->GetFormID(),
                     distToPlayer,
@@ -3268,11 +3308,31 @@ namespace TFD::HostilityController
                 primaryTargetId);
         }
         else if (IsTruceMode(primaryMode)) {
-            const auto splitTargets = PartitionTruceEventTargets(actorIds, player, primaryTargetId);
-            const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), splitTargets.primaryIds);
-            const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), splitTargets.crowdIds);
+            std::vector<RE::FormID> primaryIds;
+            std::vector<RE::FormID> crowdIds;
+            primaryIds.reserve(1);
+            crowdIds.reserve(actorIds.size());
+
+            for (const auto actorId : actorIds) {
+                if (actorId == 0) {
+                    continue;
+                }
+                if (actorId == primaryTargetId) {
+                    primaryIds.push_back(actorId);
+                }
+                else {
+                    crowdIds.push_back(actorId);
+                }
+            }
+
+            if (primaryIds.empty() && primaryTargetId != 0) {
+                primaryIds.push_back(primaryTargetId);
+            }
+
+            const auto primarySent = SendModEventToActors(GetPrimaryUnassignEventName(primaryMode), primaryIds);
+            const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), crowdIds);
             spdlog::info(
-                "TFDHostilityController: unassign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} disposition={} crowdSize={}",
+                "TFDHostilityController: unassign split mode={} session={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} primary={:08X} disposition={} crowdSize={} source=session_members",
                 ToString(primaryMode),
                 sessionId,
                 GetPrimaryUnassignEventName(primaryMode) ? GetPrimaryUnassignEventName(primaryMode) : "<none>",
@@ -3281,7 +3341,7 @@ namespace TFD::HostilityController
                 static_cast<unsigned int>(crowdSent),
                 primaryTargetId,
                 ToString(primaryDisposition),
-                static_cast<unsigned int>(splitTargets.crowdIds.size()));
+                static_cast<unsigned int>(crowdIds.size()));
         }
         else {
             const auto eventIds = SelectCrowdEventTargets(actorIds, player, primaryTargetId);

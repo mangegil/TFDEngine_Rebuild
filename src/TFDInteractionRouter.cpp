@@ -1889,6 +1889,37 @@ namespace TFD::InteractionRouter
                 return;
             }
 
+            if (g_pending.requestIssued && IsTruceMode(g_pending.mode)) {
+                const bool preCombatMode = g_pending.mode == Mode::PreCombatTruce;
+                const bool inCombatMode = g_pending.mode == Mode::InCombatTruce;
+                bool rangeReady = true;
+                float targetDist = 0.0f;
+                if (preCombatMode) {
+                    rangeReady = IsPreCombatForceGreetRangeReady(player, speaker);
+                    targetDist = kPreCombatForceGreetMaxDistance;
+                } else if (inCombatMode) {
+                    rangeReady = IsInCombatForceGreetRangeReady(player, speaker);
+                    targetDist = kInCombatForceGreetMaxDistance;
+                }
+
+                if (!rangeReady) {
+                    const float dist = std::sqrt(DistanceSquared(player, speaker));
+                    g_pending.requestIssued = false;
+                    g_pending.quietUntil = {};
+                    g_pending.nextAttempt = now + kRetryDelay;
+                    SyncDialogueStateLocked(dialogueOpen);
+                    RefreshApproachPackage(player, speaker);
+                    spdlog::info(
+                        "[TFD][DialogueOpen] request not confirmed; resume range gate mode={} speaker={:08X} dist={:.1f} max={:.1f} attempts={}",
+                        ModeName(g_pending.mode),
+                        speaker->GetFormID(),
+                        dist,
+                        targetDist,
+                        g_pending.attempts);
+                    return;
+                }
+            }
+
             const bool needsPreCombatRangeGate =
                 g_pending.mode == Mode::PreCombatTruce &&
                 !g_pending.requestIssued &&

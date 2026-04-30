@@ -1,7 +1,12 @@
 #include "TFDPleasureRuntime.h"
 #include "TFDFlowController.h"
+#include "TFDHostilityController.h"
 #include "TFDInteractionRouter.h"
+#include "TFDPreCombatGreet.h"
+#include "TFDRecruit.h"
+#include "TFDTeammateManager.h"
 
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <string>
@@ -35,6 +40,17 @@ namespace TFD::PleasureRuntime
 			bool afterPleasureCommitted{ false };
 			bool redoPending{ false };
 			AfterChoice pendingChoice{ AfterChoice::None };
+
+			std::uint32_t queuedPreCombatSpeakerFormID{ 0 };
+			std::uint32_t queuedPreCombatConsumedFormID{ 0 };
+			double queuedPreCombatNextTrySec{ 0.0 };
+			double queuedPreCombatExpireSec{ 0.0 };
+			unsigned queuedPreCombatAttempts{ 0 };
+
+			bool queuedTerminalNeutralFinalize{ false };
+			std::uint32_t queuedTerminalNeutralActorFormID{ 0 };
+			std::uint32_t queuedTerminalNeutralCycleId{ 0 };
+			double queuedTerminalNeutralDueSec{ 0.0 };
 		};
 
 		std::mutex g_lock;
@@ -59,6 +75,12 @@ namespace TFD::PleasureRuntime
 		constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
 		constexpr const char* kAfterPleasureChoiceWorkEvent = "TFDAfterPleasureChoiceWork";
 		constexpr const char* kAfterPleasureChoiceKidnapEvent = "TFDAfterPleasureChoiceKidnap";
+
+		constexpr double kPreCombatCycleInitialDelaySec = 1.75;
+		constexpr double kPreCombatCycleRetryDelaySec = 0.65;
+		constexpr double kPreCombatCycleExpireSec = 8.0;
+		constexpr unsigned kPreCombatCycleMaxAttempts = 12;
+		constexpr double kTerminalNeutralFinalizeDelaySec = 0.05;
 
 		const char* ToString(Phase value)
 		{
@@ -137,6 +159,88 @@ namespace TFD::PleasureRuntime
 			return formID ? RE::TESForm::LookupByID<RE::Actor>(formID) : nullptr;
 		}
 
+		double NowSec()
+		{
+			using Clock = std::chrono::steady_clock;
+			static const auto start = Clock::now();
+			return std::chrono::duration<double>(Clock::now() - start).count();
+		}
+
+		struct QueuedPreCombatAttempt
+		{
+			std::uint32_t actorFormID{ 0 };
+			std::uint32_t consumedActorFormID{ 0 };
+			unsigned attemptIndex{ 0 };
+			bool valid{ false };
+		};
+
+		struct QueuedTerminalNeutralFinalize
+		{
+			std::uint32_t actorFormID{ 0 };
+			std::uint32_t cycleId{ 0 };
+			bool valid{ false };
+		};
+
+		void ClearQueuedPreCombatCycleLocked(std::string_view reason)
+		{
+			const auto oldActor = g_state.queuedPreCombatSpeakerFormID;
+			const auto oldConsumed = g_state.queuedPreCombatConsumedFormID;
+			const auto oldAttempts = g_state.queuedPreCombatAttempts;
+
+			g_state.queuedPreCombatSpeakerFormID = 0;
+			g_state.queuedPreCombatConsumedFormID = 0;
+			g_state.queuedPreCombatNextTrySec = 0.0;
+			g_state.queuedPreCombatExpireSec = 0.0;
+			g_state.queuedPreCombatAttempts = 0;
+
+			if (oldActor != 0 || oldConsumed != 0) {
+				spdlog::info(
+					"[TFD][PleasureRuntime] after pleasure cycle queue cleared actor={:08X} consumed={:08X} attempts={} reason={}",
+					oldActor,
+					oldConsumed,
+					oldAttempts,
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+			}
+		}
+
+		void ClearQueuedTerminalNeutralFinalizeLocked(std::string_view reason)
+		{
+			const auto oldActor = g_state.queuedTerminalNeutralActorFormID;
+			const auto oldCycle = g_state.queuedTerminalNeutralCycleId;
+
+			g_state.queuedTerminalNeutralFinalize = false;
+			g_state.queuedTerminalNeutralActorFormID = 0;
+			g_state.queuedTerminalNeutralCycleId = 0;
+			g_state.queuedTerminalNeutralDueSec = 0.0;
+
+			if (oldActor != 0 || oldCycle != 0) {
+				spdlog::info(
+					"[TFD][PleasureRuntime] terminal neutral finalize queue cleared actor={:08X} cycle={} reason={}",
+					oldActor,
+					oldCycle,
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+			}
+		}
+
+		void ArmTerminalNeutralFinalizeLocked(RE::Actor* consumedActor, std::string_view reason)
+		{
+			if (g_state.source != SourceContext::PreCombat || !consumedActor) {
+				return;
+			}
+
+			g_state.queuedTerminalNeutralFinalize = true;
+			g_state.queuedTerminalNeutralActorFormID = consumedActor->GetFormID();
+			g_state.queuedTerminalNeutralCycleId = g_state.sessionCycleId;
+			g_state.queuedTerminalNeutralDueSec = NowSec() + kTerminalNeutralFinalizeDelaySec;
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] terminal neutral finalize queued actor={:08X} cycle={} delay={:.2f}s reason={}",
+				g_state.queuedTerminalNeutralActorFormID,
+				g_state.queuedTerminalNeutralCycleId,
+				kTerminalNeutralFinalizeDelaySec,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
 		void ClearSpeakerStateLocked()
 		{
 			g_state.pleasureSpeakerFormID = 0;
@@ -172,6 +276,8 @@ namespace TFD::PleasureRuntime
 			ClearSpeakerStateLocked();
 			ClearBridgeStateLocked();
 			ClearHoldStateLocked();
+			ClearQueuedPreCombatCycleLocked(reason.empty() ? "reset" : reason);
+			ClearQueuedTerminalNeutralFinalizeLocked(reason.empty() ? "reset" : reason);
 
 			spdlog::info(
 				"[TFD][PleasureRuntime] Reset reason={} oldPhase={} oldCycle={}",
@@ -217,6 +323,8 @@ namespace TFD::PleasureRuntime
 			g_state.holdActive = false;
 			g_state.passiveLockActive = false;
 			g_state.blocking = false;
+			ClearQueuedPreCombatCycleLocked("new_cycle");
+			ClearQueuedTerminalNeutralFinalizeLocked("new_cycle");
 
 			spdlog::info(
 				"[TFD][PleasureRuntime] BeginCycle cycle={} source={} speaker={:08X} reason={}",
@@ -418,6 +526,368 @@ namespace TFD::PleasureRuntime
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
+		bool IsValidPreCombatCycleCandidate(RE::Actor* candidate, RE::Actor* currentActor)
+		{
+			if (!candidate || candidate->IsDead() || candidate->IsDisabled() || !candidate->Is3DLoaded()) {
+				return false;
+			}
+
+			if (currentActor && candidate->GetFormID() == currentActor->GetFormID()) {
+				return false;
+			}
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (player && candidate->GetFormID() == player->GetFormID()) {
+				return false;
+			}
+
+			if (TFD::Recruit::IsRecruitLike(candidate)) {
+				return false;
+			}
+
+			return true;
+		}
+
+		void QueueTruceAliasUnassign(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			const bool ok = TFD::FlowController::QueueBridgeModEvent("TFDTruceUnassign", actor);
+			spdlog::info(
+				"[TFD][PleasureRuntime] after pleasure cycle truce unassign actor={:08X} ok={} reason={}",
+				actor->GetFormID(),
+				ok ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		void QueueTruceAliasPromoteSpeaker(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			const bool ok = TFD::FlowController::QueueBridgeModEvent("TFDTrucePromoteSpeaker", actor);
+			spdlog::info(
+				"[TFD][PleasureRuntime] after pleasure cycle truce promote-speaker actor={:08X} ok={} reason={}",
+				actor->GetFormID(),
+				ok ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		void QueuePreCombatAliasClear(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			const bool ok = TFD::FlowController::QueueBridgeModEvent("TFDPreCombatClear", actor);
+			spdlog::info(
+				"[TFD][PleasureRuntime] after pleasure cycle precombat clear actor={:08X} ok={} reason={}",
+				actor->GetFormID(),
+				ok ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		RE::Actor* SelectNextPreCombatCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
+		{
+			scannedCount = 0;
+
+			auto actors = TFD::HostilityController::CollectDialogueTruceActors(currentActor);
+			if (actors.empty()) {
+				actors = TFD::HostilityController::CollectActiveTruceActors(currentActor);
+			}
+
+			scannedCount = static_cast<unsigned>(actors.size());
+			for (auto* candidate : actors) {
+				if (IsValidPreCombatCycleCandidate(candidate, currentActor)) {
+					return candidate;
+				}
+			}
+
+			return nullptr;
+		}
+
+		void QueuePreCombatCycleLocked(RE::Actor* nextActor, RE::Actor* currentActor, unsigned scannedCount, std::string_view reason)
+		{
+			if (!nextActor) {
+				spdlog::info(
+					"[TFD][PleasureRuntime] after pleasure cycle queue skipped current={:08X} scanned={} source={} reason=no_candidate",
+					currentActor ? currentActor->GetFormID() : 0u,
+					scannedCount,
+					ToString(g_state.source));
+				ClearQueuedPreCombatCycleLocked("no_candidate");
+				ArmTerminalNeutralFinalizeLocked(currentActor, "after_pleasure_cycle_no_candidate");
+				return;
+			}
+
+			const double now = NowSec();
+			g_state.queuedPreCombatSpeakerFormID = nextActor->GetFormID();
+			g_state.queuedPreCombatConsumedFormID = currentActor ? currentActor->GetFormID() : 0;
+			g_state.queuedPreCombatNextTrySec = now + kPreCombatCycleInitialDelaySec;
+			g_state.queuedPreCombatExpireSec = now + kPreCombatCycleExpireSec;
+			g_state.queuedPreCombatAttempts = 0;
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] after pleasure cycle queued current={:08X} next={:08X} scanned={} source={} delay={:.2f}s expire={:.2f}s reason={}",
+				currentActor ? currentActor->GetFormID() : 0u,
+				nextActor->GetFormID(),
+				scannedCount,
+				ToString(g_state.source),
+				kPreCombatCycleInitialDelaySec,
+				kPreCombatCycleExpireSec,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		void QueueNextPreCombatCycleIfNeededLocked(RE::Actor* recruitedActor, bool commitClean)
+		{
+			if (!commitClean || !recruitedActor || g_state.source != SourceContext::PreCombat) {
+				return;
+			}
+
+			unsigned scannedCount = 0;
+			auto* nextActor = SelectNextPreCombatCycleActor(recruitedActor, scannedCount);
+			QueuePreCombatCycleLocked(nextActor, recruitedActor, scannedCount, "after_pleasure_recruit_cycle");
+		}
+
+		QueuedPreCombatAttempt TakeDueQueuedPreCombatAttemptLocked(double nowSec)
+		{
+			QueuedPreCombatAttempt attempt{};
+			if (g_state.queuedPreCombatSpeakerFormID == 0) {
+				return attempt;
+			}
+
+			if (nowSec < g_state.queuedPreCombatNextTrySec) {
+				return attempt;
+			}
+
+			if (nowSec >= g_state.queuedPreCombatExpireSec || g_state.queuedPreCombatAttempts >= kPreCombatCycleMaxAttempts) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure cycle queue expired actor={:08X} attempts={} now={:.2f} expire={:.2f}",
+					g_state.queuedPreCombatSpeakerFormID,
+					g_state.queuedPreCombatAttempts,
+					nowSec,
+					g_state.queuedPreCombatExpireSec);
+				ClearQueuedPreCombatCycleLocked("expired");
+				return attempt;
+			}
+
+			++g_state.queuedPreCombatAttempts;
+			g_state.queuedPreCombatNextTrySec = nowSec + kPreCombatCycleRetryDelaySec;
+
+			attempt.actorFormID = g_state.queuedPreCombatSpeakerFormID;
+			attempt.consumedActorFormID = g_state.queuedPreCombatConsumedFormID;
+			attempt.attemptIndex = g_state.queuedPreCombatAttempts;
+			attempt.valid = true;
+			return attempt;
+		}
+
+		void FinishQueuedPreCombatAttemptLocked(const QueuedPreCombatAttempt& attempt, bool success, bool terminalFailure, std::string_view reason)
+		{
+			if (!attempt.valid || g_state.queuedPreCombatSpeakerFormID != attempt.actorFormID) {
+				return;
+			}
+
+			const double now = NowSec();
+			if (success) {
+				ClearQueuedPreCombatCycleLocked("begin_ok");
+				return;
+			}
+
+			if (terminalFailure || now >= g_state.queuedPreCombatExpireSec || g_state.queuedPreCombatAttempts >= kPreCombatCycleMaxAttempts) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure cycle queue terminal actor={:08X} attempts={} terminal={} reason={}",
+					attempt.actorFormID,
+					g_state.queuedPreCombatAttempts,
+					terminalFailure ? 1 : 0,
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+				ClearQueuedPreCombatCycleLocked(reason.empty() ? "terminal" : reason);
+				return;
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] after pleasure cycle retry actor={:08X} attempts={} nextDelay={:.2f}s reason={}",
+				attempt.actorFormID,
+				g_state.queuedPreCombatAttempts,
+				kPreCombatCycleRetryDelaySec,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		QueuedTerminalNeutralFinalize TakeDueTerminalNeutralFinalizeLocked(double nowSec)
+		{
+			QueuedTerminalNeutralFinalize finalize{};
+			if (!g_state.queuedTerminalNeutralFinalize) {
+				return finalize;
+			}
+
+			if (nowSec < g_state.queuedTerminalNeutralDueSec) {
+				return finalize;
+			}
+
+			finalize.actorFormID = g_state.queuedTerminalNeutralActorFormID;
+			finalize.cycleId = g_state.queuedTerminalNeutralCycleId;
+			finalize.valid = true;
+
+			g_state.queuedTerminalNeutralFinalize = false;
+			g_state.queuedTerminalNeutralActorFormID = 0;
+			g_state.queuedTerminalNeutralCycleId = 0;
+			g_state.queuedTerminalNeutralDueSec = 0.0;
+
+			return finalize;
+		}
+
+		void MarkTerminalNeutralFinalizedLocked(const QueuedTerminalNeutralFinalize& finalize, bool completeFlow, std::string_view reason)
+		{
+			if (!finalize.valid) {
+				return;
+			}
+
+			if (finalize.cycleId != 0 && finalize.cycleId != g_state.sessionCycleId) {
+				spdlog::info(
+					"[TFD][PleasureRuntime] terminal neutral finalize ignored actor={:08X} queuedCycle={} currentCycle={} reason=cycle_mismatch",
+					finalize.actorFormID,
+					finalize.cycleId,
+					g_state.sessionCycleId);
+				return;
+			}
+
+			const auto oldPhase = g_state.phase;
+			const auto oldSource = g_state.source;
+
+			g_state.phase = Phase::Idle;
+			g_state.source = SourceContext::None;
+			g_state.active = false;
+			g_state.blocking = false;
+			g_state.passiveLockActive = false;
+			g_state.holdActive = false;
+			g_state.redoPending = false;
+			g_state.flowOwnerToken = 0;
+			g_state.pendingChoice = AfterChoice::None;
+			ClearSpeakerStateLocked();
+			ClearBridgeStateLocked();
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] terminal neutral finalized actor={:08X} cycle={} completeFlow={} oldPhase={} oldSource={} reason={}",
+				finalize.actorFormID,
+				finalize.cycleId,
+				completeFlow ? 1 : 0,
+				ToString(oldPhase),
+				ToString(oldSource),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		RE::Actor* ResolveAfterPleasureRecruitActorLocked(const EventInfo& info)
+		{
+			if (info.actor && !info.actor->IsDisabled() && !info.actor->IsDead()) {
+				return info.actor;
+			}
+
+			if (auto* actor = LookupActor(info.actorFormID)) {
+				if (!actor->IsDisabled() && !actor->IsDead()) {
+					return actor;
+				}
+			}
+
+			if (auto* actor = LookupActor(g_state.afterPleasureSpeakerFormID)) {
+				if (!actor->IsDisabled() && !actor->IsDead()) {
+					return actor;
+				}
+			}
+
+			if (auto* actor = LookupActor(g_state.pleasureSpeakerFormID)) {
+				if (!actor->IsDisabled() && !actor->IsDead()) {
+					return actor;
+				}
+			}
+
+			return nullptr;
+		}
+
+		bool CommitAfterPleasureRecruitLocked(const EventInfo& info)
+		{
+			auto* actor = ResolveAfterPleasureRecruitActorLocked(info);
+			if (!actor) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure recruit rejected actor=00000000 cycle={} source={} reason=no_valid_actor",
+					g_state.sessionCycleId,
+					ToString(g_state.source));
+				return false;
+			}
+
+			const auto actorFormID = actor->GetFormID();
+			if (!IsTrackedActorFormIDLocked(actorFormID)) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure recruit rejected actor={:08X} cycle={} source={} reason=actor_not_tracked pleasureSpeaker={:08X} afterSpeaker={:08X}",
+					actorFormID,
+					g_state.sessionCycleId,
+					ToString(g_state.source),
+					g_state.pleasureSpeakerFormID,
+					g_state.afterPleasureSpeakerFormID);
+				return false;
+			}
+
+			TFD::Recruit::MarkRecruitCommitPending(
+				actor,
+				6.0,
+				TFD::Recruit::SourceFlow::Pleasure,
+				"after_pleasure_recruit_pending");
+
+			TFD::Recruit::CommitOptions options{};
+			options.sourceFlow = TFD::Recruit::SourceFlow::Pleasure;
+			options.reason = "after_pleasure_recruit_commit";
+			options.quarantineHostileFactions = true;
+			options.clearCombat = true;
+			options.evaluatePackage = true;
+			options.detailedLog = true;
+			options.throttleObserve = false;
+			options.ensurePacifyAlliance = true;
+			options.applyRuntimeProfile = true;
+
+			const auto result = TFD::Recruit::CommitRecruit(actor, options);
+			const bool clean = result.attempted && !result.skipped && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+			bool aliasRegistered = false;
+
+			if (clean) {
+				aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "after_pleasure_recruit_commit");
+			}
+
+			if (clean) {
+				spdlog::info(
+					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} rawAfter={} hostileAfter={} aliasRegistered={} reason={}",
+					actorFormID,
+					g_state.sessionCycleId,
+					ToString(g_state.source),
+					info.sourceFlow,
+					result.attempted ? 1 : 0,
+					result.skipped ? 1 : 0,
+					1,
+					result.rawHostileAfter ? 1 : 0,
+					result.hostileFactionMatchesAfter,
+					aliasRegistered ? 1 : 0,
+					"after_pleasure_recruit_commit");
+			}
+			else {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} rawAfter={} hostileAfter={} aliasRegistered={} reason={}",
+					actorFormID,
+					g_state.sessionCycleId,
+					ToString(g_state.source),
+					info.sourceFlow,
+					result.attempted ? 1 : 0,
+					result.skipped ? 1 : 0,
+					0,
+					result.rawHostileAfter ? 1 : 0,
+					result.hostileFactionMatchesAfter,
+					aliasRegistered ? 1 : 0,
+					"commit_not_clean_no_alias");
+			}
+
+			QueueNextPreCombatCycleIfNeededLocked(actor, clean);
+
+			return clean;
+		}
+
 		void HandleRecognizedEventLocked(std::string_view eventName, const EventInfo& info)
 		{
 			if (eventName == kPleasureStartPendingEvent || eventName == kOStimSceneStartPendingEvent) {
@@ -518,6 +988,10 @@ namespace TFD::PleasureRuntime
 					return;
 				}
 
+				if (choice == AfterChoice::Recruit) {
+					(void)CommitAfterPleasureRecruitLocked(info);
+				}
+
 				g_state.redoPending = false;
 				AdvancePhaseLocked(Phase::Finalizing, eventName);
 				AdvancePhaseLocked(Phase::Closed, eventName);
@@ -558,11 +1032,92 @@ namespace TFD::PleasureRuntime
 
 	void Tick()
 	{
-		std::scoped_lock lk(g_lock);
-		if (!g_state.installed) {
+		QueuedPreCombatAttempt attempt{};
+		QueuedTerminalNeutralFinalize terminalFinalize{};
+		{
+			std::scoped_lock lk(g_lock);
+			if (!g_state.installed) {
+				return;
+			}
+
+			const double now = NowSec();
+			attempt = TakeDueQueuedPreCombatAttemptLocked(now);
+			if (!attempt.valid) {
+				terminalFinalize = TakeDueTerminalNeutralFinalizeLocked(now);
+			}
+		}
+
+		if (!attempt.valid && terminalFinalize.valid) {
+			auto* terminalActor = LookupActor(terminalFinalize.actorFormID);
+			if (terminalActor) {
+				QueuePreCombatAliasClear(terminalActor, "after_pleasure_cycle_terminal_no_candidate");
+				QueueTruceAliasUnassign(terminalActor, "after_pleasure_cycle_terminal_no_candidate");
+			}
+
+			const bool completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_no_candidate");
+			spdlog::info(
+				"[TFD][PleasureRuntime] terminal neutral finalize actor={:08X} cycle={} completeFlow={} reason=after_pleasure_cycle_no_candidate",
+				terminalFinalize.actorFormID,
+				terminalFinalize.cycleId,
+				completeFlow ? 1 : 0);
+
+			{
+				std::scoped_lock lk(g_lock);
+				MarkTerminalNeutralFinalizedLocked(terminalFinalize, completeFlow, "after_pleasure_cycle_no_candidate");
+			}
 			return;
 		}
-		// shell awal: timeout/lease resolver belum diaktifkan
+
+		if (!attempt.valid) {
+			return;
+		}
+
+		auto* actor = LookupActor(attempt.actorFormID);
+		TFD::InteractionRouter::Action action = TFD::InteractionRouter::Action::None;
+		bool success = false;
+		bool terminalFailure = false;
+		bool completeFlow = false;
+		const char* reason = "begin_failed";
+
+		if (!actor) {
+			terminalFailure = true;
+			reason = "actor_missing";
+		}
+		else if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			terminalFailure = true;
+			reason = "actor_invalid";
+		}
+		else if (TFD::Recruit::IsRecruitLike(actor)) {
+			terminalFailure = true;
+			reason = "actor_already_recruit_like";
+		}
+		else {
+			auto* consumedActor = LookupActor(attempt.consumedActorFormID);
+			if (consumedActor && consumedActor->GetFormID() != attempt.actorFormID) {
+				QueueTruceAliasUnassign(consumedActor, "after_pleasure_cycle_consumed_recruit");
+			}
+			QueueTruceAliasPromoteSpeaker(actor, "after_pleasure_cycle_promote_next_speaker");
+
+			completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_precombat");
+			success = TFD::PreCombatGreet::BeginForPleasureCycleActor(actor, &action);
+			reason = success ? "begin_ok" : "begin_failed";
+		}
+
+		spdlog::info(
+			"[TFD][PleasureRuntime] after pleasure cycle precombat attempt actor={:08X} consumed={:08X} attempt={} ok={} terminal={} completeFlow={} action={} reason={}",
+			attempt.actorFormID,
+			attempt.consumedActorFormID,
+			attempt.attemptIndex,
+			success ? 1 : 0,
+			terminalFailure ? 1 : 0,
+			completeFlow ? 1 : 0,
+			TFD::InteractionRouter::ToString(action),
+			reason);
+
+		{
+			std::scoped_lock lk(g_lock);
+			FinishQueuedPreCombatAttemptLocked(attempt, success, terminalFailure, reason);
+		}
 	}
 
 	void ResetRuntime(std::string_view reason)
@@ -638,6 +1193,7 @@ namespace TFD::PleasureRuntime
 
 		g_state.redoPending = false;
 		g_state.pendingChoice = AfterChoice::None;
+		ClearQueuedTerminalNeutralFinalizeLocked(reason.empty() ? "break" : reason);
 		g_state.active = false;
 		g_state.blocking = false;
 		g_state.phase = Phase::Closed;
