@@ -37,6 +37,7 @@
 #include "TFDCaptive.h"
 #include "TFDRescue.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDVictory.h"
 #include "EditorIdCache.h"
 
 #ifndef UNICODE
@@ -456,6 +457,8 @@ namespace TFDMenu
 				return "No";
 			case 2:
 				return "Yes";
+			case 3:
+				return "Dialogue";
 			default:
 				return "Custom";
 			}
@@ -1797,10 +1800,34 @@ namespace TFDMenu
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
 							if (player && !TFD::Captive::IsStandardCaptiveActive()) {
-								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(220.0f)) {
-									spdlog::info("[TFD][Menu] activate intercepted for defeated dialogue target={:08X}", defeatedTalkTarget->GetFormID());
-									RE::DebugNotification("TFD: Defeated Dialogue");
-									return RE::BSEventNotifyControl::kStop;
+								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(512.0f)) {
+									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
+									TFD::Victory::SetStateValue(3);
+									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
+										defeatedTalkTarget->GetFormID(),
+										"victory_activate_dialogue");
+									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=3",
+										defeatedTalkTarget->GetFormID(),
+										flowOk ? 1 : 0);
+
+									if (!defeatedTalkTarget->IsAIEnabled()) {
+										defeatedTalkTarget->EnableAI(true);
+									}
+									defeatedTalkTarget->AllowPCDialogue(true);
+									if (auto* process = RE::ProcessLists::GetSingleton()) {
+										process->StopCombatAndAlarmOnActor(defeatedTalkTarget, false);
+									}
+									defeatedTalkTarget->EvaluatePackage(false, true);
+									defeatedTalkTarget->EvaluatePackage(true, true);
+
+									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, false, nullptr);
+									spdlog::info("[TFD][Menu] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue", defeatedTalkTarget->GetFormID(), opened ? 1 : 0);
+									if (opened) {
+										return RE::BSEventNotifyControl::kStop;
+									}
+								}
+								else {
+									spdlog::info("[TFD][Menu] activate defeated victory dialogue miss radius=512 action=allow_vanilla_activate");
 								}
 							}
 						}

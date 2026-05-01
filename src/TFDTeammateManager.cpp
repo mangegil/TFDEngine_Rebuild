@@ -136,7 +136,7 @@ namespace
                 }
 
                 try {
-                    const int slot = std::stoi(aliasName.substr(9));
+                    const int slot = std::stoi(aliasName.substr(8));
                     if (slot >= 1 && slot <= static_cast<int>(g_cache.teammateAliases.size())) {
                         const auto index = static_cast<std::size_t>(slot - 1);
                         g_cache.teammateAliases[index] = refAlias;
@@ -390,7 +390,7 @@ namespace
                         continue;
                     }
                     try {
-                        const int slot = std::stoi(aliasName.substr(9));
+                        const int slot = std::stoi(aliasName.substr(8));
                         if (slot >= 1 && slot <= static_cast<int>(g_registry.teammateAliases.size())) {
                             const auto index = static_cast<std::size_t>(slot - 1);
                             g_registry.teammateAliases[index] = refAlias;
@@ -605,6 +605,38 @@ namespace
             return true;
         }
 
+        bool IsKnownConvertedAliasActor(RE::Actor* actor);
+        bool IsHardInvalidConvertedAliasActor(RE::Actor* actor);
+
+        bool IsAliasUsableForNewRecruitUnsafe(RE::BGSRefAlias* alias)
+        {
+            if (!alias) {
+                return false;
+            }
+
+            auto* current = alias->GetActorReference();
+            if (!current) {
+                return true;
+            }
+
+            if (IsValidTeammate(current)) {
+                return false;
+            }
+
+            if (TFD::Recruit::IsRecruitCommitPending(current)) {
+                return false;
+            }
+
+            // A temporarily invalid converted teammate still owns its alias until
+            // the hard-invalid cleanup path releases it. Do not report that alias
+            // as free, or PreCombat can over-admit crowd participants and later hit no_slot.
+            if (IsKnownConvertedAliasActor(current) && !IsHardInvalidConvertedAliasActor(current)) {
+                return false;
+            }
+
+            return true;
+        }
+
         int CountOccupiedRecruitSlotsFromAliasesUnsafe()
         {
             ResolveRegistry();
@@ -616,11 +648,15 @@ namespace
                 }
 
                 auto* actor = alias->GetActorReference();
-                if (!actor || !IsValidTeammate(actor)) {
+                if (!actor) {
                     continue;
                 }
 
-                ++occupied;
+                if (IsValidTeammate(actor) ||
+                    TFD::Recruit::IsRecruitCommitPending(actor) ||
+                    (IsKnownConvertedAliasActor(actor) && !IsHardInvalidConvertedAliasActor(actor))) {
+                    ++occupied;
+                }
             }
 
             return occupied;
@@ -630,9 +666,14 @@ namespace
         {
             ResolveRegistry();
 
-            const int maxSlots = static_cast<int>(g_registry.teammateAliases.size());
-            const int occupied = CountOccupiedRecruitSlotsFromAliasesUnsafe();
-            return std::clamp(maxSlots - occupied, 0, maxSlots);
+            int freeSlots = 0;
+            for (auto* alias : g_registry.teammateAliases) {
+                if (IsAliasUsableForNewRecruitUnsafe(alias)) {
+                    ++freeSlots;
+                }
+            }
+
+            return std::clamp(freeSlots, 0, static_cast<int>(g_registry.teammateAliases.size()));
         }
 
         int ComputeTeammateStateValue(const std::vector<RE::Actor*>& teammates, int recruitSlotsFree)
@@ -1237,6 +1278,7 @@ namespace
                     "[TFD][TeammateManager] register now failed actor={:08X} reason={} detail=no_slot",
                     actor->GetFormID(),
                     reason ? reason : "unknown");
+                RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_no_slot");
                 QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_no_slot_bridge_only");
                 return false;
             }
@@ -1709,16 +1751,44 @@ namespace TFD::TeammateManager
         if (!actor) {
             return false;
         }
+        if (actor->IsDisabled() || actor->IsDead()) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=invalid_actor",
+                actor ? actor->GetFormID() : 0u);
+            return false;
+        }
         if (BridgeInternal::g_runtimeProviders.isDialogueCapableDefeatedEnemy && !BridgeInternal::g_runtimeProviders.isDialogueCapableDefeatedEnemy(actor)) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=not_dialogue_capable_defeated",
+                actor->GetFormID());
             return false;
         }
         if (BridgeInternal::g_runtimeProviders.getDefeatedEnemyRemainingSeconds && BridgeInternal::g_runtimeProviders.getDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=defeated_window_expired",
+                actor->GetFormID());
             return false;
         }
-        if (!TFD::FlowController::QueueBridgeModEvent(BridgeInternal::kHumanoidTeammateAssignEvent, actor)) {
-            spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=bridge_assign_failed", actor->GetFormID());
+
+        AliasInternal::ResolveRegistry();
+        AliasInternal::RefreshRecruitCapacityGlobalsUnsafe("defeated_humanoid_recruit_preflight");
+        if (!AliasInternal::IsValidTeammate(actor) && AliasInternal::ComputeRecruitSlotsFreeUnsafe() <= 0) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=no_teammate_slot",
+                actor->GetFormID());
             return false;
         }
+
+        // Victory recruit starts from a defeated hostile actor, so it is not yet
+        // recruit-like when the player chooses the topic. Mark it pending before
+        // commit; otherwise CommitRecruit and the Papyrus teammate registry see it
+        // as a normal hostile and alias assignment is rejected.
+        TFD::Recruit::MarkRecruitCommitPending(
+            actor,
+            8.0,
+            TFD::Recruit::SourceFlow::Victory,
+            "defeated_humanoid_recruit");
+
         if (BridgeInternal::g_runtimeProviders.suppressDefeatedReentry) {
             BridgeInternal::g_runtimeProviders.suppressDefeatedReentry(actor, BridgeInternal::kDefeatedReentrySuppressSeconds, "defeated_humanoid_recruit");
         }
@@ -1734,17 +1804,55 @@ namespace TFD::TeammateManager
                 45.0f,
                 "defeated_humanoid_recruit");
         }
+
+        TFD::Recruit::CommitOptions recruitOptions{};
+        recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Victory;
+        recruitOptions.reason = "defeated_humanoid_recruit";
+        recruitOptions.quarantineHostileFactions = true;
+        recruitOptions.clearCombat = true;
+        recruitOptions.evaluatePackage = true;
+        recruitOptions.detailedLog = true;
+        recruitOptions.throttleObserve = false;
+        recruitOptions.ensurePacifyAlliance = true;
+        recruitOptions.applyRuntimeProfile = true;
+
+        const auto commit = TFD::Recruit::CommitRecruit(actor, recruitOptions);
+        if (!commit.attempted || commit.skipped || commit.hostileFactionMatchesAfter > 0) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=commit_not_clean attempted={} skipped={} rawAfter={} hostileAfter={}",
+                actor->GetFormID(),
+                commit.attempted ? 1 : 0,
+                commit.skipped ? 1 : 0,
+                commit.rawHostileAfter ? 1 : 0,
+                commit.hostileFactionMatchesAfter);
+            return false;
+        }
+
+        const bool aliasOk = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "defeated_humanoid_recruit");
+        if (!aliasOk) {
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=alias_assign_failed",
+                actor->GetFormID());
+            return false;
+        }
+
+        if (!TFD::FlowController::QueueBridgeModEvent(BridgeInternal::kHumanoidTeammateAssignEvent, actor)) {
+            spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit bridge dispatch failed actor={:08X}", actor->GetFormID());
+        }
         if (actor->IsInCombat()) {
             actor->StopCombat();
         }
         actor->DrawWeaponMagicHands(false);
+        if (actor->Is3DLoaded()) {
+            actor->EvaluatePackage();
+        }
         if (BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget) {
             BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget();
         }
-        spdlog::info("[TFD][TeammateManager] defeated humanoid recruit actor={:08X}", actor->GetFormID());
+        AliasInternal::RefreshRecruitCapacityGlobalsUnsafe("defeated_humanoid_recruit_done");
+        spdlog::info("[TFD][TeammateManager] defeated humanoid recruit actor={:08X} aliasOk=1", actor->GetFormID());
         return true;
     }
-
     bool IsCreatureCompanion(RE::Actor* actor)
     {
         return TFD::Tame::IsCompanion(actor);

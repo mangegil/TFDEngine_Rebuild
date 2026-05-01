@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cmath>
 #include <cstdlib>
 #include <mutex>
@@ -52,7 +53,7 @@ namespace TFD::PreCombatGreet
         constexpr double kPreCombatOutcomeGraceSec = 3.50;
         constexpr double kTerminalPendingOutcomeGraceSec = 6.00;
         constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
-        constexpr unsigned kDialogueOpenRetryLimit = 3;
+        constexpr unsigned kDialogueOpenRetryLogEvery = 10;
         constexpr double kDialogueOpenRetryDelaySec = 0.35;
         constexpr double kPostHandoffSettleBlockSec = 1.25;
         constexpr double kHotkeyCooldownSec = 3.0;
@@ -849,8 +850,9 @@ namespace TFD::PreCombatGreet
                     }),
                 actors.end());
 
-            std::sort(actors.begin(), actors.end());
-            actors.erase(std::unique(actors.begin(), actors.end()), actors.end());
+            // Preserve dialogue assignment order: primary first, then crowd alias order.
+            // Do not sort here; recruit capacity clamp must choose the same actors
+            // that Papyrus quarantined from TFDTruceBridge slot order.
             return actors;
         }
 
@@ -878,6 +880,7 @@ namespace TFD::PreCombatGreet
             options.applyRuntimeProfile = true;
 
             std::vector<RE::Actor*> clampedActors = actors;
+            std::vector<RE::Actor*> overflowActors;
 
             auto primaryIt = std::find(clampedActors.begin(), clampedActors.end(), primaryActor);
             if (primaryIt != clampedActors.end() && primaryIt != clampedActors.begin()) {
@@ -888,11 +891,39 @@ namespace TFD::PreCombatGreet
             const auto slotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
             const auto beforeClamp = clampedActors.size();
             if (slotsFree == 0) {
+                overflowActors = clampedActors;
                 clampedActors.clear();
             }
             else if (clampedActors.size() > slotsFree) {
+                overflowActors.assign(clampedActors.begin() + static_cast<std::ptrdiff_t>(slotsFree), clampedActors.end());
                 clampedActors.resize(slotsFree);
             }
+
+            auto restoreOverflowActors = [&](const char* phase) -> unsigned {
+                if (overflowActors.empty()) {
+                    return 0;
+                }
+
+                for (auto* actor : overflowActors) {
+                    TFD::Recruit::ClearRecruitCommitPending(actor, phase ? phase : "precombat_recruit_overflow_restore");
+                }
+
+                const auto restored = TFD::HostilityController::ReleaseDialogueTruceActors(
+                    primaryActor,
+                    overflowActors,
+                    TFD::Tame::ReleaseReason::DialogueClosed);
+
+                spdlog::info(
+                    "[TFD][PreCombatGreet] recruit overflow restore primary={:08X} overflow={} restored={} slotsFree={} phase={} reason={}",
+                    primaryActor->GetFormID(),
+                    static_cast<unsigned>(overflowActors.size()),
+                    static_cast<unsigned>(restored),
+                    static_cast<unsigned>(slotsFree),
+                    phase ? phase : "unknown",
+                    reason ? reason : "unknown");
+
+                return static_cast<unsigned>(restored);
+            };
 
             if (clampedActors.empty()) {
                 spdlog::warn(
@@ -901,6 +932,7 @@ namespace TFD::PreCombatGreet
                     static_cast<unsigned>(beforeClamp),
                     static_cast<unsigned>(slotsFree),
                     reason ? reason : "unknown");
+                restoreOverflowActors("precombat_recruit_blocked_no_slots");
                 TFD::TeammateManager::RefreshRecruitCapacityGlobals("precombat_recruit_blocked_no_slots");
                 return 0;
             }
@@ -921,6 +953,7 @@ namespace TFD::PreCombatGreet
             unsigned removed = 0;
             unsigned rawClean = 0;
             unsigned aliasRegistered = 0;
+            unsigned overflowRestored = 0;
 
             for (auto* actor : clampedActors) {
                 const auto result = TFD::Recruit::CommitRecruit(actor, player, options);
@@ -941,8 +974,10 @@ namespace TFD::PreCombatGreet
                 }
             }
 
+            overflowRestored = restoreOverflowActors("precombat_recruit_overflow_after_commit");
+
             spdlog::info(
-                "[TFD][PreCombatGreet] recruit commit group primary={:08X} actors={} attempted={} skipped={} ensuredState={} removed={} rawClean={} aliasRegistered={} reason={}",
+                "[TFD][PreCombatGreet] recruit commit group primary={:08X} actors={} attempted={} skipped={} ensuredState={} removed={} rawClean={} aliasRegistered={} overflow={} overflowRestored={} reason={}",
                 primaryActor->GetFormID(),
                 static_cast<unsigned>(clampedActors.size()),
                 attempted,
@@ -951,6 +986,8 @@ namespace TFD::PreCombatGreet
                 removed,
                 rawClean,
                 aliasRegistered,
+                static_cast<unsigned>(overflowActors.size()),
+                overflowRestored,
                 reason ? reason : "unknown");
 
             TFD::TeammateManager::RefreshRecruitCapacityGlobals("precombat_recruit_commit_group");
@@ -1681,10 +1718,6 @@ namespace TFD::PreCombatGreet
             if (nowSec < pending.nextDialogueOpenRetrySec) {
                 return true;
             }
-            if (pending.dialogueOpenRetryCount >= kDialogueOpenRetryLimit) {
-                return false;
-            }
-
             ++pending.dialogueOpenRetryCount;
             pending.nextDialogueOpenRetrySec = nowSec + kDialogueOpenRetryDelaySec;
             pending.stickyReopenPending = false;
@@ -1697,11 +1730,11 @@ namespace TFD::PreCombatGreet
             CacheRecentActor(actor, 0.0, reason ? reason : "dialogue_open_retry");
 
             spdlog::info(
-                "[TFD][PreCombatGreet] dialogue open retry actor={:08X} action={} retry={}/{} reason={}",
+                "[TFD][PreCombatGreet] dialogue open retry actor={:08X} action={} retry={} logEvery={} reason={}",
                 actor->GetFormID(),
                 TFD::InteractionRouter::ToString(pending.action),
                 pending.dialogueOpenRetryCount,
-                kDialogueOpenRetryLimit,
+                kDialogueOpenRetryLogEvery,
                 reason ? reason : "unknown");
 
             return true;
@@ -2506,6 +2539,24 @@ namespace TFD::PreCombatGreet
                 }
 
                 if (now >= pending.expiresSec) {
+                    if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat &&
+                        pending.dialogueRequested &&
+                        !pending.dialogSeen &&
+                        !pending.terminalChoiceCommitted &&
+                        !pending.payFollowupPending &&
+                        !pending.terminalPendingBarrier &&
+                        !pending.pleasureChoiceCommitted) {
+                        pending.expiresSec = now + kManualWindowSec;
+                        EnforceNegotiationState(actor, pending, now);
+                        CacheRecentActor(actor, 0.0, "committed_approach_extended");
+                        spdlog::warn(
+                            "[TFD][PreCombatGreet] committed approach extended actor={:08X} action={} reason=no_time_abort",
+                            actor ? actor->GetFormID() : 0u,
+                            TFD::InteractionRouter::ToString(pending.action));
+                        ++it;
+                        continue;
+                    }
+
                     CleanupOne(actor, pending, kCooldownAfterFailSec, "hidden_failsafe_expired", TFD::Tame::ReleaseReason::HardFailsafeExpired);
                     it = gPending.erase(it);
                     continue;

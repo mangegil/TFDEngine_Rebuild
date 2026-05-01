@@ -56,6 +56,7 @@ namespace TFD::TeammateManager
     bool ReviveDownedAlly(RE::Actor* actor, float targetHealthPct = 55.0f);
     void SetPendingDefeatedDialogueTarget(RE::Actor* actor);
     bool RecruitDefeatedHumanoidAsTeammate(RE::Actor* actor);
+    bool RecoverDefeatedHumanoidForVictoryOutcome(RE::Actor* actor, const char* reason = nullptr);
 
     bool IsCreatureCompanion(RE::Actor* actor);
     double GetRemainingCreatureCompanionHours(RE::Actor* actor);

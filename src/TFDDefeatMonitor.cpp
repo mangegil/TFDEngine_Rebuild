@@ -519,7 +519,23 @@ namespace TFD::DefeatMonitor
 		static void ClearLastEnemyTargetingPlayerInternal();
 		static RE::Actor* FindBestAggressor(float radius);
 		static RE::Actor* ResolvePendingDefeatedDialogueTargetInternal();
+		static void SetPendingDefeatedDialogueTargetInternal(RE::Actor* actor);
 		static void ClearPendingDefeatedDialogueTargetInternal();
+
+		static void SetPendingDefeatedDialogueTargetInternal(RE::Actor* actor)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				ClearPendingDefeatedDialogueTargetInternal();
+				return;
+			}
+
+			g_pendingDefeatedDialogueTarget = actor->CreateRefHandle();
+			g_pendingDefeatedDialogueExpiry = std::chrono::steady_clock::now() +
+				std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(kPendingDefeatedDialogueTargetSeconds));
+			spdlog::info("[TFD][Defeat] pending defeated dialogue target set actor={:08X} seconds={:.1f}",
+				actor->GetFormID(),
+				kPendingDefeatedDialogueTargetSeconds);
+		}
 
 		static RE::Actor* ResolvePendingDefeatedDialogueTargetInternal()
 		{
@@ -546,6 +562,31 @@ namespace TFD::DefeatMonitor
 		static bool IsTrackedDefeatedEnemyHook(RE::Actor* actor)
 		{
 			return actor && g_bleedBattleObserver.enemyIds.find(actor->GetFormID()) != g_bleedBattleObserver.enemyIds.end();
+		}
+
+		static bool TryGetDefeatedEnemyStateHook(RE::Actor* actor, std::uint8_t* lockKindValue, bool* defeatedManaged, std::chrono::steady_clock::time_point* deadline)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			auto it = g_bleedLocks.find(actor->GetFormID());
+			if (it == g_bleedLocks.end()) {
+				return false;
+			}
+
+			const auto& entry = it->second;
+			if (lockKindValue) {
+				*lockKindValue = static_cast<std::uint8_t>(entry.kind);
+			}
+			if (defeatedManaged) {
+				*defeatedManaged = entry.defeatedManaged;
+			}
+			if (deadline) {
+				*deadline = entry.defeatedDeadline;
+			}
+
+			return true;
 		}
 
 		static bool IsLastAggressorHook(RE::Actor* actor)
@@ -2661,7 +2702,7 @@ else {
 			hooks.teammateRestoreActorHealthToSafePct = [](RE::Actor* actor, float thresholdPct, float bonusPct, float minSafePct, float maxSafePct, float minAbsHp, const char* reason) { RestoreActorHealthToSafePct(actor, thresholdPct, bonusPct, minSafePct, maxSafePct, minAbsHp, reason); };
 			hooks.teammateResolvePendingDefeatedDialogueTarget = []() -> RE::Actor* { return ResolvePendingDefeatedDialogueTargetInternal(); };
 			hooks.teammateClearPendingDefeatedDialogueTarget = []() { ClearPendingDefeatedDialogueTargetInternal(); };
-			hooks.teammateSetPendingDefeatedDialogueTarget = [](RE::Actor* actor) { TFD::TeammateManager::SetPendingDefeatedDialogueTarget(actor); };
+			hooks.teammateSetPendingDefeatedDialogueTarget = [](RE::Actor* actor) { SetPendingDefeatedDialogueTargetInternal(actor); };
 			hooks.teammateReviveDownedAlly = [](RE::Actor* actor, float targetHealthPct) { return TFD::TeammateManager::ReviveDownedAlly(actor, targetHealthPct); };
 			hooks.hostilityStartBleedTruceSessionForSpeaker = [](RE::Actor* player, RE::Actor* speaker, const char* reason) {
 				return TFD::Bleedout::StartTruceSessionForSpeaker(player, speaker, reason, TFD::Bleedout::RuntimeHost::BuildStateRefs(), TFD::Bleedout::RuntimeHost::BuildHandlers());
@@ -2913,6 +2954,9 @@ else {
 			&IsTrackedDefeatedEnemyHook,
 			&IsLastAggressorHook
 			});
+		TFD::Actor::Ops::InstallDefeatedEnemyStateHooks(TFD::Actor::Ops::DefeatedEnemyStateHooks{
+			&TryGetDefeatedEnemyStateHook
+			});
 		TFD::Location::Initialize();
 		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
 			scripts->AddEventSink<RE::TESHitEvent>(&g_passiveBreakEventSink);
@@ -2943,6 +2987,7 @@ else {
 		TFD::FlowController::Controller::GetSingleton().ResetRuntime("defeat_shutdown");
 		TFD::FlowController::ResetDefeatLifecycleProviders();
 		TFD::TeammateManager::ResetRuntimeProviders();
+		TFD::Actor::Ops::InstallDefeatedEnemyStateHooks(TFD::Actor::Ops::DefeatedEnemyStateHooks{});
 		TFD::Tame::ResetRuntimeProviders();
 		TFD::HostilityController::ResetBleedTruceRuntimeProviders();
 		g_lastRouterCombatContextActive = false;

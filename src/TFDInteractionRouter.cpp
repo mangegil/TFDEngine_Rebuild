@@ -13,7 +13,9 @@
 #include "TFDBleedout.h"
 
 #include <spdlog/spdlog.h>
+#include <SKSE/SKSE.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -1186,12 +1188,16 @@ namespace TFD::InteractionRouter
 
         RE::Actor* best = nullptr;
         float bestScore = -1.0e30f;
+        std::uint32_t scanned = 0;
+        std::uint32_t validState = 0;
+        std::uint32_t frontRejected = 0;
 
         for (const auto& info : snapshot.actors) {
             auto* actor = info.get();
             if (!actor) {
                 continue;
             }
+            ++scanned;
             if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 continue;
             }
@@ -1204,13 +1210,23 @@ namespace TFD::InteractionRouter
             if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
                 continue;
             }
+            ++validState;
 
             const float frontDot = GetActorFrontDot2D(actor, player);
-            if (frontDot < 0.75f) {
+            const bool pointedEnough = frontDot >= 0.35f;
+            const bool veryClose = info.dist <= 180.0f && frontDot >= 0.05f;
+            if (!pointedEnough && !veryClose) {
+                ++frontRejected;
                 continue;
             }
 
             float score = (frontDot * 100000.0f) - info.dist;
+            if (info.dist <= 160.0f) {
+                score += 6000.0f;
+            }
+            else if (info.dist <= 260.0f) {
+                score += 3000.0f;
+            }
             if (frontDot >= 0.96f) {
                 score += 4000.0f;
             }
@@ -1222,6 +1238,24 @@ namespace TFD::InteractionRouter
                 bestScore = score;
                 best = actor;
             }
+        }
+
+        if (best) {
+            spdlog::info(
+                "[TFD][Router] defeated dialogue target picked actor={:08X} radius={:.1f} scanned={} validState={} frontRejected={}",
+                best->GetFormID(),
+                radius,
+                scanned,
+                validState,
+                frontRejected);
+        }
+        else {
+            spdlog::info(
+                "[TFD][Router] defeated dialogue target miss radius={:.1f} scanned={} validState={} frontRejected={}",
+                radius,
+                scanned,
+                validState,
+                frontRejected);
         }
 
         return best;
@@ -1421,7 +1455,9 @@ namespace TFD::InteractionRouter
             constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
             constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
-            constexpr float kPreCombatForceGreetMaxDistance = 160.0f;
+            constexpr auto kPreCombatApproachAssistDelay = std::chrono::milliseconds(10000);
+            constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
+            constexpr float kPreCombatApproachAssistDistance = 240.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
             constexpr float kInCombatForceGreetMaxDistance = 160.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
@@ -1443,6 +1479,8 @@ namespace TFD::InteractionRouter
                 Clock::time_point lastHardReset{};
                 Clock::time_point lastRangeGateLog{};
                 Clock::time_point lastApproachRefresh{};
+                Clock::time_point nextApproachAssist{};
+                bool approachAssistUsed = false;
             };
 
             PendingState g_pending{};
@@ -1523,7 +1561,12 @@ namespace TFD::InteractionRouter
 
             bool CanAttemptOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
-                return player && speaker && speaker != player && !speaker->IsDead() && !speaker->IsDisabled();
+                return player &&
+                    speaker &&
+                    speaker != player &&
+                    !speaker->IsDead() &&
+                    !speaker->IsDisabled() &&
+                    speaker->Is3DLoaded();
             }
 
             float DistanceSquared(RE::Actor* a, RE::Actor* b)
@@ -1559,6 +1602,190 @@ namespace TFD::InteractionRouter
             bool IsInCombatForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
                 return IsForceGreetRangeReady(player, speaker, kInCombatForceGreetMaxDistanceSq);
+            }
+
+            constexpr const char* kPreCombatCrowdApproachAssistEvent = "TFDTruceApproachAssist";
+
+            void SendPreCombatCrowdApproachAssistEvent(RE::Actor* speaker, unsigned movedCount, unsigned crowdMovedCount, unsigned participantCount, const char* reason)
+            {
+                if (!speaker) {
+                    return;
+                }
+
+                auto* src = SKSE::GetModCallbackEventSource();
+                if (!src) {
+                    spdlog::warn(
+                        "[TFD][DialogueOpen] approach assist crowd bridge skipped speaker={:08X} reason=no_mod_callback_source",
+                        speaker->GetFormID());
+                    return;
+                }
+
+                SKSE::ModCallbackEvent ev(
+                    kPreCombatCrowdApproachAssistEvent,
+                    reason ? reason : "approach_assist",
+                    static_cast<float>(crowdMovedCount),
+                    speaker);
+                src->SendEvent(&ev);
+
+                spdlog::info(
+                    "[TFD][DialogueOpen] approach assist crowd bridge event={} speaker={:08X} moved={} crowdMoved={} participants={} reason={}",
+                    kPreCombatCrowdApproachAssistEvent,
+                    speaker->GetFormID(),
+                    movedCount,
+                    crowdMovedCount,
+                    participantCount,
+                    reason ? reason : "unknown");
+            }
+
+            void AddUniqueDialogueAssistActor(std::vector<RE::Actor*>& actors, RE::Actor* actor)
+            {
+                if (!actor) {
+                    return;
+                }
+                if (std::find(actors.begin(), actors.end(), actor) != actors.end()) {
+                    return;
+                }
+                actors.push_back(actor);
+            }
+
+            void EnsureDialogueAssistCrowdFallback(std::vector<RE::Actor*>& actors, RE::Actor* speaker)
+            {
+                if (!speaker) {
+                    return;
+                }
+
+                bool hasCrowd = false;
+                for (auto* actor : actors) {
+                    if (actor && actor != speaker) {
+                        hasCrowd = true;
+                        break;
+                    }
+                }
+                if (hasCrowd) {
+                    return;
+                }
+
+                const auto activeActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
+                for (auto* actor : activeActors) {
+                    if (!actor || actor == speaker) {
+                        continue;
+                    }
+                    if (!TFD::HostilityController::CanOpenDialogue(actor)) {
+                        continue;
+                    }
+                    AddUniqueDialogueAssistActor(actors, actor);
+                }
+            }
+
+            bool MoveActorNearPlayerForApproach(RE::PlayerCharacter* player, RE::Actor* actor, float yawOffset, float distance, const char* role, const char* reason)
+            {
+                if (!player || !actor || actor == player) {
+                    return false;
+                }
+
+                if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                    return false;
+                }
+
+                const float beforeDist = std::sqrt(DistanceSquared(player, actor));
+                const float yaw = player->GetAngleZ() + yawOffset;
+                RE::NiPoint3 pos = player->GetPosition();
+
+                pos.x += std::sin(yaw) * distance;
+                pos.y += std::cos(yaw) * distance;
+
+                actor->MoveTo(player);
+                actor->SetPosition(pos, true);
+
+                if (!actor->IsAIEnabled()) {
+                    actor->EnableAI(true);
+                }
+
+                actor->AllowPCDialogue(true);
+                if (actor->IsInCombat()) {
+                    actor->StopCombat();
+                }
+                actor->EvaluatePackage(false, true);
+
+                const float afterDist = std::sqrt(DistanceSquared(player, actor));
+                spdlog::warn(
+                    "[TFD][DialogueOpen] approach assist moveto member mode=PreCombatTruce role={} actor={:08X} beforeDist={:.1f} afterDist={:.1f} targetDist={:.1f} reason={}",
+                    role ? role : "member",
+                    actor->GetFormID(),
+                    beforeDist,
+                    afterDist,
+                    kPreCombatForceGreetMaxDistance,
+                    reason ? reason : "unknown");
+
+                return true;
+            }
+
+            bool AssistPreCombatApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
+            {
+                if (!player || !speaker || speaker == player) {
+                    return false;
+                }
+
+                if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+
+                std::vector<RE::Actor*> actors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
+                if (actors.empty()) {
+                    actors.push_back(speaker);
+                }
+
+                if (std::find(actors.begin(), actors.end(), speaker) == actors.end()) {
+                    actors.insert(actors.begin(), speaker);
+                }
+                else if (actors.front() != speaker) {
+                    actors.erase(std::remove(actors.begin(), actors.end(), speaker), actors.end());
+                    actors.insert(actors.begin(), speaker);
+                }
+
+                EnsureDialogueAssistCrowdFallback(actors, speaker);
+
+                unsigned movedCount = 0;
+                unsigned crowdMovedCount = 0;
+                for (std::size_t i = 0; i < actors.size(); ++i) {
+                    auto* actor = actors[i];
+                    if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                        continue;
+                    }
+
+                    float yawOffset = 0.0f;
+                    float distance = kPreCombatApproachAssistDistance;
+                    const char* role = i == 0 ? "speaker" : "crowd";
+
+                    if (i > 0) {
+                        const float side = (i % 2) == 1 ? 1.0f : -1.0f;
+                        const float ring = static_cast<float>((i - 1) / 2);
+                        yawOffset = side * (0.75f + (0.20f * ring));
+                        distance = kPreCombatApproachAssistDistance + 70.0f + (30.0f * ring);
+                    }
+
+                    if (MoveActorNearPlayerForApproach(player, actor, yawOffset, distance, role, reason)) {
+                        ++movedCount;
+                        if (i > 0) {
+                            ++crowdMovedCount;
+                        }
+                    }
+                }
+
+                const auto participantCount = static_cast<unsigned>(actors.size());
+                spdlog::warn(
+                    "[TFD][DialogueOpen] approach assist moveto group mode=PreCombatTruce speaker={:08X} moved={} crowdMoved={} participants={} reason={}",
+                    speaker->GetFormID(),
+                    movedCount,
+                    crowdMovedCount,
+                    participantCount,
+                    reason ? reason : "unknown");
+
+                if (movedCount > 0) {
+                    SendPreCombatCrowdApproachAssistEvent(speaker, movedCount, crowdMovedCount, participantCount, reason);
+                }
+
+                return movedCount > 0;
             }
 
             std::uint32_t PendingSpeakerFormID()
@@ -1631,6 +1858,8 @@ namespace TFD::InteractionRouter
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
                 g_pending.lastApproachRefresh = {};
+                g_pending.nextApproachAssist = {};
+                g_pending.approachAssistUsed = false;
             }
 
             void CancelLocked(const char* reason)
@@ -1764,6 +1993,8 @@ namespace TFD::InteractionRouter
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
                 g_pending.lastApproachRefresh = {};
+                g_pending.nextApproachAssist = mode == Mode::PreCombatTruce ? now + kPreCombatApproachAssistDelay : Clock::time_point{};
+                g_pending.approachAssistUsed = false;
 
                 if (IsTruceMode(mode)) {
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
@@ -1874,15 +2105,26 @@ namespace TFD::InteractionRouter
             }
 
             if (now >= g_pending.deadline) {
-                spdlog::warn(
-                    "[TFD][DialogueOpen] timeout mode={} speaker={:08X} attempts={} requestIssued={}",
-                    ModeName(g_pending.mode),
-                    speaker->GetFormID(),
-                    g_pending.attempts,
-                    g_pending.requestIssued ? 1 : 0);
-                ResetLocked();
-                SyncDialogueStateLocked(IsDialogueOpen());
-                return;
+                if (g_pending.mode == Mode::PreCombatTruce) {
+                    g_pending.deadline = now + kPreCombatTimeout;
+                    RefreshApproachPackage(player, speaker);
+                    spdlog::warn(
+                        "[TFD][DialogueOpen] timeout converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
+                        ModeName(g_pending.mode),
+                        speaker->GetFormID(),
+                        g_pending.attempts,
+                        g_pending.requestIssued ? 1 : 0);
+                } else {
+                    spdlog::warn(
+                        "[TFD][DialogueOpen] timeout mode={} speaker={:08X} attempts={} requestIssued={}",
+                        ModeName(g_pending.mode),
+                        speaker->GetFormID(),
+                        g_pending.attempts,
+                        g_pending.requestIssued ? 1 : 0);
+                    ResetLocked();
+                    SyncDialogueStateLocked(IsDialogueOpen());
+                    return;
+                }
             }
 
             if (g_pending.requestIssued && g_pending.quietUntil.time_since_epoch().count() != 0 && now < g_pending.quietUntil) {
@@ -1932,6 +2174,17 @@ namespace TFD::InteractionRouter
             if (needsPreCombatRangeGate || needsInCombatRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
+
+                if (needsPreCombatRangeGate &&
+                    !g_pending.approachAssistUsed &&
+                    g_pending.nextApproachAssist.time_since_epoch().count() != 0 &&
+                    now >= g_pending.nextApproachAssist) {
+                    g_pending.approachAssistUsed = AssistPreCombatApproach(player, speaker, "range_gate_stuck");
+                    g_pending.lastApproachRefresh = now;
+                    g_pending.lastPackageRefresh = now;
+                    g_pending.nextAttempt = now + kRetryDelay;
+                    return;
+                }
 
                 if (g_pending.lastApproachRefresh.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastApproachRefresh) >= kApproachRefreshInterval) {
@@ -2022,13 +2275,19 @@ namespace TFD::InteractionRouter
             }
             SyncDialogueStateLocked(IsDialogueOpen());
 
+            const float tryDist = std::sqrt(DistanceSquared(player, speaker));
+            const float tryMaxDist = g_pending.mode == Mode::PreCombatTruce ?
+                kPreCombatForceGreetMaxDistance :
+                (g_pending.mode == Mode::InCombatTruce ? kInCombatForceGreetMaxDistance : 0.0f);
             spdlog::info(
-                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={}",
+                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f}",
                 ModeName(g_pending.mode),
                 speaker->GetFormID(),
                 g_pending.attempts,
                 ok ? 1 : 0,
-                g_pending.requestIssued ? 1 : 0);
+                g_pending.requestIssued ? 1 : 0,
+                tryDist,
+                tryMaxDist);
 
             if (firstIssued) {
                 spdlog::info(

@@ -1258,7 +1258,7 @@ namespace TFD::HostilityController
         }
 
         std::vector<RE::FormID> BuildTruceInCombatMemberIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t& cellBubbleCount, std::size_t& truceClusterCount);
-        std::vector<RE::FormID> BuildPreCombatDialogueCrowdIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t& sameCellCount, std::size_t& sameWorldspaceCount);
+        std::vector<RE::FormID> BuildPreCombatDialogueCrowdIds(RE::Actor* player, RE::Actor* primaryTarget, float scanRadius, std::size_t maxCrowdCount, std::size_t& sameCellCount, std::size_t& sameWorldspaceCount);
 
         struct TruceCandidate
         {
@@ -1392,6 +1392,7 @@ namespace TFD::HostilityController
             RE::Actor* player,
             RE::Actor* primaryTarget,
             float scanRadius,
+            std::size_t maxCrowdCount,
             std::size_t& sameCellCount,
             std::size_t& sameWorldspaceCount)
         {
@@ -1431,10 +1432,15 @@ namespace TFD::HostilityController
                 return a.actorId < b.actorId;
                 });
 
+            const std::size_t crowdLimit = (std::min)(maxCrowdCount, kCrowdAliasCap);
             std::vector<RE::FormID> result;
-            result.reserve((std::min)(candidates.size(), kCrowdAliasCap));
+            result.reserve((std::min)(candidates.size(), crowdLimit));
+            if (crowdLimit == 0) {
+                return result;
+            }
+
             for (const auto& c : candidates) {
-                if (result.size() >= kCrowdAliasCap) {
+                if (result.size() >= crowdLimit) {
                     break;
                 }
                 result.push_back(c.actorId);
@@ -2352,6 +2358,25 @@ namespace TFD::HostilityController
             session.dialogueAssignedActorIds.clear();
             session.finished = false;
 
+            std::size_t preCombatDialogueParticipantLimit = kCrowdAliasCap + 1;
+            std::size_t preCombatCrowdCap = kCrowdAliasCap;
+            std::size_t preCombatParticipantsAdded = 1;
+            std::size_t preCombatRecruitSlotsFree = kCrowdAliasCap + 1;
+            if (mode == Mode::TrucePreCombat && allowDialogue) {
+                // Recruit slot capacity must not decide whether a truce can happen.
+                // Truce can still lead to Release, Fight, Pleasure, Captive, Follow, etc.
+                // This refresh only keeps TFDRecruitSlotsFree accurate for ESP dialogue conditions.
+                TFD::TeammateManager::RefreshRecruitCapacityGlobals("precombat_truce_dialog_state");
+                preCombatRecruitSlotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
+                preCombatCrowdCap = kCrowdAliasCap;
+                spdlog::info(
+                    "TFDHostilityController: precombat dialogue participant window target={:08X} slotsFree={} maxDialogueParticipants={} maxCrowd={} reason=truce_not_slot_blocked",
+                    targetId,
+                    static_cast<unsigned int>(preCombatRecruitSlotsFree),
+                    static_cast<unsigned int>(preCombatDialogueParticipantLimit),
+                    static_cast<unsigned int>(preCombatCrowdCap));
+            }
+
             if (!AddOrRefreshEntry(
                 primaryTarget,
                 mode,
@@ -2371,6 +2396,24 @@ namespace TFD::HostilityController
             std::size_t localSplashCount = 0;
             std::size_t truceClusterCount = 0;
             std::vector<RE::FormID> curatedTruceIds;
+            std::vector<RE::FormID> preCombatDialogueEventIds;
+            auto addPreCombatDialogueEventId = [&](RE::FormID actorId) {
+                if (!(mode == Mode::TrucePreCombat && allowDialogue)) {
+                    return;
+                }
+                if (actorId == 0) {
+                    return;
+                }
+                if (std::find(preCombatDialogueEventIds.begin(), preCombatDialogueEventIds.end(), actorId) != preCombatDialogueEventIds.end()) {
+                    return;
+                }
+                preCombatDialogueEventIds.push_back(actorId);
+                };
+
+            if (mode == Mode::TrucePreCombat && allowDialogue) {
+                addPreCombatDialogueEventId(targetId);
+            }
+
             if (mode == Mode::TruceInCombat) {
                 const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), 6000.0f);
                 curatedTruceIds = BuildTruceInCombatMemberIds(player, primaryTarget, scanRadius, cellBubbleCount, truceClusterCount);
@@ -2404,7 +2447,7 @@ namespace TFD::HostilityController
             }
             else if (mode == Mode::TrucePreCombat && allowDialogue) {
                 const float scanRadius = (std::max)(GetCellBubbleRadius(cellBubbleRadius), kPreCombatDialoguePackScanRadius);
-                curatedTruceIds = BuildPreCombatDialogueCrowdIds(player, primaryTarget, scanRadius, cellBubbleCount, truceClusterCount);
+                curatedTruceIds = BuildPreCombatDialogueCrowdIds(player, primaryTarget, scanRadius, preCombatCrowdCap, cellBubbleCount, truceClusterCount);
                 for (auto actorId : curatedTruceIds) {
                     auto* actor = ResolveActor(actorId);
                     if (!actor) {
@@ -2417,7 +2460,7 @@ namespace TFD::HostilityController
                     if (existedInSession) {
                         continue;
                     }
-                    AddOrRefreshEntry(
+                    if (AddOrRefreshEntry(
                         actor,
                         mode,
                         sessionId,
@@ -2428,7 +2471,10 @@ namespace TFD::HostilityController
                         false,
                         TameDisposition::None,
                         0.0,
-                        false);
+                        false)) {
+                        ++preCombatParticipantsAdded;
+                        addPreCombatDialogueEventId(actorId);
+                    }
                 }
             }
             if (applyCellBubble && mode != Mode::TruceInCombat) {
@@ -2447,6 +2493,8 @@ namespace TFD::HostilityController
                         }();
 
                     const bool isPrimary = actorId == targetId;
+                    const bool ambientPreCombatHold = (mode == Mode::TrucePreCombat && allowDialogue && !existedInSession && !isPrimary);
+                    const bool entryAllowsDialogue = ambientPreCombatHold ? false : allowDialogue;
                     if (!AddOrRefreshEntry(
                         actor,
                         mode,
@@ -2454,7 +2502,7 @@ namespace TFD::HostilityController
                         targetId,
                         nowSec,
                         endTimeSec,
-                        allowDialogue,
+                        entryAllowsDialogue,
                         isPrimary)) {
                         continue;
                     }
@@ -2484,7 +2532,16 @@ namespace TFD::HostilityController
                     if (alreadyInSession) {
                         continue;
                     }
-                    AddOrRefreshEntry(
+                    if (mode == Mode::TrucePreCombat && allowDialogue && preCombatParticipantsAdded >= preCombatDialogueParticipantLimit) {
+                        spdlog::info(
+                            "TFDHostilityController: truce handoff skipped actor={:08X} session={} reason=precombat_dialogue_cap participants={} cap={}",
+                            actorId,
+                            sessionId,
+                            static_cast<unsigned int>(preCombatParticipantsAdded),
+                            static_cast<unsigned int>(preCombatDialogueParticipantLimit));
+                        continue;
+                    }
+                    if (AddOrRefreshEntry(
                         actor,
                         mode,
                         sessionId,
@@ -2495,7 +2552,12 @@ namespace TFD::HostilityController
                         false,
                         mode == Mode::Tame ? TameDisposition::Calm : TameDisposition::None,
                         0.0,
-                        false);
+                        false)) {
+                        if (mode == Mode::TrucePreCombat && allowDialogue) {
+                            ++preCombatParticipantsAdded;
+                            addPreCombatDialogueEventId(actorId);
+                        }
+                    }
                 }
             }
 
@@ -2560,6 +2622,16 @@ namespace TFD::HostilityController
             }
 
 
+            if (mode == Mode::TrucePreCombat && allowDialogue && applyCellBubble) {
+                spdlog::info(
+                    "TFDHostilityController: precombat dialogue participants target={:08X} participants={} dialogueCap={} slotsFree={} ambientSuppression={} reason=truce_allows_non_recruit_outcomes",
+                    targetId,
+                    static_cast<unsigned int>(preCombatParticipantsAdded),
+                    static_cast<unsigned int>(preCombatDialogueParticipantLimit),
+                    static_cast<unsigned int>(preCombatRecruitSlotsFree),
+                    static_cast<unsigned int>(cellBubbleCount));
+            }
+
             g_sessions[sessionId] = session;
 
             std::vector<RE::FormID> applyIds;
@@ -2607,7 +2679,17 @@ namespace TFD::HostilityController
                     targetId);
             }
             else if (IsTruceMode(mode)) {
-                const auto splitTargets = PartitionTruceEventTargets(applyIds, player, targetId);
+                const std::vector<RE::FormID>* assignSourceIds = std::addressof(applyIds);
+                if (mode == Mode::TrucePreCombat && allowDialogue && !preCombatDialogueEventIds.empty()) {
+                    assignSourceIds = std::addressof(preCombatDialogueEventIds);
+                    spdlog::info(
+                        "TFDHostilityController: precombat assign source dialogueCount={} suppressedPackSize={} slotsFree={}",
+                        static_cast<unsigned int>(preCombatDialogueEventIds.size()),
+                        static_cast<unsigned int>(applyIds.size()),
+                        static_cast<unsigned int>(preCombatRecruitSlotsFree));
+                }
+
+                const auto splitTargets = PartitionTruceEventTargets(*assignSourceIds, player, targetId);
                 const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
                 if (auto sessionIt = g_sessions.find(sessionId); sessionIt != g_sessions.end()) {
                     sessionIt->second.dialogueAssignedActorIds = assignedDialogueIds;
@@ -3154,6 +3236,116 @@ namespace TFD::HostilityController
         }
 
         return actors;
+    }
+
+    std::size_t ReleaseDialogueTruceActors(
+        RE::Actor* primaryTarget,
+        const std::vector<RE::Actor*>& actors,
+        ReleaseReason reason)
+    {
+        if (!primaryTarget || actors.empty()) {
+            return 0;
+        }
+
+        const auto primaryTargetId = primaryTarget->GetFormID();
+        if (primaryTargetId == 0) {
+            return 0;
+        }
+
+        auto primaryEntryIt = g_entries.find(primaryTargetId);
+        if (primaryEntryIt == g_entries.end() || !IsTruceMode(primaryEntryIt->second.mode)) {
+            return 0;
+        }
+
+        const auto sessionId = primaryEntryIt->second.sessionId;
+        if (sessionId == 0) {
+            return 0;
+        }
+
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || !IsTruceMode(sessionIt->second.primaryMode)) {
+            return 0;
+        }
+
+        auto* player = Runtime::ResolveActor(sessionIt->second.playerId);
+        const auto primaryMode = sessionIt->second.primaryMode;
+        const double releaseNowSec = SuppressionNowSec();
+        const bool suppressRehostile = reason == ReleaseReason::FlowHandoff;
+
+        std::vector<RE::FormID> releasedIds;
+        releasedIds.reserve(actors.size());
+
+        for (auto* actor : actors) {
+            if (!actor) {
+                continue;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0 || actorId == primaryTargetId) {
+                continue;
+            }
+
+            if (std::find(releasedIds.begin(), releasedIds.end(), actorId) != releasedIds.end()) {
+                continue;
+            }
+
+            auto entryIt = g_entries.find(actorId);
+            if (entryIt == g_entries.end()) {
+                continue;
+            }
+
+            if (entryIt->second.sessionId != sessionId || !IsTruceMode(entryIt->second.mode)) {
+                continue;
+            }
+
+            Entry releasedEntry = entryIt->second;
+            RemoveSuppression(actor, releasedEntry);
+
+            const bool shouldRehostileTruce =
+                player &&
+                (!suppressRehostile &&
+                    (reason == ReleaseReason::DialogueClosed ||
+                        reason == ReleaseReason::PlayerArmed ||
+                        reason == ReleaseReason::FightChoice));
+
+            if (shouldRehostileTruce) {
+                const bool drawWeapon = true;
+                const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
+                if (!satisfied || !actor->IsInCombat()) {
+                    QueueRehostileRetry(actor, player, sessionId, reason, releaseNowSec, drawWeapon);
+                }
+            }
+            else {
+                actor->EvaluatePackage(false, true);
+            }
+
+            g_entries.erase(entryIt);
+            releasedIds.push_back(actorId);
+        }
+
+        auto& assignedDialogueIds = sessionIt->second.dialogueAssignedActorIds;
+            assignedDialogueIds.erase(
+                std::remove_if(
+                    assignedDialogueIds.begin(),
+                    assignedDialogueIds.end(),
+                    [&](RE::FormID actorId) {
+                        return std::find(releasedIds.begin(), releasedIds.end(), actorId) != releasedIds.end();
+                    }),
+                assignedDialogueIds.end());
+
+        if (!releasedIds.empty()) {
+            const auto crowdSent = SendModEventToActors(GetCrowdUnassignEventName(primaryMode), releasedIds);
+            spdlog::info(
+                "TFDHostilityController: release dialogue truce actors session={} primary={:08X} released={} crowdEvent={} crowdSent={} reason={}",
+                sessionId,
+                primaryTargetId,
+                static_cast<unsigned int>(releasedIds.size()),
+                GetCrowdUnassignEventName(primaryMode) ? GetCrowdUnassignEventName(primaryMode) : "<none>",
+                static_cast<unsigned int>(crowdSent),
+                ToString(reason));
+        }
+
+        return releasedIds.size();
     }
 
     bool CanStartTruce(RE::Actor* actor)

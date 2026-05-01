@@ -2,6 +2,7 @@
 
 #include <RE/Skyrim.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -121,6 +122,10 @@ namespace TFD::HostilityController
     bool CanOpenDialogue(RE::Actor* actor);
     [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
     [[nodiscard]] std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget);
+    std::size_t ReleaseDialogueTruceActors(
+        RE::Actor* primaryTarget,
+        const std::vector<RE::Actor*>& actors,
+        ReleaseReason reason = ReleaseReason::DialogueClosed);
 
     bool CanStartTruce(RE::Actor* actor);
     bool HasSpentTruce(RE::Actor* actor);

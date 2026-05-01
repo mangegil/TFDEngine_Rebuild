@@ -382,21 +382,17 @@ namespace TFD::PayModel
                     addUnique(actor);
                 }
 
-                const auto beforeClamp = out.size();
+                const auto actorCount = out.size();
                 const auto slotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
-                if (slotsFree == 0) {
-                    out.clear();
-                }
-                else if (out.size() > slotsFree) {
-                    out.resize(slotsFree);
-                }
 
+                // Pay is not a recruit-only quote. It also gates release / mercy outcomes,
+                // so recruit capacity must never reduce the encounter price to zero.
+                // Recruit overflow is handled later by the recruit commit path.
                 spdlog::info(
-                    "[TFD][PayModel] dialogue assigned capacity-clamped actors speaker={:08X} context={} actors={} beforeClamp={} slotsFree={}",
+                    "[TFD][PayModel] dialogue assigned actors speaker={:08X} context={} actors={} slotsFree={} reason=pay_not_recruit_capacity_clamped",
                     speaker->GetFormID(),
                     static_cast<int>(context),
-                    static_cast<unsigned>(out.size()),
-                    static_cast<unsigned>(beforeClamp),
+                    static_cast<unsigned>(actorCount),
                     static_cast<unsigned>(slotsFree));
                 return out;
             }
