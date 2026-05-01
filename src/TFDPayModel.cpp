@@ -3,6 +3,7 @@
 #include "TFDActor.h"
 #include "TFDHostilityController.h"
 #include "TFDLocation.h"
+#include "TFDTeammateManager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -374,26 +375,29 @@ namespace TFD::PayModel
             }
 
             if (context == PayContext::PreCombat || context == PayContext::InCombat) {
+                addUnique(speaker);
+
                 const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
                 for (auto* actor : dialogueTruceActors) {
                     addUnique(actor);
                 }
 
-                if (!out.empty()) {
-                    spdlog::info(
-                        "[TFD][PayModel] dialogue assigned truce actors speaker={:08X} context={} actors={}",
-                        speaker->GetFormID(),
-                        static_cast<int>(context),
-                        static_cast<unsigned>(out.size()));
-                    return out;
+                const auto beforeClamp = out.size();
+                const auto slotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
+                if (slotsFree == 0) {
+                    out.clear();
+                }
+                else if (out.size() > slotsFree) {
+                    out.resize(slotsFree);
                 }
 
-                addUnique(speaker);
                 spdlog::info(
-                    "[TFD][PayModel] dialogue assigned fallback speaker-only speaker={:08X} context={} actors={}",
+                    "[TFD][PayModel] dialogue assigned capacity-clamped actors speaker={:08X} context={} actors={} beforeClamp={} slotsFree={}",
                     speaker->GetFormID(),
                     static_cast<int>(context),
-                    static_cast<unsigned>(out.size()));
+                    static_cast<unsigned>(out.size()),
+                    static_cast<unsigned>(beforeClamp),
+                    static_cast<unsigned>(slotsFree));
                 return out;
             }
 

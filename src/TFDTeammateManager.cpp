@@ -346,6 +346,7 @@ namespace
             RE::TESFaction* currentFollowerFaction{ nullptr };
             RE::TESFaction* playerFollowerFaction{ nullptr };
             RE::TESGlobal* teammateStateGlobal{ nullptr };
+            RE::TESGlobal* recruitSlotsFreeGlobal{ nullptr };
         };
 
         inline RegistryCache g_registry{};
@@ -357,6 +358,8 @@ namespace
 
         inline std::unordered_set<RE::FormID> g_knownConvertedTeammates{};
         inline std::unordered_map<RE::FormID, std::uint32_t> g_invalidAliasStrikes{};
+        inline int g_lastRecruitSlotsFreeWritten{ -999 };
+        inline int g_lastTeammateStateWritten{ -999 };
 
         constexpr std::uint32_t kConvertedAliasInvalidGraceTicks = 12;
 
@@ -403,6 +406,7 @@ namespace
             g_registry.currentFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("CurrentFollowerFaction");
             g_registry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
             g_registry.teammateStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTeammateState");
+            g_registry.recruitSlotsFreeGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRecruitSlotsFree");
             if (!g_registry.teammateFaction) {
                 spdlog::warn("[TFD][TeammateManager] faction TFDTeammateFaction not found");
             }
@@ -416,14 +420,15 @@ namespace
                     ++found;
                 }
             }
-            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} truceTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X}",
+            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} truceTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X} recruitSlotsFree={:08X}",
                 g_registry.quest ? g_registry.quest->GetFormID() : 0u,
                 found,
                 g_registry.teammateFaction ? g_registry.teammateFaction->GetFormID() : 0u,
                 g_registry.truceTeammateFaction ? g_registry.truceTeammateFaction->GetFormID() : 0u,
                 g_registry.currentFollowerFaction ? g_registry.currentFollowerFaction->GetFormID() : 0u,
                 g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u,
-                g_registry.teammateStateGlobal ? g_registry.teammateStateGlobal->GetFormID() : 0u);
+                g_registry.teammateStateGlobal ? g_registry.teammateStateGlobal->GetFormID() : 0u,
+                g_registry.recruitSlotsFreeGlobal ? g_registry.recruitSlotsFreeGlobal->GetFormID() : 0u);
         }
 
         RE::Actor* ResolveCombatTarget(RE::Actor* actor)
@@ -600,8 +605,42 @@ namespace
             return true;
         }
 
-        int ComputeTeammateStateValue(const std::vector<RE::Actor*>& teammates)
+        int CountOccupiedRecruitSlotsFromAliasesUnsafe()
         {
+            ResolveRegistry();
+
+            int occupied = 0;
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+
+                auto* actor = alias->GetActorReference();
+                if (!actor || !IsValidTeammate(actor)) {
+                    continue;
+                }
+
+                ++occupied;
+            }
+
+            return occupied;
+        }
+
+        int ComputeRecruitSlotsFreeUnsafe()
+        {
+            ResolveRegistry();
+
+            const int maxSlots = static_cast<int>(g_registry.teammateAliases.size());
+            const int occupied = CountOccupiedRecruitSlotsFromAliasesUnsafe();
+            return std::clamp(maxSlots - occupied, 0, maxSlots);
+        }
+
+        int ComputeTeammateStateValue(const std::vector<RE::Actor*>& teammates, int recruitSlotsFree)
+        {
+            if (recruitSlotsFree <= 0) {
+                return 3;
+            }
+
             int activeCount = 0;
             for (auto* actor : teammates) {
                 if (!IsCombatCapableTeammate(actor)) {
@@ -625,6 +664,55 @@ namespace
             }
 
             g_registry.teammateStateGlobal->value = static_cast<float>(value);
+        }
+
+        void WriteRecruitSlotsFree(int value)
+        {
+            ResolveRegistry();
+            if (!g_registry.recruitSlotsFreeGlobal) {
+                return;
+            }
+
+            const int maxSlots = static_cast<int>(g_registry.teammateAliases.size());
+            g_registry.recruitSlotsFreeGlobal->value = static_cast<float>(std::clamp(value, 0, maxSlots));
+        }
+
+        void RefreshRecruitCapacityGlobalsUnsafe(const char* reason)
+        {
+            ResolveRegistry();
+
+            std::vector<RE::Actor*> registeredStateActors;
+            registeredStateActors.reserve(g_registry.teammateAliases.size());
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+
+                auto* actor = alias->GetActorReference();
+                if (!actor || !IsValidTeammate(actor)) {
+                    continue;
+                }
+
+                registeredStateActors.push_back(actor);
+            }
+
+            const int freeSlots = ComputeRecruitSlotsFreeUnsafe();
+            const int teammateState = ComputeTeammateStateValue(registeredStateActors, freeSlots);
+            WriteRecruitSlotsFree(freeSlots);
+            WriteTeammateState(teammateState);
+
+            const bool changed = freeSlots != g_lastRecruitSlotsFreeWritten || teammateState != g_lastTeammateStateWritten;
+            g_lastRecruitSlotsFreeWritten = freeSlots;
+            g_lastTeammateStateWritten = teammateState;
+
+            if (changed || (reason && std::string_view(reason) != "sync_aliases")) {
+                spdlog::info(
+                    "[TFD][TeammateManager] recruit capacity refresh slotsFree={} teammateState={} registered={} reason={}",
+                    freeSlots,
+                    teammateState,
+                    static_cast<unsigned>(registeredStateActors.size()),
+                    reason ? reason : "unknown");
+            }
         }
 
         void SyncTeammateFaction(RE::Actor* actor, bool shouldHaveFaction)
@@ -1123,6 +1211,7 @@ namespace
                         alias->aliasName.c_str(),
                         actor->GetFormID(),
                         reason ? reason : "unknown");
+                    RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_refresh");
                     return true;
                 }
 
@@ -1180,6 +1269,7 @@ namespace
                 actor->GetName() ? actor->GetName() : "",
                 reason ? reason : "unknown");
 
+            RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_fill");
             return true;
         }
 
@@ -1266,19 +1356,7 @@ namespace
                     actor ? actor->GetFormID() : 0u,
                     actor && actor->GetName() ? actor->GetName() : "");
             }
-            std::vector<RE::Actor*> registeredStateActors;
-            registeredStateActors.reserve(g_registry.teammateAliases.size());
-            for (auto* alias : g_registry.teammateAliases) {
-                if (!alias) {
-                    continue;
-                }
-                auto* actor = alias->GetActorReference();
-                if (!actor || !IsValidTeammate(actor)) {
-                    continue;
-                }
-                registeredStateActors.push_back(actor);
-            }
-            WriteTeammateState(ComputeTeammateStateValue(registeredStateActors));
+            RefreshRecruitCapacityGlobalsUnsafe("sync_aliases");
 
         }
 
@@ -1426,6 +1504,25 @@ namespace TFD::TeammateManager
     void SyncNow()
     {
         AliasInternal::SyncAliasesImpl();
+    }
+
+    std::size_t GetMaxRecruitSlots()
+    {
+        AliasInternal::ResolveRegistry();
+        return AliasInternal::g_registry.teammateAliases.size();
+    }
+
+    std::size_t GetRecruitSlotsFree()
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        return static_cast<std::size_t>(AliasInternal::ComputeRecruitSlotsFreeUnsafe());
+    }
+
+    void RefreshRecruitCapacityGlobals(const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "external_refresh");
     }
 
     bool RegisterOrRefreshTeammateNow(RE::Actor* actor, const char* reason)

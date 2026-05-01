@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <cstddef>
 #include <functional>
@@ -36,6 +36,9 @@ namespace TFD::TeammateManager
     void Install();
     void Shutdown();
     void SyncNow();
+    std::size_t GetMaxRecruitSlots();
+    std::size_t GetRecruitSlotsFree();
+    void RefreshRecruitCapacityGlobals(const char* reason = nullptr);
     bool RegisterOrRefreshTeammateNow(RE::Actor* actor, const char* reason = nullptr);
     void QueueHumanoidTeammateCatchupAfterLoad(const char* reason = nullptr);
 

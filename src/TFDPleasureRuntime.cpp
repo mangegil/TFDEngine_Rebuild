@@ -827,6 +827,18 @@ namespace TFD::PleasureRuntime
 				return false;
 			}
 
+			const auto slotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
+			if (slotsFree == 0) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime] after pleasure recruit rejected actor={:08X} cycle={} source={} reason=no_recruit_slots",
+					actorFormID,
+					g_state.sessionCycleId,
+					ToString(g_state.source));
+				QueueNextPreCombatCycleIfNeededLocked(actor, false);
+				TFD::TeammateManager::RefreshRecruitCapacityGlobals("after_pleasure_recruit_no_slots");
+				return false;
+			}
+
 			TFD::Recruit::MarkRecruitCommitPending(
 				actor,
 				6.0,
@@ -850,6 +862,7 @@ namespace TFD::PleasureRuntime
 
 			if (clean) {
 				aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "after_pleasure_recruit_commit");
+				TFD::TeammateManager::RefreshRecruitCapacityGlobals("after_pleasure_recruit_commit");
 			}
 
 			if (clean) {

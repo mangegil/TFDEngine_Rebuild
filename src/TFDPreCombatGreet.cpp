@@ -877,6 +877,44 @@ namespace TFD::PreCombatGreet
             options.ensurePacifyAlliance = true;
             options.applyRuntimeProfile = true;
 
+            std::vector<RE::Actor*> clampedActors = actors;
+
+            auto primaryIt = std::find(clampedActors.begin(), clampedActors.end(), primaryActor);
+            if (primaryIt != clampedActors.end() && primaryIt != clampedActors.begin()) {
+                clampedActors.erase(primaryIt);
+                clampedActors.insert(clampedActors.begin(), primaryActor);
+            }
+
+            const auto slotsFree = TFD::TeammateManager::GetRecruitSlotsFree();
+            const auto beforeClamp = clampedActors.size();
+            if (slotsFree == 0) {
+                clampedActors.clear();
+            }
+            else if (clampedActors.size() > slotsFree) {
+                clampedActors.resize(slotsFree);
+            }
+
+            if (clampedActors.empty()) {
+                spdlog::warn(
+                    "[TFD][PreCombatGreet] recruit commit group blocked primary={:08X} actors={} slotsFree={} reason={}",
+                    primaryActor->GetFormID(),
+                    static_cast<unsigned>(beforeClamp),
+                    static_cast<unsigned>(slotsFree),
+                    reason ? reason : "unknown");
+                TFD::TeammateManager::RefreshRecruitCapacityGlobals("precombat_recruit_blocked_no_slots");
+                return 0;
+            }
+
+            if (beforeClamp != clampedActors.size()) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet] recruit commit group capacity clamp primary={:08X} actorsBefore={} actorsAllowed={} slotsFree={} reason={}",
+                    primaryActor->GetFormID(),
+                    static_cast<unsigned>(beforeClamp),
+                    static_cast<unsigned>(clampedActors.size()),
+                    static_cast<unsigned>(slotsFree),
+                    reason ? reason : "unknown");
+            }
+
             unsigned attempted = 0;
             unsigned skipped = 0;
             unsigned ensuredState = 0;
@@ -884,7 +922,7 @@ namespace TFD::PreCombatGreet
             unsigned rawClean = 0;
             unsigned aliasRegistered = 0;
 
-            for (auto* actor : actors) {
+            for (auto* actor : clampedActors) {
                 const auto result = TFD::Recruit::CommitRecruit(actor, player, options);
                 if (!result.attempted || result.skipped) {
                     ++skipped;
@@ -906,7 +944,7 @@ namespace TFD::PreCombatGreet
             spdlog::info(
                 "[TFD][PreCombatGreet] recruit commit group primary={:08X} actors={} attempted={} skipped={} ensuredState={} removed={} rawClean={} aliasRegistered={} reason={}",
                 primaryActor->GetFormID(),
-                static_cast<unsigned>(actors.size()),
+                static_cast<unsigned>(clampedActors.size()),
                 attempted,
                 skipped,
                 ensuredState,
@@ -915,6 +953,7 @@ namespace TFD::PreCombatGreet
                 aliasRegistered,
                 reason ? reason : "unknown");
 
+            TFD::TeammateManager::RefreshRecruitCapacityGlobals("precombat_recruit_commit_group");
             return attempted;
         }
 
