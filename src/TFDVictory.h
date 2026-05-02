@@ -11,6 +11,7 @@ namespace TFD::Victory
         bool hasPlayer{ false };
         bool playerDown{ false };
         bool combatContext{ false };
+        // This is the standing/active observed enemy roster from DefeatMonitor, not every living downed enemy.
         bool hasEnemies{ false };
     };
 

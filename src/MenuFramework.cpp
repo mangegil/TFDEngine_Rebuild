@@ -452,13 +452,11 @@ namespace TFDMenu
 		{
 			switch (value) {
 			case 0:
-				return "Not in Combat";
+				return "Neutral";
 			case 1:
 				return "No";
 			case 2:
 				return "Yes";
-			case 3:
-				return "Dialogue";
 			default:
 				return "Custom";
 			}
@@ -1802,11 +1800,11 @@ namespace TFDMenu
 							if (player && !TFD::Captive::IsStandardCaptiveActive()) {
 								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(512.0f)) {
 									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
-									TFD::Victory::SetStateValue(3);
+									TFD::Victory::SetStateValue(2);
 									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
 										defeatedTalkTarget->GetFormID(),
 										"victory_activate_dialogue");
-									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=3",
+									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=2",
 										defeatedTalkTarget->GetFormID(),
 										flowOk ? 1 : 0);
 
@@ -1827,7 +1825,12 @@ namespace TFDMenu
 									}
 								}
 								else {
-									spdlog::info("[TFD][Menu] activate defeated victory dialogue miss radius=512 action=allow_vanilla_activate");
+									// Native must not open normal teammate dialogue by scanning nearby teammates.
+									// The input event does not carry the exact activated actor here, so the scan
+									// can open the wrong teammate and keep TFDSystemEventQuest's speaker alias stale.
+									// Let vanilla activation pick the clicked teammate. The Teammate root fragment
+									// will call BeginTeammateGreet(akSpeaker) with the real speaker.
+									spdlog::info("[TFD][Menu] activate defeated victory dialogue miss radius=512 action=allow_vanilla_teammate_dialogue");
 								}
 							}
 						}

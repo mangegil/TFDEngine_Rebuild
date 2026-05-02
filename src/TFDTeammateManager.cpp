@@ -29,6 +29,9 @@
 #include "TFDHostilityController.h"
 #include "TFDTame.h"
 #include "TFDRecruit.h"
+#include "TFDPayModel.h"
+#include "EditorIdCache.h"
+#include <cctype>
 
 namespace
 {
@@ -347,6 +350,7 @@ namespace
             RE::TESFaction* playerFollowerFaction{ nullptr };
             RE::TESGlobal* teammateStateGlobal{ nullptr };
             RE::TESGlobal* recruitSlotsFreeGlobal{ nullptr };
+            RE::TESGlobal* hasPotionsGlobal{ nullptr };
         };
 
         inline RegistryCache g_registry{};
@@ -358,10 +362,15 @@ namespace
 
         inline std::unordered_set<RE::FormID> g_knownConvertedTeammates{};
         inline std::unordered_map<RE::FormID, std::uint32_t> g_invalidAliasStrikes{};
+        inline std::unordered_map<RE::FormID, double> g_contractEndDays{};
         inline int g_lastRecruitSlotsFreeWritten{ -999 };
         inline int g_lastTeammateStateWritten{ -999 };
+        inline int g_lastHasPotionsWritten{ -999 };
 
         constexpr std::uint32_t kConvertedAliasInvalidGraceTicks = 12;
+        constexpr double kHumanoidContractDays = 1.0;
+        constexpr float kTeammateHealTargetPct = 0.85f;
+        constexpr float kTeammateHealMinAbsHp = 45.0f;
 
         RE::PlayerCharacter* Player()
         {
@@ -407,6 +416,7 @@ namespace
             g_registry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
             g_registry.teammateStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTeammateState");
             g_registry.recruitSlotsFreeGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRecruitSlotsFree");
+            g_registry.hasPotionsGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDHasPotions");
             if (!g_registry.teammateFaction) {
                 spdlog::warn("[TFD][TeammateManager] faction TFDTeammateFaction not found");
             }
@@ -420,7 +430,7 @@ namespace
                     ++found;
                 }
             }
-            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} truceTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X} recruitSlotsFree={:08X}",
+            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} truceTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X} recruitSlotsFree={:08X} hasPotions={:08X}",
                 g_registry.quest ? g_registry.quest->GetFormID() : 0u,
                 found,
                 g_registry.teammateFaction ? g_registry.teammateFaction->GetFormID() : 0u,
@@ -428,7 +438,8 @@ namespace
                 g_registry.currentFollowerFaction ? g_registry.currentFollowerFaction->GetFormID() : 0u,
                 g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u,
                 g_registry.teammateStateGlobal ? g_registry.teammateStateGlobal->GetFormID() : 0u,
-                g_registry.recruitSlotsFreeGlobal ? g_registry.recruitSlotsFreeGlobal->GetFormID() : 0u);
+                g_registry.recruitSlotsFreeGlobal ? g_registry.recruitSlotsFreeGlobal->GetFormID() : 0u,
+                g_registry.hasPotionsGlobal ? g_registry.hasPotionsGlobal->GetFormID() : 0u);
         }
 
         RE::Actor* ResolveCombatTarget(RE::Actor* actor)
@@ -718,9 +729,324 @@ namespace
             g_registry.recruitSlotsFreeGlobal->value = static_cast<float>(std::clamp(value, 0, maxSlots));
         }
 
+        void WriteAlias(RE::BGSRefAlias* alias, RE::Actor* actor);
+        void RefreshRecruitCapacityGlobalsUnsafe(const char* reason);
+
+        double CurrentGameDays()
+        {
+            auto* calendar = RE::Calendar::GetSingleton();
+            return calendar ? static_cast<double>(calendar->rawDaysPassed) : 0.0;
+        }
+
+        std::string ToLowerAscii(std::string_view in)
+        {
+            std::string out;
+            out.reserve(in.size());
+            for (char c : in) {
+                out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            }
+            return out;
+        }
+
+        bool ContainsNoCase(std::string_view haystack, std::string_view needle)
+        {
+            if (haystack.empty() || needle.empty()) {
+                return false;
+            }
+            const auto h = ToLowerAscii(haystack);
+            const auto n = ToLowerAscii(needle);
+            return h.find(n) != std::string::npos;
+        }
+
+        bool IsHealthPotionCandidate(RE::AlchemyItem* potion)
+        {
+            if (!potion || potion->IsPoison() || potion->IsFood()) {
+                return false;
+            }
+
+            // Do not require AlchemyItem::IsMedicine() here. On SE 1.5.97/CommonLibSSE-NG
+            // ordinary restore-health ALCH records such as RestoreHealth01 can fail that
+            // runtime classification even though they are valid inventory healing potions.
+            const auto editorId = TFD::Util::GetEditorId(potion);
+            const char* displayName = potion->GetName();
+            const std::string_view nameView = displayName ? std::string_view(displayName) : std::string_view{};
+
+            if (ContainsNoCase(editorId, "restorehealth") ||
+                ContainsNoCase(editorId, "restore_health") ||
+                ContainsNoCase(editorId, "healing") ||
+                ContainsNoCase(nameView, "healing") ||
+                ContainsNoCase(nameView, "restore health") ||
+                ContainsNoCase(nameView, "health potion")) {
+                return true;
+            }
+
+            return false;
+        }
+
+        RE::AlchemyItem* ResolveHealthPotionCandidateUnsafe()
+        {
+            auto* player = Player();
+            if (!player) {
+                return nullptr;
+            }
+
+            RE::AlchemyItem* bestPotion = nullptr;
+            const auto inv = player->GetInventory([](RE::TESBoundObject& obj) {
+                if (!obj.Is(RE::FormType::AlchemyItem)) {
+                    return false;
+                }
+                auto* potion = obj.As<RE::AlchemyItem>();
+                return IsHealthPotionCandidate(potion);
+                }, true);
+
+            for (const auto& [item, invData] : inv) {
+                const auto& [count, entry] = invData;
+                (void)entry;
+                if (count <= 0) {
+                    continue;
+                }
+                auto* potion = item ? item->As<RE::AlchemyItem>() : nullptr;
+                if (!IsHealthPotionCandidate(potion)) {
+                    continue;
+                }
+                if (!bestPotion || potion->GetFormID() < bestPotion->GetFormID()) {
+                    bestPotion = potion;
+                }
+            }
+
+            return bestPotion;
+        }
+
+        bool HasHealthPotionAvailableUnsafe()
+        {
+            return ResolveHealthPotionCandidateUnsafe() != nullptr;
+        }
+
+        void WriteHasPotions(int value)
+        {
+            ResolveRegistry();
+            if (!g_registry.hasPotionsGlobal) {
+                return;
+            }
+            g_registry.hasPotionsGlobal->value = static_cast<float>(std::clamp(value, 0, 1));
+        }
+
+        void RefreshPotionGlobalUnsafe(const char* reason)
+        {
+            const int hasPotions = HasHealthPotionAvailableUnsafe() ? 1 : 0;
+            WriteHasPotions(hasPotions);
+            if (hasPotions != g_lastHasPotionsWritten) {
+                g_lastHasPotionsWritten = hasPotions;
+                spdlog::info("[TFD][TeammateManager] potion global refresh TFDHasPotions={} reason={}",
+                    hasPotions,
+                    reason ? reason : "unknown");
+            }
+        }
+
+        bool ConsumeHealthPotionFromPlayerUnsafe(const char* reason)
+        {
+            ResolveRegistry();
+            auto* player = Player();
+            auto* potion = ResolveHealthPotionCandidateUnsafe();
+            if (!player || !potion) {
+                RefreshPotionGlobalUnsafe(reason ? reason : "consume_health_potion_failed");
+                spdlog::warn("[TFD][TeammateManager] consume health potion failed reason={} hasPlayer={} hasPotion={}",
+                    reason ? reason : "unknown",
+                    player ? 1 : 0,
+                    potion ? 1 : 0);
+                return false;
+            }
+
+            player->RemoveItem(potion, 1, RE::ITEM_REMOVE_REASON::kRemove, nullptr, nullptr);
+            spdlog::info("[TFD][TeammateManager] consume health potion item={:08X} reason={}",
+                potion->GetFormID(),
+                reason ? reason : "unknown");
+            RefreshPotionGlobalUnsafe(reason ? reason : "consume_health_potion");
+            return true;
+        }
+
+        bool RestoreActorHealthDirect(RE::Actor* actor, float targetPct, float minAbsHp, const char* reason)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+
+            const float maxHp = std::max(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float targetHp = std::clamp(std::max(minAbsHp, maxHp * targetPct), 1.0f, maxHp);
+            const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+            if (hpNow < targetHp) {
+                actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, targetHp - hpNow);
+            }
+
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+            }
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->StopCombatAndAlarmOnActor(actor, false);
+            }
+            if (actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(false);
+            }
+            if (actor->Is3DLoaded()) {
+                actor->EvaluatePackage();
+            }
+
+            spdlog::info("[TFD][TeammateManager] restore actor health actor={:08X} hpNow={:.1f} target={:.1f} max={:.1f} reason={}",
+                actor->GetFormID(),
+                hpNow,
+                targetHp,
+                maxHp,
+                reason ? reason : "unknown");
+            return true;
+        }
+
+        bool RestoreTeammateHealthUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || !IsValidTeammate(actor)) {
+                spdlog::warn("[TFD][TeammateManager] restore teammate health rejected actor={:08X} reason={} detail=not_valid_teammate",
+                    actor ? actor->GetFormID() : 0u,
+                    reason ? reason : "unknown");
+                return false;
+            }
+            return RestoreActorHealthDirect(actor, kTeammateHealTargetPct, kTeammateHealMinAbsHp, reason ? reason : "teammate_restore_health");
+        }
+
+        void EnsureContractForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player() || actor->IsDead() || actor->IsDisabled()) {
+                return;
+            }
+            if (!IsTFDConvertedTeammate(actor)) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                return;
+            }
+
+            const double nowDays = CurrentGameDays();
+            auto it = g_contractEndDays.find(actorId);
+            if (it != g_contractEndDays.end() && it->second > nowDays) {
+                return;
+            }
+
+            const double endDays = nowDays + kHumanoidContractDays;
+            g_contractEndDays[actorId] = endDays;
+            spdlog::info("[TFD][TeammateManager] contract set actor={:08X} days=1.00 endDay={:.4f} reason={}",
+                actorId,
+                endDays,
+                reason ? reason : "unknown");
+        }
+
+        bool ExtendContractForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || !IsValidTeammate(actor)) {
+                spdlog::warn("[TFD][TeammateManager] contract extend rejected actor={:08X} reason={} detail=not_valid_teammate",
+                    actor ? actor->GetFormID() : 0u,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            const double nowDays = CurrentGameDays();
+            const auto actorId = actor->GetFormID();
+            const auto found = g_contractEndDays.find(actorId);
+            const double oldEnd = found != g_contractEndDays.end() ? found->second : nowDays;
+            const double base = std::max(nowDays, oldEnd);
+            const double newEnd = base + kHumanoidContractDays;
+            g_contractEndDays[actorId] = newEnd;
+            spdlog::info("[TFD][TeammateManager] contract extended actor={:08X} oldEndDay={:.4f} newEndDay={:.4f} reason={}",
+                actorId,
+                oldEnd,
+                newEnd,
+                reason ? reason : "unknown");
+            return true;
+        }
+
+        void RemoveContractForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return;
+            }
+            g_contractEndDays.erase(actor->GetFormID());
+            spdlog::info("[TFD][TeammateManager] contract cleared actor={:08X} reason={}",
+                actor->GetFormID(),
+                reason ? reason : "unknown");
+        }
+
+        bool ClearAliasForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            ResolveRegistry();
+            if (!actor || !g_registry.quest) {
+                return false;
+            }
+
+            bool cleared = false;
+            for (auto* alias : g_registry.teammateAliases) {
+                if (!alias) {
+                    continue;
+                }
+                auto* current = alias->GetActorReference();
+                if (!current || current->GetFormID() != actor->GetFormID()) {
+                    continue;
+                }
+                WriteAlias(alias, nullptr);
+                cleared = true;
+                spdlog::info("[TFD][TeammateManager] clear teammate alias alias='{}' actor={:08X} reason={}",
+                    alias->aliasName.c_str(),
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+            }
+            return cleared;
+        }
+
+        bool ReleaseHumanoidTeammateContractUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player()) {
+                return false;
+            }
+
+            ResolveRegistry();
+            RemoveContractForActorUnsafe(actor, reason ? reason : "release_contract");
+            ClearAliasForActorUnsafe(actor, reason ? reason : "release_contract");
+            ForgetConvertedTeammate(actor, reason ? reason : "release_contract");
+
+            if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
+                actor->RemoveFromFaction(g_registry.teammateFaction);
+            }
+            if (g_registry.truceTeammateFaction && actor->IsInFaction(g_registry.truceTeammateFaction)) {
+                actor->RemoveFromFaction(g_registry.truceTeammateFaction);
+            }
+
+            if (!actor->IsDead() && !actor->IsDisabled()) {
+                if (actor->IsInCombat()) {
+                    actor->StopCombat();
+                }
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                }
+                if (actor->IsWeaponDrawn()) {
+                    actor->DrawWeaponMagicHands(false);
+                }
+                // CommonLibSSE-NG SE 1.5.97 does not expose Actor::SetPlayerTeammate().
+                // Papyrus clears the engine teammate flag through Actor.SetPlayerTeammate(False, False).
+                // Native owns alias/faction/contract cleanup only.
+                if (actor->Is3DLoaded()) {
+                    actor->EvaluatePackage();
+                }
+            }
+
+            RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "release_contract");
+            spdlog::info("[TFD][TeammateManager] humanoid contract terminated actor={:08X} reason={}",
+                actor->GetFormID(),
+                reason ? reason : "unknown");
+            return true;
+        }
+
         void RefreshRecruitCapacityGlobalsUnsafe(const char* reason)
         {
             ResolveRegistry();
+            RefreshPotionGlobalUnsafe(reason ? reason : "recruit_capacity_refresh");
 
             std::vector<RE::Actor*> registeredStateActors;
             registeredStateActors.reserve(g_registry.teammateAliases.size());
@@ -1243,6 +1569,7 @@ namespace
                         ResetInvalidAliasStrike(actor);
                     }
                     SyncTeammateFaction(actor, true);
+                    EnsureContractForActorUnsafe(actor, reason ? reason : "register_now_refresh");
                     QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
                     if (actor->Is3DLoaded()) {
                         actor->EvaluatePackage();
@@ -1299,6 +1626,7 @@ namespace
                 ResetInvalidAliasStrike(actor);
             }
             SyncTeammateFaction(actor, true);
+            EnsureContractForActorUnsafe(actor, reason ? reason : "register_now_assign");
             QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_assign");
             if (actor->Is3DLoaded()) {
                 actor->EvaluatePackage();
@@ -1369,6 +1697,7 @@ namespace
                 }
 
                 SyncTeammateFaction(current, true);
+                EnsureContractForActorUnsafe(current, "sync_alias_valid");
                 remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](RE::Actor* actor) {
                     return actor == current || (actor && current && actor->GetFormID() == current->GetFormID());
                     }), remaining.end());
@@ -1393,6 +1722,7 @@ namespace
                     ResetInvalidAliasStrike(actor);
                 }
                 SyncTeammateFaction(actor, true);
+                EnsureContractForActorUnsafe(actor, "sync_fill_alias");
                 spdlog::info("[TFD][TeammateManager] fill alias='{}' actor={:08X} name='{}'",
                     alias->aliasName.c_str(),
                     actor ? actor->GetFormID() : 0u,
@@ -1431,6 +1761,12 @@ namespace TFD::TeammateManager::BridgeInternal
 {
     constexpr const char* kDefeatedHumanoidRecruitEvent = "TFDDefeatedHumanoidRecruit";
     constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
+    constexpr const char* kTeammateGreetStartedEvent = "TFDTeammateGreetStarted";
+    constexpr const char* kTeammateExtendContractGoldEvent = "TFDTeammateExtendContractGold";
+    constexpr const char* kTeammateExtendContractPleasureEvent = "TFDTeammateExtendContractPleasure";
+    constexpr const char* kTeammateRestoreHealthPotionEvent = "TFDTeammateRestoreHealthPotion";
+    constexpr const char* kTeammateRestoreHealthPleasureEvent = "TFDTeammateRestoreHealthPleasure";
+    constexpr const char* kTeammateTerminateContractEvent = "TFDTeammateTerminateContract";
     constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 
     inline RuntimeProviders g_runtimeProviders{};
@@ -1444,16 +1780,73 @@ namespace TFD::TeammateManager::BridgeInternal
                 return RE::BSEventNotifyControl::kContinue;
             }
             std::string_view name(ev->eventName);
-            if (name.empty() || name != kDefeatedHumanoidRecruitEvent) {
+            if (name.empty()) {
                 return RE::BSEventNotifyControl::kContinue;
             }
-            auto* actor = g_runtimeProviders.resolvePendingDefeatedDialogueTarget ? g_runtimeProviders.resolvePendingDefeatedDialogueTarget() : nullptr;
-            if (!actor) {
-                spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit event ignored reason=no_pending_target");
+
+            auto* senderActor = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
+
+            if (name == kDefeatedHumanoidRecruitEvent) {
+                auto* pendingActor = g_runtimeProviders.resolvePendingDefeatedDialogueTarget ? g_runtimeProviders.resolvePendingDefeatedDialogueTarget() : nullptr;
+                auto* actor = senderActor ? senderActor : pendingActor;
+                if (!actor) {
+                    spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit event ignored reason=no_sender_or_pending_target");
+                    return RE::BSEventNotifyControl::kContinue;
+                }
+                if (senderActor && pendingActor && senderActor->GetFormID() != pendingActor->GetFormID()) {
+                    spdlog::warn(
+                        "[TFD][TeammateManager] defeated humanoid recruit event target mismatch sender={:08X} pending={:08X} action=use_sender",
+                        senderActor->GetFormID(),
+                        pendingActor->GetFormID());
+                }
+                const bool ok = TFD::TeammateManager::RecruitDefeatedHumanoidAsTeammate(actor);
+                spdlog::info("[TFD][TeammateManager] defeated humanoid recruit event actor={:08X} sender={:08X} pending={:08X} ok={}",
+                    actor->GetFormID(),
+                    senderActor ? senderActor->GetFormID() : 0u,
+                    pendingActor ? pendingActor->GetFormID() : 0u,
+                    ok ? 1 : 0);
                 return RE::BSEventNotifyControl::kContinue;
             }
-            const bool ok = TFD::TeammateManager::RecruitDefeatedHumanoidAsTeammate(actor);
-            spdlog::info("[TFD][TeammateManager] defeated humanoid recruit event actor={} ok={}", static_cast<std::uint32_t>(actor->GetFormID()), ok ? 1 : 0);
+
+            if (!senderActor) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
+            if (name == kTeammateGreetStartedEvent) {
+                AliasInternal::EnsureContractForActorUnsafe(senderActor, "teammate_greet_started");
+                AliasInternal::RefreshRecruitCapacityGlobalsUnsafe("teammate_greet_started");
+                (void)TFD::PayModel::PublishSharedGold(senderActor, TFD::PayModel::PayContext::TeammateContract, "teammate_greet_started");
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateExtendContractGoldEvent) {
+                const bool ok = AliasInternal::ExtendContractForActorUnsafe(senderActor, "extend_contract_gold");
+                spdlog::info("[TFD][TeammateManager] contract extend gold actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateExtendContractPleasureEvent) {
+                const bool ok = AliasInternal::ExtendContractForActorUnsafe(senderActor, "extend_contract_pleasure");
+                spdlog::info("[TFD][TeammateManager] contract extend pleasure actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateRestoreHealthPotionEvent) {
+                bool ok = false;
+                if (AliasInternal::ConsumeHealthPotionFromPlayerUnsafe("teammate_restore_health_potion")) {
+                    ok = AliasInternal::RestoreTeammateHealthUnsafe(senderActor, "teammate_restore_health_potion");
+                }
+                spdlog::info("[TFD][TeammateManager] teammate restore health potion actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateRestoreHealthPleasureEvent) {
+                const bool ok = AliasInternal::RestoreTeammateHealthUnsafe(senderActor, "teammate_restore_health_pleasure");
+                spdlog::info("[TFD][TeammateManager] teammate restore health pleasure actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateTerminateContractEvent) {
+                const bool ok = AliasInternal::ReleaseHumanoidTeammateContractUnsafe(senderActor, "terminate_contract");
+                spdlog::info("[TFD][TeammateManager] teammate terminate contract actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+
             return RE::BSEventNotifyControl::kContinue;
         }
     };
@@ -1778,6 +2171,13 @@ namespace TFD::TeammateManager
                 actor->GetFormID());
             return false;
         }
+        if (!AliasInternal::HasHealthPotionAvailableUnsafe()) {
+            AliasInternal::RefreshPotionGlobalUnsafe("defeated_humanoid_recruit_no_potion");
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=no_health_potion",
+                actor->GetFormID());
+            return false;
+        }
 
         // Victory recruit starts from a defeated hostile actor, so it is not yet
         // recruit-like when the player chooses the topic. Mark it pending before
@@ -1835,10 +2235,18 @@ namespace TFD::TeammateManager
                 actor->GetFormID());
             return false;
         }
-
-        if (!TFD::FlowController::QueueBridgeModEvent(BridgeInternal::kHumanoidTeammateAssignEvent, actor)) {
-            spdlog::warn("[TFD][TeammateManager] defeated humanoid recruit bridge dispatch failed actor={:08X}", actor->GetFormID());
+        if (!AliasInternal::ConsumeHealthPotionFromPlayerUnsafe("defeated_humanoid_recruit")) {
+            AliasInternal::ReleaseHumanoidTeammateContractUnsafe(actor, "defeated_humanoid_recruit_potion_consume_failed");
+            spdlog::warn(
+                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=potion_consume_failed_after_alias",
+                actor->GetFormID());
+            return false;
         }
+        AliasInternal::EnsureContractForActorUnsafe(actor, "defeated_humanoid_recruit");
+
+        // RegisterOrRefreshTeammateNow() already queues TFDHumanoidTeammateAssign
+        // with strArg="defeated_humanoid_recruit".
+        // Do not queue a second blank bridge event here.
         if (actor->IsInCombat()) {
             actor->StopCombat();
         }
@@ -1853,6 +2261,37 @@ namespace TFD::TeammateManager
         spdlog::info("[TFD][TeammateManager] defeated humanoid recruit actor={:08X} aliasOk=1", actor->GetFormID());
         return true;
     }
+    bool ExtendHumanoidTeammateContract(RE::Actor* actor, const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        return AliasInternal::ExtendContractForActorUnsafe(actor, reason ? reason : "native_extend_contract");
+    }
+
+    bool RestoreHumanoidTeammateHealthWithPotion(RE::Actor* actor)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        if (!AliasInternal::ConsumeHealthPotionFromPlayerUnsafe("native_restore_teammate_potion")) {
+            return false;
+        }
+        return AliasInternal::RestoreTeammateHealthUnsafe(actor, "native_restore_teammate_potion");
+    }
+
+    bool RestoreHumanoidTeammateHealthWithPleasure(RE::Actor* actor)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        return AliasInternal::RestoreTeammateHealthUnsafe(actor, "native_restore_teammate_pleasure");
+    }
+
+    bool TerminateHumanoidTeammateContract(RE::Actor* actor)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        return AliasInternal::ReleaseHumanoidTeammateContractUnsafe(actor, "native_terminate_contract");
+    }
+
     bool IsCreatureCompanion(RE::Actor* actor)
     {
         return TFD::Tame::IsCompanion(actor);

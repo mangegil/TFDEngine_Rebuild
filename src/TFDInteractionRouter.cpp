@@ -1188,16 +1188,12 @@ namespace TFD::InteractionRouter
 
         RE::Actor* best = nullptr;
         float bestScore = -1.0e30f;
-        std::uint32_t scanned = 0;
-        std::uint32_t validState = 0;
-        std::uint32_t frontRejected = 0;
 
         for (const auto& info : snapshot.actors) {
             auto* actor = info.get();
             if (!actor) {
                 continue;
             }
-            ++scanned;
             if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
                 continue;
             }
@@ -1210,23 +1206,13 @@ namespace TFD::InteractionRouter
             if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
                 continue;
             }
-            ++validState;
 
             const float frontDot = GetActorFrontDot2D(actor, player);
-            const bool pointedEnough = frontDot >= 0.35f;
-            const bool veryClose = info.dist <= 180.0f && frontDot >= 0.05f;
-            if (!pointedEnough && !veryClose) {
-                ++frontRejected;
+            if (frontDot < 0.75f) {
                 continue;
             }
 
             float score = (frontDot * 100000.0f) - info.dist;
-            if (info.dist <= 160.0f) {
-                score += 6000.0f;
-            }
-            else if (info.dist <= 260.0f) {
-                score += 3000.0f;
-            }
             if (frontDot >= 0.96f) {
                 score += 4000.0f;
             }
@@ -1240,21 +1226,76 @@ namespace TFD::InteractionRouter
             }
         }
 
-        if (best) {
-            spdlog::info(
-                "[TFD][Router] defeated dialogue target picked actor={:08X} radius={:.1f} scanned={} validState={} frontRejected={}",
-                best->GetFormID(),
-                radius,
-                scanned,
-                validState,
-                frontRejected);
+        return best;
+    }
+
+    RE::Actor* PickExactTeammateDialogueTarget(float radius)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return nullptr;
         }
-        else {
-            spdlog::info(
-                "[TFD][Router] defeated dialogue target miss radius={:.1f} scanned={} validState={} frontRejected={}",
-                radius,
+
+        const float maxRadius = radius > 0.0f ? radius : 512.0f;
+        RE::Actor* best = nullptr;
+        float bestScore = -1.0e30f;
+        int scanned = 0;
+        int teammateRejected = 0;
+        int frontRejected = 0;
+
+        for (auto* actor : TFD::TeammateManager::CollectKnownTeammates(maxRadius)) {
+            ++scanned;
+            if (!actor || actor == player) {
+                continue;
+            }
+            if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                continue;
+            }
+            if (actor->GetParentCell() != player->GetParentCell()) {
+                continue;
+            }
+            if (!TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+                ++teammateRejected;
+                continue;
+            }
+
+            const float dist = GetDistance(actor, player);
+            if (dist > maxRadius) {
+                continue;
+            }
+
+            const float frontDot = GetActorFrontDot2D(actor, player);
+            if (frontDot < 0.35f) {
+                ++frontRejected;
+                continue;
+            }
+
+            float score = (frontDot * 100000.0f) - dist;
+            if (actor->IsPlayerTeammate()) {
+                score += 5000.0f;
+            }
+            if (frontDot >= 0.90f) {
+                score += 2500.0f;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = actor;
+            }
+        }
+
+        if (best) {
+            spdlog::info("[TFD][Router] teammate dialogue target picked actor={:08X} radius={:.1f} scanned={} playerTeammate={} activeFollower=1",
+                best->GetFormID(),
+                maxRadius,
                 scanned,
-                validState,
+                best->IsPlayerTeammate() ? 1 : 0);
+        }
+        else if (scanned > 0) {
+            spdlog::info("[TFD][Router] teammate dialogue target miss radius={:.1f} scanned={} teammateRejected={} frontRejected={}",
+                maxRadius,
+                scanned,
+                teammateRejected,
                 frontRejected);
         }
 

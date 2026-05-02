@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
@@ -213,6 +214,78 @@ namespace TFD::PostDefeatState
             const bool hasRecoveryFactor = TFD::Transition::HasRecoveryPotionAvailable();
             return (hasRescueFactor || hasRecoveryFactor) ? 0 : 1;
         }
+
+        static constexpr int kVictoryStateNeutral = 0;
+        static constexpr int kVictoryStateYes = 2;
+        static constexpr int kVictoryRecruitGlobalRefreshIntervalMs = 1000;
+        static constexpr int kStaleVictoryNeutralConfirmTicks = 2;
+
+        int g_lastObservedVictoryStateForRecruitGlobals = -1;
+        std::chrono::steady_clock::time_point g_nextVictoryRecruitGlobalRefresh{};
+        int g_staleVictoryNeutralTicks = 0;
+
+        bool IsDialogueMenuOpen()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+        }
+
+        void RefreshRecruitGlobalsWhenVictoryReady(int victoryState)
+        {
+            if (victoryState != kVictoryStateYes) {
+                g_lastObservedVictoryStateForRecruitGlobals = victoryState;
+                g_nextVictoryRecruitGlobalRefresh = {};
+                return;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            const bool enteredVictoryReady = g_lastObservedVictoryStateForRecruitGlobals != kVictoryStateYes;
+            const bool refreshDue =
+                g_nextVictoryRecruitGlobalRefresh == std::chrono::steady_clock::time_point{} ||
+                now >= g_nextVictoryRecruitGlobalRefresh;
+
+            if (enteredVictoryReady || refreshDue) {
+                TFD::TeammateManager::RefreshRecruitCapacityGlobals(
+                    enteredVictoryReady ? "victory_state_ready_enter" : "victory_state_ready_hold");
+                g_nextVictoryRecruitGlobalRefresh = now + std::chrono::milliseconds(kVictoryRecruitGlobalRefreshIntervalMs);
+            }
+
+            g_lastObservedVictoryStateForRecruitGlobals = victoryState;
+        }
+
+        void ClearStaleVictoryFlowWhenNeutral(int victoryState, const RefreshInput& input)
+        {
+            (void)input;
+
+            if (victoryState != kVictoryStateNeutral) {
+                g_staleVictoryNeutralTicks = 0;
+                return;
+            }
+
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto snapshot = flow.GetSnapshot();
+            if (snapshot.root != TFD::FlowController::RootFlow::Victory) {
+                g_staleVictoryNeutralTicks = 0;
+                return;
+            }
+
+            if (snapshot.terminalResolved || IsDialogueMenuOpen()) {
+                g_staleVictoryNeutralTicks = 0;
+                return;
+            }
+
+            ++g_staleVictoryNeutralTicks;
+            if (g_staleVictoryNeutralTicks < kStaleVictoryNeutralConfirmTicks) {
+                return;
+            }
+
+            spdlog::info(
+                "[TFD][PostDefeatState] clearing stale Victory flow root because VictoryState is neutral primary={:08X} token={} reason=victory_state_neutral",
+                snapshot.primaryActorFormID,
+                snapshot.token);
+            flow.ResetRuntime("victory_state_neutral_stale_root_clear");
+            g_staleVictoryNeutralTicks = 0;
+        }
     }
 
     RefreshResult Refresh(const RefreshInput& input)
@@ -235,6 +308,8 @@ namespace TFD::PostDefeatState
             SetGlobalInt(g_defeatStateGlobal, 0);
             TFD::Victory::ResetObservedContext();
             TFD::Victory::SetStateValue(0);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
+            g_staleVictoryNeutralTicks = 0;
             SetGlobalInt(g_hostileStateGlobal, 0);
             SetGlobalInt(g_enemyFactionStateGlobal, 0);
             SetGlobalInt(g_enemyRaceStateGlobal, 0);
@@ -249,7 +324,10 @@ namespace TFD::PostDefeatState
             .playerDown = ComputePlayerBleedOutState(input.player),
             .combatContext = input.victoryContext,
             .hasEnemies = !input.enemies.empty()
-        });
+            });
+        const int victoryState = TFD::Victory::GetStateValue();
+        RefreshRecruitGlobalsWhenVictoryReady(victoryState);
+        ClearStaleVictoryFlowWhenNeutral(victoryState, input);
         SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies));
         SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
         SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));
