@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cctype>
 #include <vector>
+#include <unordered_map>
 
 #include <spdlog/spdlog.h>
 
@@ -98,6 +99,11 @@ namespace TFDMenu
 		static bool gCaptureHotkey = false;
 		static Clock::time_point nextHotkey{};
 
+		static Clock::time_point gNextTeammateManualDialogueOpen{};
+		static std::unordered_map<RE::FormID, Clock::time_point> gTeammateManualDialogueCooldownUntil{};
+		constexpr double kTeammateManualGlobalCooldownSec = 2.50;
+		constexpr double kTeammateManualActorCooldownSec = 6.00;
+
 		static std::vector<TFD::Tame::ActiveSnapshot> gCreatureTeammateMenuRows{};
 		static double gCreatureTeammateMenuRefreshRealSec = 0.0;
 		static double gCreatureTeammateMenuRefreshGameDays = 0.0;
@@ -160,6 +166,153 @@ namespace TFDMenu
 			if (global && !logged) {
 				logged = true;
 				spdlog::info("[TFD][Menu] {} resolved {:08X}", editorId, global->GetFormID());
+			}
+		}
+
+		static void ResolveGlobals();
+		static int GetGlobalValueInt(RE::TESGlobal* g);
+
+		static RE::TESTopicInfo* ResolveTeammateGreetTopicInfo()
+		{
+			static RE::TESTopicInfo* info = nullptr;
+			static bool attempted = false;
+
+			if (!attempted) {
+				attempted = true;
+
+				// R47: Actor::SetDialogueWithPlayer expects a TESTopicInfo, not a TESTopic.
+				// This is the INFO record behind the CK fragment TFD_TIF__05195939
+				// under TFDDialogueTeammateGreet. Use plugin-local ID so runtime
+				// load order does not matter.
+				constexpr RE::FormID kTeammateGreetInfoLocalFormID = 0x00195939;
+				constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+				if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+					info = dataHandler->LookupForm<RE::TESTopicInfo>(kTeammateGreetInfoLocalFormID, kPluginName);
+				}
+
+				if (info) {
+					spdlog::info("[TFD][Menu] TFDDialogueTeammateGreet INFO resolved {:08X} local={:06X}",
+						info->GetFormID(),
+						kTeammateGreetInfoLocalFormID);
+				}
+				else {
+					spdlog::warn("[TFD][Menu] TFDDialogueTeammateGreet INFO {:06X} not found in {}; teammate hard dialogue will fall back to default topic selection",
+						kTeammateGreetInfoLocalFormID,
+						kPluginName);
+				}
+			}
+
+			return info;
+		}
+
+
+		static RE::TESObjectREFR* GetCrosshairTargetRef()
+		{
+			auto* pickData = RE::CrosshairPickData::GetSingleton();
+			if (!pickData) {
+				return nullptr;
+			}
+
+			// Prefer the actual activation target. If the crosshair is on a chest,
+			// door, container, harvestable, or other non-actor reference, TFD must
+			// not steal the E key just because a teammate stands near the player.
+			if (auto* ref = pickData->target.get().get()) {
+				return ref;
+			}
+
+			// Some actor picks are exposed through targetActor when target is empty.
+			if (auto* ref = pickData->targetActor.get().get()) {
+				return ref;
+			}
+
+			return nullptr;
+		}
+
+		static Clock::duration SecondsToClockDuration(double seconds)
+		{
+			return std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>((std::max)(0.0, seconds)));
+		}
+
+		static void PruneTeammateManualDialogueCooldowns(Clock::time_point now)
+		{
+			for (auto it = gTeammateManualDialogueCooldownUntil.begin(); it != gTeammateManualDialogueCooldownUntil.end();) {
+				if (now >= it->second) {
+					it = gTeammateManualDialogueCooldownUntil.erase(it);
+				}
+				else {
+					++it;
+				}
+			}
+		}
+
+		static bool IsTeammateManualDialogueBlocked(RE::Actor* actor, Clock::time_point now, const char*& outReason, double& outRemainingSec)
+		{
+			outReason = "none";
+			outRemainingSec = 0.0;
+
+			if (!actor) {
+				outReason = "no_actor";
+				return true;
+			}
+
+			ResolveGlobals();
+
+			if (TFD::PleasureRuntime::IsActive() || TFD::PleasureRuntime::IsBlocking()) {
+				outReason = TFD::PleasureRuntime::GetPhaseName();
+				return true;
+			}
+
+			if (TFD::FlowController::IsDialogueContextActive()) {
+				outReason = TFD::FlowController::GetDialogueContextName();
+				return true;
+			}
+
+			if (GetGlobalValueInt(gDialogueState) == 1) {
+				outReason = "dialogue_state_in";
+				return true;
+			}
+
+			if (GetGlobalValueInt(gPleasureState) != 0) {
+				outReason = "pleasure_state_active";
+				return true;
+			}
+
+			if (now < gNextTeammateManualDialogueOpen) {
+				outReason = "global_cooldown";
+				outRemainingSec = std::chrono::duration<double>(gNextTeammateManualDialogueOpen - now).count();
+				return true;
+			}
+
+			PruneTeammateManualDialogueCooldowns(now);
+
+			const auto formID = actor->GetFormID();
+			if (auto it = gTeammateManualDialogueCooldownUntil.find(formID); it != gTeammateManualDialogueCooldownUntil.end()) {
+				if (now < it->second) {
+					outReason = "actor_cooldown";
+					outRemainingSec = std::chrono::duration<double>(it->second - now).count();
+					return true;
+				}
+				gTeammateManualDialogueCooldownUntil.erase(it);
+			}
+
+			return false;
+		}
+
+		static void ArmTeammateManualDialogueCooldown(RE::Actor* actor, Clock::time_point now, const char* reason)
+		{
+			gNextTeammateManualDialogueOpen = now + SecondsToClockDuration(kTeammateManualGlobalCooldownSec);
+
+			if (actor) {
+				const auto actorUntil = now + SecondsToClockDuration(kTeammateManualActorCooldownSec);
+				gTeammateManualDialogueCooldownUntil.insert_or_assign(actor->GetFormID(), actorUntil);
+
+				spdlog::info(
+					"[TFD][Menu] teammate manual dialogue cooldown armed actor={:08X} global={:.2f}s actor={:.2f}s reason={}",
+					actor->GetFormID(),
+					kTeammateManualGlobalCooldownSec,
+					kTeammateManualActorCooldownSec,
+					reason ? reason : "unknown");
 			}
 		}
 
@@ -1798,15 +1951,95 @@ namespace TFDMenu
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
 							if (player && !TFD::Captive::IsStandardCaptiveActive()) {
-								if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(512.0f)) {
+								auto openTeammateDialogue = [&](RE::Actor* teammateTalkTarget, const char* sourceReason) -> bool {
+									if (!teammateTalkTarget) {
+										return false;
+									}
+
+									const auto teammateNow = Clock::now();
+									const char* blockReason = "none";
+									double blockRemainingSec = 0.0;
+									if (IsTeammateManualDialogueBlocked(teammateTalkTarget, teammateNow, blockReason, blockRemainingSec)) {
+										spdlog::info(
+											"[TFD][Menu] teammate manual dialogue blocked target={:08X} source={} reason={} remaining={:.2f}s pleasurePhase={} dialogueContext={} dialogueState={}",
+											teammateTalkTarget->GetFormID(),
+											sourceReason ? sourceReason : "unknown",
+											blockReason ? blockReason : "unknown",
+											blockRemainingSec,
+											TFD::PleasureRuntime::GetPhaseName(),
+											TFD::FlowController::GetDialogueContextName(),
+											GetGlobalValueInt(gDialogueState));
+										return true;
+									}
+
+									const bool refreshed = TFD::TeammateManager::RegisterOrRefreshTeammateNow(teammateTalkTarget, sourceReason ? sourceReason : "teammate_activate_dialogue");
+
+									if (!teammateTalkTarget->IsAIEnabled()) {
+										teammateTalkTarget->EnableAI(true);
+									}
+
+									auto combatTargetSp = teammateTalkTarget->GetActorRuntimeData().currentCombatTarget.get();
+									auto* combatTarget = combatTargetSp.get();
+									const bool combatTargetPlayerSide =
+										combatTarget == player ||
+										(combatTarget && (TFD::TeammateManager::IsActiveFollowerActor(combatTarget) || TFD::TeammateManager::IsPlayerSideTeammateActor(combatTarget)));
+									const bool shouldClearStaleCombat =
+										teammateTalkTarget->IsHostileToActor(player) ||
+										combatTargetPlayerSide ||
+										(teammateTalkTarget->IsInCombat() && !combatTarget);
+
+									if (shouldClearStaleCombat) {
+										teammateTalkTarget->StopCombat();
+										if (auto* process = RE::ProcessLists::GetSingleton()) {
+											process->StopCombatAndAlarmOnActor(teammateTalkTarget, false);
+										}
+										if (teammateTalkTarget->IsWeaponDrawn()) {
+											teammateTalkTarget->DrawWeaponMagicHands(false);
+										}
+									}
+
+									teammateTalkTarget->AllowPCDialogue(true);
+									teammateTalkTarget->EvaluatePackage(false, true);
+									teammateTalkTarget->EvaluatePackage(true, true);
+
+									auto* teammateGreetInfo = ResolveTeammateGreetTopicInfo();
+									teammateTalkTarget->SetDialogueWithPlayer(false, false, nullptr);
+									const bool opened = teammateTalkTarget->SetDialogueWithPlayer(true, true, teammateGreetInfo);
+
+									spdlog::info(
+										"[TFD][Menu] activate hard-open teammate dialogue target={:08X} opened={} refreshed={} source={} topicInfo={:08X} staleCombatClear={} playerTeammate={} activeFollower={} playerSide={}",
+										teammateTalkTarget->GetFormID(),
+										opened ? 1 : 0,
+										refreshed ? 1 : 0,
+										sourceReason ? sourceReason : "unknown",
+										teammateGreetInfo ? teammateGreetInfo->GetFormID() : 0u,
+										shouldClearStaleCombat ? 1 : 0,
+										teammateTalkTarget->IsPlayerTeammate() ? 1 : 0,
+										TFD::TeammateManager::IsActiveFollowerActor(teammateTalkTarget) ? 1 : 0,
+										TFD::TeammateManager::IsPlayerSideTeammateActor(teammateTalkTarget) ? 1 : 0);
+
+									if (opened) {
+										ArmTeammateManualDialogueCooldown(teammateTalkTarget, teammateNow, "hard_open_teammate_manual_dialogue");
+										return true;
+									}
+
+									return false;
+									};
+
+								auto openVictoryDialogue = [&](RE::Actor* defeatedTalkTarget, const char* sourceReason) -> bool {
+									if (!defeatedTalkTarget) {
+										return false;
+									}
+
 									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
 									TFD::Victory::SetStateValue(2);
 									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
 										defeatedTalkTarget->GetFormID(),
-										"victory_activate_dialogue");
-									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=2",
+										sourceReason ? sourceReason : "victory_activate_dialogue");
+									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=2 source={}",
 										defeatedTalkTarget->GetFormID(),
-										flowOk ? 1 : 0);
+										flowOk ? 1 : 0,
+										sourceReason ? sourceReason : "victory_activate_dialogue");
 
 									if (!defeatedTalkTarget->IsAIEnabled()) {
 										defeatedTalkTarget->EnableAI(true);
@@ -1819,18 +2052,65 @@ namespace TFDMenu
 									defeatedTalkTarget->EvaluatePackage(true, true);
 
 									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, false, nullptr);
-									spdlog::info("[TFD][Menu] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue", defeatedTalkTarget->GetFormID(), opened ? 1 : 0);
-									if (opened) {
-										return RE::BSEventNotifyControl::kStop;
+									spdlog::info("[TFD][Menu] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue source={}",
+										defeatedTalkTarget->GetFormID(),
+										opened ? 1 : 0,
+										sourceReason ? sourceReason : "victory_activate_dialogue");
+									return opened;
+									};
+
+								// R55: the normal teammate dialogue opener must be crosshair-exact.
+								// The R54 proximity scanner was too aggressive and could steal the E key
+								// from containers/chests when a teammate stood beside the player.
+								// If the crosshair has a non-actor activation target, never run TFD's
+								// teammate/Victory scans; let vanilla activation handle that target.
+								auto* crosshairRef = GetCrosshairTargetRef();
+								auto* crosshairActor = crosshairRef ? crosshairRef->As<RE::Actor>() : nullptr;
+
+								if (crosshairRef && !crosshairActor) {
+									spdlog::info("[TFD][Menu] activate skipped TFD dialogue: crosshair target is non-actor ref={:08X} action=allow_vanilla_activation",
+										crosshairRef->GetFormID());
+								}
+								else if (crosshairActor && crosshairActor != player) {
+									if (TFD::TeammateManager::IsActiveFollowerActor(crosshairActor) || TFD::TeammateManager::IsPlayerSideTeammateActor(crosshairActor)) {
+										if (openTeammateDialogue(crosshairActor, "teammate_crosshair_activate_dialogue")) {
+											return RE::BSEventNotifyControl::kStop;
+										}
+									}
+									else if (TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(crosshairActor)) {
+										if (openVictoryDialogue(crosshairActor, "victory_crosshair_activate_dialogue")) {
+											return RE::BSEventNotifyControl::kStop;
+										}
+									}
+									else {
+										spdlog::info("[TFD][Menu] activate crosshair actor not owned by TFD actor={:08X} action=allow_vanilla_activation",
+											crosshairActor->GetFormID());
 									}
 								}
 								else {
-									// Native must not open normal teammate dialogue by scanning nearby teammates.
-									// The input event does not carry the exact activated actor here, so the scan
-									// can open the wrong teammate and keep TFDSystemEventQuest's speaker alias stale.
-									// Let vanilla activation pick the clicked teammate. The Teammate root fragment
-									// will call BeginTeammateGreet(akSpeaker) with the real speaker.
-									spdlog::info("[TFD][Menu] activate defeated victory dialogue miss radius=512 action=allow_vanilla_teammate_dialogue");
+									// No crosshair target. Keep a conservative fallback for awkward downed
+									// bodies and defeated enemies, but do not proximity-open standing
+									// teammates anymore. Standing teammate dialogue requires direct crosshair.
+									if (auto* downedTeammateTalkTarget = TFD::InteractionRouter::PickExactDownedTeammateDialogueTarget(768.0f)) {
+										if (openTeammateDialogue(downedTeammateTalkTarget, "teammate_downed_fallback_activate_dialogue")) {
+											return RE::BSEventNotifyControl::kStop;
+										}
+									}
+
+									if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(512.0f)) {
+										if (TFD::TeammateManager::IsPlayerSideTeammateActor(defeatedTalkTarget)) {
+											spdlog::info("[TFD][Menu] activate redirected defeated target to teammate dialogue target={:08X} reason=player_side_teammate_fallback", defeatedTalkTarget->GetFormID());
+											if (openTeammateDialogue(defeatedTalkTarget, "teammate_defeated_redirect_dialogue")) {
+												return RE::BSEventNotifyControl::kStop;
+											}
+										}
+										else if (openVictoryDialogue(defeatedTalkTarget, "victory_fallback_activate_dialogue")) {
+											return RE::BSEventNotifyControl::kStop;
+										}
+									}
+									else {
+										spdlog::info("[TFD][Menu] activate TFD dialogue miss no_crosshair_target action=allow_vanilla_activation");
+									}
 								}
 							}
 						}

@@ -48,6 +48,7 @@ namespace TFD::TeammateManager
     void ResetRuntimeProviders();
 
     bool IsActiveFollowerActor(RE::Actor* actor);
+    bool IsPlayerSideTeammateActor(RE::Actor* actor);
     std::vector<RE::Actor*> CollectRegisteredTeammates();
     std::vector<RE::Actor*> CollectKnownTeammates(float radius);
     FollowerResolution ResolveFollowerCandidates(float radius);

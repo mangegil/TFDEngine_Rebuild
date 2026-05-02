@@ -115,6 +115,7 @@ namespace TFD::InteractionRouter
     FlowOwnedPrimaryResult HandleFlowOwnedPrimaryHotkey(RE::Actor* player, const TFD::FlowController::Snapshot& snapshot);
 
     RE::Actor* PickExactDialogueDefeatedTarget(float radius);
+    RE::Actor* PickExactDownedTeammateDialogueTarget(float radius);
     RE::Actor* PickExactTeammateDialogueTarget(float radius);
     RE::Actor* PickExactActiveTameTarget(float radius);
     RE::Actor* PickExactDefeatedCreatureTarget(float radius);

@@ -2022,9 +2022,9 @@ namespace TFD::Actor::Ops
 			if (IsDefeatedReentrySuppressedInternal(actor)) {
 				return false;
 			}
-			if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor)) {
-				return false;
-			}
+            if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+                return false;
+            }
 			if (TFD::Tame::IsCompanion(actor) || TFD::Tame::HasActiveSession(actor)) {
 				return false;
 			}

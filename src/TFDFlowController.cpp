@@ -895,6 +895,9 @@ void InstallRuntime()
             } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
                 (void)TFD::CaptiveGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
                 spdlog::info("[TFD][Flow] captive after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
+            } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Teammate)) {
+                TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
+                spdlog::info("[TFD][Flow] teammate after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
             } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::PreCombat)) {
                 if (flow.RequestBeginAfterPleasure(actor->GetFormID(), "after_pleasure_enter")) {
                     TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);

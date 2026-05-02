@@ -11,6 +11,7 @@
 #include "TFDTeammateManager.h"
 #include "TFDActor.h"
 #include "TFDBleedout.h"
+#include "TFDSettings.h"
 
 #include <spdlog/spdlog.h>
 #include <SKSE/SKSE.h>
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <mutex>
+#include <string_view>
 #include <limits>
 #include <unordered_map>
 
@@ -1177,6 +1179,29 @@ namespace TFD::InteractionRouter
         return static_cast<int>(std::lround(g_interactionStateGlobal->value));
     }
 
+
+    bool IsActorBleedingOutLite(RE::Actor* actor)
+    {
+        auto* state = actor ? actor->AsActorState() : nullptr;
+        return state && state->IsBleedingOut();
+    }
+
+    bool IsDownedTeammateDialogueCandidate(RE::Actor* actor)
+    {
+        if (!actor || actor == RE::PlayerCharacter::GetSingleton() || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+            return false;
+        }
+        if (!TFD::TeammateManager::IsPlayerSideTeammateActor(actor) && !TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+            return false;
+        }
+
+        if (IsActorBleedingOutLite(actor)) {
+            return true;
+        }
+
+        return TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct());
+    }
+
     RE::Actor* PickExactDialogueDefeatedTarget(float radius)
     {
         auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1203,6 +1228,9 @@ namespace TFD::InteractionRouter
             if (actor->GetParentCell() != player->GetParentCell()) {
                 continue;
             }
+            if (TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+                continue;
+            }
             if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
                 continue;
             }
@@ -1224,6 +1252,124 @@ namespace TFD::InteractionRouter
                 bestScore = score;
                 best = actor;
             }
+        }
+
+        return best;
+    }
+
+    RE::Actor* PickExactDownedTeammateDialogueTarget(float radius)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return nullptr;
+        }
+
+        const float maxRadius = radius > 0.0f ? radius : 1024.0f;
+        RE::Actor* best = nullptr;
+        float bestScore = -1.0e30f;
+        int scanned = 0;
+        int teammateRejected = 0;
+        int downRejected = 0;
+        int frontRejected = 0;
+
+        std::unordered_set<RE::FormID> seen;
+
+        auto consider = [&](RE::Actor* actor, bool knownTeammateSource) {
+            if (!actor || actor == player) {
+                return;
+            }
+            if (!seen.insert(actor->GetFormID()).second) {
+                return;
+            }
+
+            ++scanned;
+
+            if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                return;
+            }
+            if (actor->GetParentCell() != player->GetParentCell()) {
+                return;
+            }
+
+            const float dist = GetDistance(actor, player);
+            if (dist > maxRadius) {
+                return;
+            }
+
+            const bool teammateLike =
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::TeammateManager::IsPlayerSideTeammateActor(actor);
+            if (!teammateLike) {
+                ++teammateRejected;
+                return;
+            }
+
+            if (!IsDownedTeammateDialogueCandidate(actor)) {
+                ++downRejected;
+                return;
+            }
+
+            const float frontDot = GetActorFrontDot2D(actor, player);
+            if (frontDot < 0.10f && dist > 240.0f) {
+                ++frontRejected;
+                return;
+            }
+
+            float score = (frontDot * 100000.0f) - dist;
+            if (knownTeammateSource) {
+                score += 6000.0f;
+            }
+            if (actor->IsPlayerTeammate()) {
+                score += 5000.0f;
+            }
+            if (TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+                score += 3000.0f;
+            }
+            if (IsActorBleedingOutLite(actor)) {
+                score += 3000.0f;
+            }
+            if (dist <= 240.0f) {
+                score += 2000.0f;
+            }
+
+            if (score > bestScore) {
+                bestScore = score;
+                best = actor;
+            }
+        };
+
+        for (auto* actor : TFD::TeammateManager::CollectKnownTeammates(maxRadius)) {
+            consider(actor, true);
+        }
+
+        const auto snapshot = TFD::Actor::BuildSnapshot(maxRadius, false);
+        for (const auto& info : snapshot.actors) {
+            auto* actor = info.get();
+            if (!actor) {
+                continue;
+            }
+            if (info.dist > maxRadius) {
+                continue;
+            }
+            consider(actor, false);
+        }
+
+        if (best) {
+            spdlog::info("[TFD][Router] downed teammate dialogue target picked actor={:08X} radius={:.1f} scanned={} playerTeammate={} activeFollower={} bleedingOut={}",
+                best->GetFormID(),
+                maxRadius,
+                scanned,
+                best->IsPlayerTeammate() ? 1 : 0,
+                TFD::TeammateManager::IsActiveFollowerActor(best) ? 1 : 0,
+                IsActorBleedingOutLite(best) ? 1 : 0);
+        }
+        else if (scanned > 0) {
+            spdlog::info("[TFD][Router] downed teammate dialogue target miss radius={:.1f} scanned={} teammateRejected={} downRejected={} frontRejected={}",
+                maxRadius,
+                scanned,
+                teammateRejected,
+                downRejected,
+                frontRejected);
         }
 
         return best;
@@ -1492,7 +1638,7 @@ namespace TFD::InteractionRouter
             constexpr auto kInCombatTimeout = std::chrono::milliseconds(12000);
             constexpr auto kPreCombatTimeout = std::chrono::milliseconds(12000);
             constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
-            constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(4500);
+            constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(12000);
             constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
             constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
@@ -1549,6 +1695,41 @@ namespace TFD::InteractionRouter
                 default:
                     return "None";
                 }
+            }
+
+            RE::TESTopicInfo* ResolveAfterPleasureGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // INFO record behind TFD_TIF__050986F0, the root response for
+                    // TFDDialogueAfterPleasureGreet. Use plugin-local ID so runtime
+                    // load order does not matter.
+                    constexpr RE::FormID kAfterPleasureGreetInfoLocalFormID = 0x000986F0;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kAfterPleasureGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen] TFDDialogueAfterPleasureGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kAfterPleasureGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen] TFDDialogueAfterPleasureGreet INFO {:06X} not found in {}; after-pleasure hard dialogue will fall back to default topic selection",
+                            kAfterPleasureGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
             }
 
             void ResolveDialogueStateGlobal()
@@ -2042,6 +2223,15 @@ namespace TFD::InteractionRouter
                         RefreshApproachPackage(player, speaker);
                     }
                 }
+                else if (mode == Mode::AfterPleasure) {
+                    if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                        PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                    }
+                    SetDialogueStateValue(1);
+                    spdlog::info(
+                        "[TFD][DialogueOpen] after pleasure native hard-open armed speaker={:08X} policy=force_topic_no_ai_package",
+                        speaker->GetFormID());
+                }
 
                 SyncDialogueStateLocked(IsDialogueOpen());
 
@@ -2294,16 +2484,23 @@ namespace TFD::InteractionRouter
                 return;
             }
 
+            const bool afterPleasureMode = g_pending.mode == Mode::AfterPleasure;
             const bool forceGreet =
                 g_pending.mode == Mode::PreCombatTruce ||
-                g_pending.mode == Mode::InCombatTruce;
+                g_pending.mode == Mode::InCombatTruce ||
+                afterPleasureMode;
+
+            RE::TESTopicInfo* topicInfo = nullptr;
+            if (afterPleasureMode) {
+                topicInfo = ResolveAfterPleasureGreetTopicInfo();
+            }
 
             if (forceGreet) {
                 PrepareSpeakerForNativeDialogueOpen(player, speaker);
                 SetDialogueStateValue(1);
             }
 
-            const bool ok = speaker->SetDialogueWithPlayer(true, forceGreet, nullptr);
+            const bool ok = speaker->SetDialogueWithPlayer(true, forceGreet, topicInfo);
             ++g_pending.attempts;
             const bool firstIssued = ok && !g_pending.requestIssued;
             g_pending.requestIssued = g_pending.requestIssued || ok;
@@ -2321,14 +2518,16 @@ namespace TFD::InteractionRouter
                 kPreCombatForceGreetMaxDistance :
                 (g_pending.mode == Mode::InCombatTruce ? kInCombatForceGreetMaxDistance : 0.0f);
             spdlog::info(
-                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f}",
+                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X}",
                 ModeName(g_pending.mode),
                 speaker->GetFormID(),
                 g_pending.attempts,
                 ok ? 1 : 0,
                 g_pending.requestIssued ? 1 : 0,
                 tryDist,
-                tryMaxDist);
+                tryMaxDist,
+                forceGreet ? 1 : 0,
+                topicInfo ? topicInfo->GetFormID() : 0u);
 
             if (firstIssued) {
                 spdlog::info(

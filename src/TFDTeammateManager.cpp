@@ -598,6 +598,26 @@ namespace
             return IsTFDConvertedTeammate(actor) || IsNaturalPlayerSideTeammate(actor);
         }
 
+        bool IsPlayerSideTeammateAnchor(RE::Actor* actor)
+        {
+            ResolveRegistry();
+            if (!actor || actor == Player() || actor->IsDisabled() || actor->IsDead()) {
+                return false;
+            }
+
+            if (IsTFDConvertedTeammate(actor)) {
+                return true;
+            }
+            if (actor->IsPlayerTeammate()) {
+                return true;
+            }
+            if (HasFollowerAnchorFaction(actor)) {
+                return true;
+            }
+
+            return false;
+        }
+
         bool IsCombatCapableTeammate(RE::Actor* actor)
         {
             if (!IsValidTeammate(actor)) {
@@ -1988,6 +2008,11 @@ namespace TFD::TeammateManager
     bool IsActiveFollowerActor(RE::Actor* actor)
     {
         return AliasInternal::IsValidTeammate(actor);
+    }
+
+    bool IsPlayerSideTeammateActor(RE::Actor* actor)
+    {
+        return AliasInternal::IsPlayerSideTeammateAnchor(actor);
     }
 
     std::vector<RE::Actor*> CollectRegisteredTeammates()

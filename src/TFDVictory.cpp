@@ -71,7 +71,7 @@ namespace TFD::Victory
             if (actor->GetParentCell() != player->GetParentCell()) {
                 return false;
             }
-            if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+            if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
                 return false;
             }
             if (TFD::Tame::IsCompanion(actor) || TFD::Tame::HasActiveSession(actor)) {

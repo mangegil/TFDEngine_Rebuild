@@ -2056,6 +2056,19 @@ namespace TFD::DefeatMonitor
 				if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
 					continue;
 				}
+
+				// R54: player-side teammates/followers must never fall through the generic
+				// defeated-enemy path. If a converted teammate is downed, keep it as Ally
+				// bleed lock so manual recovery dialogue can win over Victory activation.
+				if (TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+					const float threshold = TFD::Settings::GetAllyDownedThresholdPct();
+					const bool followerThreat = playerSideThreat || (actor && actor->IsInCombat());
+					if (ShouldEnterBleedLock(actor, threshold, followerThreat)) {
+						EnterBleedLock(actor, BleedLockKind::Ally, threshold, "threshold_scan_follower_loose");
+					}
+					continue;
+				}
+
 				if (IsActiveFollowerActor(actor)) {
 					continue;
 				}

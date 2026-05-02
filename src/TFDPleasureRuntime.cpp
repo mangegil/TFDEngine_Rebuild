@@ -51,6 +51,8 @@ namespace TFD::PleasureRuntime
 			std::uint32_t queuedTerminalNeutralActorFormID{ 0 };
 			std::uint32_t queuedTerminalNeutralCycleId{ 0 };
 			double queuedTerminalNeutralDueSec{ 0.0 };
+
+			double afterPleasureDialogueExpireSec{ 0.0 };
 		};
 
 		std::mutex g_lock;
@@ -75,12 +77,16 @@ namespace TFD::PleasureRuntime
 		constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
 		constexpr const char* kAfterPleasureChoiceWorkEvent = "TFDAfterPleasureChoiceWork";
 		constexpr const char* kAfterPleasureChoiceKidnapEvent = "TFDAfterPleasureChoiceKidnap";
+		constexpr const char* kPleasureClearEvent = "TFDPleasureClear";
+		constexpr const char* kSystemEventClearAfterPleasureEvent = "TFDSystemEventClearAfterPleasure";
 
 		constexpr double kPreCombatCycleInitialDelaySec = 1.75;
 		constexpr double kPreCombatCycleRetryDelaySec = 0.65;
 		constexpr double kPreCombatCycleExpireSec = 8.0;
 		constexpr unsigned kPreCombatCycleMaxAttempts = 12;
 		constexpr double kTerminalNeutralFinalizeDelaySec = 0.05;
+		constexpr double kAfterPleasureDialogueHardTimeoutSec = 20.0;
+		constexpr double kSuppressSceneStartDialogueCooldownSec = 0.75;
 
 		const char* ToString(Phase value)
 		{
@@ -125,6 +131,24 @@ namespace TFD::PleasureRuntime
 				return "Teammate";
 			default:
 				return "Unknown";
+			}
+		}
+
+		SourceContext SourceFromFlowValue(int sourceFlow, SourceContext fallback)
+		{
+			switch (sourceFlow) {
+			case static_cast<int>(SourceContext::PreCombat):
+				return SourceContext::PreCombat;
+			case static_cast<int>(SourceContext::Bleedout):
+				return SourceContext::Bleedout;
+			case static_cast<int>(SourceContext::Captive):
+				return SourceContext::Captive;
+			case static_cast<int>(SourceContext::Victory):
+				return SourceContext::Victory;
+			case static_cast<int>(SourceContext::Teammate):
+				return SourceContext::Teammate;
+			default:
+				return fallback;
 			}
 		}
 
@@ -178,6 +202,14 @@ namespace TFD::PleasureRuntime
 		{
 			std::uint32_t actorFormID{ 0 };
 			std::uint32_t cycleId{ 0 };
+			bool valid{ false };
+		};
+
+		struct QueuedAfterPleasureDialogueTimeout
+		{
+			std::uint32_t actorFormID{ 0 };
+			std::uint32_t cycleId{ 0 };
+			SourceContext source{ SourceContext::None };
 			bool valid{ false };
 		};
 
@@ -252,6 +284,7 @@ namespace TFD::PleasureRuntime
 			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
 			g_state.bridgeState = 0;
 			g_state.afterPleasureCommitted = false;
+			g_state.afterPleasureDialogueExpireSec = 0.0;
 		}
 
 		void ClearHoldStateLocked()
@@ -515,6 +548,35 @@ namespace TFD::PleasureRuntime
 				detail.empty() ? std::string{ "-" } : std::string{ detail });
 		}
 
+		void SuppressActorDialogueForSceneLocked(RE::Actor* actor, std::string_view reason, double cooldownSec = kSuppressSceneStartDialogueCooldownSec)
+		{
+			if (!actor) {
+				return;
+			}
+
+			const std::string reasonText = reason.empty() ? "pleasure_scene_dialogue_suppress" : std::string{ reason };
+
+			// Keep PC dialogue disabled after a teammate-driven pleasure transition.
+			// Manual teammate interaction explicitly re-enables it in MenuFramework before
+			// hard-opening the root topic, while stale engine forcegreet requests do not.
+			// This prevents the delayed teammate dialogue reopen caused by the manual
+			// SetDialogueWithPlayer(..., forceGreet=true, teammateInfo) path.
+			actor->SetDialogueWithPlayer(false, false, nullptr);
+			actor->AllowPCDialogue(false);
+			TFD::InteractionRouter::DialogueOpen::ArmTemporaryDialogueCooldown(
+				actor,
+				cooldownSec,
+				reasonText.c_str());
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] suppress actor dialogue actor={:08X} cooldown={:.2f}s phase={} cycle={} reason={}",
+				actor->GetFormID(),
+				cooldownSec,
+				ToString(g_state.phase),
+				g_state.sessionCycleId,
+				reasonText);
+		}
+
 		void HandleAfterPleasureLoopNoiseLocked(const EventInfo& info, std::string_view reason)
 		{
 			spdlog::info(
@@ -737,6 +799,42 @@ namespace TFD::PleasureRuntime
 			return finalize;
 		}
 
+		QueuedAfterPleasureDialogueTimeout TakeDueAfterPleasureDialogueTimeoutLocked(double nowSec)
+		{
+			QueuedAfterPleasureDialogueTimeout timeout{};
+			if (g_state.phase != Phase::AfterPleasureDialogue || g_state.afterPleasureDialogueExpireSec <= 0.0) {
+				return timeout;
+			}
+
+			if (nowSec < g_state.afterPleasureDialogueExpireSec) {
+				return timeout;
+			}
+
+			timeout.actorFormID = g_state.afterPleasureSpeakerFormID ? g_state.afterPleasureSpeakerFormID : g_state.pleasureSpeakerFormID;
+			timeout.cycleId = g_state.sessionCycleId;
+			timeout.source = g_state.source;
+			timeout.valid = true;
+
+			const auto oldPhase = g_state.phase;
+			g_state.afterPleasureDialogueExpireSec = 0.0;
+			g_state.redoPending = false;
+			g_state.pendingChoice = AfterChoice::None;
+			AdvancePhaseLocked(Phase::Finalizing, "after_pleasure_dialogue_timeout");
+			AdvancePhaseLocked(Phase::Closed, "after_pleasure_dialogue_timeout");
+			ClearBridgeStateLocked();
+			ClearHoldStateLocked();
+
+			spdlog::warn(
+				"[TFD][PleasureRuntime] after pleasure dialogue timeout actor={:08X} cycle={} source={} oldPhase={} timeout={:.2f}s reason=no_terminal_choice",
+				timeout.actorFormID,
+				timeout.cycleId,
+				ToString(timeout.source),
+				ToString(oldPhase),
+				kAfterPleasureDialogueHardTimeoutSec);
+
+			return timeout;
+		}
+
 		void MarkTerminalNeutralFinalizedLocked(const QueuedTerminalNeutralFinalize& finalize, bool completeFlow, std::string_view reason)
 		{
 			if (!finalize.valid) {
@@ -905,9 +1003,15 @@ namespace TFD::PleasureRuntime
 		{
 			if (eventName == kPleasureStartPendingEvent || eventName == kOStimSceneStartPendingEvent) {
 				if (g_state.phase == Phase::Idle || g_state.phase == Phase::Closed) {
-					BeginNewCycleLocked(info.actor, g_state.source == SourceContext::None ? SourceContext::PreCombat : g_state.source, eventName);
+					const auto fallbackSource = g_state.source == SourceContext::None ? SourceContext::PreCombat : g_state.source;
+					auto eventSource = SourceFromFlowValue(info.sourceFlow, fallbackSource);
+					if (eventSource == SourceContext::None) {
+						eventSource = SourceContext::PreCombat;
+					}
+					BeginNewCycleLocked(info.actor, eventSource, eventName);
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.blocking = true;
+					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_suppress_dialogue");
 					LogEventAcceptedLocked(eventName, info, "new_cycle");
 					return;
 				}
@@ -924,6 +1028,7 @@ namespace TFD::PleasureRuntime
 					AdvancePhaseLocked(Phase::PleasureActive, eventName);
 					g_state.holdActive = true;
 					g_state.passiveLockActive = true;
+					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
 					LogEventAcceptedLocked(eventName, info, "scene_active");
 					return;
 				}
@@ -957,6 +1062,7 @@ namespace TFD::PleasureRuntime
 					g_state.afterPleasureCommitted = true;
 					g_state.pendingChoice = AfterChoice::None;
 					g_state.blocking = true;
+					g_state.afterPleasureDialogueExpireSec = NowSec() + kAfterPleasureDialogueHardTimeoutSec;
 					LogEventAcceptedLocked(eventName, info, "dialogue_open");
 					return;
 				}
@@ -989,6 +1095,7 @@ namespace TFD::PleasureRuntime
 				}
 
 				const auto choice = MapAfterPleasureChoice(eventName);
+				g_state.afterPleasureDialogueExpireSec = 0.0;
 				g_state.pendingChoice = choice;
 
 				if (choice == AfterChoice::Redo) {
@@ -997,6 +1104,9 @@ namespace TFD::PleasureRuntime
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.afterPleasureCommitted = false;
 					g_state.blocking = true;
+					SuppressActorDialogueForSceneLocked(
+						info.actor ? info.actor : LookupActor(info.actorFormID),
+						"after_pleasure_redo_suppress_teammate_dialogue");
 					LogEventAcceptedLocked(eventName, info, "redo_pending");
 					return;
 				}
@@ -1008,6 +1118,9 @@ namespace TFD::PleasureRuntime
 				g_state.redoPending = false;
 				AdvancePhaseLocked(Phase::Finalizing, eventName);
 				AdvancePhaseLocked(Phase::Closed, eventName);
+				SuppressActorDialogueForSceneLocked(
+					info.actor ? info.actor : LookupActor(info.actorFormID),
+					"after_pleasure_terminal_suppress_teammate_dialogue");
 				ClearBridgeStateLocked();
 				ClearHoldStateLocked();
 				g_state.pendingChoice = AfterChoice::None;
@@ -1047,6 +1160,7 @@ namespace TFD::PleasureRuntime
 	{
 		QueuedPreCombatAttempt attempt{};
 		QueuedTerminalNeutralFinalize terminalFinalize{};
+		QueuedAfterPleasureDialogueTimeout afterDialogueTimeout{};
 		{
 			std::scoped_lock lk(g_lock);
 			if (!g_state.installed) {
@@ -1054,10 +1168,37 @@ namespace TFD::PleasureRuntime
 			}
 
 			const double now = NowSec();
-			attempt = TakeDueQueuedPreCombatAttemptLocked(now);
-			if (!attempt.valid) {
+			afterDialogueTimeout = TakeDueAfterPleasureDialogueTimeoutLocked(now);
+			if (!afterDialogueTimeout.valid) {
+				attempt = TakeDueQueuedPreCombatAttemptLocked(now);
+			}
+			if (!afterDialogueTimeout.valid && !attempt.valid) {
 				terminalFinalize = TakeDueTerminalNeutralFinalizeLocked(now);
 			}
+		}
+
+		if (afterDialogueTimeout.valid) {
+			auto* timeoutActor = LookupActor(afterDialogueTimeout.actorFormID);
+			const bool pleasureClearQueued = TFD::FlowController::QueueBridgeModEvent(
+				kPleasureClearEvent,
+				timeoutActor,
+				"after_pleasure_dialogue_timeout",
+				0.0f);
+			const bool systemClearQueued = TFD::FlowController::QueueBridgeModEvent(
+				kSystemEventClearAfterPleasureEvent,
+				timeoutActor,
+				"after_pleasure_dialogue_timeout",
+				0.0f);
+			const bool completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_dialogue_timeout");
+			spdlog::warn(
+				"[TFD][PleasureRuntime] after pleasure dialogue timeout finalized actor={:08X} cycle={} source={} completeFlow={} pleasureClearQueued={} systemClearQueued={}",
+				afterDialogueTimeout.actorFormID,
+				afterDialogueTimeout.cycleId,
+				ToString(afterDialogueTimeout.source),
+				completeFlow ? 1 : 0,
+				pleasureClearQueued ? 1 : 0,
+				systemClearQueued ? 1 : 0);
+			return;
 		}
 
 		if (!attempt.valid && terminalFinalize.valid) {
