@@ -1697,6 +1697,41 @@ namespace TFD::InteractionRouter
                 }
             }
 
+            RE::TESTopicInfo* ResolvePreCombatGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // INFO record behind TFD_TIF__0504762C, the root response for
+                    // TFDDialoguePreCombatGreet. Use plugin-local ID so runtime
+                    // load order does not matter.
+                    constexpr RE::FormID kPreCombatGreetInfoLocalFormID = 0x0004762C;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kPreCombatGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen] TFDDialoguePreCombatGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kPreCombatGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen] TFDDialoguePreCombatGreet INFO {:06X} not found in {}; precombat hard dialogue will fall back to default topic selection",
+                            kPreCombatGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
+            }
+
             RE::TESTopicInfo* ResolveAfterPleasureGreetTopicInfo()
             {
                 static RE::TESTopicInfo* info = nullptr;
@@ -2484,14 +2519,18 @@ namespace TFD::InteractionRouter
                 return;
             }
 
+            const bool preCombatTruceMode = g_pending.mode == Mode::PreCombatTruce;
             const bool afterPleasureMode = g_pending.mode == Mode::AfterPleasure;
             const bool forceGreet =
-                g_pending.mode == Mode::PreCombatTruce ||
+                preCombatTruceMode ||
                 g_pending.mode == Mode::InCombatTruce ||
                 afterPleasureMode;
 
             RE::TESTopicInfo* topicInfo = nullptr;
-            if (afterPleasureMode) {
+            if (preCombatTruceMode) {
+                topicInfo = ResolvePreCombatGreetTopicInfo();
+            }
+            else if (afterPleasureMode) {
                 topicInfo = ResolveAfterPleasureGreetTopicInfo();
             }
 

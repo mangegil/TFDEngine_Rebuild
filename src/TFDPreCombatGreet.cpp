@@ -1846,6 +1846,16 @@ namespace TFD::PreCombatGreet
             const char* reason,
             TFD::Tame::ReleaseReason releaseReason)
         {
+            const bool abortingPreCombatDialogue =
+                pending.action == TFD::InteractionRouter::Action::TrucePreCombat &&
+                pending.dialogueRequested &&
+                !pending.terminalChoiceCommitted &&
+                !pending.payFollowupPending &&
+                !pending.pleasureChoiceCommitted;
+
+            if (abortingPreCombatDialogue) {
+                CancelPreCombatDialogueOpenLocked(actor, pending, reason ? reason : "precombat_cleanup_abort");
+            }
 
             if (pending.truceSessionId != 0) {
                 TFD::HostilityController::ReleaseSession(pending.truceSessionId, releaseReason);

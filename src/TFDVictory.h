@@ -20,6 +20,7 @@ namespace TFD::Victory
     bool IsActive();
 
     void ResetObservedContext();
+    void ArmDialogueReadyHold(RE::Actor* actor, double seconds, const char* reason = nullptr);
     int ComputeObservedState(const ObservedContext& context);
     void RefreshObservedState(const ObservedContext& context);
 

@@ -53,6 +53,11 @@ namespace
     constexpr const char* kCaptiveOutcomeEscapeEvent = "TFDCaptiveOutcomeEscape";
     constexpr const char* kCaptiveOutcomePleasureEvent = "TFDCaptiveOutcomePleasure";
     constexpr const char* kCaptiveOutcomeCancelEvent = "TFDCaptiveOutcomeCancel";
+    constexpr const char* kVictoryOutcomeRecruitEvent = "TFDVictoryOutcomeRecruit";
+    constexpr const char* kVictoryOutcomeKillEvent = "TFDVictoryOutcomeKill";
+    constexpr const char* kVictoryOutcomeLootEvent = "TFDVictoryOutcomeLoot";
+    constexpr const char* kVictoryOutcomeCancelEvent = "TFDVictoryOutcomeCancel";
+    constexpr const char* kVictoryOutcomePleasureEvent = "TFDVictoryOutcomePleasure";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
     constexpr const char* kPassiveBreakCrimeEvent = "TFDPassiveBreakCrime";
     constexpr const char* kPassiveBreakPickpocketEvent = "TFDPassiveBreakPickpocket";
@@ -735,6 +740,98 @@ void InstallRuntime()
         return false;
     }
 
+    bool HandleVictoryOutcomeModEvent(std::string_view name, std::string_view arg, RE::TESForm* sender)
+    {
+        if (name.rfind("TFDVictoryOutcome", 0) != 0) {
+            return false;
+        }
+
+        auto& flow = TFD::FlowController::Controller::GetSingleton();
+        const auto actorFormID = ResolveActorFormIDFromEventArgOrSender(arg, sender);
+        const auto senderFormID = sender ? sender->GetFormID() : 0u;
+
+        VictoryOutcome outcome = VictoryOutcome::None;
+        const char* reason = "mod_event_victory";
+        const char* completeReason = "mod_event_victory_complete";
+        bool terminalOutcome = true;
+
+        if (name == kVictoryOutcomeRecruitEvent) {
+            outcome = VictoryOutcome::RecruitEnemy;
+            reason = "mod_event_victory_recruit";
+            completeReason = "mod_event_victory_recruit_complete";
+        } else if (name == kVictoryOutcomeKillEvent) {
+            outcome = VictoryOutcome::KillEnemy;
+            reason = "mod_event_victory_kill";
+            completeReason = "mod_event_victory_kill_complete";
+        } else if (name == kVictoryOutcomeLootEvent) {
+            outcome = VictoryOutcome::Cancel;
+            reason = "mod_event_victory_loot";
+            completeReason = "mod_event_victory_loot_complete";
+        } else if (name == kVictoryOutcomeCancelEvent) {
+            outcome = VictoryOutcome::Cancel;
+            reason = "mod_event_victory_cancel";
+            completeReason = "mod_event_victory_cancel_complete";
+        } else if (name == kVictoryOutcomePleasureEvent) {
+            outcome = VictoryOutcome::Pleasure;
+            reason = "mod_event_victory_pleasure";
+            completeReason = "mod_event_victory_pleasure_complete";
+            terminalOutcome = false;
+        } else {
+            return false;
+        }
+
+        const auto before = flow.GetSnapshot();
+        bool ok = false;
+        bool completeOk = false;
+        bool forcedClear = false;
+
+        if (before.root == RootFlow::Victory) {
+            ok = flow.RequestResolveVictoryOutcome(outcome, actorFormID, reason);
+        } else if (before.contextRoot == RootFlow::Victory && before.terminalResolved) {
+            ok = true;
+        } else {
+            spdlog::info(
+                "[TFD][Flow] victory outcome event={} actor={:08X} sender={:08X} ignored root={} ctx={} terminal={} primary={:08X}",
+                std::string(name),
+                actorFormID,
+                senderFormID,
+                Controller::ToString(before.root),
+                Controller::ToString(before.contextRoot),
+                before.terminalResolved ? 1 : 0,
+                before.primaryActorFormID);
+            return true;
+        }
+
+        if (ok && terminalOutcome) {
+            completeOk = flow.RequestCompleteTerminalContext(completeReason);
+            if (!completeOk) {
+                const auto afterResolve = flow.GetSnapshot();
+                if (afterResolve.contextRoot == RootFlow::Victory || afterResolve.root == RootFlow::Victory) {
+                    flow.ResetRuntime(completeReason);
+                    forcedClear = true;
+                }
+            }
+        } else if (!ok && terminalOutcome) {
+            const auto afterReject = flow.GetSnapshot();
+            if (afterReject.root == RootFlow::Victory) {
+                flow.ResetRuntime(completeReason);
+                forcedClear = true;
+            }
+        }
+
+        spdlog::info(
+            "[TFD][Flow] victory outcome event={} actor={:08X} sender={:08X} ok={} complete={} forcedClear={} terminal={} reason={}",
+            std::string(name),
+            actorFormID,
+            senderFormID,
+            ok ? 1 : 0,
+            completeOk ? 1 : 0,
+            forcedClear ? 1 : 0,
+            terminalOutcome ? 1 : 0,
+            reason);
+        return true;
+    }
+
     bool HandleCaptiveOutcomeModEvent(std::string_view name, std::string_view arg, RE::TESForm* sender)
     {
         if (name.rfind("TFDCaptiveOutcome", 0) != 0) {
@@ -866,6 +963,10 @@ void InstallRuntime()
         }
 
         (void)TFD::PleasureRuntime::HandleModEvent(eventName, strArg ? strArg : "", numArg, sender);
+
+        if (HandleVictoryOutcomeModEvent(name, arg, sender)) {
+            return true;
+        }
 
         if (HandleCaptiveOutcomeModEvent(name, arg, sender)) {
             return true;

@@ -19,6 +19,8 @@ namespace TFD::Victory
         RE::TESGlobal* g_stateGlobal = nullptr;
         bool g_logged = false;
         std::chrono::steady_clock::time_point g_observedCombatContextUntil{};
+        std::chrono::steady_clock::time_point g_dialogueReadyHoldUntil{};
+        RE::FormID g_dialogueReadyHoldActorFormID = 0;
 
         static constexpr int kStateNeutral = 0;
         static constexpr int kStateNo = 1;
@@ -157,6 +159,29 @@ namespace TFD::Victory
             return false;
         }
 
+        bool IsDialogueReadyHoldActive()
+        {
+            const auto now = Now();
+            if (g_dialogueReadyHoldActorFormID == 0 || now >= g_dialogueReadyHoldUntil) {
+                g_dialogueReadyHoldActorFormID = 0;
+                g_dialogueReadyHoldUntil = {};
+                return false;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_dialogueReadyHoldActorFormID);
+            if (!IsUsableDefeatedDialogueActor(actor, player)) {
+                spdlog::info(
+                    "[TFD][Victory] dialogue ready hold cleared actor={:08X} reason=actor_not_usable",
+                    g_dialogueReadyHoldActorFormID);
+                g_dialogueReadyHoldActorFormID = 0;
+                g_dialogueReadyHoldUntil = {};
+                return false;
+            }
+
+            return true;
+        }
+
         bool HasRelevantLivingEnemyActor(float radius)
         {
             auto* player = RE::PlayerCharacter::GetSingleton();
@@ -215,6 +240,28 @@ namespace TFD::Victory
     void ResetObservedContext()
     {
         g_observedCombatContextUntil = {};
+    }
+
+    void ArmDialogueReadyHold(RE::Actor* actor, double seconds, const char* reason)
+    {
+        if (!actor || seconds <= 0.0) {
+            return;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!IsUsableDefeatedDialogueActor(actor, player)) {
+            return;
+        }
+
+        const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
+        g_dialogueReadyHoldActorFormID = actor->GetFormID();
+        g_dialogueReadyHoldUntil = Now() + duration;
+
+        spdlog::info(
+            "[TFD][Victory] dialogue ready hold armed actor={:08X} seconds={:.2f} reason={}",
+            actor->GetFormID(),
+            seconds,
+            reason ? reason : "unknown");
     }
 
     RE::Actor* FindDialogueCapableDefeatedEnemy(float radius)
@@ -281,6 +328,10 @@ namespace TFD::Victory
         const bool lingerActive =
             g_observedCombatContextUntil != std::chrono::steady_clock::time_point{} &&
             now < g_observedCombatContextUntil;
+
+        if (IsDialogueReadyHoldActive()) {
+            return kStateYes;
+        }
 
         if (context.hasEnemies) {
             if (context.combatContext) {

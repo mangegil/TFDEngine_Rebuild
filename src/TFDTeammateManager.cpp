@@ -778,6 +778,15 @@ namespace
             return h.find(n) != std::string::npos;
         }
 
+        bool IsManualTeammateDialogueRefreshReason(std::string_view reason)
+        {
+            return reason == "teammate_activate_dialogue" ||
+                reason == "teammate_crosshair_activate_dialogue" ||
+                reason == "teammate_downed_activate_dialogue" ||
+                reason == "teammate_downed_fallback_activate_dialogue" ||
+                reason == "teammate_defeated_redirect_dialogue";
+        }
+
         bool IsHealthPotionCandidate(RE::AlchemyItem* potion)
         {
             if (!potion || potion->IsPoison() || potion->IsFood()) {
@@ -1584,22 +1593,40 @@ namespace
 
                 auto* current = alias->GetActorReference();
                 if (SameActor(current, actor)) {
+                    const std::string_view reasonView{ reason ? reason : "" };
+                    const bool manualDialogueRefresh = IsManualTeammateDialogueRefreshReason(reasonView);
+
                     if (IsTFDConvertedTeammate(actor)) {
                         RememberConvertedTeammate(actor, reason ? reason : "register_now_refresh_converted");
                         ResetInvalidAliasStrike(actor);
                     }
                     SyncTeammateFaction(actor, true);
                     EnsureContractForActorUnsafe(actor, reason ? reason : "register_now_refresh");
-                    QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
-                    if (actor->Is3DLoaded()) {
-                        actor->EvaluatePackage();
+
+                    // R56: manual teammate dialogue activation is only a dialogue prep pass.
+                    // Do not bounce Papyrus alias assignment or force EvaluatePackage here;
+                    // the actor is already in this alias slot and package churn can create
+                    // small follow/dialogue timing artifacts. Initial recruit and real alias
+                    // repair still use the normal event/evaluate path.
+                    if (!manualDialogueRefresh) {
+                        QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
+                        if (actor->Is3DLoaded()) {
+                            actor->EvaluatePackage();
+                        }
                     }
+
                     spdlog::info(
-                        "[TFD][TeammateManager] register now refresh alias='{}' actor={:08X} reason={}",
+                        "[TFD][TeammateManager] register now {} alias='{}' actor={:08X} reason={} queued={} eval={}",
+                        manualDialogueRefresh ? "manual_refresh" : "refresh",
                         alias->aliasName.c_str(),
                         actor->GetFormID(),
-                        reason ? reason : "unknown");
-                    RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_refresh");
+                        reason ? reason : "unknown",
+                        manualDialogueRefresh ? 0 : 1,
+                        (manualDialogueRefresh || !actor->Is3DLoaded()) ? 0 : 1);
+
+                    if (!manualDialogueRefresh) {
+                        RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_refresh");
+                    }
                     return true;
                 }
 

@@ -912,6 +912,12 @@ namespace TFD::DefeatMonitor
 			if (!player || !actor || actor == player) {
 				return false;
 			}
+			if (actor->IsPlayerTeammate() ||
+				TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+				TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+				TFD::Tame::IsCompanion(actor)) {
+				return false;
+			}
 			if (!IsStandingEnemyThresholdActor(actor) || IsObserverAlly(actor) || !actor->Is3DLoaded()) {
 				return false;
 			}
@@ -1286,7 +1292,9 @@ namespace TFD::DefeatMonitor
 			if (actor == player) {
 				return true;
 			}
-			return IsActiveFollowerActor(actor) || TFD::Tame::IsCompanion(actor);
+			return IsActiveFollowerActor(actor) ||
+				TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+				TFD::Tame::IsCompanion(actor);
 		}
 
 		static bool IsActorActivelyTargetingPlayerSideForRouter(RE::Actor* actor, RE::Actor* player)

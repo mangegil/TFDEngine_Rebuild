@@ -9,6 +9,7 @@
 #include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
 #include "TFDBleedout.h"
+#include "TFDInteractionRouter.h"
 
 #include <RE/Skyrim.h>
 #include <RE/A/ActorValues.h>
@@ -462,6 +463,7 @@ namespace TFD::HostilityController
         std::unordered_map<RE::FormID, Entry> g_entries;
         std::unordered_map<RE::FormID, Session> g_sessions;
         std::unordered_map<RE::FormID, TruceState> g_truceState;
+        std::unordered_map<RE::FormID, double> g_preCombatDialogueArmedHoldNextLogSec;
         std::unordered_map<RE::FormID, RehostileRequest> g_rehostileRequests;
         RE::FormID g_nextSessionId = 1;
 
@@ -641,6 +643,8 @@ namespace TFD::HostilityController
 
         constexpr double kArmedGraceSec = 1.25;
         constexpr double kArmedDebounceSec = 0.50;
+        constexpr double kPreCombatDialogueArmedHoldSec = 18.00;
+        constexpr double kPreCombatDialogueArmedHoldLogIntervalSec = 1.25;
         constexpr double kTooFarDebounceSec = 1.25;
         constexpr double kTameStartleDebounceSec = 0.35;
 
@@ -1714,6 +1718,66 @@ namespace TFD::HostilityController
             return false;
         }
 
+        bool IsDialogueMenuOpen()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+        }
+
+        bool ShouldHoldPreCombatDialogueAgainstPlayerArmed(
+            Session& session,
+            double nowSec,
+            RE::Actor* player,
+            RE::Actor* primaryTarget)
+        {
+            if (!player || !primaryTarget) {
+                return false;
+            }
+
+            if (session.primaryMode != Mode::TrucePreCombat) {
+                return false;
+            }
+
+            if (!session.dialogueRequested) {
+                return false;
+            }
+
+            const double ageSec = nowSec - session.startTimeSec;
+            if (ageSec < 0.0 || ageSec > kPreCombatDialogueArmedHoldSec) {
+                return false;
+            }
+
+            const bool dialogueMenuOpen = IsDialogueMenuOpen();
+            const bool nativePreCombatOpenPending =
+                TFD::InteractionRouter::DialogueOpen::IsActive() &&
+                TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::PreCombatTruce;
+
+            if (!dialogueMenuOpen && !nativePreCombatOpenPending) {
+                return false;
+            }
+
+            // PlayerArmed is still a valid betrayal after the truce dialogue actually
+            // fails or closes. During native forcegreet handoff, however, Skyrim can
+            // briefly report the player as armed even after DrawWeaponMagicHands(false).
+            // Treat that as a pending-dialogue handshake artifact, not betrayal.
+            player->DrawWeaponMagicHands(false);
+            session.armedSinceSec = 0.0;
+
+            auto& nextLogSec = g_preCombatDialogueArmedHoldNextLogSec[session.sessionId];
+            if (nowSec >= nextLogSec) {
+                nextLogSec = nowSec + kPreCombatDialogueArmedHoldLogIntervalSec;
+                spdlog::info(
+                    "TFDHostilityController: precombat PlayerArmed held during dialogue handoff session={} target={:08X} age={:.2f}s nativeOpen={} menuOpen={}",
+                    session.sessionId,
+                    primaryTarget->GetFormID(),
+                    ageSec,
+                    nativePreCombatOpenPending ? 1 : 0,
+                    dialogueMenuOpen ? 1 : 0);
+            }
+
+            return true;
+        }
+
         float ComputeTravelSpeedPerSec(
             const RE::NiPoint3& prev,
             const RE::NiPoint3& next,
@@ -2139,7 +2203,10 @@ namespace TFD::HostilityController
                 session.armedSinceSec = 0.0;
             }
             else if ((nowSec - session.startTimeSec) >= kArmedGraceSec && IsPlayerArmedForSuppression(player)) {
-                if (session.armedSinceSec <= 0.0) {
+                if (ShouldHoldPreCombatDialogueAgainstPlayerArmed(session, nowSec, player, primaryTarget)) {
+                    session.armedSinceSec = 0.0;
+                }
+                else if (session.armedSinceSec <= 0.0) {
                     session.armedSinceSec = nowSec;
                 }
                 else if ((nowSec - session.armedSinceSec) >= kArmedDebounceSec) {
@@ -2894,6 +2961,7 @@ namespace TFD::HostilityController
         ReleaseAll();
         g_nextSessionId = 1;
         g_truceState.clear();
+        g_preCombatDialogueArmedHoldNextLogSec.clear();
     }
 
     void Update(double nowSec)
@@ -3404,6 +3472,7 @@ namespace TFD::HostilityController
             primaryDisposition = sessionIt->second.disposition;
             primarySuppressBridgeEvents = sessionIt->second.suppressBridgeEvents;
         }
+        g_preCombatDialogueArmedHoldNextLogSec.erase(sessionId);
 
         std::vector<RE::FormID> actorIds;
         actorIds.reserve(g_entries.size());

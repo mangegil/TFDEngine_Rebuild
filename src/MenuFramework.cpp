@@ -104,6 +104,12 @@ namespace TFDMenu
 		constexpr double kTeammateManualGlobalCooldownSec = 2.50;
 		constexpr double kTeammateManualActorCooldownSec = 6.00;
 
+		static Clock::time_point gNextVictoryManualDialogueOpen{};
+		static std::unordered_map<RE::FormID, Clock::time_point> gVictoryManualDialogueCooldownUntil{};
+		constexpr double kVictoryManualGlobalCooldownSec = 0.65;
+		constexpr double kVictoryManualActorCooldownSec = 1.50;
+		constexpr double kVictoryDialogueReadyHoldSec = 4.00;
+
 		static std::vector<TFD::Tame::ActiveSnapshot> gCreatureTeammateMenuRows{};
 		static double gCreatureTeammateMenuRefreshRealSec = 0.0;
 		static double gCreatureTeammateMenuRefreshGameDays = 0.0;
@@ -312,6 +318,66 @@ namespace TFDMenu
 					actor->GetFormID(),
 					kTeammateManualGlobalCooldownSec,
 					kTeammateManualActorCooldownSec,
+					reason ? reason : "unknown");
+			}
+		}
+
+		static void PruneVictoryManualDialogueCooldowns(Clock::time_point now)
+		{
+			for (auto it = gVictoryManualDialogueCooldownUntil.begin(); it != gVictoryManualDialogueCooldownUntil.end();) {
+				if (now >= it->second) {
+					it = gVictoryManualDialogueCooldownUntil.erase(it);
+				}
+				else {
+					++it;
+				}
+			}
+		}
+
+		static bool IsVictoryManualDialogueBlocked(RE::Actor* actor, Clock::time_point now, const char*& outReason, double& outRemainingSec)
+		{
+			outReason = "none";
+			outRemainingSec = 0.0;
+
+			if (!actor) {
+				outReason = "no_actor";
+				return true;
+			}
+
+			if (now < gNextVictoryManualDialogueOpen) {
+				outReason = "global_cooldown";
+				outRemainingSec = std::chrono::duration<double>(gNextVictoryManualDialogueOpen - now).count();
+				return true;
+			}
+
+			PruneVictoryManualDialogueCooldowns(now);
+
+			const auto formID = actor->GetFormID();
+			if (auto it = gVictoryManualDialogueCooldownUntil.find(formID); it != gVictoryManualDialogueCooldownUntil.end()) {
+				if (now < it->second) {
+					outReason = "actor_cooldown";
+					outRemainingSec = std::chrono::duration<double>(it->second - now).count();
+					return true;
+				}
+				gVictoryManualDialogueCooldownUntil.erase(it);
+			}
+
+			return false;
+		}
+
+		static void ArmVictoryManualDialogueCooldown(RE::Actor* actor, Clock::time_point now, const char* reason)
+		{
+			gNextVictoryManualDialogueOpen = now + SecondsToClockDuration(kVictoryManualGlobalCooldownSec);
+
+			if (actor) {
+				const auto actorUntil = now + SecondsToClockDuration(kVictoryManualActorCooldownSec);
+				gVictoryManualDialogueCooldownUntil.insert_or_assign(actor->GetFormID(), actorUntil);
+
+				spdlog::info(
+					"[TFD][Menu] victory manual dialogue cooldown armed actor={:08X} global={:.2f}s actor={:.2f}s reason={}",
+					actor->GetFormID(),
+					kVictoryManualGlobalCooldownSec,
+					kVictoryManualActorCooldownSec,
 					reason ? reason : "unknown");
 			}
 		}
@@ -2024,14 +2090,28 @@ namespace TFDMenu
 									}
 
 									return false;
-									};
+								};
 
 								auto openVictoryDialogue = [&](RE::Actor* defeatedTalkTarget, const char* sourceReason) -> bool {
 									if (!defeatedTalkTarget) {
 										return false;
 									}
 
+									const auto victoryNow = Clock::now();
+									const char* blockReason = "none";
+									double blockRemainingSec = 0.0;
+									if (IsVictoryManualDialogueBlocked(defeatedTalkTarget, victoryNow, blockReason, blockRemainingSec)) {
+										spdlog::info(
+											"[TFD][Menu] victory manual dialogue blocked target={:08X} source={} reason={} remaining={:.2f}s",
+											defeatedTalkTarget->GetFormID(),
+											sourceReason ? sourceReason : "victory_activate_dialogue",
+											blockReason ? blockReason : "unknown",
+											blockRemainingSec);
+										return true;
+									}
+
 									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
+									TFD::Victory::ArmDialogueReadyHold(defeatedTalkTarget, kVictoryDialogueReadyHoldSec, sourceReason ? sourceReason : "victory_activate_dialogue");
 									TFD::Victory::SetStateValue(2);
 									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
 										defeatedTalkTarget->GetFormID(),
@@ -2051,13 +2131,21 @@ namespace TFDMenu
 									defeatedTalkTarget->EvaluatePackage(false, true);
 									defeatedTalkTarget->EvaluatePackage(true, true);
 
+									// RefreshObservedState may run in the same frame and downgrade VictoryState
+									// to No while other enemies are still present. Force it back to Yes
+									// immediately before opening so CK dialogue conditions stay valid.
+									TFD::Victory::SetStateValue(2);
 									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, false, nullptr);
+									if (opened) {
+										TFD::Victory::SetStateValue(2);
+										ArmVictoryManualDialogueCooldown(defeatedTalkTarget, victoryNow, "hard_open_victory_manual_dialogue");
+									}
 									spdlog::info("[TFD][Menu] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue source={}",
 										defeatedTalkTarget->GetFormID(),
 										opened ? 1 : 0,
 										sourceReason ? sourceReason : "victory_activate_dialogue");
 									return opened;
-									};
+								};
 
 								// R55: the normal teammate dialogue opener must be crosshair-exact.
 								// The R54 proximity scanner was too aggressive and could steal the E key
@@ -2113,7 +2201,7 @@ namespace TFDMenu
 									}
 								}
 							}
-						}
+					}
 					}
 
 					if (TFD::FeedPopup::IsOpen()) {
