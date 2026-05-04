@@ -484,7 +484,7 @@ namespace TFD::HostilityController
                 "TFDPreCombatTruceFaction",
                 "TFDSaviorFaction",
                 "TFDTeammateFaction",
-                "TFDTruceTeammateFaction",
+                "TFDExpiredTeammate",
                 "TFDWorkingCaptiveFaction"
             };
 

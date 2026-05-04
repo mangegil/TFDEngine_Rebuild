@@ -1,5 +1,6 @@
 #include "TFDTeammateManager.h"
 #include "TFDActor.h"
+#include "TFDCombatBehavior.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -348,7 +349,6 @@ namespace
             std::array<RE::BGSRefAlias*, 10> expiredAliases{};
             RE::TESFaction* expiredTeammateFaction{ nullptr };
             RE::TESFaction* teammateFaction{ nullptr };
-            RE::TESFaction* truceTeammateFaction{ nullptr };
             RE::TESFaction* currentFollowerFaction{ nullptr };
             RE::TESFaction* playerFollowerFaction{ nullptr };
             RE::TESGlobal* teammateStateGlobal{ nullptr };
@@ -374,6 +374,9 @@ namespace
         inline RE::FormID g_contractExpiryPleasureHoldActor{ 0 };
         inline double g_contractExpiryPleasureHoldStartedSec{ 0.0 };
         inline double g_contractExpiryPleasureHoldLastLogSec{ 0.0 };
+        inline RE::FormID g_downedRecoveryDialogueHoldActor{ 0 };
+        inline double g_downedRecoveryDialogueHoldUntilSec{ 0.0 };
+        inline double g_downedRecoveryDialogueHoldLastLogSec{ 0.0 };
         inline int g_lastRecruitSlotsFreeWritten{ -999 };
         inline int g_lastTeammateStateWritten{ -999 };
         inline int g_lastHasPotionsWritten{ -999 };
@@ -386,6 +389,7 @@ namespace
         constexpr double kContractExpiryPackageGraceSeconds = 0.0; // R66: native opens expired teammate dialogue immediately; CK package must not win first frame
         constexpr double kContractExpiryPleasureHoldMaxSeconds = 300.0;
         constexpr double kContractExpiryPleasureHoldLogIntervalSeconds = 5.0;
+        constexpr double kDownedRecoveryDialogueHoldLogIntervalSeconds = 2.0;
         constexpr float kContractExpiryForcegreetRadius = 4096.0f;
         constexpr float kTeammateHealTargetPct = 0.85f;
         constexpr float kTeammateHealMinAbsHp = 45.0f;
@@ -445,7 +449,6 @@ namespace
             }
 
             g_registry.teammateFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTeammateFaction");
-            g_registry.truceTeammateFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTruceTeammateFaction");
             g_registry.currentFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("CurrentFollowerFaction");
             g_registry.playerFollowerFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("PlayerFollowerFaction");
             g_registry.teammateStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDTeammateState");
@@ -454,21 +457,17 @@ namespace
             if (!g_registry.teammateFaction) {
                 spdlog::warn("[TFD][TeammateManager] faction TFDTeammateFaction not found");
             }
-            if (!g_registry.truceTeammateFaction) {
-                spdlog::warn("[TFD][TeammateManager] faction TFDTruceTeammateFaction not found");
-            }
-
             std::size_t found = 0;
             for (auto* alias : g_registry.teammateAliases) {
                 if (alias) {
                     ++found;
                 }
             }
-            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} truceTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X} recruitSlotsFree={:08X} hasPotions={:08X}",
+            spdlog::info("[TFD][TeammateManager] alias registry resolved quest={:08X} aliases={} tfdTeammateFaction={:08X} expiredTeammateFaction={:08X} currentFollowerFaction={:08X} playerFollowerFaction={:08X} teammateState={:08X} recruitSlotsFree={:08X} hasPotions={:08X}",
                 g_registry.quest ? g_registry.quest->GetFormID() : 0u,
                 found,
                 g_registry.teammateFaction ? g_registry.teammateFaction->GetFormID() : 0u,
-                g_registry.truceTeammateFaction ? g_registry.truceTeammateFaction->GetFormID() : 0u,
+                g_registry.expiredTeammateFaction ? g_registry.expiredTeammateFaction->GetFormID() : 0u,
                 g_registry.currentFollowerFaction ? g_registry.currentFollowerFaction->GetFormID() : 0u,
                 g_registry.playerFollowerFaction ? g_registry.playerFollowerFaction->GetFormID() : 0u,
                 g_registry.teammateStateGlobal ? g_registry.teammateStateGlobal->GetFormID() : 0u,
@@ -511,7 +510,7 @@ namespace
             if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
                 return true;
             }
-            if (g_registry.truceTeammateFaction && actor->IsInFaction(g_registry.truceTeammateFaction)) {
+            if (g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction)) {
                 return true;
             }
 
@@ -630,6 +629,16 @@ namespace
         bool IsValidTeammate(RE::Actor* actor)
         {
             return IsTFDConvertedTeammate(actor) || IsNaturalPlayerSideTeammate(actor);
+        }
+
+        bool IsAliasManagedTeammate(RE::Actor* actor)
+        {
+            // R67: the TFD teammate alias/package quest owns only TFD-converted humanoids.
+            // Vanilla/framework followers are still recognized as player-side actors by
+            // IsValidTeammate()/IsPlayerSideTeammateAnchor(), but they must not be placed
+            // into TFDPlayerTeammateQuest aliases because that applies TFDTeammatePackage
+            // and can override their native follower framework combat AI.
+            return IsTFDConvertedTeammate(actor);
         }
 
         bool IsPlayerSideTeammateAnchor(RE::Actor* actor)
@@ -791,7 +800,35 @@ namespace
         double CurrentGameDays()
         {
             auto* calendar = RE::Calendar::GetSingleton();
-            return calendar ? static_cast<double>(calendar->rawDaysPassed) : 0.0;
+            if (!calendar) {
+                return 0.0;
+            }
+
+            double days = static_cast<double>(calendar->rawDaysPassed);
+            if (calendar->gameDaysPassed) {
+                const double globalDays = static_cast<double>(calendar->gameDaysPassed->value);
+                if (globalDays > 0.0) {
+                    days = globalDays;
+                }
+            }
+
+            // Some runtime paths expose only the whole day counter here while
+            // GameHour carries the fractional part. Contract expiry must be a
+            // true 24-hour timer, not "next day boundary".
+            if (calendar->gameHour) {
+                const double hourRaw = static_cast<double>(calendar->gameHour->value);
+                double hour = std::fmod(hourRaw, 24.0);
+                if (hour < 0.0) {
+                    hour += 24.0;
+                }
+                const double hourFrac = hour / 24.0;
+                const double nearestWholeDay = std::round(days);
+                if (std::abs(days - nearestWholeDay) <= 0.0001) {
+                    days = std::floor(days) + hourFrac;
+                }
+            }
+
+            return days;
         }
 
         double NowRealSeconds()
@@ -799,6 +836,86 @@ namespace
             using Clock = std::chrono::steady_clock;
             static const auto start = Clock::now();
             return std::chrono::duration<double>(Clock::now() - start).count();
+        }
+
+        void ClearDownedRecoveryDialogueHoldUnsafe(RE::FormID actorId, const char* reason)
+        {
+            if (g_downedRecoveryDialogueHoldActor == 0) {
+                return;
+            }
+            if (actorId != 0 && actorId != g_downedRecoveryDialogueHoldActor) {
+                return;
+            }
+
+            spdlog::info("[TFD][TeammateManager] downed recovery dialogue hold cleared actor={:08X} reason={}",
+                g_downedRecoveryDialogueHoldActor,
+                reason ? reason : "unknown");
+
+            g_downedRecoveryDialogueHoldActor = 0;
+            g_downedRecoveryDialogueHoldUntilSec = 0.0;
+            g_downedRecoveryDialogueHoldLastLogSec = 0.0;
+        }
+
+        void ClearDownedRecoveryDialogueHoldUnsafe(RE::Actor* actor, const char* reason)
+        {
+            ClearDownedRecoveryDialogueHoldUnsafe(actor ? actor->GetFormID() : 0, reason);
+        }
+
+        void ArmDownedRecoveryDialogueHoldUnsafe(RE::Actor* actor, double seconds, const char* reason)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return;
+            }
+
+            const double nowReal = NowRealSeconds();
+            const double safeSeconds = std::clamp(seconds, 1.0, 30.0);
+            g_downedRecoveryDialogueHoldActor = actor->GetFormID();
+            g_downedRecoveryDialogueHoldUntilSec = nowReal + safeSeconds;
+            g_downedRecoveryDialogueHoldLastLogSec = 0.0;
+
+            spdlog::info("[TFD][TeammateManager] downed recovery dialogue hold armed actor={:08X} seconds={:.1f} reason={}",
+                g_downedRecoveryDialogueHoldActor,
+                safeSeconds,
+                reason ? reason : "unknown");
+        }
+
+        bool IsDownedRecoveryDialogueHoldActorUnsafe(RE::Actor* actor)
+        {
+            if (!actor || g_downedRecoveryDialogueHoldActor == 0) {
+                return false;
+            }
+            if (actor->GetFormID() != g_downedRecoveryDialogueHoldActor) {
+                return false;
+            }
+
+            const double nowReal = NowRealSeconds();
+            if (g_downedRecoveryDialogueHoldUntilSec > 0.0 && nowReal > g_downedRecoveryDialogueHoldUntilSec) {
+                ClearDownedRecoveryDialogueHoldUnsafe(g_downedRecoveryDialogueHoldActor, "hold_timeout");
+                return false;
+            }
+
+            if (g_downedRecoveryDialogueHoldLastLogSec <= 0.0 || nowReal - g_downedRecoveryDialogueHoldLastLogSec >= kDownedRecoveryDialogueHoldLogIntervalSeconds) {
+                g_downedRecoveryDialogueHoldLastLogSec = nowReal;
+                spdlog::info("[TFD][TeammateManager] downed recovery dialogue hold active actor={:08X} remaining={:.1f}s",
+                    g_downedRecoveryDialogueHoldActor,
+                    std::max(0.0, g_downedRecoveryDialogueHoldUntilSec - nowReal));
+            }
+
+            return true;
+        }
+
+        bool IsDownedRecoveryDialogueHoldActiveUnsafe()
+        {
+            if (g_downedRecoveryDialogueHoldActor == 0) {
+                return false;
+            }
+
+            const double nowReal = NowRealSeconds();
+            if (g_downedRecoveryDialogueHoldUntilSec > 0.0 && nowReal > g_downedRecoveryDialogueHoldUntilSec) {
+                ClearDownedRecoveryDialogueHoldUnsafe(g_downedRecoveryDialogueHoldActor, "hold_timeout");
+                return false;
+            }
+            return true;
         }
 
         bool IsReasonExtendContractPleasure(const char* reason)
@@ -1148,7 +1265,11 @@ namespace
                     reason ? reason : "unknown");
                 return false;
             }
-            return RestoreActorHealthDirect(actor, kTeammateHealTargetPct, kTeammateHealMinAbsHp, reason ? reason : "teammate_restore_health");
+            const bool ok = RestoreActorHealthDirect(actor, kTeammateHealTargetPct, kTeammateHealMinAbsHp, reason ? reason : "teammate_restore_health");
+            if (ok) {
+                ClearDownedRecoveryDialogueHoldUnsafe(actor, reason ? reason : "teammate_restore_health");
+            }
+            return ok;
         }
 
         void ClearContractExpiryRuntimeForActorIdUnsafe(RE::FormID actorId, const char* reason)
@@ -1305,8 +1426,8 @@ namespace
             if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
                 actor->RemoveFromFaction(g_registry.teammateFaction);
             }
-            if (g_registry.truceTeammateFaction && actor->IsInFaction(g_registry.truceTeammateFaction)) {
-                actor->RemoveFromFaction(g_registry.truceTeammateFaction);
+            if (g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction)) {
+                actor->RemoveFromFaction(g_registry.expiredTeammateFaction);
             }
 
             if (!actor->IsDead() && !actor->IsDisabled()) {
@@ -1347,7 +1468,7 @@ namespace
                 }
 
                 auto* actor = alias->GetActorReference();
-                if (!actor || !IsValidTeammate(actor)) {
+                if (!actor || !IsAliasManagedTeammate(actor)) {
                     continue;
                 }
 
@@ -1382,7 +1503,7 @@ namespace
 
             // R11: this manager owns alias recognition only.
             // It must not grant or remove TFDTeammateFaction for natural vanilla/framework followers.
-            // TFDTeammateFaction / TFDTruceTeammateFaction are owned by TFDRecruit and temporary TFD follow flows.
+            // TFDTeammateFaction / TFDExpiredTeammate are owned by TFDRecruit, contract-expiry, and temporary TFD follow flows.
             if (!shouldHaveFaction) {
                 spdlog::info("[TFD][TeammateManager] alias side effects skipped actor={:08X} reason=alias_clear_no_faction_mutation",
                     actor->GetFormID());
@@ -1692,7 +1813,7 @@ namespace
 
             for (const auto& info : snapshot.actors) {
                 auto* actor = info.get();
-                if (!IsValidTeammate(actor)) {
+                if (!IsAliasManagedTeammate(actor)) {
                     continue;
                 }
                 if (info.dist > useRadius) {
@@ -1718,17 +1839,50 @@ namespace
                 return false;
             }
 
+            auto* combatTarget = ResolveCombatTarget(actor);
+            const bool combatDiagActor = TFD::CombatBehavior::IsDiagnosticActor(actor);
+            const bool combatDiagTarget = TFD::CombatBehavior::IsDiagnosticActor(combatTarget);
+            const char* useReason = reason ? reason : "teammate_manager_register_now";
+
+            if (TFD::CombatBehavior::ShouldSuppressTeammatePackageRepair(actor, useReason)) {
+                spdlog::info(
+                    "[TFD][TeammateManager] queue humanoid assign skipped actor={:08X} reason={} rule=active_combat_behavior target={:08X} actorRole={} targetRole={} actorCombat={}",
+                    actor->GetFormID(),
+                    useReason,
+                    combatTarget ? combatTarget->GetFormID() : 0u,
+                    TFD::CombatBehavior::DiagnosticRole(actor),
+                    TFD::CombatBehavior::DiagnosticRole(combatTarget),
+                    actor->IsInCombat() ? 1 : 0);
+                return false;
+            }
+
             const bool queued = TFD::FlowController::QueueBridgeModEvent(
                 "TFDHumanoidTeammateAssign",
                 actor,
-                reason ? reason : "teammate_manager_register_now",
+                useReason,
                 0.0f);
 
             spdlog::info(
-                "[TFD][TeammateManager] queue humanoid assign actor={:08X} reason={} ok={}",
+                "[TFD][TeammateManager] queue humanoid assign actor={:08X} reason={} ok={} combatDiagActor={} actorRole={} target={:08X} targetRole={} targetDiag={}",
                 actor->GetFormID(),
-                reason ? reason : "unknown",
-                queued ? 1 : 0);
+                useReason,
+                queued ? 1 : 0,
+                combatDiagActor ? 1 : 0,
+                TFD::CombatBehavior::DiagnosticRole(actor),
+                combatTarget ? combatTarget->GetFormID() : 0u,
+                TFD::CombatBehavior::DiagnosticRole(combatTarget),
+                combatDiagTarget ? 1 : 0);
+
+            if (combatDiagActor || combatDiagTarget) {
+                spdlog::info(
+                    "[TFD][TeammateManagerDiag] queue_during_combat_behavior actor={:08X} reason={} actorCombat={} target={:08X} actorRole={} targetRole={}",
+                    actor->GetFormID(),
+                    useReason,
+                    actor->IsInCombat() ? 1 : 0,
+                    combatTarget ? combatTarget->GetFormID() : 0u,
+                    TFD::CombatBehavior::DiagnosticRole(actor),
+                    TFD::CombatBehavior::DiagnosticRole(combatTarget));
+            }
 
             return queued;
         }
@@ -1770,7 +1924,7 @@ namespace
             const float dist = (actor && player) ? DistanceToPlayer(actor, player) : 0.0f;
 
             spdlog::info(
-                "[TFD][TeammateManager] invalid alias diag alias='{}' actor={:08X} action={} reason={} strikes={} maxGrace={} hasActor={} dead={} disabled={} loaded={} tfdRank={} truceRank={} knownConverted={} nowConverted={} playerTeammate={} currentFollower={} playerFollower={} pendingRecruit={} inCombat={} actorTarget={:08X} playerTarget={:08X} rawHostile={} hostileFaction={} dist={:.1f}",
+                "[TFD][TeammateManager] invalid alias diag alias='{}' actor={:08X} action={} reason={} strikes={} maxGrace={} hasActor={} dead={} disabled={} loaded={} tfdRank={} expiredRank={} knownConverted={} nowConverted={} playerTeammate={} currentFollower={} playerFollower={} pendingRecruit={} inCombat={} actorTarget={:08X} playerTarget={:08X} rawHostile={} hostileFaction={} dist={:.1f}",
                 alias ? alias->aliasName.c_str() : "",
                 actor ? actor->GetFormID() : 0u,
                 action ? action : "unknown",
@@ -1782,7 +1936,7 @@ namespace
                 disabled ? 1 : 0,
                 loaded ? 1 : 0,
                 FactionRank(actor, g_registry.teammateFaction),
-                FactionRank(actor, g_registry.truceTeammateFaction),
+                FactionRank(actor, g_registry.expiredTeammateFaction),
                 knownConverted ? 1 : 0,
                 nowConverted ? 1 : 0,
                 playerTeammate ? 1 : 0,
@@ -1927,21 +2081,63 @@ namespace
                 bool evaluated = false;
                 bool assigned = false;
 
+                auto* combatTarget = ResolveCombatTarget(actor);
+                const bool hasValidExternalCombatTarget =
+                    combatTarget &&
+                    combatTarget != player &&
+                    !combatTarget->IsDead() &&
+                    !combatTarget->IsDisabled() &&
+                    !IsPlayerSideTeammateAnchor(combatTarget) &&
+                    !TFD::HostilityController::IsActorTemporarilySuppressed(combatTarget);
+
+                const bool combatDiagActor = TFD::CombatBehavior::IsDiagnosticActor(actor);
+                const bool combatDiagTarget = TFD::CombatBehavior::IsDiagnosticActor(combatTarget);
+                const char* useReason = reason ? reason : "post_load_humanoid_catchup";
+                const bool combatBehaviorProtected = TFD::CombatBehavior::ShouldSuppressTeammatePackageRepair(actor, useReason);
+
                 // R30: do not rubber-band followers during ordinary running.
                 // Move only on the final post-loading pass, and only if the actor
                 // is still unloaded, in a different cell and far away, or extremely far.
                 const bool allowEmergencyMove = attempt >= 3;
-                const bool shouldMove = allowEmergencyMove && (unloaded || far || wrongCellFar);
+                const bool shouldMove = !combatBehaviorProtected && allowEmergencyMove && (unloaded || far || wrongCellFar);
 
 
-                if (actor->IsInCombat()) {
-                    actor->StopCombat();
-                }
-                if (auto* process = RE::ProcessLists::GetSingleton()) {
-                    process->StopCombatAndAlarmOnActor(actor, false);
-                }
-                if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
+                if (!hasValidExternalCombatTarget && !combatBehaviorProtected) {
+                    if (combatDiagActor || combatDiagTarget) {
+                        spdlog::info(
+                            "[TFD][TeammateManagerDiag] catchup_clear_before actor={:08X} reason={} attempt={} target={:08X} actorCombat={} actorRole={} targetRole={} wrongCell={} unloaded={} dist={:.1f}",
+                            actor->GetFormID(),
+                            reason ? reason : "post_load_humanoid_catchup",
+                            attempt,
+                            combatTarget ? combatTarget->GetFormID() : 0u,
+                            actor->IsInCombat() ? 1 : 0,
+                            TFD::CombatBehavior::DiagnosticRole(actor),
+                            TFD::CombatBehavior::DiagnosticRole(combatTarget),
+                            wrongCell ? 1 : 0,
+                            unloaded ? 1 : 0,
+                            dist);
+                    }
+                    if (actor->IsInCombat()) {
+                        actor->StopCombat();
+                    }
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->StopCombatAndAlarmOnActor(actor, false);
+                    }
+                    if (actor->IsWeaponDrawn()) {
+                        actor->DrawWeaponMagicHands(false);
+                    }
+                    if (combatDiagActor || combatDiagTarget) {
+                        auto* targetAfterClear = ResolveCombatTarget(actor);
+                        spdlog::info(
+                            "[TFD][TeammateManagerDiag] catchup_clear_after actor={:08X} reason={} attempt={} targetAfter={:08X} actorCombat={} actorRole={} targetAfterRole={}",
+                            actor->GetFormID(),
+                            reason ? reason : "post_load_humanoid_catchup",
+                            attempt,
+                            targetAfterClear ? targetAfterClear->GetFormID() : 0u,
+                            actor->IsInCombat() ? 1 : 0,
+                            TFD::CombatBehavior::DiagnosticRole(actor),
+                            TFD::CombatBehavior::DiagnosticRole(targetAfterClear));
+                    }
                 }
 
                 if (shouldMove) {
@@ -1958,24 +2154,35 @@ namespace
                 options.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
                 options.reason = reason ? reason : "post_load_humanoid_catchup";
                 options.quarantineHostileFactions = true;
-                options.clearCombat = true;
+                options.clearCombat = !hasValidExternalCombatTarget && !combatBehaviorProtected;
                 options.evaluatePackage = false;
                 options.detailedLog = false;
                 options.throttleObserve = true;
                 options.ensurePacifyAlliance = true;
                 options.applyRuntimeProfile = true;
-                TFD::Recruit::CommitRecruit(actor, player, options);
+                if (!combatBehaviorProtected) {
+                    TFD::Recruit::CommitRecruit(actor, player, options);
+                    assigned = QueueHumanoidTeammateAssignEvent(actor, useReason);
 
-                assigned = QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "post_load_humanoid_catchup");
-
-                const bool shouldEvaluateForPackageRepair = moved || wrongCell || dist > kEvaluateDistance || !actor->Is3DLoaded();
-                if (shouldEvaluateForPackageRepair) {
-                    actor->EvaluatePackage();
-                    evaluated = true;
+                    const bool shouldEvaluateForPackageRepair = moved || wrongCell || dist > kEvaluateDistance || !actor->Is3DLoaded();
+                    if (shouldEvaluateForPackageRepair) {
+                        actor->EvaluatePackage();
+                        evaluated = true;
+                    }
+                }
+                else {
+                    spdlog::info(
+                        "[TFD][TeammateManager] post-load package repair skipped actor={:08X} reason={} rule=active_combat_behavior target={:08X} actorRole={} targetRole={} actorCombat={}",
+                        actor->GetFormID(),
+                        useReason,
+                        combatTarget ? combatTarget->GetFormID() : 0u,
+                        TFD::CombatBehavior::DiagnosticRole(actor),
+                        TFD::CombatBehavior::DiagnosticRole(combatTarget),
+                        actor->IsInCombat() ? 1 : 0);
                 }
 
                 spdlog::info(
-                    "[TFD][TeammateManager] humanoid post-load catchup actor={:08X} reason={} attempt={} moved={} assigned={} evaluated={} wrongCell={} unloaded={} dist={:.1f}",
+                    "[TFD][TeammateManager] humanoid post-load catchup actor={:08X} reason={} attempt={} moved={} assigned={} evaluated={} wrongCell={} unloaded={} activeCombatPreserved={} dist={:.1f} combatDiagActor={} actorRole={} target={:08X} targetRole={} targetDiag={}",
                     actor->GetFormID(),
                     reason ? reason : "post_load_humanoid_catchup",
                     attempt,
@@ -1984,7 +2191,13 @@ namespace
                     evaluated ? 1 : 0,
                     wrongCell ? 1 : 0,
                     unloaded ? 1 : 0,
-                    dist);
+                    (hasValidExternalCombatTarget || combatBehaviorProtected) ? 1 : 0,
+                    dist,
+                    combatDiagActor ? 1 : 0,
+                    TFD::CombatBehavior::DiagnosticRole(actor),
+                    combatTarget ? combatTarget->GetFormID() : 0u,
+                    TFD::CombatBehavior::DiagnosticRole(combatTarget),
+                    combatDiagTarget ? 1 : 0);
 
                 ++touched;
             }
@@ -2038,14 +2251,16 @@ namespace
                 return false;
             }
 
-            if (!IsValidTeammate(actor)) {
+            if (!IsAliasManagedTeammate(actor)) {
                 const bool pendingRecruit = TFD::Recruit::IsRecruitCommitPending(actor);
+                const bool naturalPlayerSide = IsNaturalPlayerSideTeammate(actor);
                 spdlog::warn(
-                    "[TFD][TeammateManager] register now rejected actor={:08X} reason={} detail={} pendingRecruit={}",
+                    "[TFD][TeammateManager] register now rejected actor={:08X} reason={} detail={} pendingRecruit={} naturalPlayerSide={}",
                     actor->GetFormID(),
                     reason ? reason : "unknown",
-                    pendingRecruit ? "recruit_commit_pending_no_alias_pre_marker" : "not_valid_teammate",
-                    pendingRecruit ? 1 : 0);
+                    pendingRecruit ? "recruit_commit_pending_no_alias_pre_marker" : (naturalPlayerSide ? "natural_follower_not_alias_managed" : "not_tfd_managed_teammate"),
+                    pendingRecruit ? 1 : 0,
+                    naturalPlayerSide ? 1 : 0);
                 return false;
             }
 
@@ -2462,7 +2677,7 @@ namespace
                     continue;
                 }
 
-                if (!IsValidTeammate(current)) {
+                if (!IsAliasManagedTeammate(current)) {
                     if (TFD::Recruit::IsRecruitCommitPending(current)) {
                         spdlog::info(
                             "[TFD][TeammateManager] defer clear alias='{}' actor={:08X} reason=recruit_commit_pending",
@@ -2499,7 +2714,7 @@ namespace
                     continue;
                 }
                 auto* current = alias->GetActorReference();
-                if (current && IsValidTeammate(current)) {
+                if (current && IsAliasManagedTeammate(current)) {
                     continue;
                 }
                 if (current && IsKnownConvertedAliasActor(current) && !IsHardInvalidConvertedAliasActor(current)) {
@@ -2811,6 +3026,11 @@ namespace TFD::TeammateManager
         return AliasInternal::IsPlayerSideTeammateAnchor(actor);
     }
 
+    bool IsTFDManagedTeammateActor(RE::Actor* actor)
+    {
+        return AliasInternal::IsAliasManagedTeammate(actor);
+    }
+
     std::vector<RE::Actor*> CollectRegisteredTeammates()
     {
         return BridgeInternal::CollectRegisteredActors();
@@ -3111,6 +3331,30 @@ namespace TFD::TeammateManager
         std::scoped_lock lock(AliasInternal::g_syncLock);
         AliasInternal::ResolveRegistry();
         return AliasInternal::ReleaseHumanoidTeammateContractUnsafe(actor, "native_terminate_contract");
+    }
+
+    void ArmDownedTeammateRecoveryDialogueHold(RE::Actor* actor, double seconds, const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ArmDownedRecoveryDialogueHoldUnsafe(actor, seconds, reason ? reason : "native_downed_recovery_dialogue");
+    }
+
+    bool IsDownedTeammateRecoveryDialogueHoldActor(RE::Actor* actor)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        return AliasInternal::IsDownedRecoveryDialogueHoldActorUnsafe(actor);
+    }
+
+    bool IsDownedTeammateRecoveryDialogueHoldActive()
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        return AliasInternal::IsDownedRecoveryDialogueHoldActiveUnsafe();
+    }
+
+    void ClearDownedTeammateRecoveryDialogueHold(RE::Actor* actor, const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ClearDownedRecoveryDialogueHoldUnsafe(actor, reason ? reason : "native_clear_downed_recovery_dialogue");
     }
 
     bool IsCreatureCompanion(RE::Actor* actor)

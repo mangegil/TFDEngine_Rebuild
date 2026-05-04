@@ -1191,7 +1191,7 @@ namespace TFD::InteractionRouter
         if (!actor || actor == RE::PlayerCharacter::GetSingleton() || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
             return false;
         }
-        if (!TFD::TeammateManager::IsPlayerSideTeammateActor(actor) && !TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+        if (!TFD::TeammateManager::IsTFDManagedTeammateActor(actor)) {
             return false;
         }
 
@@ -1296,9 +1296,7 @@ namespace TFD::InteractionRouter
                 return;
             }
 
-            const bool teammateLike =
-                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
-                TFD::TeammateManager::IsPlayerSideTeammateActor(actor);
+            const bool teammateLike = TFD::TeammateManager::IsTFDManagedTeammateActor(actor);
             if (!teammateLike) {
                 ++teammateRejected;
                 return;
@@ -1400,7 +1398,7 @@ namespace TFD::InteractionRouter
             if (actor->GetParentCell() != player->GetParentCell()) {
                 continue;
             }
-            if (!TFD::TeammateManager::IsActiveFollowerActor(actor)) {
+            if (!TFD::TeammateManager::IsTFDManagedTeammateActor(actor)) {
                 ++teammateRejected;
                 continue;
             }

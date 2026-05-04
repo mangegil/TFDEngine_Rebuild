@@ -28,6 +28,7 @@ namespace TFD::PayModel
 
         constexpr float kScanRadius = 2200.0f;
         constexpr int kEncounterGoldCap = 3000;
+        constexpr int kTeammateContractGold = 50;
         constexpr const char* kSharedGoldGlobalEditorID = "TFDPayGold";
 
         struct CacheState
@@ -368,9 +369,17 @@ namespace TFD::PayModel
                 }
 
                 out.push_back(actor);
-            };
+                };
 
             if (!speaker) {
+                return out;
+            }
+
+            if (context == PayContext::TeammateContract) {
+                addUnique(speaker);
+                spdlog::info(
+                    "[TFD][PayModel] teammate contract quote single actor speaker={:08X} reason=no_squad_scaling",
+                    speaker->GetFormID());
                 return out;
             }
 
@@ -835,9 +844,16 @@ namespace TFD::PayModel
         }
 
         quote.actorCount = static_cast<int>(quote.actors.size());
-        quote.baseGold = ResolveEncounterBaseGold(quote.actors);
-        quote.contextPercent = GetContextPercent(context);
-        quote.totalGold = ApplyContextAdjustment(quote.baseGold, context);
+        if (context == PayContext::TeammateContract) {
+            quote.baseGold = kTeammateContractGold;
+            quote.contextPercent = 0;
+            quote.totalGold = kTeammateContractGold;
+        }
+        else {
+            quote.baseGold = ResolveEncounterBaseGold(quote.actors);
+            quote.contextPercent = GetContextPercent(context);
+            quote.totalGold = ApplyContextAdjustment(quote.baseGold, context);
+        }
 
         spdlog::info(
             "[TFD][PayModel] built quote speaker={:08X} context={} actors={} base={} pct={} total={}",

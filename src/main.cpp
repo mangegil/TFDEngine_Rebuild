@@ -1,4 +1,4 @@
-﻿#include <RE/Skyrim.h>
+#include <RE/Skyrim.h>
 #include <RE/A/ActorValues.h>
 #include <type_traits>
 #include "SKSE/SKSE.h"
@@ -27,6 +27,7 @@
 #include "TFDRelease.h"
 #include "TFDHostilityController.h"
 #include "TFDHostilityHooks.h"
+#include "TFDCombatBehavior.h"
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
@@ -95,6 +96,7 @@ static void ResetTransientStateForLoad()
     TFD::FlowController::ResetRuntimeLifecycle();
     TFD::BleedoutGreet::Reset();
     TFD::HostilityController::Reset();
+    TFD::CombatBehavior::ResetForLoad();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
     TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
@@ -141,6 +143,7 @@ static void InitOnceAfterLoad()
     TFD::CaptiveGreet::Install();
     TFD::RescueGreet::Install();
     TFD::TeammateManager::Install();
+    TFD::CombatBehavior::Install();
     TFD::PayModel::Install();
 
     QueueHud("TFDEngine: Init OK (after load)");

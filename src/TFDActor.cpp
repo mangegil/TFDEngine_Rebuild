@@ -1721,9 +1721,9 @@ namespace TFD::Actor::Ops
 		static void ResolveReleaseFollowHelperFaction()
 		{
 			if (!g_releaseFollowHelperFaction) {
-				g_releaseFollowHelperFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDTruceTeammateFaction");
+				g_releaseFollowHelperFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDExpiredTeammate");
 				if (!g_releaseFollowHelperFaction) {
-					spdlog::warn("[TFD][FactionManager] helper faction not found editorId=TFDTruceTeammateFaction");
+					spdlog::warn("[TFD][FactionManager] helper faction not found editorId=TFDExpiredTeammate");
 				}
 			}
 			if (!g_dialogueHelperFaction) {

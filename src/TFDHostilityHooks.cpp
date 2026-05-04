@@ -1,5 +1,6 @@
-﻿#include "TFDHostilityHooks.h"
+#include "TFDHostilityHooks.h"
 #include "TFDActor.h"
+#include "TFDCombatBehavior.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -110,6 +111,71 @@ namespace TFD::HostilityHooks
                 return actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor);
             }
 
+            static RE::Actor* CurrentCombatTarget(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return nullptr;
+                }
+                auto sp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                return sp.get();
+            }
+
+            static std::uint32_t FormIDOrZero(RE::TESForm* form)
+            {
+                return form ? form->GetFormID() : 0u;
+            }
+
+            static bool ShouldTraceTargetTransition(RE::Character* actor, RE::Actor* before, RE::Actor* after)
+            {
+                auto* actorAsActor = static_cast<RE::Actor*>(actor);
+                return actorAsActor && (
+                    FormIDOrZero(before) != FormIDOrZero(after) ||
+                    TFD::CombatBehavior::IsDiagnosticActor(actorAsActor) ||
+                    TFD::CombatBehavior::IsDiagnosticActor(before) ||
+                    TFD::CombatBehavior::IsDiagnosticActor(after) ||
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, before) ||
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, after));
+            }
+
+            static void LogTargetTransition(
+                const char* phase,
+                RE::Character* actor,
+                RE::Actor* before,
+                RE::Actor* afterPreClear,
+                RE::Actor* afterVanilla,
+                RE::Actor* afterPostClear)
+            {
+                if (!actor || !ShouldTraceTargetTransition(actor, before, afterPostClear)) {
+                    return;
+                }
+
+                auto* actorAsActor = static_cast<RE::Actor*>(actor);
+                spdlog::info(
+                    "[TFD][HostilityHooksDiag] phase={} actor={:08X} before={:08X} afterPreClear={:08X} afterVanilla={:08X} afterPostClear={:08X} actorRole={} beforeRole={} preRole={} vanillaRole={} postRole={} pairBefore={} pairPre={} pairVanilla={} pairPost={} suppressed={} releaseGrace={} dialogue={} passive={} pleasure={} observedBleedout={} actorInCombat={}",
+                    phase ? phase : "unknown",
+                    actor->GetFormID(),
+                    FormIDOrZero(before),
+                    FormIDOrZero(afterPreClear),
+                    FormIDOrZero(afterVanilla),
+                    FormIDOrZero(afterPostClear),
+                    TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                    TFD::CombatBehavior::DiagnosticRole(before),
+                    TFD::CombatBehavior::DiagnosticRole(afterPreClear),
+                    TFD::CombatBehavior::DiagnosticRole(afterVanilla),
+                    TFD::CombatBehavior::DiagnosticRole(afterPostClear),
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, before) ? 1 : 0,
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, afterPreClear) ? 1 : 0,
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, afterVanilla) ? 1 : 0,
+                    TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, afterPostClear) ? 1 : 0,
+                    TFD::HostilityController::IsSuppressed(actor) ? 1 : 0,
+                    IsReleaseGraceActor(actor) ? 1 : 0,
+                    TFD::FlowController::IsDialogueContextActive() ? 1 : 0,
+                    TFD::FlowController::IsPassiveHoldActive() ? 1 : 0,
+                    TFD::FlowController::IsPleasureLockActive() ? 1 : 0,
+                    TFD::Bleedout::DefeatGlue::IsObservedCombatCommitInProgress() ? 1 : 0,
+                    actor->IsInCombat() ? 1 : 0);
+            }
+
             static void SyncPlayerCombatFlow(RE::Character* actor)
             {
                 if (!actor || !actor->IsPlayerRef()) {
@@ -144,7 +210,7 @@ namespace TFD::HostilityHooks
                 gPlayerCombatActive.store(false, std::memory_order_release);
             }
 
-            static void ClearInvalidCombatTarget(RE::Character* actor)
+            static void ClearInvalidCombatTarget(RE::Character* actor, const char* phase)
             {
                 if (!actor) {
                     return;
@@ -153,6 +219,22 @@ namespace TFD::HostilityHooks
                 auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
                 auto* target = targetSp.get();
                 auto* player = RE::PlayerCharacter::GetSingleton();
+                auto* actorAsActor = static_cast<RE::Actor*>(actor);
+                const bool actorDiag = TFD::CombatBehavior::IsDiagnosticActor(actorAsActor);
+                const bool targetDiag = TFD::CombatBehavior::IsDiagnosticActor(target);
+                const bool pairDiag = TFD::CombatBehavior::IsDiagnosticPair(actorAsActor, target);
+
+                if (target && TFD::CombatBehavior::ShouldPreserveCombatTarget(actorAsActor, target)) {
+                    spdlog::info(
+                        "[TFD][CombatOwnership] preserve active ally target actor={:08X} target={:08X} phase={} actorRole={} targetRole={} pairActive=1",
+                        actor->GetFormID(),
+                        target->GetFormID(),
+                        phase ? phase : "unknown",
+                        TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                        TFD::CombatBehavior::DiagnosticRole(target));
+                    return;
+                }
+
                 if (player && target && IsPlayerSideCombatConflict(actor, target, player)) {
                     const auto actorId = actor->GetFormID();
                     const auto targetId = target->GetFormID();
@@ -162,12 +244,18 @@ namespace TFD::HostilityHooks
 
                     CalmPlayerSideCombatActor(actor);
                     spdlog::info(
-                        "[TFD][HostilityHooks] cleared player-side combat target actor={:08X} target={:08X} actorTeammate={} actorFollower={} actorTame={} reason=player_side_conflict",
+                        "[TFD][HostilityHooks] cleared player-side combat target actor={:08X} target={:08X} actorTeammate={} actorFollower={} actorTame={} reason=player_side_conflict phase={} actorDiag={} targetDiag={} pairDiag={} actorRole={} targetRole={}",
                         actorId,
                         targetId,
                         actorTeammate ? 1 : 0,
                         actorFollower ? 1 : 0,
-                        actorTame ? 1 : 0);
+                        actorTame ? 1 : 0,
+                        phase ? phase : "unknown",
+                        actorDiag ? 1 : 0,
+                        targetDiag ? 1 : 0,
+                        pairDiag ? 1 : 0,
+                        TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                        TFD::CombatBehavior::DiagnosticRole(target));
                     return;
                 }
 
@@ -206,10 +294,17 @@ namespace TFD::HostilityHooks
                     replacement->EvaluatePackage(false, true);
                     replacement->EvaluatePackage(true, true);
 
-                    spdlog::info("[TFD][HostilityHooks] swapped invalid combat target actor={:08X} old={:08X} new={:08X}",
+                    spdlog::info("[TFD][HostilityHooks] swapped invalid combat target actor={:08X} old={:08X} new={:08X} phase={} actorDiag={} oldDiag={} pairDiag={} actorRole={} oldRole={} newRole={}",
                         actor->GetFormID(),
                         target ? target->GetFormID() : 0u,
-                        replacement->GetFormID());
+                        replacement->GetFormID(),
+                        phase ? phase : "unknown",
+                        actorDiag ? 1 : 0,
+                        targetDiag ? 1 : 0,
+                        pairDiag ? 1 : 0,
+                        TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                        TFD::CombatBehavior::DiagnosticRole(target),
+                        TFD::CombatBehavior::DiagnosticRole(replacement));
                     return;
                 }
 
@@ -220,14 +315,25 @@ namespace TFD::HostilityHooks
                 actor->EvaluatePackage(false, true);
                 actor->EvaluatePackage(true, true);
 
-                spdlog::info("[TFD][HostilityHooks] cleared invalid combat target actor={:08X} target={:08X}",
+                spdlog::info("[TFD][HostilityHooks] cleared invalid combat target actor={:08X} target={:08X} phase={} actorDiag={} targetDiag={} pairDiag={} actorRole={} targetRole={} dialogue={} passive={} pleasure={}",
                     actor->GetFormID(),
-                    target ? target->GetFormID() : 0u);
+                    target ? target->GetFormID() : 0u,
+                    phase ? phase : "unknown",
+                    actorDiag ? 1 : 0,
+                    targetDiag ? 1 : 0,
+                    pairDiag ? 1 : 0,
+                    TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                    TFD::CombatBehavior::DiagnosticRole(target),
+                    TFD::FlowController::IsDialogueContextActive() ? 1 : 0,
+                    TFD::FlowController::IsPassiveHoldActive() ? 1 : 0,
+                    TFD::FlowController::IsPleasureLockActive() ? 1 : 0);
             }
 
             static void UpdateCombat(RE::Character* actor)
             {
                 if (actor && (TFD::HostilityController::IsSuppressed(actor) || IsReleaseGraceActor(actor))) {
+                    auto* before = CurrentCombatTarget(actor);
+
                     if (auto* process = RE::ProcessLists::GetSingleton()) {
                         const bool runDetection = process->runDetection;
                         process->runDetection = false;
@@ -244,18 +350,53 @@ namespace TFD::HostilityHooks
 
                     actor->EvaluatePackage(false, true);
                     actor->EvaluatePackage(true, true);
+                    auto* after = CurrentCombatTarget(actor);
+                    LogTargetTransition("suppressed_or_release_grace", actor, before, after, after, after);
                     return;
                 }
 
-                auto targetSp = actor ? actor->GetActorRuntimeData().currentCombatTarget.get() : RE::NiPointer<RE::Actor>{};
                 if (TFD::Bleedout::DefeatGlue::IsObservedCombatCommitInProgress()) {
+                    auto* before = CurrentCombatTarget(actor);
                     _UpdateCombat(actor);
+                    auto* after = CurrentCombatTarget(actor);
+                    LogTargetTransition("observed_bleedout_update", actor, before, before, after, after);
                     return;
                 }
 
-                ClearInvalidCombatTarget(actor);
+                auto* before = CurrentCombatTarget(actor);
+                ClearInvalidCombatTarget(actor, "pre_clear");
+                auto* afterPreClear = CurrentCombatTarget(actor);
+
+                const bool preserveNormalPair = TFD::CombatBehavior::ShouldPreserveCombatTarget(static_cast<RE::Actor*>(actor), afterPreClear);
+
                 _UpdateCombat(actor);
-                ClearInvalidCombatTarget(actor);
+                auto* afterVanilla = CurrentCombatTarget(actor);
+
+                if (preserveNormalPair && afterPreClear && afterVanilla != afterPreClear) {
+                    auto* actorAsActor = static_cast<RE::Actor*>(actor);
+                    actor->GetActorRuntimeData().currentCombatTarget = afterPreClear->GetHandle();
+                    actor->SetBeenAttacked(true);
+                    afterPreClear->SetBeenAttacked(true);
+                    (void)actor->RequestDetectionLevel(afterPreClear, RE::DETECTION_PRIORITY::kCritical);
+                    (void)afterPreClear->RequestDetectionLevel(actorAsActor, RE::DETECTION_PRIORITY::kCritical);
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->ClearCachedFactionFightReactions();
+                    }
+                    spdlog::info(
+                        "[TFD][CombatOwnership] restored ally target after vanilla actor={:08X} restored={:08X} vanillaAfter={:08X} actorRole={} targetRole={} actorCombat={}",
+                        actor->GetFormID(),
+                        afterPreClear->GetFormID(),
+                        afterVanilla ? afterVanilla->GetFormID() : 0u,
+                        TFD::CombatBehavior::DiagnosticRole(actorAsActor),
+                        TFD::CombatBehavior::DiagnosticRole(afterPreClear),
+                        actor->IsInCombat() ? 1 : 0);
+                    afterVanilla = CurrentCombatTarget(actor);
+                }
+
+                ClearInvalidCombatTarget(actor, "post_clear");
+                auto* afterPostClear = CurrentCombatTarget(actor);
+
+                LogTargetTransition("normal_update", actor, before, afterPreClear, afterVanilla, afterPostClear);
                 SyncPlayerCombatFlow(actor);
             }
 

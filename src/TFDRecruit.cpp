@@ -62,7 +62,7 @@ namespace
 
     constexpr const char* kPlayerSideStateFactionEditorIDs[] = {
         "TFDTeammateFaction",
-        "TFDTruceTeammateFaction",
+        "TFDExpiredTeammate",
         "TFDPacifyFaction",
         "TFDPlayerFaction",
         "TFDPreCombatTruceFaction",
@@ -216,7 +216,7 @@ namespace
         unsigned hostileMatches{ 0 };
         unsigned stateMatches{ 0 };
         bool tfdTeammate{ false };
-        bool truceTeammate{ false };
+        bool expiredTeammate{ false };
         bool tfdPacify{ false };
         bool tfdPlayer{ false };
         bool currentFollower{ false };
@@ -261,8 +261,8 @@ namespace
             if (id == "TFDTeammateFaction") {
                 summary.tfdTeammate = true;
             }
-            else if (id == "TFDTruceTeammateFaction") {
-                summary.truceTeammate = true;
+            else if (id == "TFDExpiredTeammate") {
+                summary.expiredTeammate = true;
             }
             else if (id == "TFDPacifyFaction") {
                 summary.tfdPacify = true;
@@ -289,7 +289,7 @@ namespace
         return actor &&
             (actor->IsPlayerTeammate() ||
                 summary.tfdTeammate ||
-                summary.truceTeammate ||
+                summary.expiredTeammate ||
                 summary.currentFollower ||
                 summary.playerFollower);
     }
@@ -303,7 +303,7 @@ namespace
             return true;
         }
 
-        const bool interesting = rawHostile || summary.hostileMatches > 0 || actor->IsPlayerTeammate() || summary.tfdTeammate || summary.truceTeammate;
+        const bool interesting = rawHostile || summary.hostileMatches > 0 || actor->IsPlayerTeammate() || summary.tfdTeammate || summary.expiredTeammate;
         if (!interesting) {
             return false;
         }
@@ -449,6 +449,13 @@ namespace
                 ++result.actorFactions;
             }
             if (EnsureFactionActive(actor, "TFDPacifyFaction", "actor")) {
+                ++result.actorFactions;
+            }
+            // R67: converted enemies must be true player-side allies, not only
+            // dialogue-safe pacified actors. Sharing TFDPlayerFaction with the
+            // player lets normal Assistance=FriendsAndAllies combat alarm treat
+            // attacks on the player as calls for help, without force-starting combat.
+            if (EnsureFactionActive(actor, "TFDPlayerFaction", "actor_player_side")) {
                 ++result.actorFactions;
             }
         }
@@ -738,7 +745,7 @@ namespace TFD::Recruit
         }
 
         spdlog::info(
-            "[TFD][Recruit] observe actor={:08X} name='{}' source={} reason={} rawHostile={} recruitLike={} playerTeammate={} tfdTeammate={} truceTeammate={} tfdPacify={} tfdPlayer={} currentFollower={} playerFollower={} potentialFollower={} hostileFactions={} stateFactions={}",
+            "[TFD][Recruit] observe actor={:08X} name='{}' source={} reason={} rawHostile={} recruitLike={} playerTeammate={} tfdTeammate={} expiredTeammate={} tfdPacify={} tfdPlayer={} currentFollower={} playerFollower={} potentialFollower={} hostileFactions={} stateFactions={}",
             actor->GetFormID(),
             actor->GetName() ? actor->GetName() : "",
             ToString(options.sourceFlow),
@@ -747,7 +754,7 @@ namespace TFD::Recruit
             recruitLike ? 1 : 0,
             actor->IsPlayerTeammate() ? 1 : 0,
             summary.tfdTeammate ? 1 : 0,
-            summary.truceTeammate ? 1 : 0,
+            summary.expiredTeammate ? 1 : 0,
             summary.tfdPacify ? 1 : 0,
             summary.tfdPlayer ? 1 : 0,
             summary.currentFollower ? 1 : 0,
@@ -1024,7 +1031,7 @@ namespace TFD::Recruit
             result.rawHostileBefore &&
             result.hostileFactionMatchesBefore == 0 &&
             beforeSummary.stateMatches > 0 &&
-            (beforeSummary.tfdTeammate || beforeSummary.truceTeammate || beforeSummary.tfdPacify);
+            (beforeSummary.tfdTeammate || beforeSummary.expiredTeammate || beforeSummary.tfdPacify);
 
         const bool nothingNewToSettle =
             quarantineAlreadyAttempted &&

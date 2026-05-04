@@ -27,7 +27,7 @@ namespace TFD::TeammateManager
         std::function<void(RE::Actor*, double, const char*)> suppressDefeatedReentry;
         std::function<void(RE::Actor*, const char*, bool)> releaseBleedLock;
         std::function<void(RE::Actor*, float, float, float, float, float, const char*)> restoreActorHealthToSafePct;
-        std::function<RE::Actor*()> resolvePendingDefeatedDialogueTarget;
+        std::function<RE::Actor* ()> resolvePendingDefeatedDialogueTarget;
         std::function<void()> clearPendingDefeatedDialogueTarget;
         std::function<void(RE::Actor*)> setPendingDefeatedDialogueTarget;
         std::function<bool(RE::Actor*, float)> reviveDownedAlly;
@@ -49,6 +49,7 @@ namespace TFD::TeammateManager
 
     bool IsActiveFollowerActor(RE::Actor* actor);
     bool IsPlayerSideTeammateActor(RE::Actor* actor);
+    bool IsTFDManagedTeammateActor(RE::Actor* actor);
     std::vector<RE::Actor*> CollectRegisteredTeammates();
     std::vector<RE::Actor*> CollectKnownTeammates(float radius);
     FollowerResolution ResolveFollowerCandidates(float radius);
@@ -61,6 +62,11 @@ namespace TFD::TeammateManager
     bool RestoreHumanoidTeammateHealthWithPotion(RE::Actor* actor);
     bool RestoreHumanoidTeammateHealthWithPleasure(RE::Actor* actor);
     bool TerminateHumanoidTeammateContract(RE::Actor* actor);
+
+    void ArmDownedTeammateRecoveryDialogueHold(RE::Actor* actor, double seconds = 10.0, const char* reason = nullptr);
+    bool IsDownedTeammateRecoveryDialogueHoldActor(RE::Actor* actor);
+    bool IsDownedTeammateRecoveryDialogueHoldActive();
+    void ClearDownedTeammateRecoveryDialogueHold(RE::Actor* actor, const char* reason = nullptr);
 
     bool IsCreatureCompanion(RE::Actor* actor);
     double GetRemainingCreatureCompanionHours(RE::Actor* actor);

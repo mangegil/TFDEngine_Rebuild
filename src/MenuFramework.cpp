@@ -103,6 +103,9 @@ namespace TFDMenu
 		static std::unordered_map<RE::FormID, Clock::time_point> gTeammateManualDialogueCooldownUntil{};
 		constexpr double kTeammateManualGlobalCooldownSec = 2.50;
 		constexpr double kTeammateManualActorCooldownSec = 6.00;
+		constexpr double kDownedTeammateRecoveryGlobalCooldownSec = 0.35;
+		constexpr double kDownedTeammateRecoveryActorCooldownSec = 0.85;
+		constexpr double kDownedTeammateRecoveryHoldSec = 10.0;
 
 		static Clock::time_point gNextVictoryManualDialogueOpen{};
 		static std::unordered_map<RE::FormID, Clock::time_point> gVictoryManualDialogueCooldownUntil{};
@@ -252,7 +255,7 @@ namespace TFDMenu
 			}
 		}
 
-		static bool IsTeammateManualDialogueBlocked(RE::Actor* actor, Clock::time_point now, const char*& outReason, double& outRemainingSec)
+		static bool IsTeammateManualDialogueBlocked(RE::Actor* actor, Clock::time_point now, const char*& outReason, double& outRemainingSec, bool allowDownedRecoveryRetry = false)
 		{
 			outReason = "none";
 			outRemainingSec = 0.0;
@@ -263,6 +266,8 @@ namespace TFDMenu
 			}
 
 			ResolveGlobals();
+
+			const bool downedRecoveryHold = allowDownedRecoveryRetry && TFD::TeammateManager::IsDownedTeammateRecoveryDialogueHoldActor(actor);
 
 			if (TFD::PleasureRuntime::IsActive() || TFD::PleasureRuntime::IsBlocking()) {
 				outReason = TFD::PleasureRuntime::GetPhaseName();
@@ -275,8 +280,11 @@ namespace TFDMenu
 			}
 
 			if (GetGlobalValueInt(gDialogueState) == 1) {
-				outReason = "dialogue_state_in";
-				return true;
+				if (!downedRecoveryHold) {
+					outReason = "dialogue_state_in";
+					return true;
+				}
+				spdlog::info("[TFD][Menu] downed teammate recovery retry bypassed stale dialogue state actor={:08X}", actor->GetFormID());
 			}
 
 			if (GetGlobalValueInt(gPleasureState) != 0) {
@@ -285,9 +293,12 @@ namespace TFDMenu
 			}
 
 			if (now < gNextTeammateManualDialogueOpen) {
-				outReason = "global_cooldown";
-				outRemainingSec = std::chrono::duration<double>(gNextTeammateManualDialogueOpen - now).count();
-				return true;
+				if (!downedRecoveryHold) {
+					outReason = "global_cooldown";
+					outRemainingSec = std::chrono::duration<double>(gNextTeammateManualDialogueOpen - now).count();
+					return true;
+				}
+				spdlog::info("[TFD][Menu] downed teammate recovery retry bypassed global cooldown actor={:08X}", actor->GetFormID());
 			}
 
 			PruneTeammateManualDialogueCooldowns(now);
@@ -295,29 +306,35 @@ namespace TFDMenu
 			const auto formID = actor->GetFormID();
 			if (auto it = gTeammateManualDialogueCooldownUntil.find(formID); it != gTeammateManualDialogueCooldownUntil.end()) {
 				if (now < it->second) {
-					outReason = "actor_cooldown";
-					outRemainingSec = std::chrono::duration<double>(it->second - now).count();
-					return true;
+					if (!downedRecoveryHold) {
+						outReason = "actor_cooldown";
+						outRemainingSec = std::chrono::duration<double>(it->second - now).count();
+						return true;
+					}
+					spdlog::info("[TFD][Menu] downed teammate recovery retry bypassed actor cooldown actor={:08X}", actor->GetFormID());
+					gTeammateManualDialogueCooldownUntil.erase(it);
 				}
-				gTeammateManualDialogueCooldownUntil.erase(it);
+				else {
+					gTeammateManualDialogueCooldownUntil.erase(it);
+				}
 			}
 
 			return false;
 		}
 
-		static void ArmTeammateManualDialogueCooldown(RE::Actor* actor, Clock::time_point now, const char* reason)
+		static void ArmTeammateManualDialogueCooldown(RE::Actor* actor, Clock::time_point now, const char* reason, double globalSeconds = kTeammateManualGlobalCooldownSec, double actorSeconds = kTeammateManualActorCooldownSec)
 		{
-			gNextTeammateManualDialogueOpen = now + SecondsToClockDuration(kTeammateManualGlobalCooldownSec);
+			gNextTeammateManualDialogueOpen = now + SecondsToClockDuration(globalSeconds);
 
 			if (actor) {
-				const auto actorUntil = now + SecondsToClockDuration(kTeammateManualActorCooldownSec);
+				const auto actorUntil = now + SecondsToClockDuration(actorSeconds);
 				gTeammateManualDialogueCooldownUntil.insert_or_assign(actor->GetFormID(), actorUntil);
 
 				spdlog::info(
 					"[TFD][Menu] teammate manual dialogue cooldown armed actor={:08X} global={:.2f}s actor={:.2f}s reason={}",
 					actor->GetFormID(),
-					kTeammateManualGlobalCooldownSec,
-					kTeammateManualActorCooldownSec,
+					globalSeconds,
+					actorSeconds,
 					reason ? reason : "unknown");
 			}
 		}
@@ -2022,19 +2039,33 @@ namespace TFDMenu
 										return false;
 									}
 
+									const std::string_view teammateSource = sourceReason ? std::string_view(sourceReason) : std::string_view{};
+									const bool downedDialogueOpen =
+										teammateSource.find("downed") != std::string_view::npos ||
+										teammateSource.find("defeated_redirect") != std::string_view::npos ||
+										TFD::Actor::IsDownByHealthThreshold(teammateTalkTarget, TFD::Settings::GetAllyDownedThresholdPct());
+
+									if (downedDialogueOpen) {
+										TFD::TeammateManager::ArmDownedTeammateRecoveryDialogueHold(
+											teammateTalkTarget,
+											kDownedTeammateRecoveryHoldSec,
+											sourceReason ? sourceReason : "teammate_downed_recovery_dialogue");
+									}
+
 									const auto teammateNow = Clock::now();
 									const char* blockReason = "none";
 									double blockRemainingSec = 0.0;
-									if (IsTeammateManualDialogueBlocked(teammateTalkTarget, teammateNow, blockReason, blockRemainingSec)) {
+									if (IsTeammateManualDialogueBlocked(teammateTalkTarget, teammateNow, blockReason, blockRemainingSec, downedDialogueOpen)) {
 										spdlog::info(
-											"[TFD][Menu] teammate manual dialogue blocked target={:08X} source={} reason={} remaining={:.2f}s pleasurePhase={} dialogueContext={} dialogueState={}",
+											"[TFD][Menu] teammate manual dialogue blocked target={:08X} source={} reason={} remaining={:.2f}s pleasurePhase={} dialogueContext={} dialogueState={} downedRecovery={}",
 											teammateTalkTarget->GetFormID(),
 											sourceReason ? sourceReason : "unknown",
 											blockReason ? blockReason : "unknown",
 											blockRemainingSec,
 											TFD::PleasureRuntime::GetPhaseName(),
 											TFD::FlowController::GetDialogueContextName(),
-											GetGlobalValueInt(gDialogueState));
+											GetGlobalValueInt(gDialogueState),
+											downedDialogueOpen ? 1 : 0);
 										return true;
 									}
 
@@ -2054,7 +2085,7 @@ namespace TFDMenu
 										combatTargetPlayerSide ||
 										(teammateTalkTarget->IsInCombat() && !combatTarget);
 
-									if (shouldClearStaleCombat) {
+									if (shouldClearStaleCombat || downedDialogueOpen) {
 										teammateTalkTarget->StopCombat();
 										if (auto* process = RE::ProcessLists::GetSingleton()) {
 											process->StopCombatAndAlarmOnActor(teammateTalkTarget, false);
@@ -2065,15 +2096,28 @@ namespace TFDMenu
 									}
 
 									teammateTalkTarget->AllowPCDialogue(true);
-									teammateTalkTarget->EvaluatePackage(false, true);
-									teammateTalkTarget->EvaluatePackage(true, true);
+									if (!downedDialogueOpen) {
+										teammateTalkTarget->EvaluatePackage(false, true);
+										teammateTalkTarget->EvaluatePackage(true, true);
+									}
+									else {
+										spdlog::info(
+											"[TFD][Menu] downed teammate recovery dialogue prepared target={:08X} source={} hp={:.1f} downByThreshold={} bleedout={}",
+											teammateTalkTarget->GetFormID(),
+											sourceReason ? sourceReason : "unknown",
+											teammateTalkTarget->GetActorValue(RE::ActorValue::kHealth),
+											TFD::Actor::IsDownByHealthThreshold(teammateTalkTarget, TFD::Settings::GetAllyDownedThresholdPct()) ? 1 : 0,
+											(teammateTalkTarget->AsActorState() && teammateTalkTarget->AsActorState()->IsBleedingOut()) ? 1 : 0);
+									}
 
 									auto* teammateGreetInfo = ResolveTeammateGreetTopicInfo();
-									teammateTalkTarget->SetDialogueWithPlayer(false, false, nullptr);
+									if (!downedDialogueOpen) {
+										teammateTalkTarget->SetDialogueWithPlayer(false, false, nullptr);
+									}
 									const bool opened = teammateTalkTarget->SetDialogueWithPlayer(true, true, teammateGreetInfo);
 
 									spdlog::info(
-										"[TFD][Menu] activate hard-open teammate dialogue target={:08X} opened={} refreshed={} source={} topicInfo={:08X} staleCombatClear={} playerTeammate={} activeFollower={} playerSide={}",
+										"[TFD][Menu] activate hard-open teammate dialogue target={:08X} opened={} refreshed={} source={} topicInfo={:08X} staleCombatClear={} playerTeammate={} activeFollower={} playerSide={} downedRecovery={}",
 										teammateTalkTarget->GetFormID(),
 										opened ? 1 : 0,
 										refreshed ? 1 : 0,
@@ -2082,15 +2126,26 @@ namespace TFDMenu
 										shouldClearStaleCombat ? 1 : 0,
 										teammateTalkTarget->IsPlayerTeammate() ? 1 : 0,
 										TFD::TeammateManager::IsActiveFollowerActor(teammateTalkTarget) ? 1 : 0,
-										TFD::TeammateManager::IsPlayerSideTeammateActor(teammateTalkTarget) ? 1 : 0);
+										TFD::TeammateManager::IsPlayerSideTeammateActor(teammateTalkTarget) ? 1 : 0,
+										downedDialogueOpen ? 1 : 0);
 
 									if (opened) {
-										ArmTeammateManualDialogueCooldown(teammateTalkTarget, teammateNow, "hard_open_teammate_manual_dialogue");
+										if (downedDialogueOpen) {
+											ArmTeammateManualDialogueCooldown(
+												teammateTalkTarget,
+												teammateNow,
+												"hard_open_downed_teammate_recovery_dialogue",
+												kDownedTeammateRecoveryGlobalCooldownSec,
+												kDownedTeammateRecoveryActorCooldownSec);
+										}
+										else {
+											ArmTeammateManualDialogueCooldown(teammateTalkTarget, teammateNow, "hard_open_teammate_manual_dialogue");
+										}
 										return true;
 									}
 
 									return false;
-								};
+									};
 
 								auto openVictoryDialogue = [&](RE::Actor* defeatedTalkTarget, const char* sourceReason) -> bool {
 									if (!defeatedTalkTarget) {
@@ -2145,7 +2200,7 @@ namespace TFDMenu
 										opened ? 1 : 0,
 										sourceReason ? sourceReason : "victory_activate_dialogue");
 									return opened;
-								};
+									};
 
 								// R55: the normal teammate dialogue opener must be crosshair-exact.
 								// The R54 proximity scanner was too aggressive and could steal the E key
@@ -2160,7 +2215,7 @@ namespace TFDMenu
 										crosshairRef->GetFormID());
 								}
 								else if (crosshairActor && crosshairActor != player) {
-									if (TFD::TeammateManager::IsActiveFollowerActor(crosshairActor) || TFD::TeammateManager::IsPlayerSideTeammateActor(crosshairActor)) {
+									if (TFD::TeammateManager::IsTFDManagedTeammateActor(crosshairActor)) {
 										if (openTeammateDialogue(crosshairActor, "teammate_crosshair_activate_dialogue")) {
 											return RE::BSEventNotifyControl::kStop;
 										}
@@ -2186,7 +2241,7 @@ namespace TFDMenu
 									}
 
 									if (auto* defeatedTalkTarget = TFD::InteractionRouter::PickExactDialogueDefeatedTarget(512.0f)) {
-										if (TFD::TeammateManager::IsPlayerSideTeammateActor(defeatedTalkTarget)) {
+										if (TFD::TeammateManager::IsTFDManagedTeammateActor(defeatedTalkTarget)) {
 											spdlog::info("[TFD][Menu] activate redirected defeated target to teammate dialogue target={:08X} reason=player_side_teammate_fallback", defeatedTalkTarget->GetFormID());
 											if (openTeammateDialogue(defeatedTalkTarget, "teammate_defeated_redirect_dialogue")) {
 												return RE::BSEventNotifyControl::kStop;
@@ -2201,7 +2256,7 @@ namespace TFDMenu
 									}
 								}
 							}
-					}
+						}
 					}
 
 					if (TFD::FeedPopup::IsOpen()) {
