@@ -32,6 +32,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDTame.h"
 #include "TFDFeedPopup.h"
+#include "TFDStatusHUD.h"
 #include "TFDActor.h"
 #include "TFDTeammateManager.h"
 #include "TFDFlowController.h"
@@ -215,6 +216,41 @@ namespace TFDMenu
 			return info;
 		}
 
+
+
+		static RE::TESTopicInfo* ResolveVictoryGreetTopicInfo()
+		{
+			static RE::TESTopicInfo* info = nullptr;
+			static bool attempted = false;
+
+			if (!attempted) {
+				attempted = true;
+
+				// R93O: Victory after a real PreCombat dialogue can leave vanilla topic
+				// selection on the old dialogue route even when SetDialogueWithPlayer()
+				// returns true. Use the explicit INFO behind TFD_TIF__05195937
+				// so the Victory fragment always fires like direct Victory does.
+				constexpr RE::FormID kVictoryGreetInfoLocalFormID = 0x00195937;
+				constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+				if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+					info = dataHandler->LookupForm<RE::TESTopicInfo>(kVictoryGreetInfoLocalFormID, kPluginName);
+				}
+
+				if (info) {
+					spdlog::info("[TFD][Menu] TFDDialogueVictoryGreet INFO resolved {:08X} local={:06X}",
+						info->GetFormID(),
+						kVictoryGreetInfoLocalFormID);
+				}
+				else {
+					spdlog::warn("[TFD][Menu] TFDDialogueVictoryGreet INFO {:06X} not found in {}; victory hard dialogue will fall back to default topic selection",
+						kVictoryGreetInfoLocalFormID,
+						kPluginName);
+				}
+			}
+
+			return info;
+		}
 
 		static RE::TESObjectREFR* GetCrosshairTargetRef()
 		{
@@ -1979,6 +2015,7 @@ namespace TFDMenu
 			SKSEMenuFramework::AddSectionItem("RULES OF COMBAT", RenderCombatRulesPage);
 			SKSEMenuFramework::AddSectionItem("DEBUG", RenderDebugPage);
 			TFD::FeedPopup::Init();
+			TFD::StatusHUD::Init();
 
 			menuRegistered = true;
 			spdlog::info("[TFD][SMF] menu registered OK");
@@ -2190,15 +2227,20 @@ namespace TFDMenu
 									// to No while other enemies are still present. Force it back to Yes
 									// immediately before opening so CK dialogue conditions stay valid.
 									TFD::Victory::SetStateValue(2);
-									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, false, nullptr);
+
+									auto* victoryGreetInfo = ResolveVictoryGreetTopicInfo();
+									defeatedTalkTarget->SetDialogueWithPlayer(false, false, nullptr);
+									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, true, victoryGreetInfo);
 									if (opened) {
 										TFD::Victory::SetStateValue(2);
 										ArmVictoryManualDialogueCooldown(defeatedTalkTarget, victoryNow, "hard_open_victory_manual_dialogue");
 									}
-									spdlog::info("[TFD][Menu] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue source={}",
+									spdlog::info("[TFD][Menu][R93O] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue source={} topicInfo={:08X} explicit={} reset=1",
 										defeatedTalkTarget->GetFormID(),
 										opened ? 1 : 0,
-										sourceReason ? sourceReason : "victory_activate_dialogue");
+										sourceReason ? sourceReason : "victory_activate_dialogue",
+										victoryGreetInfo ? victoryGreetInfo->GetFormID() : 0u,
+										victoryGreetInfo ? 1 : 0);
 									return opened;
 									};
 

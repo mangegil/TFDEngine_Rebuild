@@ -362,6 +362,14 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     TFD::Settings::EnsureInitialized();
     TFD::HostilityHooks::Install();
 
+    if (auto* papyrus = SKSE::GetPapyrusInterface()) {
+        papyrus->Register(TFD::CombatBehavior::RegisterPapyrus);
+        spdlog::info("[TFD] Papyrus native registration queued");
+    }
+    else {
+        spdlog::warn("[TFD] PapyrusInterface missing; combat behavior native resolver unavailable");
+    }
+
 #if TFDEnableSmf
     TFDMenu::Init();
 #endif

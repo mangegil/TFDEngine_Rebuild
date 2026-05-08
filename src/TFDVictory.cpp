@@ -28,6 +28,7 @@ namespace TFD::Victory
         static constexpr int kObservedCombatContextLingerMs = 2500;
         static constexpr float kDefeatedDialogueScanRadius = 512.0f;
         static constexpr float kVictoryObservedScanRadius = 2400.0f;
+        static constexpr float kActorLevelDefeatedScanRadius = 4200.0f;
 
         void ResolveGlobal()
         {
@@ -134,6 +135,33 @@ namespace TFD::Victory
                 return false;
             }
             return allowContextFallback || IsRelevantLivingEnemyActor(actor, player);
+        }
+
+
+        bool HasActorLevelDefeatedLivingVictoryActor(float radius)
+        {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return false;
+            }
+
+            const float scanRadius = (std::max)(radius, kActorLevelDefeatedScanRadius);
+            const auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || info.dist > scanRadius) {
+                    continue;
+                }
+                if (!IsBasicLivingVictoryActor(actor, player)) {
+                    continue;
+                }
+                if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         bool HasThresholdDefeatedVictoryActor(float radius, bool allowContextFallback)
@@ -343,6 +371,13 @@ namespace TFD::Victory
         const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateNo || previousState == kStateYes;
 
         if (HasDialogueCapableDefeatedEnemy(kDefeatedDialogueScanRadius)) {
+            return kStateYes;
+        }
+
+        // R93M: Actor-level defeated locks are the authoritative Victory truth.
+        // Enemy downed by a teammate after PreCombat may no longer look hostile or
+        // have an active combat context, but it is still a living defeated enemy.
+        if (HasActorLevelDefeatedLivingVictoryActor(kActorLevelDefeatedScanRadius)) {
             return kStateYes;
         }
 

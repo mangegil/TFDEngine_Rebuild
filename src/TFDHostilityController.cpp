@@ -632,6 +632,8 @@ namespace TFD::HostilityController
         constexpr double kTameDurationSec = 60.0;
         constexpr double kMaxTameTotalSec = 180.0;
         constexpr double kTruceHiddenFailsafeSec = 120.0;
+        constexpr double kFlowHandoffHoldMinSec = 2.0;
+        constexpr double kFlowHandoffHoldMaxSec = 12.0;
 
         constexpr double kSuppressionApplyIntervalSec = 0.25;
         constexpr double kPackageEvalIntervalSec = 1.0;
@@ -2193,6 +2195,17 @@ namespace TFD::HostilityController
                 return ReleaseReason::InvalidActor;
             }
 
+            if (session.flowHandoffHold) {
+                if (session.flowHandoffHoldUntilSec <= 0.0 || nowSec < session.flowHandoffHoldUntilSec) {
+                    session.armedSinceSec = 0.0;
+                    session.tooFarSinceSec = 0.0;
+                    session.tameStartleSinceSec = 0.0;
+                    session.invalidSinceSec = 0.0;
+                    return ReleaseReason::Generic;
+                }
+                return ReleaseReason::FlowHandoff;
+            }
+
             if (session.primaryMode == Mode::Tame &&
                 session.endTimeSec > 0.0 &&
                 nowSec >= session.endTimeSec) {
@@ -2422,6 +2435,8 @@ namespace TFD::HostilityController
             session.temporaryTeammateApplied = false;
             session.dialogueRequested = allowDialogue;
             session.suppressBridgeEvents = suppressBridgeEvents;
+            session.flowHandoffHold = false;
+            session.flowHandoffHoldUntilSec = 0.0;
             session.dialogueAssignedActorIds.clear();
             session.finished = false;
 
@@ -3129,6 +3144,90 @@ namespace TFD::HostilityController
         }
 
         return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor);
+    }
+
+    bool PreserveTruceSessionForFlowHandoff(RE::Actor* primaryTarget, double durationSec, const char* reason)
+    {
+        if (!primaryTarget) {
+            return false;
+        }
+
+        const auto targetId = primaryTarget->GetFormID();
+        if (targetId == 0) {
+            return false;
+        }
+
+        auto entryIt = g_entries.find(targetId);
+        if (entryIt == g_entries.end() || !IsTruceMode(entryIt->second.mode)) {
+            return false;
+        }
+
+        const auto sessionId = entryIt->second.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || !IsTruceMode(sessionIt->second.primaryMode)) {
+            return false;
+        }
+
+        const double nowSec = SuppressionNowSec();
+        const double clampedDuration = std::clamp(durationSec, kFlowHandoffHoldMinSec, kFlowHandoffHoldMaxSec);
+        auto& session = sessionIt->second;
+        session.flowHandoffHold = true;
+        session.flowHandoffHoldUntilSec = std::max(session.flowHandoffHoldUntilSec, nowSec + clampedDuration);
+        session.pendingReleaseReason = ReleaseReason::FlowHandoff;
+        session.dialogueRequested = false;
+        session.dialogueOpened = true;
+        session.suppressBridgeEvents = true;
+        session.armedSinceSec = 0.0;
+        session.tooFarSinceSec = 0.0;
+        session.tameStartleSinceSec = 0.0;
+        session.invalidSinceSec = 0.0;
+
+        std::uint32_t refreshed = 0;
+        for (auto& [actorId, entry] : g_entries) {
+            if (entry.sessionId != sessionId || !IsTruceMode(entry.mode)) {
+                continue;
+            }
+
+            entry.allowDialogue = false;
+            entry.lastSuppressionApplySec = 0.0;
+            entry.lastPackageEvalSec = 0.0;
+            g_rehostileRequests.erase(actorId);
+
+            if (auto* actor = ResolveActor(actorId)) {
+                ApplySuppression(actor, entry, nowSec);
+                ++refreshed;
+            }
+        }
+
+        spdlog::info(
+            "TFDHostilityController: preserve truce for flow handoff session={} primary={:08X} duration={:.2f}s until={:.2f} refreshed={} reason={}",
+            sessionId,
+            targetId,
+            clampedDuration,
+            session.flowHandoffHoldUntilSec,
+            refreshed,
+            reason ? reason : "unknown");
+
+        return true;
+    }
+
+    bool IsFlowHandoffHoldActive(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+
+        auto entryIt = g_entries.find(actor->GetFormID());
+        if (entryIt == g_entries.end()) {
+            return false;
+        }
+
+        auto sessionIt = g_sessions.find(entryIt->second.sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
+            return false;
+        }
+
+        return sessionIt->second.flowHandoffHold;
     }
 
     std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget)

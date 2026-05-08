@@ -53,6 +53,7 @@ add_library(TFDEngine SHARED
     src/MenuFramework.cpp
     src/TFDTame.cpp
     src/TFDFeedPopup.cpp
+    src/TFDStatusHUD.cpp
     src/TFDCaptiveDoorController.cpp
     src/TFDTeammateManager.cpp
     src/TFDRecruit.cpp

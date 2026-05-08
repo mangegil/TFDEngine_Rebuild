@@ -3,6 +3,11 @@
 namespace RE
 {
     class Actor;
+
+    namespace BSScript
+    {
+        class IVirtualMachine;
+    }
 }
 
 namespace TFD::CombatBehavior
@@ -10,6 +15,7 @@ namespace TFD::CombatBehavior
     void Install();
     void Shutdown();
     void ResetForLoad();
+    bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm);
 
     // Diagnostic helpers. R73 also uses this runtime state as short-lived normal-combat ownership.
     bool IsDiagnosticActor(RE::Actor* actor);

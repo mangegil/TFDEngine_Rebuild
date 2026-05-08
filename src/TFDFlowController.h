@@ -37,6 +37,16 @@ namespace TFD::FlowController
         LeftForDead
     };
 
+    enum class ObservedMainState : std::uint8_t
+    {
+        Neutral = 0,
+        Precombat,
+        Incombat,
+        Victory,
+        Defeat,
+        Captive
+    };
+
     enum class DecisionGate : std::uint8_t
     {
         None = 0,
@@ -137,6 +147,55 @@ namespace TFD::FlowController
         std::uint32_t primaryActorFormID{ 0 };
         bool terminalResolved{ false };
         bool locked{ false };
+    };
+
+    enum class ObservedReasonFlag : std::uint32_t
+    {
+        None = 0,
+        CaptiveRuntime = 1u << 0,
+        CaptiveGlobal = 1u << 1,
+        CaptiveRoot = 1u << 2,
+        PlayerBleedRuntime = 1u << 3,
+        DefeatGlobal = 1u << 4,
+        BleedoutRoot = 1u << 5,
+        ActiveHostile = 1u << 6,
+        DefeatedLivingEnemy = 1u << 7,
+        MutualLosHostile = 1u << 8,
+        RootInCombat = 1u << 9,
+        RootVictory = 1u << 10,
+        RootPreCombat = 1u << 11
+    };
+
+    struct ObservedMainStateSnapshot
+    {
+        ObservedMainState observed{ ObservedMainState::Neutral };
+        ObservedMainState rootProjected{ ObservedMainState::Neutral };
+        ObservedMainState globalsProjected{ ObservedMainState::Neutral };
+
+        Snapshot flow{};
+
+        std::uint32_t reasonFlags{ 0 };
+        std::uint32_t reasonActorFormID{ 0 };
+        std::uint32_t reasonTargetFormID{ 0 };
+
+        std::uint32_t scannedActorCount{ 0 };
+        std::uint32_t activeHostileCount{ 0 };
+        std::uint32_t mutualLosHostileCount{ 0 };
+        std::uint32_t defeatedLivingEnemyCount{ 0 };
+        std::uint32_t playerSideStandingCount{ 0 };
+
+        int preCombatGlobal{ 0 };
+        int inCombatGlobal{ 0 };
+        int victoryGlobal{ 0 };
+        int defeatGlobal{ 0 };
+        int captiveGlobal{ 0 };
+        int pleasureGlobal{ 0 };
+        int dialogueGlobal{ 0 };
+
+        bool playerInCombat{ false };
+        bool playerBleedRuntimeActive{ false };
+        bool captiveRuntimeActive{ false };
+        bool combatActiveFlag{ false };
     };
 
 
@@ -328,6 +387,9 @@ namespace TFD::FlowController
         static Controller& GetSingleton();
 
         Snapshot GetSnapshot() const;
+        ObservedMainStateSnapshot GetObservedMainStateSnapshot() const;
+        ObservedMainState GetObservedMainState() const;
+        void TickObservedMainStateDiagnostic(RE::Actor* player, std::string_view reason);
 
         void ResetRuntime(std::string_view reason);
         void ResetForLoad(std::string_view reason);
@@ -397,6 +459,7 @@ namespace TFD::FlowController
         bool BeginCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason);
 
         static const char* ToString(RootFlow value);
+        static const char* ToString(ObservedMainState value);
         static const char* ToString(DecisionGate value);
         static const char* ToString(CaptiveMode value);
         static const char* ToString(SubFlow value);
@@ -427,6 +490,8 @@ namespace TFD::FlowController
         mutable std::mutex _lock;
         Snapshot _snapshot{};
         bool _combatActive{ false };
+        ObservedMainStateSnapshot _observedSnapshot{};
+        bool _hasObservedSnapshot{ false };
     };
 }
 

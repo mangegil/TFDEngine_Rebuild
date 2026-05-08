@@ -661,6 +661,32 @@ namespace
             return false;
         }
 
+        bool IsVanillaAssistIsolationCombatPressure(RE::Actor* actor, RE::PlayerCharacter* player, RE::Actor* combatTarget)
+        {
+            if (!actor || !player || actor == player) {
+                return false;
+            }
+            if (!IsTFDConvertedTeammate(actor)) {
+                return false;
+            }
+            if (actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+
+            auto* playerTarget = ResolveCombatTarget(player);
+            if (player->IsInCombat() || playerTarget) {
+                return true;
+            }
+            if (actor->IsInCombat() || combatTarget) {
+                return true;
+            }
+            if (player->IsWeaponDrawn() && actor->IsWeaponDrawn()) {
+                return true;
+            }
+
+            return false;
+        }
+
         bool IsCombatCapableTeammate(RE::Actor* actor)
         {
             if (!IsValidTeammate(actor)) {
@@ -1516,11 +1542,30 @@ namespace
                 auto* playerTarget = ResolveCombatTarget(player);
                 const bool actorTargetsPlayer = player && actorTarget == player;
                 const bool playerTargetsActor = playerTarget == actor;
+                const bool actorHasExternalCombatTarget =
+                    actorTarget &&
+                    actorTarget != player &&
+                    !actorTarget->IsDead() &&
+                    !actorTarget->IsDisabled() &&
+                    !IsPlayerSideTeammateAnchor(actorTarget) &&
+                    !TFD::HostilityController::IsActorTemporarilySuppressed(actorTarget);
                 const bool activeCombatConflict =
-                    actor->IsInCombat() ||
                     actorTargetsPlayer ||
                     playerTargetsActor ||
-                    TFD::Recruit::HasKnownHostileSourceFaction(actor);
+                    TFD::Recruit::HasKnownHostileSourceFaction(actor) ||
+                    (actor->IsInCombat() && !actorHasExternalCombatTarget);
+
+                // R80: do not run the heavy recruit commit path while a converted
+                // teammate is already fighting a valid external enemy. CommitRecruit
+                // clears combat and evaluates package; doing that during assist combat
+                // can make the actor sheathe, idle, or wait until self-defense damage.
+                if (actorHasExternalCombatTarget) {
+                    spdlog::info(
+                        "[TFD][TeammateManager] skip heavy alias resettle actor={:08X} reason=active_external_combat target={:08X}",
+                        actor->GetFormID(),
+                        actorTarget->GetFormID());
+                    return;
+                }
 
                 // R29: Do not run the heavy recruit commit path on every teammate
                 // alias refresh for raw-only stale hostility. Some converted bandits
@@ -2042,6 +2087,9 @@ namespace
 
         std::size_t CatchupRegisteredHumanoidTeammatesAfterLoad(const char* reason, std::size_t attempt)
         {
+            spdlog::info("[TFD][TeammateManager] R86 vanilla assist isolation: humanoid post-load catchup skipped reason={} attempt={}", reason ? reason : "post_load_humanoid_catchup", attempt);
+            return 0;
+
             std::scoped_lock lock(g_syncLock);
             ResolveRegistry();
 
@@ -2094,15 +2142,19 @@ namespace
                 const bool combatDiagTarget = TFD::CombatBehavior::IsDiagnosticActor(combatTarget);
                 const char* useReason = reason ? reason : "post_load_humanoid_catchup";
                 const bool combatBehaviorProtected = TFD::CombatBehavior::ShouldSuppressTeammatePackageRepair(actor, useReason);
+                const bool vanillaAssistIsolationProtected = IsVanillaAssistIsolationCombatPressure(actor, player, combatTarget);
+                const bool packageRepairProtected = combatBehaviorProtected || vanillaAssistIsolationProtected;
 
                 // R30: do not rubber-band followers during ordinary running.
                 // Move only on the final post-loading pass, and only if the actor
                 // is still unloaded, in a different cell and far away, or extremely far.
+                // R85: do not move/clear/recommit during live combat pressure. This keeps the
+                // vanilla follower package stack isolated from TFD catchup repair.
                 const bool allowEmergencyMove = attempt >= 3;
-                const bool shouldMove = !combatBehaviorProtected && allowEmergencyMove && (unloaded || far || wrongCellFar);
+                const bool shouldMove = !packageRepairProtected && allowEmergencyMove && (unloaded || far || wrongCellFar);
 
 
-                if (!hasValidExternalCombatTarget && !combatBehaviorProtected) {
+                if (!hasValidExternalCombatTarget && !packageRepairProtected) {
                     if (combatDiagActor || combatDiagTarget) {
                         spdlog::info(
                             "[TFD][TeammateManagerDiag] catchup_clear_before actor={:08X} reason={} attempt={} target={:08X} actorCombat={} actorRole={} targetRole={} wrongCell={} unloaded={} dist={:.1f}",
@@ -2154,13 +2206,13 @@ namespace
                 options.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
                 options.reason = reason ? reason : "post_load_humanoid_catchup";
                 options.quarantineHostileFactions = true;
-                options.clearCombat = !hasValidExternalCombatTarget && !combatBehaviorProtected;
+                options.clearCombat = !hasValidExternalCombatTarget && !packageRepairProtected;
                 options.evaluatePackage = false;
                 options.detailedLog = false;
                 options.throttleObserve = true;
                 options.ensurePacifyAlliance = true;
                 options.applyRuntimeProfile = true;
-                if (!combatBehaviorProtected) {
+                if (!packageRepairProtected) {
                     TFD::Recruit::CommitRecruit(actor, player, options);
                     assigned = QueueHumanoidTeammateAssignEvent(actor, useReason);
 
@@ -2172,9 +2224,10 @@ namespace
                 }
                 else {
                     spdlog::info(
-                        "[TFD][TeammateManager] post-load package repair skipped actor={:08X} reason={} rule=active_combat_behavior target={:08X} actorRole={} targetRole={} actorCombat={}",
+                        "[TFD][TeammateManager] post-load package repair skipped actor={:08X} reason={} rule={} target={:08X} actorRole={} targetRole={} actorCombat={}",
                         actor->GetFormID(),
                         useReason,
+                        vanillaAssistIsolationProtected ? "vanilla_assist_isolation" : "active_combat_behavior",
                         combatTarget ? combatTarget->GetFormID() : 0u,
                         TFD::CombatBehavior::DiagnosticRole(actor),
                         TFD::CombatBehavior::DiagnosticRole(combatTarget),
@@ -2191,7 +2244,7 @@ namespace
                     evaluated ? 1 : 0,
                     wrongCell ? 1 : 0,
                     unloaded ? 1 : 0,
-                    (hasValidExternalCombatTarget || combatBehaviorProtected) ? 1 : 0,
+                    (hasValidExternalCombatTarget || packageRepairProtected) ? 1 : 0,
                     dist,
                     combatDiagActor ? 1 : 0,
                     TFD::CombatBehavior::DiagnosticRole(actor),
@@ -2207,6 +2260,9 @@ namespace
 
         void QueueHumanoidTeammateCatchupAfterLoad(const char* reason)
         {
+            spdlog::info("[TFD][TeammateManager] R86 vanilla assist isolation: humanoid post-load catchup queue ignored reason={}", reason && reason[0] ? reason : "post_load_humanoid_catchup");
+            return;
+
             const std::string reasonText = reason && reason[0] ? reason : "post_load_humanoid_catchup";
 
             std::thread([reasonText]() {

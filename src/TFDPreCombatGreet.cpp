@@ -63,6 +63,7 @@ namespace TFD::PreCombatGreet
         constexpr unsigned kPostRecruitSettleRequiredCleanSweeps = 3;
         constexpr double kStaleRecruitCombatStateSuppressSec = 8.00;
         constexpr double kRecruitCommitPendingGuardSec = 5.00;
+        constexpr double kPleasureHandoffHoldSec = 18.00;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -146,6 +147,7 @@ namespace TFD::PreCombatGreet
         void ArmTerminalPendingBarrierLocked(Pending& pending, const char* reason);
         void ResetDialogueOpenRetryLocked(Pending& pending);
         void CancelPreCombatDialogueOpenLocked(RE::Actor* actor, Pending& pending, const char* reason);
+        void EnforceNegotiationState(RE::Actor* actor, Pending& pending, double nowSec);
 
         bool IsGraceEventName(std::string_view eventName)
         {
@@ -621,7 +623,8 @@ namespace TFD::PreCombatGreet
             const bool firstTrack = it == gStaleRecruitHostilityUntil.end() || now >= it->second;
             if (it == gStaleRecruitHostilityUntil.end()) {
                 gStaleRecruitHostilityUntil.emplace(actorId, until);
-            } else {
+            }
+            else {
                 it->second = std::max(it->second, until);
             }
 
@@ -923,7 +926,7 @@ namespace TFD::PreCombatGreet
                     reason ? reason : "unknown");
 
                 return static_cast<unsigned>(restored);
-            };
+                };
 
             if (clampedActors.empty()) {
                 spdlog::warn(
@@ -1184,10 +1187,42 @@ namespace TFD::PreCombatGreet
                 return false;
             }
 
-            // Real terminal outcomes may clean up normally. TerminalPending is only a
+            // Pleasure is a handoff, not a release. The precombat truce / pacify
+            // ownership must stay alive until OStim has either really started or the
+            // handoff has failed cleanly. If we release here, the speaker can reacquire
+            // the player for one AI tick and OStim can abort/crash.
+            if (pending.pleasureChoiceCommitted) {
+                const bool pleasureRuntimeProtect = TFD::PleasureRuntime::ShouldProtectPendingDialogue(actor);
+                const bool holdWindowActive = nowSec < pending.postCloseOutcomeGraceUntilSec;
+                if (pleasureRuntimeProtect || holdWindowActive) {
+                    EnforceNegotiationState(actor, pending, nowSec);
+                    if (nowSec >= pending.nextPostCloseOutcomeLogSec) {
+                        pending.nextPostCloseOutcomeLogSec = nowSec + 0.50;
+                        spdlog::info(
+                            "[TFD][PreCombatGreet] hold close for pleasure handoff actor={:08X} action={} runtimeProtect={} holdActive={} graceUntil={:.2f} now={:.2f}",
+                            actor->GetFormID(),
+                            TFD::InteractionRouter::ToString(pending.action),
+                            pleasureRuntimeProtect ? 1 : 0,
+                            holdWindowActive ? 1 : 0,
+                            pending.postCloseOutcomeGraceUntilSec,
+                            nowSec);
+                    }
+                    return true;
+                }
+
+                spdlog::warn(
+                    "[TFD][PreCombatGreet] pleasure handoff hold expired actor={:08X} action={} graceUntil={:.2f} now={:.2f}",
+                    actor->GetFormID(),
+                    TFD::InteractionRouter::ToString(pending.action),
+                    pending.postCloseOutcomeGraceUntilSec,
+                    nowSec);
+                return false;
+            }
+
+            // Other real terminal outcomes may clean up normally. TerminalPending is only a
             // Papyrus-side "the player picked a terminal answer" signal; the real
             // native outcome still has to arrive after the TIF chain finishes.
-            if (pending.terminalChoiceCommitted || pending.pleasureChoiceCommitted) {
+            if (pending.terminalChoiceCommitted) {
                 return false;
             }
 
@@ -1498,11 +1533,13 @@ namespace TFD::PreCombatGreet
             pending.payFollowupPending = false;
             pending.terminalPendingBarrier = false;
             pending.pleasureChoiceCommitted = false;
+            const double now = NowSec();
             pending.stickySuppressTerminalUntilSec = 0.0;
             pending.nextStickyRetrySec = 0.0;
             pending.nextPreserveHandoffLogSec = 0.0;
-            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = now + kPleasureHandoffHoldSec;
             pending.nextPostCloseOutcomeLogSec = 0.0;
+            pending.expiresSec = std::max(pending.expiresSec, pending.postCloseOutcomeGraceUntilSec);
             ResetDialogueOpenRetryLocked(pending);
             ClearDialogueClosePendingLocked(pending);
             spdlog::info(
@@ -1542,21 +1579,24 @@ namespace TFD::PreCombatGreet
             pending.payFollowupPending = false;
             pending.terminalPendingBarrier = false;
             pending.pleasureChoiceCommitted = true;
+            const double now = NowSec();
             pending.stickySuppressTerminalUntilSec = 0.0;
             pending.nextStickyRetrySec = 0.0;
             pending.nextPreserveHandoffLogSec = 0.0;
-            pending.postCloseOutcomeGraceUntilSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = now + kPleasureHandoffHoldSec;
             pending.nextPostCloseOutcomeLogSec = 0.0;
+            pending.expiresSec = std::max(pending.expiresSec, pending.postCloseOutcomeGraceUntilSec);
             ResetDialogueOpenRetryLocked(pending);
             ClearDialogueClosePendingLocked(pending);
             if (actor) {
                 CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pleasure");
             }
             spdlog::info(
-                "[TFD][PreCombatGreet] pleasure choice committed action={} actor={:08X} reason={}",
+                "[TFD][PreCombatGreet] pleasure choice committed action={} actor={:08X} reason={} holdUntil={:.2f}",
                 TFD::InteractionRouter::ToString(pending.action),
                 actor ? actor->GetFormID() : 0u,
-                reason ? reason : "unknown");
+                reason ? reason : "unknown",
+                pending.postCloseOutcomeGraceUntilSec);
         }
 
         bool ShouldSuppressTerminalEventLocked(const Pending& pending, RE::Actor* actor, const char* eventName)

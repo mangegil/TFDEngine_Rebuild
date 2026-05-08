@@ -90,6 +90,8 @@ namespace TFD::HostilityController
         bool dialogueRequested{ false };
         bool dialogueOpened{ false };
         bool suppressBridgeEvents{ false };
+        bool flowHandoffHold{ false };
+        double flowHandoffHoldUntilSec{ 0.0 };
         std::vector<RE::FormID> dialogueAssignedActorIds{};
         bool finished{ false };
     };
@@ -120,6 +122,8 @@ namespace TFD::HostilityController
     bool IsSuppressed(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
+    bool PreserveTruceSessionForFlowHandoff(RE::Actor* primaryTarget, double durationSec, const char* reason = nullptr);
+    bool IsFlowHandoffHoldActive(RE::Actor* actor);
     [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
     [[nodiscard]] std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget);
     std::size_t ReleaseDialogueTruceActors(

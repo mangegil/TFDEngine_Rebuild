@@ -9,6 +9,7 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDFlowController.h"
+#include "TFDActor.h"
 #include "TFDLocation.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
@@ -222,6 +223,7 @@ namespace TFD::PostDefeatState
 
         int g_lastObservedVictoryStateForRecruitGlobals = -1;
         std::chrono::steady_clock::time_point g_nextVictoryRecruitGlobalRefresh{};
+        std::chrono::steady_clock::time_point g_nextVictoryPreserveLog{};
         int g_staleVictoryNeutralTicks = 0;
 
         bool IsDialogueMenuOpen()
@@ -253,6 +255,53 @@ namespace TFD::PostDefeatState
             g_lastObservedVictoryStateForRecruitGlobals = victoryState;
         }
 
+        bool IsVictoryFlowStillBackedByDefeatedActor(const TFD::FlowController::Snapshot& snapshot)
+        {
+            if (snapshot.root != TFD::FlowController::RootFlow::Victory) {
+                return false;
+            }
+            if (snapshot.primaryActorFormID == 0) {
+                return false;
+            }
+
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(snapshot.primaryActorFormID);
+            if (!actor) {
+                return false;
+            }
+
+            return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor);
+        }
+
+        bool PreserveVictoryFlowIfBackedByDefeatedActor(const char* reason)
+        {
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto snapshot = flow.GetSnapshot();
+            if (!IsVictoryFlowStillBackedByDefeatedActor(snapshot)) {
+                return false;
+            }
+
+            const int previousVictoryState = TFD::Victory::GetStateValue();
+            TFD::Victory::SetStateValue(kVictoryStateYes);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateYes);
+            g_staleVictoryNeutralTicks = 0;
+
+            const auto now = std::chrono::steady_clock::now();
+            const bool shouldLog = previousVictoryState != kVictoryStateYes ||
+                g_nextVictoryPreserveLog == std::chrono::steady_clock::time_point{} ||
+                now >= g_nextVictoryPreserveLog;
+
+            if (shouldLog) {
+                spdlog::info(
+                    "[TFD][PostDefeatState][R93N] preserving Victory flow root primary={:08X} token={} previousState={} reason={}",
+                    snapshot.primaryActorFormID,
+                    snapshot.token,
+                    previousVictoryState,
+                    reason ? reason : "victory_flow_backed_by_defeated_actor");
+                g_nextVictoryPreserveLog = now + std::chrono::milliseconds(kVictoryRecruitGlobalRefreshIntervalMs);
+            }
+            return true;
+        }
+
         void ClearStaleVictoryFlowWhenNeutral(int victoryState, const RefreshInput& input)
         {
             (void)input;
@@ -266,6 +315,17 @@ namespace TFD::PostDefeatState
             const auto snapshot = flow.GetSnapshot();
             if (snapshot.root != TFD::FlowController::RootFlow::Victory) {
                 g_staleVictoryNeutralTicks = 0;
+                return;
+            }
+
+            if (IsVictoryFlowStillBackedByDefeatedActor(snapshot)) {
+                TFD::Victory::SetStateValue(kVictoryStateYes);
+                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateYes);
+                g_staleVictoryNeutralTicks = 0;
+                spdlog::info(
+                    "[TFD][PostDefeatState] preserved Victory flow root despite neutral global primary={:08X} token={} reason=defeated_actor_still_dialogue_capable",
+                    snapshot.primaryActorFormID,
+                    snapshot.token);
                 return;
             }
 
@@ -307,9 +367,11 @@ namespace TFD::PostDefeatState
             result.routerCombatContextActive = false;
             SetGlobalInt(g_defeatStateGlobal, 0);
             TFD::Victory::ResetObservedContext();
-            TFD::Victory::SetStateValue(0);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
-            g_staleVictoryNeutralTicks = 0;
+            if (!PreserveVictoryFlowIfBackedByDefeatedActor("pleasure_passive_lock_ignored_for_active_victory")) {
+                TFD::Victory::SetStateValue(0);
+                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
+                g_staleVictoryNeutralTicks = 0;
+            }
             SetGlobalInt(g_hostileStateGlobal, 0);
             SetGlobalInt(g_enemyFactionStateGlobal, 0);
             SetGlobalInt(g_enemyRaceStateGlobal, 0);
@@ -319,14 +381,24 @@ namespace TFD::PostDefeatState
         }
 
         SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
-        TFD::Victory::RefreshObservedState(TFD::Victory::ObservedContext{
-            .hasPlayer = (input.player != nullptr),
-            .playerDown = ComputePlayerBleedOutState(input.player),
-            .combatContext = input.victoryContext,
-            .hasEnemies = !input.enemies.empty()
-            });
+
+        const bool playerCanOwnVictory = input.player && !ComputePlayerBleedOutState(input.player);
+        const bool preservedActiveVictoryFlow = playerCanOwnVictory &&
+            PreserveVictoryFlowIfBackedByDefeatedActor("active_victory_dialogue_actor_before_observed_refresh");
+
+        if (!preservedActiveVictoryFlow) {
+            TFD::Victory::RefreshObservedState(TFD::Victory::ObservedContext{
+                .hasPlayer = (input.player != nullptr),
+                .playerDown = ComputePlayerBleedOutState(input.player),
+                .combatContext = input.victoryContext,
+                .hasEnemies = !input.enemies.empty()
+                });
+        }
+
         const int victoryState = TFD::Victory::GetStateValue();
-        RefreshRecruitGlobalsWhenVictoryReady(victoryState);
+        if (!preservedActiveVictoryFlow) {
+            RefreshRecruitGlobalsWhenVictoryReady(victoryState);
+        }
         ClearStaleVictoryFlowWhenNeutral(victoryState, input);
         SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies));
         SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));

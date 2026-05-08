@@ -458,6 +458,16 @@ namespace
             if (EnsureFactionActive(actor, "TFDPlayerFaction", "actor_player_side")) {
                 ++result.actorFactions;
             }
+            // R80: TFD-converted teammates must get the same follower anchor
+            // factions as vanilla-style followers during native commit, not only
+            // after the Papyrus alias repair arrives. This makes combat assist
+            // state exist before the first threat scan/AI package tick.
+            if (EnsureFactionActive(actor, "CurrentFollowerFaction", "actor_follower_anchor")) {
+                ++result.actorFactions;
+            }
+            if (EnsureFactionActive(actor, "PlayerFollowerFaction", "actor_follower_anchor")) {
+                ++result.actorFactions;
+            }
         }
 
         if (player) {

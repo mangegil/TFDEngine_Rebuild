@@ -53,6 +53,12 @@ namespace TFD::PleasureRuntime
 			double queuedTerminalNeutralDueSec{ 0.0 };
 
 			double afterPleasureDialogueExpireSec{ 0.0 };
+
+			double pleasureStartPendingAtSec{ 0.0 };
+			double pleasureActiveStartedAtSec{ 0.0 };
+			double abortedFlowCompleteDueSec{ 0.0 };
+			std::uint32_t abortedFlowActorFormID{ 0 };
+			bool abortedFlowCompleteQueued{ false };
 		};
 
 		std::mutex g_lock;
@@ -61,6 +67,7 @@ namespace TFD::PleasureRuntime
 		constexpr const char* kPleasureStartPendingEvent = "TFDPreCombatPleasureStartPending";
 		constexpr const char* kPleasureStartedEvent = "TFDPreCombatPleasureStarted";
 		constexpr const char* kPleasureFailedEvent = "TFDPreCombatPleasureFailed";
+		constexpr const char* kPleasureAbortedEvent = "TFDPleasureAborted";
 		constexpr const char* kPleasureEndedEvent = "TFDPreCombatPleasureEnded";
 
 		constexpr const char* kOStimSceneStartPendingEvent = "TFDOStimSceneStartPending";
@@ -87,6 +94,8 @@ namespace TFD::PleasureRuntime
 		constexpr double kTerminalNeutralFinalizeDelaySec = 0.05;
 		constexpr double kAfterPleasureDialogueHardTimeoutSec = 20.0;
 		constexpr double kSuppressSceneStartDialogueCooldownSec = 0.75;
+		constexpr double kMinimumSceneActiveSec = 1.50;
+		constexpr double kAbortedFlowCompleteDelaySec = 0.05;
 
 		const char* ToString(Phase value)
 		{
@@ -213,6 +222,14 @@ namespace TFD::PleasureRuntime
 			bool valid{ false };
 		};
 
+		struct QueuedAbortedFlowComplete
+		{
+			std::uint32_t actorFormID{ 0 };
+			std::uint32_t cycleId{ 0 };
+			SourceContext source{ SourceContext::None };
+			bool valid{ false };
+		};
+
 		void ClearQueuedPreCombatCycleLocked(std::string_view reason)
 		{
 			const auto oldActor = g_state.queuedPreCombatSpeakerFormID;
@@ -285,10 +302,15 @@ namespace TFD::PleasureRuntime
 			g_state.bridgeState = 0;
 			g_state.afterPleasureCommitted = false;
 			g_state.afterPleasureDialogueExpireSec = 0.0;
+			g_state.pleasureStartPendingAtSec = 0.0;
+			g_state.pleasureActiveStartedAtSec = 0.0;
 		}
 
 		void ClearHoldStateLocked()
 		{
+			if (g_state.holdActive || g_state.passiveLockActive) {
+				TFD::HostilityController::ClearAggressionClamp();
+			}
 			g_state.holdActive = false;
 			g_state.passiveLockActive = false;
 			g_state.blocking = false;
@@ -305,6 +327,9 @@ namespace TFD::PleasureRuntime
 			g_state.redoPending = false;
 			g_state.flowOwnerToken = 0;
 			g_state.pendingChoice = AfterChoice::None;
+			g_state.abortedFlowCompleteQueued = false;
+			g_state.abortedFlowActorFormID = 0;
+			g_state.abortedFlowCompleteDueSec = 0.0;
 
 			ClearSpeakerStateLocked();
 			ClearBridgeStateLocked();
@@ -323,6 +348,14 @@ namespace TFD::PleasureRuntime
 		{
 			const auto prev = g_state.phase;
 			g_state.phase = next;
+
+			if (next == Phase::PleasureStartPending) {
+				g_state.pleasureStartPendingAtSec = NowSec();
+				g_state.pleasureActiveStartedAtSec = 0.0;
+			}
+			else if (next == Phase::PleasureActive) {
+				g_state.pleasureActiveStartedAtSec = NowSec();
+			}
 
 			if (next == Phase::Idle || next == Phase::Closed) {
 				g_state.active = false;
@@ -350,6 +383,11 @@ namespace TFD::PleasureRuntime
 			g_state.afterPleasureCommitted = false;
 			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
 			g_state.bridgeState = 0;
+			g_state.pleasureStartPendingAtSec = 0.0;
+			g_state.pleasureActiveStartedAtSec = 0.0;
+			g_state.abortedFlowCompleteQueued = false;
+			g_state.abortedFlowActorFormID = 0;
+			g_state.abortedFlowCompleteDueSec = 0.0;
 			g_state.pleasureSpeakerFormID = speaker ? speaker->GetFormID() : 0;
 			g_state.afterPleasureSpeakerFormID = 0;
 			g_state.active = true;
@@ -383,6 +421,7 @@ namespace TFD::PleasureRuntime
 			return eventName == kPleasureStartPendingEvent ||
 				eventName == kPleasureStartedEvent ||
 				eventName == kPleasureFailedEvent ||
+				eventName == kPleasureAbortedEvent ||
 				eventName == kPleasureEndedEvent ||
 				eventName == kOStimSceneStartPendingEvent ||
 				eventName == kOStimSceneStartedEvent ||
@@ -875,6 +914,77 @@ namespace TFD::PleasureRuntime
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
+		RE::Actor* ResolveEventOrTrackedActorLocked(const EventInfo& info)
+		{
+			if (info.actor && !info.actor->IsDisabled() && !info.actor->IsDead()) {
+				return info.actor;
+			}
+			if (auto* actor = LookupActor(info.actorFormID)) {
+				if (!actor->IsDisabled() && !actor->IsDead()) {
+					return actor;
+				}
+			}
+			if (auto* actor = LookupActor(g_state.pleasureSpeakerFormID)) {
+				if (!actor->IsDisabled() && !actor->IsDead()) {
+					return actor;
+				}
+			}
+			return nullptr;
+		}
+
+		bool IsSceneCombatUnsafe(RE::Actor* actor)
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (player && player->IsInCombat()) {
+				return true;
+			}
+			if (actor && actor->IsInCombat()) {
+				return true;
+			}
+			return false;
+		}
+
+		double GetActiveSceneDurationLocked()
+		{
+			if (g_state.pleasureActiveStartedAtSec <= 0.0) {
+				return 0.0;
+			}
+			return NowSec() - g_state.pleasureActiveStartedAtSec;
+		}
+
+		void QueueAbortedFlowCompleteLocked(RE::Actor* actor, std::string_view reason)
+		{
+			g_state.abortedFlowCompleteQueued = true;
+			g_state.abortedFlowActorFormID = actor ? actor->GetFormID() : g_state.pleasureSpeakerFormID;
+			g_state.abortedFlowCompleteDueSec = NowSec() + kAbortedFlowCompleteDelaySec;
+
+			spdlog::warn(
+				"[TFD][PleasureRuntime] aborted flow complete queued actor={:08X} cycle={} source={} delay={:.2f}s reason={}",
+				g_state.abortedFlowActorFormID,
+				g_state.sessionCycleId,
+				ToString(g_state.source),
+				kAbortedFlowCompleteDelaySec,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		QueuedAbortedFlowComplete TakeDueAbortedFlowCompleteLocked(double nowSec)
+		{
+			QueuedAbortedFlowComplete complete{};
+			if (!g_state.abortedFlowCompleteQueued || nowSec < g_state.abortedFlowCompleteDueSec) {
+				return complete;
+			}
+
+			complete.actorFormID = g_state.abortedFlowActorFormID;
+			complete.cycleId = g_state.sessionCycleId;
+			complete.source = g_state.source;
+			complete.valid = true;
+
+			g_state.abortedFlowCompleteQueued = false;
+			g_state.abortedFlowActorFormID = 0;
+			g_state.abortedFlowCompleteDueSec = 0.0;
+			return complete;
+		}
+
 		RE::Actor* ResolveAfterPleasureRecruitActorLocked(const EventInfo& info)
 		{
 			if (info.actor && !info.actor->IsDisabled() && !info.actor->IsDead()) {
@@ -1011,6 +1121,8 @@ namespace TFD::PleasureRuntime
 					BeginNewCycleLocked(info.actor, eventSource, eventName);
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.blocking = true;
+					g_state.passiveLockActive = true;
+					g_state.holdActive = true;
 					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_suppress_dialogue");
 					LogEventAcceptedLocked(eventName, info, "new_cycle");
 					return;
@@ -1038,6 +1150,33 @@ namespace TFD::PleasureRuntime
 
 			if (eventName == kPleasureEndedEvent || eventName == kOStimSceneEndedEvent) {
 				if (g_state.phase == Phase::PleasureActive) {
+					auto* eventActor = ResolveEventOrTrackedActorLocked(info);
+					const double activeDuration = GetActiveSceneDurationLocked();
+					const bool shortScene = activeDuration < kMinimumSceneActiveSec;
+					const bool combatUnsafe = IsSceneCombatUnsafe(eventActor);
+
+					if (shortScene || combatUnsafe) {
+						spdlog::warn(
+							"[TFD][PleasureRuntime] scene end rejected actor={:08X} cycle={} source={} duration={:.2f}s min={:.2f}s combatUnsafe={} reason={} no_afterpleasure=1",
+							eventActor ? eventActor->GetFormID() : info.actorFormID,
+							g_state.sessionCycleId,
+							ToString(g_state.source),
+							activeDuration,
+							kMinimumSceneActiveSec,
+							combatUnsafe ? 1 : 0,
+							std::string{ eventName });
+
+						AdvancePhaseLocked(Phase::Finalizing, "scene_rejected_no_afterpleasure");
+						AdvancePhaseLocked(Phase::Closed, "scene_rejected_no_afterpleasure");
+						ClearBridgeStateLocked();
+						ClearHoldStateLocked();
+						g_state.redoPending = false;
+						g_state.pendingChoice = AfterChoice::None;
+						QueueAbortedFlowCompleteLocked(eventActor, "scene_rejected_no_afterpleasure");
+						LogEventAcceptedLocked(eventName, info, "scene_rejected_no_afterpleasure");
+						return;
+					}
+
 					const auto afterSpeakerFormID = info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID;
 
 					AdvancePhaseLocked(Phase::PleasureEnding, eventName);
@@ -1075,13 +1214,17 @@ namespace TFD::PleasureRuntime
 				return;
 			}
 
-			if (eventName == kPleasureFailedEvent) {
-				if (g_state.phase == Phase::PleasureStartPending || g_state.phase == Phase::PleasureActive || g_state.phase == Phase::PleasureEnding) {
+			if (eventName == kPleasureFailedEvent || eventName == kPleasureAbortedEvent) {
+				if (g_state.phase == Phase::PleasureStartPending || g_state.phase == Phase::PleasureActive || g_state.phase == Phase::PleasureEnding || g_state.phase == Phase::RedoPending || g_state.phase == Phase::AfterPleasureDialogue) {
+					auto* eventActor = ResolveEventOrTrackedActorLocked(info);
 					AdvancePhaseLocked(Phase::Finalizing, eventName);
 					AdvancePhaseLocked(Phase::Closed, eventName);
 					ClearBridgeStateLocked();
 					ClearHoldStateLocked();
-					LogEventAcceptedLocked(eventName, info, "failed_close");
+					g_state.redoPending = false;
+					g_state.pendingChoice = AfterChoice::None;
+					QueueAbortedFlowCompleteLocked(eventActor, eventName);
+					LogEventAcceptedLocked(eventName, info, "failed_or_aborted_close");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "late_or_wrong_phase", info);
@@ -1099,11 +1242,31 @@ namespace TFD::PleasureRuntime
 				g_state.pendingChoice = choice;
 
 				if (choice == AfterChoice::Redo) {
+					auto* redoActor = ResolveEventOrTrackedActorLocked(info);
+					if (IsSceneCombatUnsafe(redoActor)) {
+						spdlog::warn(
+							"[TFD][PleasureRuntime] redo rejected actor={:08X} cycle={} source={} reason=combat_unsafe",
+							redoActor ? redoActor->GetFormID() : info.actorFormID,
+							g_state.sessionCycleId,
+							ToString(g_state.source));
+						AdvancePhaseLocked(Phase::Finalizing, "redo_combat_unsafe");
+						AdvancePhaseLocked(Phase::Closed, "redo_combat_unsafe");
+						ClearBridgeStateLocked();
+						ClearHoldStateLocked();
+						g_state.redoPending = false;
+						g_state.pendingChoice = AfterChoice::None;
+						QueueAbortedFlowCompleteLocked(redoActor, "redo_combat_unsafe");
+						LogEventAcceptedLocked(eventName, info, "redo_rejected_combat_unsafe");
+						return;
+					}
+
 					g_state.redoPending = true;
 					AdvancePhaseLocked(Phase::RedoPending, eventName);
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.afterPleasureCommitted = false;
 					g_state.blocking = true;
+					g_state.passiveLockActive = true;
+					g_state.holdActive = true;
 					SuppressActorDialogueForSceneLocked(
 						info.actor ? info.actor : LookupActor(info.actorFormID),
 						"after_pleasure_redo_suppress_teammate_dialogue");
@@ -1161,6 +1324,7 @@ namespace TFD::PleasureRuntime
 		QueuedPreCombatAttempt attempt{};
 		QueuedTerminalNeutralFinalize terminalFinalize{};
 		QueuedAfterPleasureDialogueTimeout afterDialogueTimeout{};
+		QueuedAbortedFlowComplete abortedComplete{};
 		{
 			std::scoped_lock lk(g_lock);
 			if (!g_state.installed) {
@@ -1170,9 +1334,12 @@ namespace TFD::PleasureRuntime
 			const double now = NowSec();
 			afterDialogueTimeout = TakeDueAfterPleasureDialogueTimeoutLocked(now);
 			if (!afterDialogueTimeout.valid) {
+				abortedComplete = TakeDueAbortedFlowCompleteLocked(now);
+			}
+			if (!afterDialogueTimeout.valid && !abortedComplete.valid) {
 				attempt = TakeDueQueuedPreCombatAttemptLocked(now);
 			}
-			if (!afterDialogueTimeout.valid && !attempt.valid) {
+			if (!afterDialogueTimeout.valid && !abortedComplete.valid && !attempt.valid) {
 				terminalFinalize = TakeDueTerminalNeutralFinalizeLocked(now);
 			}
 		}
@@ -1195,6 +1362,30 @@ namespace TFD::PleasureRuntime
 				afterDialogueTimeout.actorFormID,
 				afterDialogueTimeout.cycleId,
 				ToString(afterDialogueTimeout.source),
+				completeFlow ? 1 : 0,
+				pleasureClearQueued ? 1 : 0,
+				systemClearQueued ? 1 : 0);
+			return;
+		}
+
+		if (abortedComplete.valid) {
+			auto* abortActor = LookupActor(abortedComplete.actorFormID);
+			const bool pleasureClearQueued = TFD::FlowController::QueueBridgeModEvent(
+				kPleasureClearEvent,
+				abortActor,
+				"pleasure_aborted_no_afterpleasure",
+				0.0f);
+			const bool systemClearQueued = TFD::FlowController::QueueBridgeModEvent(
+				kSystemEventClearAfterPleasureEvent,
+				abortActor,
+				"pleasure_aborted_no_afterpleasure",
+				0.0f);
+			const bool completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("pleasure_aborted_no_afterpleasure");
+			spdlog::warn(
+				"[TFD][PleasureRuntime] aborted flow completed actor={:08X} cycle={} source={} completeFlow={} pleasureClearQueued={} systemClearQueued={}",
+				abortedComplete.actorFormID,
+				abortedComplete.cycleId,
+				ToString(abortedComplete.source),
 				completeFlow ? 1 : 0,
 				pleasureClearQueued ? 1 : 0,
 				systemClearQueued ? 1 : 0);
@@ -1296,8 +1487,30 @@ namespace TFD::PleasureRuntime
 		}
 
 		BeginNewCycleLocked(speaker, source, reason);
+		if (source == SourceContext::PreCombat && speaker) {
+			TFD::HostilityController::ApplyAggressionClamp(speaker);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				const bool oldRunDetection = process->runDetection;
+				process->runDetection = false;
+				process->ClearCachedFactionFightReactions();
+				process->StopCombatAndAlarmOnActor(speaker, false);
+				process->runDetection = oldRunDetection;
+			}
+			speaker->StopCombat();
+			if (speaker->IsWeaponDrawn()) {
+				speaker->DrawWeaponMagicHands(false);
+			}
+			speaker->EvaluatePackage(true, false);
+			TFD::HostilityController::ScheduleStopCombatWaves(1600.0f, false, 4, 85);
+			spdlog::info(
+				"[TFD][PleasureRuntime] precombat hard passive lock actor={:08X} reason={}",
+				speaker->GetFormID(),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
 		AdvancePhaseLocked(Phase::PleasureStartPending, reason);
 		g_state.blocking = true;
+		g_state.passiveLockActive = true;
+		g_state.holdActive = true;
 		return true;
 	}
 
