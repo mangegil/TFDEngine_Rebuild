@@ -81,4 +81,12 @@ namespace TFD::Recruit
     std::vector<RE::Actor*> CollectRecruitCommitPendingActors(SourceFlow sourceFlow, bool includeUnknownSource = false);
     bool IsRecruitCommitPending(RE::Actor* actor);
     void ClearRecruitCommitPending(RE::Actor* actor, const char* reason);
+
+    // Restore actor values/factions touched by native recruit conversion before a save swap.
+    // This prevents converted enemies from leaking pacified/player-side runtime state into older saves.
+    void RestoreRuntimeModifiedActorsForLoad(const char* reason = nullptr);
+
+    // Re-apply the same runtime restore after the loaded world is ready, then refresh faction reaction
+    // and combat detection for actors that are not legitimate TFD teammates in the loaded save.
+    void RefreshRuntimeRestoredActorsAfterLoad(const char* reason = nullptr);
 }

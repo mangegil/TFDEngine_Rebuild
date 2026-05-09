@@ -25,6 +25,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <utility>
 
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
@@ -382,8 +383,21 @@ namespace
         inline int g_lastTeammateStateWritten{ -999 };
         inline int g_lastHasPotionsWritten{ -999 };
 
+        struct DeferredHumanoidAssignEntry
+        {
+            std::string reason{};
+            double dueSec{ 0.0 };
+            std::uint32_t attempts{ 0 };
+        };
+
+        inline std::mutex g_deferredHumanoidAssignLock{};
+        inline std::unordered_map<RE::FormID, DeferredHumanoidAssignEntry> g_deferredHumanoidAssigns{};
+
         constexpr std::uint32_t kConvertedAliasInvalidGraceTicks = 12;
         constexpr double kHumanoidContractDays = 1.0;
+        constexpr double kDeferredHumanoidAssignDelaySeconds = 0.35;
+        constexpr double kDeferredHumanoidAssignRetrySeconds = 0.60;
+        constexpr std::uint32_t kDeferredHumanoidAssignMaxAttempts = 30;
         constexpr double kContractExpiryRetryBlockedSeconds = 8.0;
         constexpr double kContractExpiryRetryFailedSeconds = 12.0;
         constexpr double kContractExpiryRetryAfterOpenSeconds = 45.0;
@@ -1968,18 +1982,94 @@ namespace
             return lhs && rhs && lhs->GetFormID() == rhs->GetFormID();
         }
 
-        bool QueueHumanoidTeammateAssignEvent(RE::Actor* actor, const char* reason)
+        void DeferHumanoidTeammateAssignEvent(RE::Actor* actor, const char* reason, const char* deferReason)
+        {
+            if (!actor) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                return;
+            }
+
+            const double now = NowRealSeconds();
+            std::size_t pendingCount = 0;
+            std::uint32_t attempts = 0;
+            {
+                std::scoped_lock lk(g_deferredHumanoidAssignLock);
+                auto& entry = g_deferredHumanoidAssigns[actorId];
+                if (reason && reason[0] != '\0') {
+                    entry.reason = reason;
+                }
+                else if (entry.reason.empty()) {
+                    entry.reason = "deferred_humanoid_assign";
+                }
+                entry.dueSec = now + kDeferredHumanoidAssignDelaySeconds;
+                attempts = entry.attempts;
+                pendingCount = g_deferredHumanoidAssigns.size();
+            }
+
+            spdlog::info(
+                "[TFD][TeammateManager][R95C] deferred humanoid assign actor={:08X} reason={} deferReason={} attempts={} pending={} due={:.2f}",
+                actorId,
+                reason ? reason : "unknown",
+                deferReason ? deferReason : "unknown",
+                attempts,
+                static_cast<unsigned int>(pendingCount),
+                kDeferredHumanoidAssignDelaySeconds);
+        }
+
+        void ClearDeferredHumanoidTeammateAssignEvent(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                return;
+            }
+
+            bool removed = false;
+            std::size_t pendingCount = 0;
+            {
+                std::scoped_lock lk(g_deferredHumanoidAssignLock);
+                removed = g_deferredHumanoidAssigns.erase(actorId) > 0;
+                pendingCount = g_deferredHumanoidAssigns.size();
+            }
+
+            if (removed) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R96D] deferred humanoid assign cleared actor={:08X} reason={} pending={}",
+                    actorId,
+                    reason ? reason : "unknown",
+                    static_cast<unsigned int>(pendingCount));
+            }
+        }
+
+        bool QueueHumanoidTeammateAssignEvent(RE::Actor* actor, const char* reason, bool allowDuringInCombatPleasureChain = false)
         {
             if (!actor) {
                 return false;
             }
 
-            if (TFD::PleasureRuntime::IsInCombatPleasureChainActive()) {
+            const bool chainActive = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
+            if (chainActive && !allowDuringInCombatPleasureChain) {
+                DeferHumanoidTeammateAssignEvent(actor, reason, "incombat_pleasure_chain_active");
                 spdlog::info(
                     "[TFD][TeammateManager][R94G] queue humanoid assign deferred by incombat pleasure chain actor={:08X} reason={}",
                     actor->GetFormID(),
                     reason ? reason : "unknown");
                 return false;
+            }
+
+            if (chainActive && allowDuringInCombatPleasureChain) {
+                ClearDeferredHumanoidTeammateAssignEvent(actor, reason ? reason : "force_assign_during_chain");
+                spdlog::info(
+                    "[TFD][TeammateManager][R96D] queue humanoid assign bypass chain actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
             }
 
             auto* combatTarget = ResolveCombatTarget(actor);
@@ -2413,7 +2503,7 @@ namespace
                 }).detach();
         }
 
-        bool RegisterOrRefreshAliasForActor(RE::Actor* actor, const char* reason)
+        bool RegisterOrRefreshAliasForActor(RE::Actor* actor, const char* reason, bool forceAssignDuringInCombatPleasureChain = false)
         {
             std::scoped_lock lock(g_syncLock);
             ResolveRegistry();
@@ -2470,22 +2560,29 @@ namespace
                     // the actor is already in this alias slot and package churn can create
                     // small follow/dialogue timing artifacts. Initial recruit and real alias
                     // repair still use the normal event/evaluate path.
+                    bool queuedAssign = false;
+                    bool evaluatedPackage = false;
                     if (!manualDialogueRefresh) {
                         const bool chainLocked = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
-                        QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
-                        if (!chainLocked && actor->Is3DLoaded()) {
+                        queuedAssign = QueueHumanoidTeammateAssignEvent(
+                            actor,
+                            reason ? reason : "register_now_refresh",
+                            forceAssignDuringInCombatPleasureChain);
+                        if ((forceAssignDuringInCombatPleasureChain || !chainLocked) && actor->Is3DLoaded()) {
                             actor->EvaluatePackage();
+                            evaluatedPackage = true;
                         }
                     }
 
                     spdlog::info(
-                        "[TFD][TeammateManager] register now {} alias='{}' actor={:08X} reason={} queued={} eval={}",
+                        "[TFD][TeammateManager] register now {} alias='{}' actor={:08X} reason={} queued={} eval={} forceDuringChain={}",
                         manualDialogueRefresh ? "manual_refresh" : "refresh",
                         alias->aliasName.c_str(),
                         actor->GetFormID(),
                         reason ? reason : "unknown",
-                        manualDialogueRefresh ? 0 : 1,
-                        (manualDialogueRefresh || !actor->Is3DLoaded()) ? 0 : 1);
+                        queuedAssign ? 1 : 0,
+                        evaluatedPackage ? 1 : 0,
+                        forceAssignDuringInCombatPleasureChain ? 1 : 0);
 
                     if (!manualDialogueRefresh) {
                         RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_refresh");
@@ -2516,7 +2613,7 @@ namespace
                     actor->GetFormID(),
                     reason ? reason : "unknown");
                 RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_no_slot");
-                QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_no_slot_bridge_only");
+                QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_no_slot_bridge_only", forceAssignDuringInCombatPleasureChain);
                 return false;
             }
 
@@ -2537,20 +2634,29 @@ namespace
             }
             SyncTeammateFaction(actor, true);
             EnsureContractForActorUnsafe(actor, reason ? reason : "register_now_assign");
+            bool queuedAssign = false;
+            bool evaluatedPackage = false;
             {
                 const bool chainLocked = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
-                QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_assign");
-                if (!chainLocked && actor->Is3DLoaded()) {
+                queuedAssign = QueueHumanoidTeammateAssignEvent(
+                    actor,
+                    reason ? reason : "register_now_assign",
+                    forceAssignDuringInCombatPleasureChain);
+                if ((forceAssignDuringInCombatPleasureChain || !chainLocked) && actor->Is3DLoaded()) {
                     actor->EvaluatePackage();
+                    evaluatedPackage = true;
                 }
             }
 
             spdlog::info(
-                "[TFD][TeammateManager] register now fill alias='{}' actor={:08X} name='{}' reason={}",
+                "[TFD][TeammateManager] register now fill alias='{}' actor={:08X} name='{}' reason={} queued={} eval={} forceDuringChain={}",
                 targetAlias->aliasName.c_str(),
                 actor->GetFormID(),
                 actor->GetName() ? actor->GetName() : "",
-                reason ? reason : "unknown");
+                reason ? reason : "unknown",
+                queuedAssign ? 1 : 0,
+                evaluatedPackage ? 1 : 0,
+                forceAssignDuringInCombatPleasureChain ? 1 : 0);
 
             RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_fill");
             return true;
@@ -2902,26 +3008,174 @@ namespace
                 auto* actor = remaining.front();
                 remaining.erase(remaining.begin());
                 WriteAlias(alias, actor);
-                if (IsTFDConvertedTeammate(actor)) {
+                const bool convertedActor = IsTFDConvertedTeammate(actor);
+                if (convertedActor) {
                     RememberConvertedTeammate(actor, "sync_fill_converted");
                     ResetInvalidAliasStrike(actor);
                 }
                 SyncTeammateFaction(actor, true);
                 EnsureContractForActorUnsafe(actor, "sync_fill_alias");
-                spdlog::info("[TFD][TeammateManager] fill alias='{}' actor={:08X} name='{}'",
+
+                bool queuedAssign = false;
+                bool evaluatedPackage = false;
+                const bool chainLocked = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
+                if (convertedActor) {
+                    queuedAssign = QueueHumanoidTeammateAssignEvent(actor, "sync_fill_alias");
+                    if (!chainLocked && actor && actor->Is3DLoaded()) {
+                        actor->EvaluatePackage();
+                        evaluatedPackage = true;
+                    }
+                }
+
+                spdlog::info("[TFD][TeammateManager][R95B] fill alias='{}' actor={:08X} name='{}' converted={} chainLocked={} queuedAssign={} evalPackage={}",
                     alias->aliasName.c_str(),
                     actor ? actor->GetFormID() : 0u,
-                    actor && actor->GetName() ? actor->GetName() : "");
+                    actor && actor->GetName() ? actor->GetName() : "",
+                    convertedActor ? 1 : 0,
+                    chainLocked ? 1 : 0,
+                    queuedAssign ? 1 : 0,
+                    evaluatedPackage ? 1 : 0);
             }
             RefreshRecruitCapacityGlobalsUnsafe("sync_aliases");
             ProcessExpiredContractsUnsafe();
 
         }
 
+        void FlushDeferredHumanoidTeammateAssignEvents(const char* reason)
+        {
+            const double now = NowRealSeconds();
+
+            if (TFD::PleasureRuntime::IsInCombatPleasureChainActive()) {
+                std::size_t postponed = 0;
+                std::uint32_t maxAttempts = 0;
+                {
+                    std::scoped_lock lk(g_deferredHumanoidAssignLock);
+                    for (auto& [actorId, entry] : g_deferredHumanoidAssigns) {
+                        if (entry.dueSec <= now) {
+                            // R96B: waiting for an active InCombat pleasure chain is not a failed assign attempt.
+                            // The old R95C code incremented attempts every UI tick while the chain was still
+                            // valid, so the first recruited actor could hit max_attempts and get dropped before
+                            // the chain ended. Keep the request alive and only count real dispatch failures.
+                            entry.dueSec = now + kDeferredHumanoidAssignRetrySeconds;
+                            maxAttempts = std::max(maxAttempts, entry.attempts);
+                            ++postponed;
+                        }
+                    }
+                }
+
+                if (postponed > 0) {
+                    spdlog::info(
+                        "[TFD][TeammateManager][R96B] deferred humanoid assign wait preserved count={} reason={} rule=incombat_pleasure_chain_active maxAttempts={}",
+                        static_cast<unsigned int>(postponed),
+                        reason ? reason : "unknown",
+                        maxAttempts);
+                }
+                return;
+            }
+
+            struct DueAssign
+            {
+                RE::FormID actorId{ 0 };
+                std::string reason{};
+                std::uint32_t attempts{ 0 };
+            };
+
+            std::vector<DueAssign> due;
+            {
+                std::scoped_lock lk(g_deferredHumanoidAssignLock);
+                for (auto it = g_deferredHumanoidAssigns.begin(); it != g_deferredHumanoidAssigns.end();) {
+                    auto& entry = it->second;
+                    if (entry.dueSec > now) {
+                        ++it;
+                        continue;
+                    }
+
+                    if (entry.attempts >= kDeferredHumanoidAssignMaxAttempts) {
+                        spdlog::warn(
+                            "[TFD][TeammateManager][R96B] deferred humanoid assign dropped actor={:08X} attempts={} reason={} rule=max_dispatch_failures",
+                            it->first,
+                            entry.attempts,
+                            entry.reason.empty() ? "unknown" : entry.reason.c_str());
+                        it = g_deferredHumanoidAssigns.erase(it);
+                        continue;
+                    }
+
+                    due.push_back(DueAssign{ it->first, entry.reason, entry.attempts });
+                    it = g_deferredHumanoidAssigns.erase(it);
+                }
+            }
+
+            if (due.empty()) {
+                return;
+            }
+
+            spdlog::info(
+                "[TFD][TeammateManager][R96B] deferred humanoid assign flush count={} reason={}",
+                static_cast<unsigned int>(due.size()),
+                reason ? reason : "unknown");
+
+            for (const auto& item : due) {
+                auto* actor = LookupActorById(item.actorId);
+                if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                    spdlog::warn(
+                        "[TFD][TeammateManager][R96B] deferred humanoid assign skipped actor={:08X} reason={} rule=invalid_actor",
+                        item.actorId,
+                        item.reason.empty() ? "unknown" : item.reason.c_str());
+                    continue;
+                }
+
+                const char* assignReason = item.reason.empty() ? "deferred_humanoid_assign_flush" : item.reason.c_str();
+                const bool queued = QueueHumanoidTeammateAssignEvent(actor, assignReason);
+                bool evaluated = false;
+                if (queued && actor->Is3DLoaded()) {
+                    actor->EvaluatePackage();
+                    evaluated = true;
+                }
+
+                if (!queued) {
+                    const auto nextAttempts = item.attempts + 1;
+                    if (nextAttempts < kDeferredHumanoidAssignMaxAttempts) {
+                        std::size_t pendingCount = 0;
+                        {
+                            std::scoped_lock lk(g_deferredHumanoidAssignLock);
+                            auto& retry = g_deferredHumanoidAssigns[item.actorId];
+                            retry.reason = assignReason;
+                            retry.attempts = nextAttempts;
+                            retry.dueSec = now + kDeferredHumanoidAssignRetrySeconds;
+                            pendingCount = g_deferredHumanoidAssigns.size();
+                        }
+
+                        spdlog::warn(
+                            "[TFD][TeammateManager][R96B] deferred humanoid assign requeued actor={:08X} reason={} attempts={} pending={} rule=dispatch_failed",
+                            item.actorId,
+                            assignReason,
+                            nextAttempts,
+                            static_cast<unsigned int>(pendingCount));
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][TeammateManager][R96B] deferred humanoid assign final drop actor={:08X} reason={} attempts={} rule=dispatch_failed_max",
+                            item.actorId,
+                            assignReason,
+                            nextAttempts);
+                    }
+                }
+
+                spdlog::info(
+                    "[TFD][TeammateManager][R96B] deferred humanoid assign dispatched actor={:08X} reason={} queued={} eval={} attempts={}",
+                    item.actorId,
+                    assignReason,
+                    queued ? 1 : 0,
+                    evaluated ? 1 : 0,
+                    item.attempts);
+            }
+        }
+
         void TickUI()
 
         {
             SyncAliasesImpl();
+            FlushDeferredHumanoidTeammateAssignEvents("tick_ui");
             g_tickPending.store(false, std::memory_order_release);
         }
 
@@ -3172,8 +3426,14 @@ namespace TFD::TeammateManager
 
     bool RegisterOrRefreshTeammateNow(RE::Actor* actor, const char* reason)
     {
-        return AliasInternal::RegisterOrRefreshAliasForActor(actor, reason);
+        return AliasInternal::RegisterOrRefreshAliasForActor(actor, reason, false);
     }
+
+    bool RegisterOrRefreshTeammateNowImmediatePackage(RE::Actor* actor, const char* reason)
+    {
+        return AliasInternal::RegisterOrRefreshAliasForActor(actor, reason, true);
+    }
+
     void QueueHumanoidTeammateCatchupAfterLoad(const char* reason)
     {
         AliasInternal::QueueHumanoidTeammateCatchupAfterLoad(reason);

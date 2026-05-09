@@ -14,6 +14,7 @@
 #include "TFDDefeatMonitor.h"
 #include "SKSE/SKSE.h"
 #include "TFDInCombat.h"
+#include "TFDFlowController.h"
 #include "TFDTransition.h"
 #include "TFDPayModel.h"
 
@@ -126,14 +127,13 @@ namespace TFD::InCombatGreet
 		{
 			RE::FormID sessionId = 0;
 			bool assignSent = false;
-			bool pleasureCycleActive = false;
 			{
 				std::scoped_lock lk(g_runtime.lock);
 				sessionId = g_runtime.truceSessionId;
 				assignSent = g_runtime.assignSent;
 				g_runtime.truceSessionId = 0;
 				g_runtime.assignSent = false;
-			g_runtime.pleasureCycleActive = false;
+				g_runtime.pleasureCycleActive = false;
 			}
 
 			const auto speakerFormID = g_speakerFormID.load(std::memory_order_acquire);
@@ -152,12 +152,34 @@ namespace TFD::InCombatGreet
 
 		bool CompleteDialogueClosedInternal(const char* reason)
 		{
-			return TFD::InCombat::CompleteDialogueClosedFlow(
-				reason,
+			const char* why = reason ? reason : "incombat_dialogue_closed";
+			const auto actorFormID = TFD::InCombat::GetPrimaryActorFormID();
+			bool flowDone = false;
+			bool terminalComplete = false;
+
+			if (actorFormID != 0) {
+				auto& flow = TFD::FlowController::Controller::GetSingleton();
+				flowDone = flow.RequestResolveInCombatOutcome(TFD::FlowController::InCombatOutcome::Cancel, actorFormID, why);
+				terminalComplete = flowDone ? flow.RequestCompleteTerminalContext("incombat_dialogue_closed_complete") : false;
+			} else {
+				spdlog::warn("[TFD][InCombatGreet][R95A] dialogue closed flow cancel skipped reason={} actor=00000000", why);
+			}
+
+			const bool localDone = TFD::InCombat::CompleteDialogueClosedFlow(
+				why,
 				TFD::InCombat::CompletionHandlers{
 					[](const char* r) { TFD::InCombat::ClearDialogueOutcome(r); },
 					[](const char* r) { TFD::InCombat::Complete(r); },
 					[](const char* r) { TFD::InCombatGreet::CancelAll(r); } });
+
+			spdlog::info(
+				"[TFD][InCombatGreet][R95A] dialogue closed complete actor={:08X} flowDone={} terminalComplete={} localDone={} reason={}",
+				actorFormID,
+				flowDone ? 1 : 0,
+				terminalComplete ? 1 : 0,
+				localDone ? 1 : 0,
+				why);
+			return localDone;
 		}
 
 		bool TryBeginStickyReopen(std::uint32_t speakerFormID, const char* reason)

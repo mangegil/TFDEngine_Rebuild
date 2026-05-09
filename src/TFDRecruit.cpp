@@ -1,4 +1,6 @@
 #include "TFDRecruit.h"
+#include "TFDHostilityController.h"
+#include "TFDTeammateManager.h"
 
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
@@ -8,10 +10,12 @@
 #include <cstdint>
 #include <cmath>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
@@ -30,6 +34,25 @@ namespace
     {
         double untilSec{ 0.0 };
         TFD::Recruit::SourceFlow sourceFlow{ TFD::Recruit::SourceFlow::Unknown };
+    };
+
+    struct RuntimeFactionSnapshot
+    {
+        RE::TESFaction* faction{ nullptr };
+        RE::FormID factionId{ 0 };
+        const char* editorID{ nullptr };
+        std::int32_t rankBefore{ -2 };
+    };
+
+    struct RuntimeActorSnapshot
+    {
+        RE::FormID actorId{ 0 };
+        bool hasActorValues{ false };
+        float aggression{ 0.0f };
+        float confidence{ 0.0f };
+        float assistance{ 0.0f };
+        float morality{ 0.0f };
+        std::vector<RuntimeFactionSnapshot> factions{};
     };
 
     constexpr double kRecruitObserveThrottleSec = 3.00;
@@ -88,6 +111,8 @@ namespace
     std::unordered_set<RE::FormID> g_runtimeProfileAppliedActors;
     std::unordered_set<RE::FormID> g_recruitSettleAttemptedActors;
     std::unordered_map<RE::FormID, RecruitPendingEntry> g_recruitCommitPending;
+    std::unordered_map<RE::FormID, RuntimeActorSnapshot> g_runtimeModifiedActors;
+    std::unordered_map<RE::FormID, RuntimeActorSnapshot> g_postLoadRuntimeRestoreSnapshots;
 
     double NowSec()
     {
@@ -149,6 +174,76 @@ namespace
             });
     }
 
+    void RememberRuntimeModifiedActor(RE::Actor* actor, const char* reason)
+    {
+        if (!actor) {
+            return;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return;
+        }
+
+        {
+            std::scoped_lock lk(g_logLock);
+            if (g_runtimeModifiedActors.find(actorId) != g_runtimeModifiedActors.end()) {
+                return;
+            }
+        }
+
+        ResolveFactions();
+
+        RuntimeActorSnapshot snapshot{};
+        snapshot.actorId = actorId;
+
+        if (auto* owner = actor->AsActorValueOwner()) {
+            snapshot.hasActorValues = true;
+            snapshot.aggression = owner->GetActorValue(RE::ActorValue::kAggression);
+            snapshot.confidence = owner->GetActorValue(RE::ActorValue::kConfidence);
+            snapshot.assistance = owner->GetActorValue(RE::ActorValue::kAssistance);
+            snapshot.morality = owner->GetActorValue(RE::ActorValue::kMorality);
+        }
+
+        snapshot.factions.reserve(g_factions.size());
+        for (const auto& entry : g_factions) {
+            if (!entry.faction) {
+                continue;
+            }
+
+            snapshot.factions.push_back(RuntimeFactionSnapshot{
+                entry.faction,
+                entry.faction->GetFormID(),
+                entry.editorID,
+                actor->GetFactionRank(entry.faction, false)
+            });
+        }
+
+        {
+            std::scoped_lock lk(g_logLock);
+            const auto result = g_runtimeModifiedActors.emplace(actorId, std::move(snapshot));
+            if (!result.second) {
+                return;
+            }
+        }
+
+        spdlog::info(
+            "[TFD][Recruit][R96A] remember runtime modified actor actor={:08X} reason={}",
+            actorId,
+            reason ? reason : "unknown");
+    }
+
+    void ClearRecruitRuntimeCachesLocked()
+    {
+        g_nextObserveLogSec.clear();
+        g_nextCommitLogSec.clear();
+        g_committedCleanActors.clear();
+        g_quarantineAttemptedActors.clear();
+        g_runtimeProfileAppliedActors.clear();
+        g_recruitSettleAttemptedActors.clear();
+        g_recruitCommitPending.clear();
+    }
+
     std::int32_t GetExactFactionRank(RE::Actor* actor, RE::TESFaction* faction)
     {
         if (!actor || !faction) {
@@ -163,6 +258,13 @@ namespace
         // Treat rank -1 as a removed/tombstone state for hostile-source factions so
         // quarantine does not keep removing the same faction forever.
         return rank >= 0;
+    }
+
+    std::int8_t NormalizeFactionRankForAdd(std::int32_t rank)
+    {
+        constexpr auto minRank = static_cast<std::int32_t>(std::numeric_limits<std::int8_t>::min());
+        constexpr auto maxRank = static_cast<std::int32_t>(std::numeric_limits<std::int8_t>::max());
+        return static_cast<std::int8_t>(std::clamp(rank, minRank, maxRank));
     }
 
     bool HasQuarantineBeenAttempted(RE::FormID actorId)
@@ -419,6 +521,7 @@ namespace
             return false;
         }
 
+        RememberRuntimeModifiedActor(actor, "ensure_faction_active");
         actor->AddToFaction(faction, 0);
         const auto rankAfter = GetExactFactionRank(actor, faction);
 
@@ -544,6 +647,7 @@ namespace
         result.changed = needsAggression || needsConfidence || needsAssistance || needsMorality;
 
         if (result.changed) {
+            RememberRuntimeModifiedActor(actor, "apply_recruit_runtime_profile");
             SetActorValue(actor, RE::ActorValue::kAggression, kAggressionAggressive);
             SetActorValue(actor, RE::ActorValue::kConfidence, kConfidenceBrave);
             SetActorValue(actor, RE::ActorValue::kAssistance, kAssistanceFriendsAndAllies);
@@ -593,6 +697,7 @@ namespace
                 continue;
             }
 
+            RememberRuntimeModifiedActor(actor, "remove_hostile_source_faction");
             actor->RemoveFromFaction(entry.faction);
             ++removed;
 
@@ -672,6 +777,131 @@ namespace
         }
         actor->EvaluatePackage(false, true);
         actor->EvaluatePackage(true, true);
+    }
+
+    struct RuntimeSnapshotApplyResult
+    {
+        bool actorResolved{ false };
+        bool actorValuesRestored{ false };
+        unsigned factionRestores{ 0 };
+        unsigned stateRemoves{ 0 };
+        bool detectionRefreshAttempted{ false };
+        bool detectionRefreshed{ false };
+    };
+
+    bool RefreshRestoredHostilityDetection(RE::Actor* actor, const char* reason)
+    {
+        auto* player = Player();
+        if (!actor || !player || actor == player || actor->IsDead() || actor->IsDisabled()) {
+            return false;
+        }
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->ClearCachedFactionFightReactions();
+        }
+
+        auto* beforeTarget = ResolveCurrentCombatTarget(actor);
+        const bool hostileAfterRestore = actor->IsHostileToActor(player) ||
+            (beforeTarget && beforeTarget->GetFormID() == player->GetFormID());
+
+        actor->SetBeenAttacked(true);
+        player->SetBeenAttacked(true);
+        (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+        (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+        actor->UpdateCombat();
+        player->UpdateCombat();
+
+        if (!hostileAfterRestore) {
+            spdlog::info(
+                "[TFD][Recruit][R96E] post-load detection refresh skipped actor={:08X} reason={} hostile=0 target={:08X} name='{}'",
+                actor->GetFormID(),
+                reason ? reason : "unknown",
+                beforeTarget ? beforeTarget->GetFormID() : 0u,
+                actor->GetName() ? actor->GetName() : "");
+            return false;
+        }
+
+        const bool refreshed = TFD::HostilityController::ForceDetectionAndCombatRefresh(
+            actor,
+            player,
+            TFD::HostilityController::ReleaseReason::FightChoice,
+            true);
+
+        // R96E: after a save swap, native UpdateCombat can leave actors in Skyrim's
+        // search/combat limbo: target points at the player, but detection/LOS stays cold
+        // (voice line: "Is someone there?"). Reuse the existing Papyrus resume bridge,
+        // because it safely calls StartCombat(player) from Papyrus after aliases/factions
+        // have been cleared and the loaded world is ready.
+        TFD::HostilityController::Runtime::SendModEvent("TFDInCombatResumeCombat", actor);
+
+        auto* afterTarget = ResolveCurrentCombatTarget(actor);
+        spdlog::info(
+            "[TFD][Recruit][R96E] post-load detection refresh actor={:08X} reason={} hostile=1 refreshed={} inCombat={} targetBefore={:08X} targetAfter={:08X} resumeBridge=1 name='{}'",
+            actor->GetFormID(),
+            reason ? reason : "unknown",
+            refreshed ? 1 : 0,
+            actor->IsInCombat() ? 1 : 0,
+            beforeTarget ? beforeTarget->GetFormID() : 0u,
+            afterTarget ? afterTarget->GetFormID() : 0u,
+            actor->GetName() ? actor->GetName() : "");
+
+        return refreshed;
+    }
+
+    RuntimeSnapshotApplyResult ApplyRuntimeSnapshot(
+        RE::Actor* actor,
+        const RuntimeActorSnapshot& snapshot,
+        const char* reason,
+        bool evaluatePackage,
+        bool refreshDetection)
+    {
+        RuntimeSnapshotApplyResult result{};
+        if (!actor) {
+            return result;
+        }
+
+        result.actorResolved = true;
+
+        if (snapshot.hasActorValues) {
+            if (auto* owner = actor->AsActorValueOwner()) {
+                owner->SetActorValue(RE::ActorValue::kAggression, snapshot.aggression);
+                owner->SetActorValue(RE::ActorValue::kConfidence, snapshot.confidence);
+                owner->SetActorValue(RE::ActorValue::kAssistance, snapshot.assistance);
+                owner->SetActorValue(RE::ActorValue::kMorality, snapshot.morality);
+                result.actorValuesRestored = true;
+            }
+        }
+
+        for (const auto& factionSnapshot : snapshot.factions) {
+            auto* faction = factionSnapshot.faction ? factionSnapshot.faction : RE::TESForm::LookupByID<RE::TESFaction>(factionSnapshot.factionId);
+            if (!faction) {
+                continue;
+            }
+
+            const auto currentRank = GetExactFactionRank(actor, faction);
+            if (factionSnapshot.rankBefore >= 0) {
+                if (currentRank != factionSnapshot.rankBefore) {
+                    actor->AddToFaction(faction, NormalizeFactionRankForAdd(factionSnapshot.rankBefore));
+                    ++result.factionRestores;
+                }
+            }
+            else if (currentRank >= 0) {
+                actor->RemoveFromFaction(faction);
+                ++result.stateRemoves;
+            }
+        }
+
+        if (evaluatePackage) {
+            EvaluateRecruitPackage(actor);
+        }
+
+        if (refreshDetection) {
+            result.detectionRefreshAttempted = true;
+            result.detectionRefreshed = RefreshRestoredHostilityDetection(actor, reason);
+        }
+
+        return result;
     }
 }
 
@@ -1162,5 +1392,180 @@ namespace TFD::Recruit
             }
         }
         return converted;
+    }
+
+    void RestoreRuntimeModifiedActorsForLoad(const char* reason)
+    {
+        std::unordered_map<RE::FormID, RuntimeActorSnapshot> snapshots;
+        {
+            std::scoped_lock lk(g_logLock);
+            snapshots.swap(g_runtimeModifiedActors);
+            for (const auto& pair : snapshots) {
+                if (pair.first != 0) {
+                    // R96C: keep one post-load copy. The first restore happens during serialization
+                    // revert, while old refs/world data can still be settling. A second world-ready
+                    // pass re-applies the snapshot to the loaded save only if the actor is not a
+                    // legitimate TFD teammate there, then refreshes faction reaction/combat caches.
+                    g_postLoadRuntimeRestoreSnapshots[pair.first] = pair.second;
+                }
+            }
+            ClearRecruitRuntimeCachesLocked();
+        }
+
+        if (snapshots.empty()) {
+            spdlog::info(
+                "[TFD][Recruit][R96A] load cleanup no runtime modified actors reason={}",
+                reason ? reason : "unknown");
+            return;
+        }
+
+        unsigned restoredActors = 0;
+        unsigned restoredValues = 0;
+        unsigned restoredFactions = 0;
+        unsigned removedStateFactions = 0;
+        unsigned missingActors = 0;
+
+        for (const auto& pair : snapshots) {
+            const auto actorId = pair.first;
+            const auto& snapshot = pair.second;
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+            if (!actor) {
+                ++missingActors;
+                continue;
+            }
+
+            const auto applied = ApplyRuntimeSnapshot(actor, snapshot, reason, true, false);
+            if (!applied.actorResolved) {
+                ++missingActors;
+                continue;
+            }
+
+            ++restoredActors;
+            if (applied.actorValuesRestored) {
+                ++restoredValues;
+            }
+            restoredFactions += applied.factionRestores;
+            removedStateFactions += applied.stateRemoves;
+
+            spdlog::info(
+                "[TFD][Recruit][R96A] restored runtime actor actor={:08X} reason={} values={} factionRestores={} stateRemoves={} name='{}'",
+                actorId,
+                reason ? reason : "unknown",
+                applied.actorValuesRestored ? 1 : 0,
+                applied.factionRestores,
+                applied.stateRemoves,
+                actor->GetName() ? actor->GetName() : "");
+        }
+
+        spdlog::info(
+            "[TFD][Recruit][R96A] load cleanup complete reason={} actors={} values={} factionRestores={} stateRemoves={} missing={}",
+            reason ? reason : "unknown",
+            restoredActors,
+            restoredValues,
+            restoredFactions,
+            removedStateFactions,
+            missingActors);
+    }
+
+    void RefreshRuntimeRestoredActorsAfterLoad(const char* reason)
+    {
+        std::unordered_map<RE::FormID, RuntimeActorSnapshot> snapshots;
+        {
+            std::scoped_lock lk(g_logLock);
+            snapshots.swap(g_postLoadRuntimeRestoreSnapshots);
+        }
+
+        if (snapshots.empty()) {
+            spdlog::info(
+                "[TFD][Recruit][R96E] post-load runtime restore no pending actors reason={}",
+                reason ? reason : "unknown");
+            return;
+        }
+
+        std::unordered_set<RE::FormID> registeredTeammateIds;
+        for (auto* teammate : TFD::TeammateManager::CollectRegisteredTeammates()) {
+            if (teammate) {
+                registeredTeammateIds.insert(teammate->GetFormID());
+            }
+        }
+
+        auto* player = Player();
+        const RE::FormID playerId = player ? player->GetFormID() : 0u;
+
+        unsigned appliedActors = 0;
+        unsigned skippedRegistered = 0;
+        unsigned restoredValues = 0;
+        unsigned restoredFactions = 0;
+        unsigned removedStateFactions = 0;
+        unsigned detectionAttempts = 0;
+        unsigned detectionRefreshed = 0;
+        unsigned missingActors = 0;
+
+        for (const auto& pair : snapshots) {
+            const auto actorId = pair.first;
+            const auto& snapshot = pair.second;
+            auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+            if (!actor) {
+                ++missingActors;
+                continue;
+            }
+
+            const bool isPlayer = actorId == playerId;
+            const bool isRegisteredTeammate = !isPlayer && registeredTeammateIds.find(actorId) != registeredTeammateIds.end();
+            const bool isLoadedTeammateLike = !isPlayer && IsRecruitLike(actor);
+            if (isRegisteredTeammate || isLoadedTeammateLike) {
+                ++skippedRegistered;
+                spdlog::info(
+                    "[TFD][Recruit][R96E] post-load restore skipped loaded teammate actor={:08X} reason={} registered={} recruitLike={} name='{}'",
+                    actorId,
+                    reason ? reason : "unknown",
+                    isRegisteredTeammate ? 1 : 0,
+                    isLoadedTeammateLike ? 1 : 0,
+                    actor->GetName() ? actor->GetName() : "");
+                continue;
+            }
+
+            const auto applied = ApplyRuntimeSnapshot(actor, snapshot, reason, true, !isPlayer);
+            if (!applied.actorResolved) {
+                ++missingActors;
+                continue;
+            }
+
+            ++appliedActors;
+            if (applied.actorValuesRestored) {
+                ++restoredValues;
+            }
+            restoredFactions += applied.factionRestores;
+            removedStateFactions += applied.stateRemoves;
+            if (applied.detectionRefreshAttempted) {
+                ++detectionAttempts;
+            }
+            if (applied.detectionRefreshed) {
+                ++detectionRefreshed;
+            }
+
+            spdlog::info(
+                "[TFD][Recruit][R96E] post-load restored runtime actor actor={:08X} reason={} values={} factionRestores={} stateRemoves={} detectionAttempted={} detectionRefreshed={} name='{}'",
+                actorId,
+                reason ? reason : "unknown",
+                applied.actorValuesRestored ? 1 : 0,
+                applied.factionRestores,
+                applied.stateRemoves,
+                applied.detectionRefreshAttempted ? 1 : 0,
+                applied.detectionRefreshed ? 1 : 0,
+                actor->GetName() ? actor->GetName() : "");
+        }
+
+        spdlog::info(
+            "[TFD][Recruit][R96E] post-load runtime restore complete reason={} actors={} skippedRegistered={} values={} factionRestores={} stateRemoves={} detectionAttempts={} detectionRefreshed={} missing={}",
+            reason ? reason : "unknown",
+            appliedActors,
+            skippedRegistered,
+            restoredValues,
+            restoredFactions,
+            removedStateFactions,
+            detectionAttempts,
+            detectionRefreshed,
+            missingActors);
     }
 }

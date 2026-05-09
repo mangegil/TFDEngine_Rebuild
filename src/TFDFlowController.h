@@ -501,6 +501,7 @@ namespace TFD::FlowController
         bool EnterTerminalContextLocked(RootFlow contextRoot, SubFlow sub, std::uint32_t actorFormID, std::string_view reason);
         bool CompleteTerminalContextLocked(std::string_view reason);
         bool GuardPreCombatOwnerLocked(std::uint32_t actorFormID, std::string_view op, std::string_view reason) const;
+        bool GuardInCombatOwnerLocked(std::uint32_t actorFormID, std::string_view op, std::string_view reason) const;
         bool RejectLocked(std::string_view op, std::string_view reason) const;
         void SetPrimaryActorLocked(std::uint32_t actorFormID);
         void ClearDecisionLocked();

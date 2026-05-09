@@ -30,6 +30,7 @@ namespace TFD::HostilityController
         FightChoice,
         DialogueClosed,
         FlowHandoff,
+        InCombatPleasureEnd,
         TooFar,
         TameBroken,
         TameExpired
@@ -147,6 +148,7 @@ namespace TFD::HostilityController
     bool HasSpentTruce(RE::Actor* actor);
     bool WasTruceBetrayed(RE::Actor* actor);
 
+    bool AbortActiveInCombatTruceOnHit(const RE::TESHitEvent* ev, const char* reason = nullptr);
     void ReleaseSession(RE::FormID sessionId, ReleaseReason reason = ReleaseReason::Generic);
     bool ReleaseActiveTruceSessionForActor(
         RE::Actor* actor,

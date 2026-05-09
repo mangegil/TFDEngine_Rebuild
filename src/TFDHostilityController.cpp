@@ -11,6 +11,7 @@
 #include "TFDBleedout.h"
 #include "TFDInteractionRouter.h"
 #include "TFDInCombat.h"
+#include "TFDFlowController.h"
 
 #include <RE/Skyrim.h>
 #include <RE/A/ActorValues.h>
@@ -658,8 +659,8 @@ namespace TFD::HostilityController
         constexpr double kTameStartleGraceSec = 2.5;
         constexpr double kTameStartleWindowSec = 5.0;
         constexpr std::size_t kCrowdAliasCap = 10;
-        constexpr float kTruceActiveCombatRadius = 3500.0f;
-        constexpr float kTrucePrimaryLinkRadius = 2400.0f;
+        constexpr float kTruceActiveCombatRadius = 12000.0f;
+        constexpr float kTrucePrimaryLinkRadius = 12000.0f;
 
         // R28: Dialogue crowd is a participant list, not broad suppression.
         // Normal acceptance requires the crowd actor to see the player.
@@ -671,6 +672,10 @@ namespace TFD::HostilityController
         constexpr float kDialogueCrowdFallbackFacingDot = 0.60f;
         constexpr float kDialogueCrowdFallbackStrongFacingDot = 0.72f;
         constexpr float kDialogueCrowdPrimaryPackLinkRadius = 800.0f;
+        // R96F: In-combat crowd should represent the hostile combat pack, not only actors
+        // that currently have direct LOS to the player. Ranged enemies often fight from
+        // cover or distance, so keep PreCombat strict and relax only TruceInCombat.
+        constexpr float kInCombatDialogueCrowdPackRadius = 12000.0f;
         constexpr float kPreCombatDialoguePackScanRadius = 6000.0f;
 
         bool IsSessionSpaceCompatible(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget);
@@ -968,6 +973,48 @@ namespace TFD::HostilityController
             return true;
         }
 
+        bool HasInCombatDialogueCrowdPackFallback(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        {
+            if (!actor || !player || !primaryTarget) {
+                return false;
+            }
+
+            if (!IsSessionSpaceCompatible(actor, player, primaryTarget)) {
+                return false;
+            }
+
+            if (!SharesSpeakerCrowdSide(actor, primaryTarget, player)) {
+                return false;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            if (distToPlayer > kInCombatDialogueCrowdPackRadius && distToPrimary > kInCombatDialogueCrowdPackRadius) {
+                return false;
+            }
+
+            auto* currentTarget = ResolveCurrentCombatTarget(actor);
+            const bool targetsPlayer = currentTarget && currentTarget->GetFormID() == player->GetFormID();
+            const bool inCombat = actor->IsInCombat();
+            const bool weaponDrawn = actor->IsWeaponDrawn();
+
+            spdlog::info(
+                "TFDHostilityController: [R96F] incombat dialogue crowd pack fallback accept actor={:08X} primary={:08X} distPlayer={:.1f} distPrimary={:.1f} targetsPlayer={} inCombat={} weaponDrawn={}",
+                actor->GetFormID(),
+                primaryTarget->GetFormID(),
+                distToPlayer,
+                distToPrimary,
+                targetsPlayer ? 1 : 0,
+                inCombat ? 1 : 0,
+                weaponDrawn ? 1 : 0);
+
+            return true;
+        }
+
         bool HasDialogueCrowdLineOfSight(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
         {
             (void)primaryTarget;
@@ -995,7 +1042,7 @@ namespace TFD::HostilityController
 
         bool SharesSpeakerCrowdSide(RE::Actor* actor, RE::Actor* primaryTarget, RE::Actor* player);
 
-        bool IsEligibleDialogueCrowdActor(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget)
+        bool IsEligibleDialogueCrowdActor(RE::Actor* actor, RE::Actor* player, RE::Actor* primaryTarget, bool relaxedInCombatCrowd)
         {
             if (!IsDialogueCapableTruceEventActor(actor) || !player || !primaryTarget) {
                 return false;
@@ -1028,7 +1075,8 @@ namespace TFD::HostilityController
 
             if (!HasDialogueCrowdLineOfSight(actor, player, primaryTarget) &&
                 !HasDialogueCrowdEngagementFallback(actor, player, primaryTarget) &&
-                !HasDialogueCrowdPrimaryPackFallback(actor, player, primaryTarget)) {
+                !HasDialogueCrowdPrimaryPackFallback(actor, player, primaryTarget) &&
+                !(relaxedInCombatCrowd && HasInCombatDialogueCrowdPackFallback(actor, player, primaryTarget))) {
                 const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
                 const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
                 spdlog::info(
@@ -1162,7 +1210,8 @@ namespace TFD::HostilityController
         TruceEventTargets PartitionTruceEventTargets(
             const std::vector<RE::FormID>& actorIds,
             RE::Actor* player,
-            RE::FormID primaryTargetId)
+            RE::FormID primaryTargetId,
+            Mode mode)
         {
             TruceEventTargets result;
             if (actorIds.empty()) {
@@ -1199,7 +1248,8 @@ namespace TFD::HostilityController
                 }
 
                 auto* actor = ResolveActor(actorId);
-                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget)) {
+                const bool relaxedInCombatCrowd = mode == Mode::TruceInCombat;
+                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget, relaxedInCombatCrowd)) {
                     continue;
                 }
 
@@ -1359,9 +1409,11 @@ namespace TFD::HostilityController
                 return false;
             }
 
-            auto* combatTarget = ResolveCurrentCombatTarget(actor);
-            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
-            return targetingPlayer || distToPlayer <= 1800.0f || distToPrimary <= 1400.0f;
+            // R97A: In-combat truce represents an already-alert hostile pack.
+            // Do not require direct LoS, current target, or short melee distance here.
+            // If the speaker can negotiate mid-combat, same-side hostile actors within
+            // the effective combat/truce bubble must be paused with the pack.
+            return true;
         }
 
         std::vector<RE::FormID> BuildTruceInCombatMemberIds(
@@ -1445,7 +1497,7 @@ namespace TFD::HostilityController
 
             for (const auto& info : snapshot.actors) {
                 auto* actor = info.get();
-                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget)) {
+                if (!IsEligibleDialogueCrowdActor(actor, player, primaryTarget, false)) {
                     continue;
                 }
 
@@ -1619,6 +1671,100 @@ namespace TFD::HostilityController
                 TFD::TeammateManager::IsActiveFollowerActor(actor) ||
                 TFD::Tame::IsCompanion(actor) ||
                 TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+        }
+
+        bool IsPlayerSideActorAfterInCombatTruce(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+                TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+                TFD::Recruit::IsRecruitLike(actor) ||
+                TFD::Tame::IsCompanion(actor);
+        }
+
+        bool IsProtectedByReleaseGraceAfterInCombatTruce(RE::Actor* actor)
+        {
+            return actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+        }
+
+        bool PreparePostInCombatSuppressionRearm(
+            RE::Actor* actor,
+            RE::Actor* player,
+            ReleaseReason reason,
+            const char* source,
+            std::vector<RE::FormID>* outResumeCombatIds)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0 || actorId == player->GetFormID()) {
+                return false;
+            }
+
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->ClearCachedFactionFightReactions();
+            }
+
+            const bool playerSide = IsPlayerSideActorAfterInCombatTruce(actor);
+            if (playerSide) {
+                // R99A: converted recruits/teammates must not stay blind because of stale
+                // phase factions or release-grace leftovers from the just-finished
+                // InCombat/OStim chain. Do not StartCombat for them; only thaw package and
+                // detection cache so their follow/assist stack can work normally.
+                if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+                    TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnly(actor, "post_incombat_teammate_rearm");
+                }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+                (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+                spdlog::info(
+                    "TFDHostilityController: [R99A] post-incombat teammate rearm actor={:08X} reason={} source={}",
+                    actorId,
+                    ToString(reason),
+                    source ? source : "-");
+                return false;
+            }
+
+            if (IsProtectedByReleaseGraceAfterInCombatTruce(actor)) {
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                spdlog::info(
+                    "TFDHostilityController: [R99A] post-incombat rearm skipped actor={:08X} reason={} source={} protected=release_grace",
+                    actorId,
+                    ToString(reason),
+                    source ? source : "-");
+                return false;
+            }
+
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+
+            if (outResumeCombatIds) {
+                outResumeCombatIds->push_back(actorId);
+            }
+
+            const auto* target = ResolveCurrentCombatTarget(actor);
+            spdlog::info(
+                "TFDHostilityController: [R99A] post-incombat hostile rearm actor={:08X} reason={} source={} inCombat={} target={:08X} resumeBridge={}",
+                actorId,
+                ToString(reason),
+                source ? source : "-",
+                actor->IsInCombat() ? 1 : 0,
+                target ? target->GetFormID() : 0u,
+                outResumeCombatIds ? 1 : 0);
+            return true;
         }
 
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor)
@@ -2941,7 +3087,7 @@ namespace TFD::HostilityController
                         static_cast<unsigned int>(applyIds.size()));
                 }
 
-                const auto splitTargets = PartitionTruceEventTargets(*assignSourceIds, player, targetId);
+                const auto splitTargets = PartitionTruceEventTargets(*assignSourceIds, player, targetId, mode);
                 const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
                 if (auto sessionIt = g_sessions.find(sessionId); sessionIt != g_sessions.end()) {
                     sessionIt->second.dialogueAssignedActorIds = assignedDialogueIds;
@@ -3037,6 +3183,13 @@ namespace TFD::HostilityController
         }
         if (IsSuppressed(actor)) {
             return true;
+        }
+        // R99A: after InCombat -> Pleasure -> Recruit, converted teammates can still
+        // carry short-lived phase factions or release-grace markers for a few ticks.
+        // The hook must not treat those stale markers as combat suppression, otherwise
+        // teammates and nearby enemies end up in a blind/search state with no target.
+        if (IsPlayerSideActorAfterInCombatTruce(actor)) {
+            return false;
         }
         if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
             return true;
@@ -3612,7 +3765,7 @@ namespace TFD::HostilityController
         std::sort(actorIds.begin(), actorIds.end());
 
         auto* player = Runtime::ResolveActor(session.playerId);
-        const auto splitTargets = PartitionTruceEventTargets(actorIds, player, session.primaryTargetId);
+        const auto splitTargets = PartitionTruceEventTargets(actorIds, player, session.primaryTargetId, session.primaryMode);
         const auto assignedDialogueIds = BuildAssignedTruceDialogueIds(splitTargets);
 
         for (const auto actorId : assignedDialogueIds) {
@@ -3735,6 +3888,7 @@ namespace TFD::HostilityController
                 ToString(reason));
         }
 
+
         if (!resumeCombatIds.empty()) {
             const auto resumeSent = SendModEventToActors(kInCombatResumeCombatEvent, resumeCombatIds);
             spdlog::info(
@@ -3786,6 +3940,146 @@ namespace TFD::HostilityController
         return it != g_truceState.end() && it->second.betrayed;
     }
 
+    namespace
+    {
+        bool IsActiveInCombatTruceSession(const Session& session)
+        {
+            return !session.finished && session.primaryMode == Mode::TruceInCombat;
+        }
+
+        void AddUniqueSessionId(std::vector<RE::FormID>& sessionIds, RE::FormID sessionId)
+        {
+            if (sessionId == 0) {
+                return;
+            }
+            if (std::find(sessionIds.begin(), sessionIds.end(), sessionId) != sessionIds.end()) {
+                return;
+            }
+            sessionIds.push_back(sessionId);
+        }
+
+        void AddInCombatSessionForActor(std::vector<RE::FormID>& sessionIds, RE::Actor* actor)
+        {
+            if (!actor) {
+                return;
+            }
+            auto entryIt = g_entries.find(actor->GetFormID());
+            if (entryIt == g_entries.end() || entryIt->second.mode != Mode::TruceInCombat) {
+                return;
+            }
+            auto sessionIt = g_sessions.find(entryIt->second.sessionId);
+            if (sessionIt == g_sessions.end() || !IsActiveInCombatTruceSession(sessionIt->second)) {
+                return;
+            }
+            AddUniqueSessionId(sessionIds, entryIt->second.sessionId);
+        }
+
+        void AddAllActiveInCombatSessions(std::vector<RE::FormID>& sessionIds)
+        {
+            for (const auto& [sessionId, session] : g_sessions) {
+                if (!IsActiveInCombatTruceSession(session)) {
+                    continue;
+                }
+                AddUniqueSessionId(sessionIds, sessionId);
+            }
+        }
+    }
+
+    bool AbortActiveInCombatTruceOnHit(const RE::TESHitEvent* ev, const char* reason)
+    {
+        if (!ev) {
+            return false;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return false;
+        }
+
+        auto* targetRef = ev->target.get();
+        auto* causeRef = ev->cause.get();
+        auto* targetActor = targetRef ? targetRef->As<RE::Actor>() : nullptr;
+        auto* causeActor = causeRef ? causeRef->As<RE::Actor>() : nullptr;
+
+        if (!targetActor && !causeActor) {
+            return false;
+        }
+
+        std::vector<RE::FormID> sessionIds;
+        sessionIds.reserve(4);
+
+        const bool targetIsPlayer = targetActor && targetActor->GetFormID() == player->GetFormID();
+        const bool causeIsPlayer = causeActor && causeActor->GetFormID() == player->GetFormID();
+
+        // Player damage during an active in-combat truce is always unsafe: even if
+        // the hitter was outside the current crowd alias list, the truce has already
+        // been violated and the whole in-combat negotiation/pleasure handoff must end.
+        if (targetIsPlayer || causeIsPlayer) {
+            AddAllActiveInCombatSessions(sessionIds);
+        }
+
+        AddInCombatSessionForActor(sessionIds, targetActor);
+        AddInCombatSessionForActor(sessionIds, causeActor);
+
+        if (sessionIds.empty()) {
+            return false;
+        }
+
+        const char* why = reason && reason[0] ? reason : "hit_damage_interrupt";
+        bool handledAny = false;
+
+        // Close open forcegreet/dialogue immediately. Papyrus aliases are cleared by
+        // TFDInCombatEmergencyCancel plus the normal unassign events from ReleaseSession.
+        TFD::InteractionRouter::DialogueOpen::ForceCloseDialogueMenu(why);
+
+        for (RE::FormID sessionId : sessionIds) {
+            auto sessionIt = g_sessions.find(sessionId);
+            if (sessionIt == g_sessions.end() || !IsActiveInCombatTruceSession(sessionIt->second)) {
+                continue;
+            }
+
+            const auto primaryTargetId = sessionIt->second.primaryTargetId;
+            auto* primaryActor = ResolveActor(primaryTargetId);
+            auto* sessionPlayer = ResolveActor(sessionIt->second.playerId);
+            if (!sessionPlayer) {
+                sessionPlayer = player;
+            }
+
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(
+                TFD::FlowController::InCombatOutcome::Failed,
+                primaryTargetId,
+                "incombat_hit_damage_interrupt");
+            const bool terminalComplete = flowDone ? flow.RequestCompleteTerminalContext("incombat_hit_damage_interrupt_complete") : false;
+
+            if (primaryActor) {
+                SendModEvent("TFDInCombatEmergencyCancel", primaryActor);
+            } else {
+                SendModEvent("TFDInCombatEmergencyCancel", nullptr);
+            }
+
+            ReleaseSession(sessionId, ReleaseReason::FightChoice);
+            TFD::InCombat::Complete("incombat_hit_damage_interrupt");
+
+            if (primaryActor && sessionPlayer) {
+                (void)ForceRehostile(primaryActor, sessionPlayer, ReleaseReason::FightChoice, true);
+            }
+
+            spdlog::warn(
+                "TFDHostilityController: [R97A] incombat emergency cancel session={} primary={:08X} target={:08X} cause={:08X} flowDone={} terminalComplete={} reason={}",
+                sessionId,
+                primaryTargetId,
+                targetActor ? targetActor->GetFormID() : 0u,
+                causeActor ? causeActor->GetFormID() : 0u,
+                flowDone ? 1 : 0,
+                terminalComplete ? 1 : 0,
+                why);
+            handledAny = true;
+        }
+
+        return handledAny;
+    }
+
     void ReleaseSession(RE::FormID sessionId, ReleaseReason reason)
     {
         if (sessionId == 0) {
@@ -3826,6 +4120,8 @@ namespace TFD::HostilityController
 
         std::vector<RE::FormID> resumeCombatIds;
         resumeCombatIds.reserve(actorIds.size());
+        std::vector<RE::FormID> postInCombatRearmIds;
+        postInCombatRearmIds.reserve(actorIds.size());
 
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);
@@ -3957,6 +4253,30 @@ namespace TFD::HostilityController
                 primaryTargetId,
                 ToString(primaryDisposition));
         }
+        if (primaryMode == Mode::TruceInCombat && reason == ReleaseReason::InCombatPleasureEnd && player) {
+            PulseGlobalDetection("post_incombat_pleasure_end");
+            for (const auto actorId : actorIds) {
+                if (auto* actor = ResolveActor(actorId)) {
+                    (void)PreparePostInCombatSuppressionRearm(
+                        actor,
+                        player,
+                        reason,
+                        "session_release",
+                        &postInCombatRearmIds);
+                }
+            }
+            if (!postInCombatRearmIds.empty()) {
+                resumeCombatIds.insert(resumeCombatIds.end(), postInCombatRearmIds.begin(), postInCombatRearmIds.end());
+                std::sort(resumeCombatIds.begin(), resumeCombatIds.end());
+                resumeCombatIds.erase(std::unique(resumeCombatIds.begin(), resumeCombatIds.end()), resumeCombatIds.end());
+            }
+            spdlog::info(
+                "TFDHostilityController: [R99A] post-incombat pleasure release rearm session={} actors={} resume={}",
+                sessionId,
+                static_cast<unsigned int>(actorIds.size()),
+                static_cast<unsigned int>(postInCombatRearmIds.size()));
+        }
+
         if (!resumeCombatIds.empty()) {
             const auto resumeSent = SendModEventToActors(kInCombatResumeCombatEvent, resumeCombatIds);
             spdlog::info(
@@ -4215,6 +4535,15 @@ namespace TFD::HostilityController
             sent = SendModEventToActors(eventName, std::vector<RE::FormID>{ actorId });
         }
 
+        if (player && releasedEntry.mode == Mode::TruceInCombat && reason == ReleaseReason::FlowHandoff) {
+            (void)PreparePostInCombatSuppressionRearm(
+                actor,
+                player,
+                reason,
+                debugReason ? debugReason : "single_cycle_release",
+                nullptr);
+        }
+
         if (player && ShouldResumeCombatAfterTruceRelease(releasedEntry.mode, reason)) {
             const bool drawWeapon = true;
             const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
@@ -4356,6 +4685,8 @@ namespace TFD::HostilityController
             return "DialogueClosed";
         case ReleaseReason::FlowHandoff:
             return "FlowHandoff";
+        case ReleaseReason::InCombatPleasureEnd:
+            return "InCombatPleasureEnd";
         case ReleaseReason::TooFar:
             return "TooFar";
         case ReleaseReason::TameBroken:

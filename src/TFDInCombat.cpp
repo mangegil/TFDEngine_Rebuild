@@ -9,8 +9,10 @@
 #include <spdlog/spdlog.h>
 
 #include "TFDFlowController.h"
+#include "TFDInteractionRouter.h"
 #include "TFDActor.h"
 #include "TFDTeammateManager.h"
+#include "TFDHostilityController.h"
 
 namespace TFD::InCombat
 {
@@ -21,6 +23,20 @@ namespace TFD::InCombat
 		std::atomic<std::uint32_t> g_primaryActorFormID{ 0 };
 		std::mutex g_lock{};
 		DialogueOutcome g_dialogueOutcome = DialogueOutcome::None;
+
+		class HitSink final : public RE::BSTEventSink<RE::TESHitEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(
+				const RE::TESHitEvent* ev,
+				RE::BSTEventSource<RE::TESHitEvent>*) override
+			{
+				(void)TFD::HostilityController::AbortActiveInCombatTruceOnHit(ev, "incombat_hit_damage_interrupt");
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		HitSink g_hitSink{};
 
 		void SetStateLocked(State state, std::uint32_t actorFormID)
 		{
@@ -120,6 +136,10 @@ namespace TFD::InCombat
 			return;
 		}
 
+		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
+			scripts->AddEventSink(&g_hitSink);
+		}
+
 		spdlog::info("[TFD][InCombat] Install");
 	}
 
@@ -137,6 +157,10 @@ namespace TFD::InCombat
 
 	void Shutdown()
 	{
+		if (auto* scripts = RE::ScriptEventSourceHolder::GetSingleton()) {
+			scripts->RemoveEventSink(&g_hitSink);
+		}
+
 		std::scoped_lock lk(g_lock);
 		SetStateLocked(State::Idle, 0);
 		g_dialogueOutcome = DialogueOutcome::None;
@@ -205,7 +229,8 @@ namespace TFD::InCombat
 		std::scoped_lock lk(g_lock);
 		SetStateLocked(State::Idle, 0);
 		g_dialogueOutcome = DialogueOutcome::None;
-		spdlog::info("[TFD][InCombat] Complete reason={}", reason ? reason : "-");
+		TFD::InteractionRouter::ClearInteractionStateValue();
+		spdlog::info("[TFD][InCombat] Complete reason={} interactionCleared=1", reason ? reason : "-");
 	}
 
 	bool IsActive()

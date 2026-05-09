@@ -350,6 +350,27 @@ namespace TFD::PleasureRuntime
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
+		bool RemoveDeferredInCombatRecruitIdLocked(std::uint32_t actorId, std::string_view reason)
+		{
+			if (actorId == 0) {
+				return false;
+			}
+
+			const auto before = g_state.deferredInCombatRecruitActorIds.size();
+			g_state.deferredInCombatRecruitActorIds.erase(
+				std::remove(g_state.deferredInCombatRecruitActorIds.begin(), g_state.deferredInCombatRecruitActorIds.end(), actorId),
+				g_state.deferredInCombatRecruitActorIds.end());
+			const bool removed = g_state.deferredInCombatRecruitActorIds.size() != before;
+			if (removed) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][R96D] deferred incombat recruit removed actor={:08X} remaining={} reason={}",
+					actorId,
+					static_cast<unsigned int>(g_state.deferredInCombatRecruitActorIds.size()),
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+			}
+			return removed;
+		}
+
 		std::vector<std::uint32_t> TakeDeferredInCombatRecruitIdsLocked(std::string_view reason)
 		{
 			std::vector<std::uint32_t> ids = std::move(g_state.deferredInCombatRecruitActorIds);
@@ -1230,6 +1251,86 @@ namespace TFD::PleasureRuntime
 			return clean;
 		}
 
+		bool FinalizeConsumedInCombatRecruitForCycle(RE::Actor* consumedActor, RE::Actor* nextActor, std::string_view reason)
+		{
+			if (!consumedActor || consumedActor->IsDead() || consumedActor->IsDisabled()) {
+				return false;
+			}
+
+			const auto consumedId = consumedActor->GetFormID();
+			if (consumedId == 0) {
+				return false;
+			}
+
+			if (!TFD::Recruit::IsRecruitLike(consumedActor)) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][R96D] consumed recruit finalize skipped actor={:08X} next={:08X} reason={} detail=not_recruit_like",
+					consumedId,
+					nextActor ? nextActor->GetFormID() : 0u,
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+				return false;
+			}
+
+			{
+				std::scoped_lock lk(g_lock);
+				RemoveDeferredInCombatRecruitIdLocked(consumedId, reason.empty() ? "consumed_recruit_cycle_finalize" : reason);
+			}
+
+			TFD::Recruit::MarkRecruitCommitPending(
+				consumedActor,
+				2.0,
+				TFD::Recruit::SourceFlow::Pleasure,
+				"incombat_consumed_recruit_cycle_finalize_pending");
+
+			TFD::Recruit::CommitOptions options{};
+			options.sourceFlow = TFD::Recruit::SourceFlow::Pleasure;
+			options.reason = "incombat_consumed_recruit_cycle_finalize";
+			options.quarantineHostileFactions = true;
+			options.clearCombat = true;
+			options.evaluatePackage = true;
+			options.detailedLog = true;
+			options.throttleObserve = false;
+			options.ensurePacifyAlliance = true;
+			options.applyRuntimeProfile = true;
+
+			const auto result = TFD::Recruit::CommitRecruit(consumedActor, options);
+			const bool recruitLikeClean =
+				TFD::Recruit::IsRecruitLike(consumedActor) &&
+				!TFD::Recruit::IsRawHostileToPlayer(consumedActor) &&
+				!TFD::Recruit::HasKnownHostileSourceFaction(consumedActor);
+			const bool settledClean = result.attempted && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+			const bool finalizeOk = settledClean || recruitLikeClean;
+
+			bool truceReleased = false;
+			bool aliasRegistered = false;
+			if (finalizeOk) {
+				truceReleased = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+					consumedActor,
+					TFD::HostilityController::ReleaseReason::FlowHandoff,
+					"incombat_consumed_recruit_cycle_finalize");
+				aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(
+					consumedActor,
+					"incombat_consumed_recruit_cycle_finalize");
+				TFD::TeammateManager::RefreshRecruitCapacityGlobals("incombat_consumed_recruit_cycle_finalize");
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R96D] consumed recruit finalized actor={:08X} next={:08X} attempted={} skipped={} settledClean={} recruitLikeClean={} rawAfter={} hostileAfter={} truceReleased={} aliasRegistered={} reason={}",
+				consumedId,
+				nextActor ? nextActor->GetFormID() : 0u,
+				result.attempted ? 1 : 0,
+				result.skipped ? 1 : 0,
+				settledClean ? 1 : 0,
+				recruitLikeClean ? 1 : 0,
+				result.rawHostileAfter ? 1 : 0,
+				result.hostileFactionMatchesAfter,
+				truceReleased ? 1 : 0,
+				aliasRegistered ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+
+			return aliasRegistered;
+		}
+
 		void HandleRecognizedEventLocked(std::string_view eventName, const EventInfo& info)
 		{
 			if (eventName == kPleasureStartPendingEvent || eventName == kOStimSceneStartPendingEvent) {
@@ -1569,6 +1670,12 @@ namespace TFD::PleasureRuntime
 		else {
 			auto* consumedActor = LookupActor(attempt.consumedActorFormID);
 			if (consumedActor && consumedActor->GetFormID() != attempt.actorFormID) {
+				if (attempt.source == SourceContext::InCombat) {
+					FinalizeConsumedInCombatRecruitForCycle(
+						consumedActor,
+						actor,
+						"after_pleasure_cycle_consumed_recruit");
+				}
 				QueueTruceAliasUnassign(consumedActor, "after_pleasure_cycle_consumed_recruit");
 			}
 			QueueTruceAliasPromoteSpeaker(actor, "after_pleasure_cycle_promote_next_speaker");
@@ -1903,20 +2010,39 @@ namespace TFD::PleasureRuntime
 			options.applyRuntimeProfile = true;
 
 			const auto result = TFD::Recruit::CommitRecruit(actor, options);
-			const bool clean = result.attempted && !result.skipped && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
-			const bool aliasRegistered = clean && TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "incombat_deferred_recruit_finalize");
+			const bool settledClean = result.attempted && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+			const bool recruitLikeClean =
+				TFD::Recruit::IsRecruitLike(actor) &&
+				!TFD::Recruit::IsRawHostileToPlayer(actor) &&
+				!TFD::Recruit::HasKnownHostileSourceFaction(actor);
+			const bool clean = settledClean || recruitLikeClean;
+			bool truceReleased = false;
+			if (clean) {
+				// R95B/R96D: the actor was kept inside the TruceInCombat session while the
+				// crowd chain continued. Remove it as a FlowHandoff before the final
+				// session cleanup, otherwise PlayerArmed/FightChoice can rehostile it
+				// and the original bandit patrol package can win over teammate follow.
+				truceReleased = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+					actor,
+					TFD::HostilityController::ReleaseReason::FlowHandoff,
+					"incombat_deferred_recruit_finalize");
+			}
+			const bool aliasRegistered = clean && TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(actor, "incombat_deferred_recruit_finalize");
 			if (aliasRegistered) {
 				++registered;
 			}
 
 			spdlog::info(
-				"[TFD][PleasureRuntime][R94G] deferred recruit flush actor={:08X} attempted={} skipped={} clean={} rawAfter={} hostileAfter={} aliasRegistered={} reason={}",
+				"[TFD][PleasureRuntime][R96D] deferred recruit flush actor={:08X} attempted={} skipped={} settledClean={} recruitLikeClean={} clean={} rawAfter={} hostileAfter={} truceReleased={} aliasRegistered={} reason={}",
 				actorId,
 				result.attempted ? 1 : 0,
 				result.skipped ? 1 : 0,
+				settledClean ? 1 : 0,
+				recruitLikeClean ? 1 : 0,
 				clean ? 1 : 0,
 				result.rawHostileAfter ? 1 : 0,
 				result.hostileFactionMatchesAfter,
+				truceReleased ? 1 : 0,
 				aliasRegistered ? 1 : 0,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}

@@ -32,6 +32,7 @@
 #include "TFDFlowController.h"
 #include "TFDSettings.h"
 #include "TFDPayModel.h"
+#include "TFDRecruit.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -87,6 +88,7 @@ static void QueueHud(const char* text)
 
 static void ResetTransientStateForLoad()
 {
+    TFD::Recruit::RestoreRuntimeModifiedActorsForLoad("transient_reset_for_load");
     TFD::PreCombatGreet::CancelAll();
     TFD::CaptiveGreet::Reset();
     TFD::RescueGreet::Reset();
@@ -166,6 +168,7 @@ static void FinalizeLoadAfterWorldReady()
     ResetTransientStateForLoad();
     TFD::DefeatMonitor::SetLoadTransition(false);
     TFD::DefeatMonitor::ApplyQueuedProgressState();
+    TFD::Recruit::RefreshRuntimeRestoredActorsAfterLoad("finalize_load_after_world_ready");
 
     spdlog::info("[TFD] FinalizeLoadAfterWorldReady -> done");
 }
@@ -303,6 +306,11 @@ public:
             TFD::Location::ResetAmbientKidnapAvailabilityWatcher();
             TFD::Location::UpdateAmbientKidnapAvailability(true);
             FinalizeLoadAfterWorldReady();
+            // R96E: hard guarantee for save-swap cleanup. Some builds already call this
+            // inside FinalizeLoadAfterWorldReady(); this direct post-menu pass is harmless
+            // when the snapshot queue is empty, and catches cases where finalize was skipped
+            // or the loaded refs were not ready during the first pass.
+            TFD::Recruit::RefreshRuntimeRestoredActorsAfterLoad("loading_menu_closed_direct");
             TFD::TeammateManager::QueueHumanoidTeammateCatchupAfterLoad("loading_menu_closed");
         }
 

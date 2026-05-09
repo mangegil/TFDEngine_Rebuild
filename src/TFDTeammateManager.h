@@ -40,6 +40,7 @@ namespace TFD::TeammateManager
     std::size_t GetRecruitSlotsFree();
     void RefreshRecruitCapacityGlobals(const char* reason = nullptr);
     bool RegisterOrRefreshTeammateNow(RE::Actor* actor, const char* reason = nullptr);
+    bool RegisterOrRefreshTeammateNowImmediatePackage(RE::Actor* actor, const char* reason = nullptr);
     void QueueHumanoidTeammateCatchupAfterLoad(const char* reason = nullptr);
 
     std::size_t RestoreNow();
