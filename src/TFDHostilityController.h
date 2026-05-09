@@ -130,6 +130,18 @@ namespace TFD::HostilityController
         RE::Actor* primaryTarget,
         const std::vector<RE::Actor*>& actors,
         ReleaseReason reason = ReleaseReason::DialogueClosed);
+    std::optional<RE::FormID> PromoteTruceActorForCycle(
+        RE::Actor* actor,
+        const char* debugReason = nullptr);
+
+    bool DemoteTruceActorForCycleHold(
+        RE::Actor* actor,
+        const char* debugReason = nullptr);
+
+    bool ReleaseSingleTruceActorForCycle(
+        RE::Actor* actor,
+        ReleaseReason reason = ReleaseReason::FlowHandoff,
+        const char* debugReason = nullptr);
 
     bool CanStartTruce(RE::Actor* actor);
     bool HasSpentTruce(RE::Actor* actor);

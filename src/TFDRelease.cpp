@@ -193,8 +193,29 @@ namespace TFD::Release
 
     void Reset()
     {
-        std::scoped_lock lk(gLock);
-        gState = {};
+        State previous{};
+        {
+            std::scoped_lock lk(gLock);
+            previous = gState;
+            gState = {};
+        }
+
+        // R93W: if a load/reset happens during release-to-vanilla grace, do not
+        // leave TFDPacifyFaction / release helper markers stuck on the actor pack.
+        // PreCombat already depends on this grace lifecycle; clearing the runtime
+        // without removing its actor-side markers is what makes the passive state
+        // survive across saves.
+        if (previous.phase != Phase::None) {
+            if (auto* actor = ResolveActor(previous.actor)) {
+                TFD::Actor::Ops::RemoveReleaseFollowGraceFromSpeakerAndCrowd(actor, "release_reset_r93w");
+            }
+            spdlog::info(
+                "[TFD][Release][R93W] reset cleared active release actor={:08X} source={} phase={} reason={}",
+                previous.actorFormID,
+                ToString(previous.source),
+                static_cast<unsigned int>(previous.phase),
+                previous.reason.empty() ? "-" : previous.reason.c_str());
+        }
     }
 
     void Tick()

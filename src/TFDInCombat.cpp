@@ -3,11 +3,14 @@
 #include <atomic>
 #include <mutex>
 #include <string_view>
+#include <vector>
 
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
 #include "TFDFlowController.h"
+#include "TFDActor.h"
+#include "TFDTeammateManager.h"
 
 namespace TFD::InCombat
 {
@@ -24,6 +27,91 @@ namespace TFD::InCombat
 			g_state.store(state, std::memory_order_release);
 			g_primaryActorFormID.store(actorFormID, std::memory_order_release);
 		}
+
+		RE::TESFaction* ResolveFactionByEditorID(const char* editorID)
+		{
+			if (!editorID || editorID[0] == '\0') {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByEditorID<RE::TESFaction>(editorID);
+		}
+
+		void ClearStaleLoadHelperFactions()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return;
+			}
+
+			auto* inCombatTruceFaction = ResolveFactionByEditorID("TFDInCombatTruceFaction");
+			auto* pacifyFaction = ResolveFactionByEditorID("TFDPacifyFaction");
+			auto* expiredTeammateFaction = ResolveFactionByEditorID("TFDExpiredTeammate");
+			auto* tfdTeammateFaction = ResolveFactionByEditorID("TFDTeammateFaction");
+			if (!inCombatTruceFaction && !pacifyFaction && !expiredTeammateFaction) {
+				return;
+			}
+
+			const auto snapshot = TFD::Actor::BuildSnapshot(12000.0f, false);
+			unsigned int changedCount = 0;
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
+				if (!actor || actor == player || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				// R93X: do not use IsActiveFollowerActor() here. In older/rejected
+				// release paths, TFDExpiredTeammate itself made hostile bandits look
+				// like TFD teammates, so the load cleanup skipped exactly the dirty
+				// actors it was supposed to clean. Only preserve real teammate state.
+				const bool realTeammate =
+					actor->IsPlayerTeammate() ||
+					(tfdTeammateFaction && actor->IsInFaction(tfdTeammateFaction));
+				if (realTeammate) {
+					continue;
+				}
+
+				bool changed = false;
+				if (inCombatTruceFaction && actor->IsInFaction(inCombatTruceFaction)) {
+					actor->RemoveFromFaction(inCombatTruceFaction);
+					changed = true;
+				}
+				if (pacifyFaction && actor->IsInFaction(pacifyFaction)) {
+					actor->RemoveFromFaction(pacifyFaction);
+					changed = true;
+				}
+				if (expiredTeammateFaction && actor->IsInFaction(expiredTeammateFaction)) {
+					actor->RemoveFromFaction(expiredTeammateFaction);
+					changed = true;
+				}
+				if (changed) {
+					++changedCount;
+					const bool hostileAfterCleanup = actor->IsHostileToActor(player) || info.hostileToPlayer;
+					actor->SetBeenAttacked(true);
+					player->SetBeenAttacked(true);
+					(void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+					(void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
+
+					if (hostileAfterCleanup) {
+						(void)TFD::FlowController::QueueBridgeModEvent(
+							"TFDInCombatResumeCombat",
+							actor,
+							"load_cleanup_detection_wake",
+							1.0f);
+					}
+
+					spdlog::info(
+						"[TFD][InCombat][R93Y] load cleanup stale truce/pacify/expired factions actor={:08X} dist={:.1f} hostileAfterCleanup={}",
+						actor->GetFormID(),
+						info.dist,
+						hostileAfterCleanup ? 1 : 0);
+				}
+			}
+
+			if (changedCount > 0) {
+				spdlog::info("[TFD][InCombat][R93Y] load cleanup changed actors={}", changedCount);
+			}
+		}
 	}
 
 	void Install()
@@ -37,9 +125,13 @@ namespace TFD::InCombat
 
 	void ResetForLoad()
 	{
-		std::scoped_lock lk(g_lock);
-		SetStateLocked(State::Idle, 0);
-		g_dialogueOutcome = DialogueOutcome::None;
+		{
+			std::scoped_lock lk(g_lock);
+			SetStateLocked(State::Idle, 0);
+			g_dialogueOutcome = DialogueOutcome::None;
+		}
+
+		ClearStaleLoadHelperFactions();
 		spdlog::info("[TFD][InCombat] ResetForLoad");
 	}
 
@@ -361,15 +453,29 @@ namespace TFD::InCombat
 		if (!context.actor) {
 			return false;
 		}
+
+		// R93V: InCombat Release/Follow must not use the generic ReleaseFollowGrace
+		// helper. That helper currently marks actors with TFDExpiredTeammate, which is
+		// also consumed by TFDTeammateManager as a converted teammate marker. In the
+		// InCombat Pay > Release path that caused released bandits to be pulled into
+		// teammate aliases/contracts and remain pacified across saves.
+		//
+		// Papyrus already commits the local outcome:
+		// - Release: stops combat/alarm for the speaker before this event.
+		// - Follow: TemporaryFollowerQuest owns the follow behavior.
+		// Native only needs to complete the flow and release the truce session.
+		// Keep the handler for typed outcome logging, but intentionally do not call
+		// handlers.applyGrace here.
 		const auto name = context.eventName ? std::string_view(context.eventName) : std::string_view{};
-		const char* graceReason = name == std::string_view("TFDInCombatOutcomeFollow") ? "incombat_follow" : "incombat_release";
-		if (handlers.applyGrace) {
-			handlers.applyGrace(context.actor, context.durationSec > 0.0 ? context.durationSec : 20.0, graceReason);
-		}
-		spdlog::info("[TFD][InCombat] release/follow handled actor={:08X} reason={} duration={:.1f}",
+		const char* terminalReason = name == std::string_view("TFDInCombatOutcomeFollow") ?
+			"incombat_follow_terminal_no_teammate_grace" :
+			"incombat_release_terminal_no_teammate_grace";
+
+		(void)handlers;
+		spdlog::info("[TFD][InCombat][R93V] release/follow handled actor={:08X} reason={} requestedDuration={:.1f} action=no_expired_teammate_grace",
 			context.actor->GetFormID(),
-			graceReason,
-			context.durationSec > 0.0 ? context.durationSec : 20.0);
+			terminalReason,
+			context.durationSec > 0.0 ? context.durationSec : 0.0);
 		return true;
 	}
 

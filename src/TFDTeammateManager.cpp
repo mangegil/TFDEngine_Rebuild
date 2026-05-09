@@ -1,6 +1,7 @@
 #include "TFDTeammateManager.h"
 #include "TFDActor.h"
 #include "TFDCombatBehavior.h"
+#include "TFDPleasureRuntime.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -500,6 +501,62 @@ namespace
             return false;
         }
 
+        bool IsActorInExpiredAliasUnsafe(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+            const auto actorId = actor->GetFormID();
+            for (auto* alias : g_registry.expiredAliases) {
+                if (!alias) {
+                    continue;
+                }
+                auto* current = alias->GetActorReference();
+                if (current && current->GetFormID() == actorId) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        RE::TESFaction* ResolvePacifyFactionUnsafe()
+        {
+            static RE::TESFaction* pacifyFaction = nullptr;
+            static bool tried = false;
+            if (!tried) {
+                tried = true;
+                pacifyFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPacifyFaction");
+                if (!pacifyFaction) {
+                    spdlog::warn("[TFD][TeammateManager][R93V] faction TFDPacifyFaction not found for stale grace cleanup");
+                }
+            }
+            return pacifyFaction;
+        }
+
+        void ClearStrayExpiredHelperFactionUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player()) {
+                return;
+            }
+            bool changed = false;
+            if (g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction)) {
+                actor->RemoveFromFaction(g_registry.expiredTeammateFaction);
+                changed = true;
+            }
+            if (auto* pacifyFaction = ResolvePacifyFactionUnsafe()) {
+                if (actor->IsInFaction(pacifyFaction)) {
+                    actor->RemoveFromFaction(pacifyFaction);
+                    changed = true;
+                }
+            }
+            if (changed) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R93V] cleared stray release helper factions actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+            }
+        }
+
         bool IsTFDConvertedTeammate(RE::Actor* actor)
         {
             ResolveRegistry();
@@ -510,8 +567,26 @@ namespace
             if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
                 return true;
             }
+
             if (g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction)) {
-                return true;
+                // R93V: TFDExpiredTeammate is a valid converted marker only for the
+                // actual expired-contract flow. It must not make random release-grace
+                // actors enter TFD teammate aliases. Release/follow grace can use this
+                // faction in older builds, so reject it while runtime grace is active
+                // and clean up stray non-expired actors when no expired alias/known
+                // conversion backs the marker.
+                if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+                    return false;
+                }
+
+                const bool knownConverted = g_knownConvertedTeammates.find(actor->GetFormID()) != g_knownConvertedTeammates.end();
+                const bool expiredAliasActor = IsActorInExpiredAliasUnsafe(actor);
+                if (knownConverted || expiredAliasActor) {
+                    return true;
+                }
+
+                ClearStrayExpiredHelperFactionUnsafe(actor, "stray_expired_marker_not_converted");
+                return false;
             }
 
             return false;
@@ -693,6 +768,13 @@ namespace
                 return false;
             }
 
+            if (TFD::PleasureRuntime::IsInCombatPleasureChainActive()) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R94G] combat capable suppressed during incombat pleasure chain actor={:08X}",
+                    actor ? actor->GetFormID() : 0u);
+                return false;
+            }
+
             if (TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetAllyDownedThresholdPct())) {
                 return false;
             }
@@ -782,19 +864,21 @@ namespace
                 return 3;
             }
 
-            int activeCount = 0;
-            for (auto* actor : teammates) {
-                if (!IsCombatCapableTeammate(actor)) {
-                    continue;
-                }
-
-                ++activeCount;
-                if (activeCount > 1) {
-                    return 2;
-                }
+            // R94I: TFDTeammateState is a roster / dialogue-condition global,
+            // not an active-combat-capability flag.
+            //
+            // During InCombat pleasure chaining R94G intentionally suppresses
+            // converted teammates from combat/assist until the chain is stable.
+            // Counting only IsCombatCapableTeammate() here made the roster look
+            // empty even when aliases were already filled, producing
+            // teammateState=0 with registered=2. Keep combat suppression local to
+            // combat behavior and report the actual registered teammate roster.
+            const int registeredCount = static_cast<int>(teammates.size());
+            if (registeredCount > 1) {
+                return 2;
             }
 
-            return activeCount == 1 ? 1 : 0;
+            return registeredCount == 1 ? 1 : 0;
         }
 
         void WriteTeammateState(int value)
@@ -1858,6 +1942,12 @@ namespace
 
             for (const auto& info : snapshot.actors) {
                 auto* actor = info.get();
+                if (actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+                    spdlog::info(
+                        "[TFD][TeammateManager][R93V] skip release-follow grace actor={:08X} reason=collect_nearby",
+                        actor->GetFormID());
+                    continue;
+                }
                 if (!IsAliasManagedTeammate(actor)) {
                     continue;
                 }
@@ -1881,6 +1971,14 @@ namespace
         bool QueueHumanoidTeammateAssignEvent(RE::Actor* actor, const char* reason)
         {
             if (!actor) {
+                return false;
+            }
+
+            if (TFD::PleasureRuntime::IsInCombatPleasureChainActive()) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R94G] queue humanoid assign deferred by incombat pleasure chain actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
                 return false;
             }
 
@@ -2028,6 +2126,27 @@ namespace
             if (IsHardInvalidConvertedAliasActor(actor)) {
                 LogInvalidAliasDiagnostic(alias, actor, "clear_hard_invalid", reason, 0);
                 ForgetConvertedTeammate(actor, "hard_invalid_alias_clear");
+                return false;
+            }
+
+            // R93V: Do not preserve aliases that were created only because an
+            // InCombat Release/Follow grace marker looked like a converted teammate.
+            // These actors are still hostile bandits with no current TFD teammate
+            // marker, so preserving the alias re-applies teammate packages/contracts
+            // and causes the cross-save pacify bug.
+            if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+                ClearStrayExpiredHelperFactionUnsafe(actor, "alias_clear_release_follow_grace");
+                ForgetConvertedTeammate(actor, "alias_clear_release_follow_grace");
+                LogInvalidAliasDiagnostic(alias, actor, "clear_release_follow_grace", reason, 0);
+                return false;
+            }
+
+            const bool hasCurrentTfdMarker = HasAnyTFDTeammateFactionNow(actor);
+            const bool hasNaturalFollowerState = actor->IsPlayerTeammate() || HasFollowerAnchorFaction(actor);
+            if (!hasCurrentTfdMarker && !hasNaturalFollowerState && HasPlayerHostility(actor)) {
+                ClearStrayExpiredHelperFactionUnsafe(actor, "alias_clear_hostile_stale_conversion");
+                ForgetConvertedTeammate(actor, "alias_clear_hostile_stale_conversion");
+                LogInvalidAliasDiagnostic(alias, actor, "clear_hostile_stale_conversion", reason, 0);
                 return false;
             }
 
@@ -2352,8 +2471,9 @@ namespace
                     // small follow/dialogue timing artifacts. Initial recruit and real alias
                     // repair still use the normal event/evaluate path.
                     if (!manualDialogueRefresh) {
+                        const bool chainLocked = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
                         QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_refresh");
-                        if (actor->Is3DLoaded()) {
+                        if (!chainLocked && actor->Is3DLoaded()) {
                             actor->EvaluatePackage();
                         }
                     }
@@ -2417,9 +2537,12 @@ namespace
             }
             SyncTeammateFaction(actor, true);
             EnsureContractForActorUnsafe(actor, reason ? reason : "register_now_assign");
-            QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_assign");
-            if (actor->Is3DLoaded()) {
-                actor->EvaluatePackage();
+            {
+                const bool chainLocked = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
+                QueueHumanoidTeammateAssignEvent(actor, reason ? reason : "register_now_assign");
+                if (!chainLocked && actor->Is3DLoaded()) {
+                    actor->EvaluatePackage();
+                }
             }
 
             spdlog::info(

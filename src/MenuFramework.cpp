@@ -28,6 +28,7 @@
 #include "TFDHostilityController.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombatGreet.h"
+#include "TFDInCombat.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDInteractionRouter.h"
 #include "TFDTame.h"
@@ -252,7 +253,126 @@ namespace TFDMenu
 			return info;
 		}
 
-		static RE::TESObjectREFR* GetCrosshairTargetRef()
+		
+			static RE::TESTopicInfo* ResolveInCombatGreetTopicInfo()
+			{
+				static RE::TESTopicInfo* info = nullptr;
+				static bool attempted = false;
+
+				if (!attempted) {
+					attempted = true;
+
+					// R93U: Manual activation of a suppressed InCombat truce actor must
+					// not fall through to vanilla activation. Use the explicit INFO
+					// behind TFD_TIF__0506FEA8, matching the R93P router opener.
+					constexpr RE::FormID kInCombatGreetInfoLocalFormID = 0x0006FEA8;
+					constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+					if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+						info = dataHandler->LookupForm<RE::TESTopicInfo>(kInCombatGreetInfoLocalFormID, kPluginName);
+					}
+
+					if (info) {
+						spdlog::info("[TFD][Menu][R93U] TFDDialogueInCombatGreet INFO resolved {:08X} local={:06X}",
+							info->GetFormID(),
+							kInCombatGreetInfoLocalFormID);
+					}
+					else {
+						spdlog::warn("[TFD][Menu][R93U] TFDDialogueInCombatGreet INFO {:06X} not found in {}; suppressed actor activation will be blocked",
+							kInCombatGreetInfoLocalFormID,
+							kPluginName);
+					}
+				}
+
+				return info;
+			}
+
+			static bool IsInCombatTruceActivationActor(RE::Actor* actor)
+			{
+				if (!actor || actor == RE::PlayerCharacter::GetSingleton()) {
+					return false;
+				}
+
+				const auto actorId = actor->GetFormID();
+				const bool activePrimary = TFD::InCombat::IsActive() &&
+					TFD::InCombat::GetPrimaryActorFormID() == actorId;
+				const bool truceInCombat = TFD::HostilityController::GetMode(actor) == TFD::HostilityController::Mode::TruceInCombat;
+				return activePrimary || truceInCombat;
+			}
+
+			static bool OpenInCombatTruceDialogueFromActivation(RE::Actor* actor, const char* reason)
+			{
+				if (!IsInCombatTruceActivationActor(actor)) {
+					return false;
+				}
+
+				const auto actorFormID = actor ? actor->GetFormID() : 0u;
+				const auto activePrimaryFormID = TFD::InCombat::IsActive() ? TFD::InCombat::GetPrimaryActorFormID() : 0u;
+				const bool isActivePrimary = actorFormID != 0 && activePrimaryFormID != 0 && actorFormID == activePrimaryFormID;
+				if (!isActivePrimary && TFD::HostilityController::GetMode(actor) == TFD::HostilityController::Mode::TruceInCombat) {
+					// R94F: Suppressed crowd/ambient actors must not open the root InCombat
+					// dialogue by manual activation. R94E logs showed the player could open
+					// flow=10 on a non-primary crowd actor, causing SystemEvent speaker
+					// mismatch while the real session speaker kept following forever.
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info(
+						"[TFD][Menu][R94F] activate blocked non-primary incombat truce actor={:08X} primary={:08X} reason={} action=block_without_open",
+						actorFormID,
+						activePrimaryFormID,
+						reason ? reason : "incombat_activation");
+					return true;
+				}
+
+				const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+				const bool pleasureRuntimeActive = TFD::PleasureRuntime::IsActive();
+				const bool pleasureRuntimeBlocking = TFD::PleasureRuntime::IsBlocking();
+				const bool inCombatPleasureSub =
+					flowSnapshot.sub == TFD::FlowController::SubFlow::InCombatPleasure ||
+					flowSnapshot.sub == TFD::FlowController::SubFlow::InCombatAfterPleasure;
+				const bool flowHandoffHold = TFD::HostilityController::IsFlowHandoffHoldActive(actor);
+				if (pleasureRuntimeActive || pleasureRuntimeBlocking || inCombatPleasureSub || flowHandoffHold) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info(
+						"[TFD][Menu][R94B] activate blocked incombat truce during pleasure actor={:08X} reason={} phase={} source={} flowSub={} runtimeActive={} blocking={} handoff={} action=block_without_open",
+						actor->GetFormID(),
+						reason ? reason : "incombat_activation",
+						TFD::PleasureRuntime::GetPhaseName(),
+						TFD::PleasureRuntime::GetSourceContextName(),
+						TFD::FlowController::Controller::ToString(flowSnapshot.sub),
+						pleasureRuntimeActive ? 1 : 0,
+						pleasureRuntimeBlocking ? 1 : 0,
+						flowHandoffHold ? 1 : 0);
+					return true;
+				}
+
+				if (!actor->IsAIEnabled()) {
+					actor->EnableAI(true);
+				}
+				actor->AllowPCDialogue(true);
+
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+
+				auto* inCombatGreetInfo = ResolveInCombatGreetTopicInfo();
+				actor->SetDialogueWithPlayer(false, false, nullptr);
+				const bool opened = inCombatGreetInfo ? actor->SetDialogueWithPlayer(true, true, inCombatGreetInfo) : false;
+
+				spdlog::info("[TFD][Menu][R93U] activate intercepted incombat truce actor={:08X} opened={} reason={} topicInfo={:08X} explicit={} suppressed={} primary={} action=block_vanilla",
+					actor->GetFormID(),
+					opened ? 1 : 0,
+					reason ? reason : "incombat_activation",
+					inCombatGreetInfo ? inCombatGreetInfo->GetFormID() : 0u,
+					inCombatGreetInfo ? 1 : 0,
+					TFD::HostilityController::IsSuppressed(actor) ? 1 : 0,
+					(TFD::InCombat::IsActive() && TFD::InCombat::GetPrimaryActorFormID() == actor->GetFormID()) ? 1 : 0);
+
+				return opened;
+			}
+
+static RE::TESObjectREFR* GetCrosshairTargetRef()
 		{
 			auto* pickData = RE::CrosshairPickData::GetSingleton();
 			if (!pickData) {
@@ -2266,6 +2386,10 @@ namespace TFDMenu
 										if (openVictoryDialogue(crosshairActor, "victory_crosshair_activate_dialogue")) {
 											return RE::BSEventNotifyControl::kStop;
 										}
+									}
+									else if (IsInCombatTruceActivationActor(crosshairActor)) {
+										(void)OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue");
+										return RE::BSEventNotifyControl::kStop;
 									}
 									else {
 										spdlog::info("[TFD][Menu] activate crosshair actor not owned by TFD actor={:08X} action=allow_vanilla_activation",

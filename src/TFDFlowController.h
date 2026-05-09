@@ -70,6 +70,7 @@ namespace TFD::FlowController
         PreCombatPayFollowup,
         PreCombatPleasure,
         PreCombatAfterPleasure,
+        InCombatPayFollowup,
         InCombatPleasure,
         InCombatAfterPleasure,
         BleedoutPleasure,
@@ -98,6 +99,22 @@ namespace TFD::FlowController
         RecruitEnemy,
         Release,
         Follow,
+        Cancel,
+        Failed
+    };
+
+    enum class InCombatOutcome : std::uint8_t
+    {
+        None = 0,
+        Pay,
+        Pleasure,
+        Fight,
+        Captive,
+        JoinEnemy,
+        RecruitEnemy,
+        Release,
+        Follow,
+        DoNothing,
         Cancel,
         Failed
     };
@@ -404,9 +421,12 @@ namespace TFD::FlowController
         bool RequestEnemyBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
 
         bool RequestResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
 
         bool RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCompleteAfterPleasure(std::string_view reason);
@@ -425,9 +445,12 @@ namespace TFD::FlowController
         bool BeginEnemyBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
 
         bool ResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool ResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
+        bool ResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason);
+        bool ResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
 
         bool BeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool CompleteAfterPleasure(std::string_view reason);
@@ -464,6 +487,7 @@ namespace TFD::FlowController
         static const char* ToString(CaptiveMode value);
         static const char* ToString(SubFlow value);
         static const char* ToString(PreCombatOutcome value);
+        static const char* ToString(InCombatOutcome value);
         static const char* ToString(BleedoutOutcome value);
         static const char* ToString(VictoryOutcome value);
         static const char* ToString(CaptiveOutcome value);

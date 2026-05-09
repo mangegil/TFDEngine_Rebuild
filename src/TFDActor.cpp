@@ -2499,6 +2499,18 @@ namespace TFD::Actor::Ops
 		return g_releaseFollowGraceEntries.find(actor->GetFormID()) != g_releaseFollowGraceEntries.end();
 	}
 
+	void ApplyReleaseFollowGraceToActorOnly(RE::Actor* actor, double durationSeconds, const char* reason)
+	{
+		Initialize();
+		ApplyReleaseFollowGraceToActor(actor, durationSeconds, reason);
+	}
+
+	void RemoveReleaseFollowGraceFromActorOnly(RE::Actor* actor, const char* reason)
+	{
+		Initialize();
+		RemoveReleaseFollowGraceFromActor(actor, reason);
+	}
+
 	void ApplyReleaseFollowGraceToSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason)
 	{
 		Initialize();

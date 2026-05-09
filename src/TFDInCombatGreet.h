@@ -49,6 +49,8 @@ namespace TFD::InCombatGreet
 	void Install();
 	void Reset();
 	bool BeginForActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction = nullptr);
+	bool BeginForPleasureCycleActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction = nullptr);
+	bool IsPleasureCycleActiveForActor(RE::Actor* speaker);
 	void ResetRuntime(const char* reason = nullptr);
 	bool Begin(RE::Actor* speaker, const char* reason = nullptr);
 	bool BeginAfterPleasure(RE::Actor* speaker, const char* reason = nullptr);

@@ -23,6 +23,8 @@
 #include <chrono>
 #include <sstream>
 #include <string>
+#include <vector>
+#include <unordered_set>
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
@@ -43,6 +45,24 @@ namespace
     static TFD::FlowController::ContinuousRuntimeProviders g_continuousRuntimeProviders{};
     static bool g_flowRuntimeInstalled = false;
     static TFD::FlowController::ObservedMainStateSnapshot g_lastObservedDiagnostic{};
+
+    static std::unordered_set<RE::FormID> g_inCombatCycleReleaseGraceActors{};
+
+    static void MarkInCombatCycleReleaseGrace(RE::FormID actorFormID)
+    {
+        if (actorFormID != 0) {
+            g_inCombatCycleReleaseGraceActors.insert(actorFormID);
+        }
+    }
+
+    static bool ConsumeInCombatCycleReleaseGrace(RE::FormID actorFormID)
+    {
+        if (actorFormID == 0) {
+            return false;
+        }
+        const auto erased = g_inCombatCycleReleaseGraceActors.erase(actorFormID);
+        return erased > 0;
+    }
     static bool g_hasObservedDiagnostic = false;
     static std::chrono::steady_clock::time_point g_lastObservedDiagnosticTick{};
     static std::chrono::steady_clock::time_point g_lastObservedDiagnosticLog{};
@@ -59,7 +79,10 @@ namespace
     constexpr const char* kInCombatOutcomeCaptiveEvent = "TFDInCombatOutcomeCaptive";
     constexpr const char* kInCombatOutcomeResetEvent = "TFDInCombatOutcomeReset";
     constexpr const char* kInCombatOutcomeReleaseEvent = "TFDInCombatOutcomeRelease";
+    constexpr const char* kInCombatOutcomeReleaseEndEvent = "TFDInCombatOutcomeReleaseEnd";
     constexpr const char* kInCombatOutcomeFollowEvent = "TFDInCombatOutcomeFollow";
+    constexpr const char* kInCombatOutcomeRecruitEvent = "TFDInCombatOutcomeRecruit";
+    constexpr const char* kInCombatOutcomeJoinEnemyEvent = "TFDInCombatOutcomeJoinEnemy";
     constexpr const char* kPleasureOutcomeReleaseEvent = "TFDPleasureOutcomeRelease";
     constexpr const char* kCaptiveOutcomeWorkEvent = "TFDCaptiveOutcomeWork";
     constexpr const char* kCaptiveOutcomeReturnEvent = "TFDCaptiveOutcomeReturn";
@@ -73,6 +96,13 @@ namespace
     constexpr const char* kVictoryOutcomeCancelEvent = "TFDVictoryOutcomeCancel";
     constexpr const char* kVictoryOutcomePleasureEvent = "TFDVictoryOutcomePleasure";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
+    constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
+    constexpr const char* kAfterPleasureChoiceRecruitEvent = "TFDAfterPleasureChoiceRecruit";
+    constexpr const char* kAfterPleasureChoiceFinishEvent = "TFDAfterPleasureChoiceFinish";
+    constexpr const char* kAfterPleasureChoiceJoinEnemyEvent = "TFDAfterPleasureChoiceJoinEnemy";
+    constexpr const char* kAfterPleasureChoiceKidnapEvent = "TFDAfterPleasureChoiceKidnap";
+    constexpr const char* kAfterPleasureChoiceWorkEvent = "TFDAfterPleasureChoiceWork";
+    constexpr const char* kAfterPleasureChoicePleasureEvent = "TFDAfterPleasureChoicePleasure";
     constexpr const char* kPassiveBreakCrimeEvent = "TFDPassiveBreakCrime";
     constexpr const char* kPassiveBreakPickpocketEvent = "TFDPassiveBreakPickpocket";
 
@@ -689,6 +719,89 @@ namespace
         return 0;
     }
 
+
+    static bool IsValidReleaseWakeActor(RE::Actor* actor, RE::Actor* player)
+    {
+        return actor &&
+            player &&
+            actor != player &&
+            !actor->IsDead() &&
+            !actor->IsDisabled();
+    }
+
+    static std::size_t WakeInCombatReleasePackForDetection(const std::vector<RE::Actor*>& actors, std::string_view reason)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player || actors.empty()) {
+            return 0;
+        }
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+        }
+
+        std::vector<RE::FormID> seen;
+        seen.reserve(actors.size());
+        std::size_t queued = 0;
+
+        for (auto* actor : actors) {
+            if (!IsValidReleaseWakeActor(actor, player)) {
+                continue;
+            }
+
+            const RE::FormID actorId = actor->GetFormID();
+            if (actorId == 0 || std::find(seen.begin(), seen.end(), actorId) != seen.end()) {
+                continue;
+            }
+            seen.push_back(actorId);
+
+            const bool hostileBefore = actor->IsHostileToActor(player);
+            const bool inCombatBefore = actor->IsInCombat();
+
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            if (!actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(true);
+            }
+
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+
+            const bool sent = TFD::FlowController::QueueBridgeModEvent(
+                "TFDInCombatResumeCombat",
+                actor,
+                "incombat_release_detection_wake",
+                1.0f);
+            if (sent) {
+                ++queued;
+            }
+
+            spdlog::info(
+                "[TFD][Flow][R93Y] incombat release detection wake actor={:08X} hostileBefore={} inCombatBefore={} eventQueued={} reason={}",
+                actorId,
+                hostileBefore ? 1 : 0,
+                inCombatBefore ? 1 : 0,
+                sent ? 1 : 0,
+                reason.empty() ? std::string{ "-" } : std::string{ reason });
+        }
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->ClearCachedFactionFightReactions();
+        }
+
+        spdlog::info(
+            "[TFD][Flow][R93Y] incombat release detection wake summary candidates={} queued={} reason={}",
+            static_cast<unsigned int>(actors.size()),
+            static_cast<unsigned int>(queued),
+            reason.empty() ? std::string{ "-" } : std::string{ reason });
+
+        return queued;
+    }
+
     static RE::FormID ResolveActorFormIDFromEventArgOrSender(const std::string_view& arg, RE::TESForm* sender)
     {
         if (const auto actorFormID = ResolveActorFormIDFromEventArg(arg); actorFormID != 0) {
@@ -730,6 +843,53 @@ namespace
         }
 
         return static_cast<int>(raw);
+    }
+
+    static bool IsAfterPleasureTerminalChoiceEvent(std::string_view name)
+    {
+        return name == kAfterPleasureChoiceReleaseEvent ||
+            name == kAfterPleasureChoiceRecruitEvent ||
+            name == kAfterPleasureChoiceFinishEvent ||
+            name == kAfterPleasureChoiceJoinEnemyEvent ||
+            name == kAfterPleasureChoiceKidnapEvent ||
+            name == kAfterPleasureChoiceWorkEvent;
+    }
+
+    static bool IsInCombatSource(int sourceFlow)
+    {
+        return sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::InCombat);
+    }
+
+    static TFD::HostilityController::ReleaseReason ResolveInCombatTerminalReleaseReason(std::string_view name)
+    {
+        using TFD::HostilityController::ReleaseReason;
+        if (name == kAfterPleasureChoiceFinishEvent) {
+            return ReleaseReason::DialogueClosed;
+        }
+        return ReleaseReason::Generic;
+    }
+
+    static const char* ResolveInCombatTerminalReason(std::string_view name)
+    {
+        if (name == kAfterPleasureChoiceReleaseEvent) {
+            return "incombat_after_pleasure_release";
+        }
+        if (name == kAfterPleasureChoiceRecruitEvent) {
+            return "incombat_after_pleasure_recruit";
+        }
+        if (name == kAfterPleasureChoiceFinishEvent) {
+            return "incombat_after_pleasure_finish";
+        }
+        if (name == kAfterPleasureChoiceJoinEnemyEvent) {
+            return "incombat_after_pleasure_join_enemy";
+        }
+        if (name == kAfterPleasureChoiceKidnapEvent) {
+            return "incombat_after_pleasure_kidnap";
+        }
+        if (name == kAfterPleasureChoiceWorkEvent) {
+            return "incombat_after_pleasure_work";
+        }
+        return "incombat_after_pleasure_terminal";
     }
 
     static std::uint32_t ResolveBleedFlowActorFormIDFromProviders()
@@ -1457,6 +1617,64 @@ void InstallRuntime()
 
         (void)TFD::PleasureRuntime::HandleModEvent(eventName, strArg ? strArg : "", numArg, sender);
 
+        if (IsAfterPleasureTerminalChoiceEvent(name)) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            if (actor && IsInCombatSource(sourceFlow)) {
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                const auto releaseReason = ResolveInCombatTerminalReleaseReason(name);
+                const char* terminalReason = ResolveInCombatTerminalReason(name);
+                const bool cycleQueued = TFD::PleasureRuntime::HasQueuedCycleForConsumedActor(
+                    actor,
+                    TFD::PleasureRuntime::SourceContext::InCombat);
+
+                if (cycleQueued) {
+                    bool releaseSingle = false;
+                    bool demoteHold = false;
+                    if (name == kAfterPleasureChoiceRecruitEvent) {
+                        demoteHold = TFD::HostilityController::DemoteTruceActorForCycleHold(
+                            actor,
+                            "incombat_after_pleasure_recruit_cycle_hold");
+                    }
+                    else {
+                        releaseSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+                            actor,
+                            TFD::HostilityController::ReleaseReason::FlowHandoff,
+                            terminalReason);
+                    }
+                    TFD::InCombat::Complete("incombat_after_pleasure_cycle_preserve_crowd");
+                    spdlog::info(
+                        "[TFD][Flow][R94G] incombat after pleasure terminal preserved cycle event={} source={} actor={:08X} cycleQueued=1 releaseSingle={} demoteHold={} releaseReason={} policy={}",
+                        std::string(name),
+                        sourceFlow,
+                        actor->GetFormID(),
+                        releaseSingle ? 1 : 0,
+                        demoteHold ? 1 : 0,
+                        TFD::HostilityController::ToString(TFD::HostilityController::ReleaseReason::FlowHandoff),
+                        name == kAfterPleasureChoiceRecruitEvent ? "recruit_hold_until_chain_end" : "current_actor_only");
+                    return true;
+                }
+
+                const bool completeFlow = flow.RequestCompleteAfterPleasure(terminalReason);
+                const bool releaseTruce = TFD::HostilityController::ReleaseActiveTruceSessionForActor(
+                    actor,
+                    releaseReason,
+                    false);
+                const auto flushedDeferred = TFD::PleasureRuntime::FlushDeferredInCombatRecruits("incombat_after_pleasure_terminal_final");
+                TFD::InCombat::Complete(terminalReason);
+                spdlog::info(
+                    "[TFD][Flow][R94G] incombat after pleasure terminal event={} source={} actor={:08X} cycleQueued=0 flowComplete={} truceRelease={} deferredRegistered={} releaseReason={}",
+                    std::string(name),
+                    sourceFlow,
+                    actor->GetFormID(),
+                    completeFlow ? 1 : 0,
+                    releaseTruce ? 1 : 0,
+                    static_cast<unsigned int>(flushedDeferred),
+                    TFD::HostilityController::ToString(releaseReason));
+                return true;
+            }
+        }
+
         if (HandleVictoryOutcomeModEvent(name, arg, sender)) {
             return true;
         }
@@ -1469,7 +1687,6 @@ void InstallRuntime()
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
             auto& flow = TFD::FlowController::Controller::GetSingleton();
-            const bool inCombatAfterPleasure = flow.IsInCombatAfterPleasureContextActive();
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
                 if (TFD::Bleedout::HandleAfterPleasureEnter(actor, "after_pleasure_enter")) {
                     TFD::BleedoutGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
@@ -1477,15 +1694,20 @@ void InstallRuntime()
                 } else {
                     spdlog::warn("[TFD][Flow] bleedout after pleasure flow reject source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
                 }
-            } else if (actor && inCombatAfterPleasure) {
-                (void)TFD::InCombat::HandleAfterPleasureEnter(
-                    actor,
-                    "after_pleasure_enter",
-                    TFD::InCombat::AfterPleasureHandlers{
-                        [&](std::uint32_t actorFormID, const char* r) { TFD::InCombat::NoteAfterPleasure(actorFormID, r); },
-                        [&](RE::Actor* greetActor, const char* r) -> bool { return TFD::InCombatGreet::BeginAfterPleasure(greetActor, r); }
-                    });
-                spdlog::info("[TFD][Flow] incombat after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
+            } else if (actor && IsInCombatSource(sourceFlow)) {
+                const bool beginAfter = flow.RequestBeginAfterPleasure(actor->GetFormID(), "incombat_after_pleasure_enter");
+                if (beginAfter || flow.IsInCombatAfterPleasureContextActive()) {
+                    (void)TFD::InCombat::HandleAfterPleasureEnter(
+                        actor,
+                        "after_pleasure_enter",
+                        TFD::InCombat::AfterPleasureHandlers{
+                            [&](std::uint32_t actorFormID, const char* r) { TFD::InCombat::NoteAfterPleasure(actorFormID, r); },
+                            [&](RE::Actor* greetActor, const char* r) -> bool { return TFD::InCombatGreet::BeginAfterPleasure(greetActor, r); }
+                        });
+                    spdlog::info("[TFD][Flow][R93T] incombat after pleasure greet armed source={} actor={:08X} flowBegin={}", sourceFlow, actor->GetFormID(), beginAfter ? 1 : 0);
+                } else {
+                    spdlog::warn("[TFD][Flow][R93T] incombat after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor->GetFormID());
+                }
             } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
                 (void)TFD::CaptiveGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
                 spdlog::info("[TFD][Flow] captive after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
@@ -1501,12 +1723,132 @@ void InstallRuntime()
             return true;
         }
 
-        if (name == kInCombatOutcomeReleaseEvent || name == kInCombatOutcomeFollowEvent) {
+        if (name == kInCombatOutcomeReleaseEndEvent) {
             auto* actor = ResolveActorFromEventArg(arg);
+            const bool restoreRequested = numArg > 0.5f;
+            bool graceRemoved = false;
+            std::size_t wakeQueued = 0;
+
+            std::vector<RE::Actor*> releasePack{};
+            if (actor && restoreRequested) {
+                releasePack = TFD::Actor::Ops::CollectTruceActorsForSpeaker(actor);
+            }
+
+            const bool cycleReleaseGrace = actor ? ConsumeInCombatCycleReleaseGrace(actor->GetFormID()) : false;
+            if (actor && cycleReleaseGrace) {
+                TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnly(actor, "incombat_cycle_release_end");
+                graceRemoved = true;
+            } else if (actor && g_outcomeRuntimeProviders.removeReleaseFollowGrace) {
+                g_outcomeRuntimeProviders.removeReleaseFollowGrace(actor, "incombat_release_end");
+                graceRemoved = true;
+            }
+
+            if (actor && restoreRequested) {
+                if (releasePack.empty()) {
+                    releasePack.push_back(actor);
+                }
+                wakeQueued = WakeInCombatReleasePackForDetection(releasePack, "incombat_release_end");
+            }
+
+            spdlog::info(
+                "[TFD][Flow][R93Y] incombat release end actor={:08X} restore={} graceRemoved={} wakeQueued={} pack={} arg={}",
+                actor ? actor->GetFormID() : 0u,
+                restoreRequested ? 1 : 0,
+                graceRemoved ? 1 : 0,
+                static_cast<unsigned int>(wakeQueued),
+                static_cast<unsigned int>(releasePack.size()),
+                arg.empty() ? std::string{ "-" } : arg);
+            return true;
+        }
+
+        if (name == kInCombatOutcomeReleaseEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const std::uint32_t actorFormID = actor ? actor->GetFormID() : TFD::InCombat::GetPrimaryActorFormID();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(
+                InCombatOutcome::Release,
+                actorFormID,
+                "mod_event_incombat_release");
+
+            const bool cycleRelease = actor && TFD::InCombatGreet::IsPleasureCycleActiveForActor(actor);
+            if (cycleRelease) {
+                const double graceSeconds = numArg > 0.0f ? static_cast<double>(numArg) : 10.0;
+                const bool queuedNext = TFD::PleasureRuntime::QueueNextCycleAfterTerminal(
+                    actor,
+                    TFD::PleasureRuntime::SourceContext::InCombat,
+                    "incombat_cycle_pay_release");
+                TFD::Actor::Ops::ApplyReleaseFollowGraceToActorOnly(actor, graceSeconds, "incombat_cycle_release_to_vanilla");
+                MarkInCombatCycleReleaseGrace(actor->GetFormID());
+                const bool releasedSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+                    actor,
+                    TFD::HostilityController::ReleaseReason::FlowHandoff,
+                    "incombat_cycle_pay_release");
+                TFD::InCombat::Complete("mod_event_incombat_cycle_release");
+                spdlog::info(
+                    "[TFD][Flow][R94C] incombat cycle release actor={:08X} flowDone={} queuedNext={} releasedSingle={} duration={:.2f} policy=current_actor_only",
+                    actorFormID,
+                    flowDone ? 1 : 0,
+                    queuedNext ? 1 : 0,
+                    releasedSingle ? 1 : 0,
+                    graceSeconds);
+                return true;
+            }
+
+            // R93W: Match PreCombat Pay > Release routing.  Do not release the
+            // TruceInCombat session with Generic here: Generic removes the truce
+            // while Papyrus has just stopped combat, leaving actors pacified with
+            // no release-to-vanilla grace/finalize lifecycle.  Route through the
+            // shared Release module instead; it arms grace, releases the truce as
+            // FlowHandoff, and finalizes cleanup after the grace timer.
+            SKSE::ModCallbackEvent releaseCallbackEv{ eventName, strArg ? strArg : "", numArg, sender };
+            const bool releaseArmed = TFD::Release::HandleModCallbackEvent(&releaseCallbackEv);
+            TFD::InCombat::Complete("mod_event_incombat_release_arm");
+            spdlog::info(
+                "[TFD][Flow][R93W] incombat release routed via TFDRelease actor={:08X} flowDone={} releaseArmed={} duration={:.2f}",
+                actorFormID,
+                flowDone ? 1 : 0,
+                releaseArmed ? 1 : 0,
+                static_cast<double>(numArg));
+            return true;
+        }
+
+        if (name == kInCombatOutcomeFollowEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const double followSeconds = numArg > 0.0f ? static_cast<double>(numArg) : 20.0;
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const std::uint32_t actorFormID = actor ? actor->GetFormID() : TFD::InCombat::GetPrimaryActorFormID();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(
+                InCombatOutcome::Follow,
+                actorFormID,
+                "mod_event_incombat_follow");
+
+            const bool cycleFollow = actor && TFD::InCombatGreet::IsPleasureCycleActiveForActor(actor);
+            if (cycleFollow) {
+                const bool queuedNext = TFD::PleasureRuntime::QueueNextCycleAfterTerminal(
+                    actor,
+                    TFD::PleasureRuntime::SourceContext::InCombat,
+                    "incombat_cycle_pay_follow");
+                TFD::Actor::Ops::ApplyReleaseFollowGraceToActorOnly(actor, followSeconds, "incombat_cycle_follow");
+                MarkInCombatCycleReleaseGrace(actor->GetFormID());
+                const bool releasedSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+                    actor,
+                    TFD::HostilityController::ReleaseReason::FlowHandoff,
+                    "incombat_cycle_pay_follow");
+                TFD::InCombat::Complete("mod_event_incombat_cycle_follow");
+                spdlog::info(
+                    "[TFD][Flow][R94C] incombat cycle follow actor={:08X} flowDone={} queuedNext={} releasedSingle={} duration={:.2f} policy=current_actor_only",
+                    actorFormID,
+                    flowDone ? 1 : 0,
+                    queuedNext ? 1 : 0,
+                    releasedSingle ? 1 : 0,
+                    followSeconds);
+                return true;
+            }
+
             TFD::InCombat::GraceEventContext context{};
             context.eventName = eventName;
             context.actor = actor;
-            context.durationSec = numArg > 0.0f ? static_cast<double>(numArg) : 20.0;
+            context.durationSec = followSeconds;
             (void)TFD::InCombat::HandleReleaseFollowEvent(
                 context,
                 TFD::InCombat::GraceEventHandlers{
@@ -1516,6 +1858,14 @@ void InstallRuntime()
                         }
                     }
                 });
+            const bool truceReleased = actor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(actor, TFD::HostilityController::ReleaseReason::Generic, false) : false;
+            TFD::InCombat::Complete("mod_event_incombat_follow");
+            spdlog::info(
+                "[TFD][Flow][R93W] incombat follow terminal event={} actor={:08X} flowDone={} truceRelease={}",
+                std::string(name),
+                actorFormID,
+                flowDone ? 1 : 0,
+                truceReleased ? 1 : 0);
             return true;
         }
 
@@ -1577,14 +1927,10 @@ void InstallRuntime()
                 }
             },
             [&](const char* reason) {
-                if (g_outcomeRuntimeProviders.preparePlayerForBleedoutPleasureScene) {
-                    g_outcomeRuntimeProviders.preparePlayerForBleedoutPleasureScene(reason);
-                }
+                spdlog::info("[TFD][Flow][R93T] incombat pleasure handler prepare noop reason={}", reason ? reason : "-");
             },
             [&](const char* reason) {
-                if (g_outcomeRuntimeProviders.completeBleedPleasureHandoff) {
-                    g_outcomeRuntimeProviders.completeBleedPleasureHandoff(reason ? reason : "bleed_pleasure_handoff");
-                }
+                spdlog::info("[TFD][Flow][R93T] incombat pleasure handler complete noop reason={}", reason ? reason : "-");
             }
         };
 
@@ -1601,6 +1947,9 @@ void InstallRuntime()
             context.actorFormID = actorFormID;
             context.inCombatState = TFD::InCombat::IsActive();
             (void)TFD::InCombat::HandleOutcomePayEvent(context, inCombatOutcomeEventHandlers);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(InCombatOutcome::Pay, actorFormID, "mod_event_incombat_pay");
+            spdlog::info("[TFD][Flow][R93T] incombat pay branch actor={:08X} flowDone={} truceRelease=0", actorFormID, flowDone ? 1 : 0);
             return true;
         }
 
@@ -1617,7 +1966,65 @@ void InstallRuntime()
             context.actorFormID = actorFormID;
             context.inCombatState = TFD::InCombat::IsActive();
             context.preserveCaptive = TFD::Captive::IsStandardCaptiveActive();
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool flowPleasure = context.preserveCaptive ? true : flow.RequestResolveInCombatOutcome(InCombatOutcome::Pleasure, actorFormID, "mod_event_incombat_pleasure");
+            const bool preserveTruce = flowActor ? TFD::HostilityController::PreserveTruceSessionForFlowHandoff(flowActor, 90.0, "incombat_pleasure_handoff") : false;
+            const bool runtimeStarted = (!context.preserveCaptive && flowActor) ?
+                TFD::PleasureRuntime::BeginPleasure(flowActor, TFD::PleasureRuntime::SourceContext::InCombat, "mod_event_incombat_pleasure") :
+                false;
             (void)TFD::InCombat::HandleOutcomePleasureEvent(context, inCombatOutcomeEventHandlers);
+            spdlog::info(
+                "[TFD][Flow][R93T] incombat pleasure handoff actor={:08X} flowPleasure={} preserveTruce={} preserveCaptive={} runtimeStarted={}",
+                actorFormID,
+                flowPleasure ? 1 : 0,
+                preserveTruce ? 1 : 0,
+                context.preserveCaptive ? 1 : 0,
+                runtimeStarted ? 1 : 0);
+            return true;
+        }
+
+        if (name == kInCombatOutcomeRecruitEvent || name == kInCombatOutcomeJoinEnemyEvent) {
+            auto actorFormID = ResolveActorFormIDFromEventArg(arg);
+            if (!actorFormID) {
+                actorFormID = TFD::InCombat::GetPrimaryActorFormID();
+            }
+            auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool isRecruit = name == kInCombatOutcomeRecruitEvent;
+            const bool flowDone = flow.RequestResolveInCombatOutcome(
+                isRecruit ? InCombatOutcome::RecruitEnemy : InCombatOutcome::JoinEnemy,
+                actorFormID,
+                isRecruit ? "mod_event_incombat_recruit" : "mod_event_incombat_join_enemy");
+
+            const bool cycleTerminal = flowActor && TFD::InCombatGreet::IsPleasureCycleActiveForActor(flowActor);
+            if (cycleTerminal) {
+                const bool queuedNext = TFD::PleasureRuntime::QueueNextCycleAfterTerminal(
+                    flowActor,
+                    TFD::PleasureRuntime::SourceContext::InCombat,
+                    isRecruit ? "incombat_cycle_pay_recruit" : "incombat_cycle_pay_join_enemy");
+                const bool releasedSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+                    flowActor,
+                    TFD::HostilityController::ReleaseReason::FlowHandoff,
+                    isRecruit ? "incombat_cycle_pay_recruit" : "incombat_cycle_pay_join_enemy");
+                TFD::InCombat::Complete(isRecruit ? "mod_event_incombat_cycle_recruit" : "mod_event_incombat_cycle_join_enemy");
+                spdlog::info(
+                    "[TFD][Flow][R94C] incombat cycle recruit/join event={} actor={:08X} flowDone={} queuedNext={} releasedSingle={} policy=current_actor_only",
+                    std::string(name),
+                    actorFormID,
+                    flowDone ? 1 : 0,
+                    queuedNext ? 1 : 0,
+                    releasedSingle ? 1 : 0);
+                return true;
+            }
+
+            const bool truceReleased = flowActor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(flowActor, TFD::HostilityController::ReleaseReason::Generic, false) : false;
+            TFD::InCombat::Complete(isRecruit ? "mod_event_incombat_recruit" : "mod_event_incombat_join_enemy");
+            spdlog::info(
+                "[TFD][Flow][R93T] incombat recruit/join terminal event={} actor={:08X} flowDone={} truceRelease={}",
+                std::string(name),
+                actorFormID,
+                flowDone ? 1 : 0,
+                truceReleased ? 1 : 0);
             return true;
         }
 
@@ -1634,14 +2041,32 @@ void InstallRuntime()
             context.actorFormID = actorFormID;
             context.inCombatState = TFD::InCombat::IsActive();
             (void)TFD::InCombat::HandleOutcomeCaptiveEvent(context, inCombatOutcomeEventHandlers);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(InCombatOutcome::Captive, actorFormID, "mod_event_incombat_captive");
+            const bool truceReleased = flowActor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(flowActor, TFD::HostilityController::ReleaseReason::Generic, false) : false;
+            TFD::InCombat::Complete("mod_event_incombat_captive");
+            spdlog::info("[TFD][Flow][R93T] incombat captive terminal actor={:08X} flowDone={} truceRelease={}", actorFormID, flowDone ? 1 : 0, truceReleased ? 1 : 0);
             return true;
         }
 
         if (name == kInCombatOutcomeResetEvent) {
+            auto actorFormID = ResolveActorFormIDFromEventArg(arg);
+            if (!actorFormID) {
+                actorFormID = TFD::InCombat::GetPrimaryActorFormID();
+            }
+            auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
             TFD::InCombat::OutcomeEventContext context{};
             context.eventName = "mod_event_reset";
             context.rawEventName = eventName;
+            context.actor = flowActor;
+            context.actorFormID = actorFormID;
+            context.inCombatState = TFD::InCombat::IsActive();
             (void)TFD::InCombat::HandleOutcomeResetEvent(context, inCombatOutcomeEventHandlers);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool flowDone = flow.RequestResolveInCombatOutcome(InCombatOutcome::Fight, actorFormID, "mod_event_incombat_reset");
+            const bool truceReleased = flowActor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(flowActor, TFD::HostilityController::ReleaseReason::FightChoice, false) : false;
+            TFD::InCombat::Complete("mod_event_incombat_reset");
+            spdlog::info("[TFD][Flow][R93T] incombat reset terminal actor={:08X} flowDone={} truceRelease={}", actorFormID, flowDone ? 1 : 0, truceReleased ? 1 : 0);
             return true;
         }
 
@@ -2146,6 +2571,11 @@ void InstallRuntime()
         return ResolvePreCombatOutcome(outcome, actorFormID, reason);
     }
 
+    bool Controller::RequestResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveInCombatOutcome(outcome, actorFormID, reason);
+    }
+
     bool Controller::RequestResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
     {
         return ResolveBleedoutOutcome(outcome, actorFormID, reason);
@@ -2159,6 +2589,16 @@ void InstallRuntime()
     bool Controller::RequestResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
     {
         return ResolveCaptiveOutcome(outcome, actorFormID, reason);
+    }
+
+    bool Controller::RequestResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveInCombatOutcome(InCombatOutcome::Pleasure, actorFormID, reason);
+    }
+
+    bool Controller::RequestResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveInCombatOutcome(InCombatOutcome::Cancel, actorFormID, reason);
     }
 
     bool Controller::RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason)
@@ -2376,6 +2816,88 @@ void InstallRuntime()
         RefreshFlowGlobalsLocked();
         LogFlowSnapshot("ResolvePreCombatOutcome", reason, _snapshot, actorFormID, ToString(outcome));
         return handled;
+    }
+
+    bool Controller::ResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
+    {
+        std::scoped_lock lk(_lock);
+
+        const bool validRoot = _snapshot.root == RootFlow::InCombat ||
+            _snapshot.contextRoot == RootFlow::InCombat ||
+            _snapshot.sub == SubFlow::InCombatPayFollowup ||
+            _snapshot.sub == SubFlow::InCombatPleasure ||
+            _snapshot.sub == SubFlow::InCombatAfterPleasure;
+
+        if (!validRoot) {
+            return RejectLocked("ResolveInCombatOutcome", reason);
+        }
+
+        bool handled = false;
+        switch (outcome) {
+        case InCombatOutcome::Pay:
+            if (!(_snapshot.root == RootFlow::InCombat && _snapshot.gate == DecisionGate::Truce)) {
+                return RejectLocked("ResolveInCombatOutcomePay", reason);
+            }
+            _combatActive = false;
+            _snapshot.contextRoot = RootFlow::InCombat;
+            _snapshot.gate = DecisionGate::None;
+            _snapshot.captiveMode = CaptiveMode::None;
+            _snapshot.sub = SubFlow::InCombatPayFollowup;
+            _snapshot.terminalResolved = false;
+            SetPrimaryActorLocked(actorFormID);
+            handled = true;
+            break;
+        case InCombatOutcome::Pleasure:
+            _combatActive = false;
+            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::InCombatPleasure, actorFormID, reason);
+            break;
+        case InCombatOutcome::Fight:
+        case InCombatOutcome::DoNothing:
+            _combatActive = true;
+            handled = TransitionRootLocked(RootFlow::InCombat, actorFormID, reason);
+            _snapshot.gate = DecisionGate::None;
+            _snapshot.sub = SubFlow::None;
+            _snapshot.terminalResolved = false;
+            break;
+        case InCombatOutcome::Captive:
+            handled = BeginCaptiveLocked(actorFormID, CaptiveMode::Surrendered, reason);
+            break;
+        case InCombatOutcome::JoinEnemy:
+            handled = BeginCaptiveLocked(actorFormID, CaptiveMode::JoinedEnemy, reason);
+            break;
+        case InCombatOutcome::RecruitEnemy:
+        case InCombatOutcome::Release:
+        case InCombatOutcome::Follow:
+            if (_snapshot.sub != SubFlow::InCombatPayFollowup &&
+                _snapshot.sub != SubFlow::InCombatPleasure &&
+                _snapshot.sub != SubFlow::InCombatAfterPleasure) {
+                return RejectLocked("ResolveInCombatOutcomeTerminal", reason);
+            }
+            _combatActive = false;
+            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::None, actorFormID, reason);
+            break;
+        case InCombatOutcome::Cancel:
+        case InCombatOutcome::Failed:
+            handled = EnterTerminalContextLocked(RootFlow::InCombat, SubFlow::None, actorFormID, reason);
+            break;
+        case InCombatOutcome::None:
+        default:
+            return RejectLocked("ResolveInCombatOutcome", reason);
+        }
+
+        RefreshFlowGlobalsLocked();
+        LogFlowSnapshot("ResolveInCombatOutcome", reason, _snapshot, actorFormID, ToString(outcome));
+        return handled;
+    }
+
+    bool Controller::ResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveInCombatOutcome(InCombatOutcome::Pleasure, actorFormID, reason);
+    }
+
+    bool Controller::ResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason)
+    {
+        return ResolveInCombatOutcome(InCombatOutcome::Cancel, actorFormID, reason);
     }
 
     bool Controller::ResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
@@ -2802,8 +3324,7 @@ void InstallRuntime()
     bool Controller::IsInCombatAfterPleasureContextActive() const
     {
         std::scoped_lock lk(_lock);
-        return _snapshot.root == RootFlow::InCombat ||
-            _snapshot.sub == SubFlow::InCombatPleasure ||
+        return _snapshot.sub == SubFlow::InCombatPleasure ||
             _snapshot.sub == SubFlow::InCombatAfterPleasure;
     }
 
@@ -3055,6 +3576,7 @@ void InstallRuntime()
         case SubFlow::PreCombatPayFollowup: return "PreCombatPayFollowup";
         case SubFlow::PreCombatPleasure: return "PreCombatPleasure";
         case SubFlow::PreCombatAfterPleasure: return "PreCombatAfterPleasure";
+        case SubFlow::InCombatPayFollowup: return "InCombatPayFollowup";
         case SubFlow::InCombatPleasure: return "InCombatPleasure";
         case SubFlow::InCombatAfterPleasure: return "InCombatAfterPleasure";
         case SubFlow::BleedoutPleasure: return "BleedoutPleasure";
@@ -3088,6 +3610,25 @@ void InstallRuntime()
         case PreCombatOutcome::Cancel: return "Cancel";
         case PreCombatOutcome::Failed: return "Failed";
         default: return "UnknownPreCombatOutcome";
+        }
+    }
+
+    const char* Controller::ToString(InCombatOutcome value)
+    {
+        switch (value) {
+        case InCombatOutcome::None: return "None";
+        case InCombatOutcome::Pay: return "Pay";
+        case InCombatOutcome::Pleasure: return "Pleasure";
+        case InCombatOutcome::Fight: return "Fight";
+        case InCombatOutcome::Captive: return "Captive";
+        case InCombatOutcome::JoinEnemy: return "JoinEnemy";
+        case InCombatOutcome::RecruitEnemy: return "RecruitEnemy";
+        case InCombatOutcome::Release: return "Release";
+        case InCombatOutcome::Follow: return "Follow";
+        case InCombatOutcome::DoNothing: return "DoNothing";
+        case InCombatOutcome::Cancel: return "Cancel";
+        case InCombatOutcome::Failed: return "Failed";
+        default: return "UnknownInCombatOutcome";
         }
     }
 

@@ -1,4 +1,4 @@
-﻿#include "TFDInCombatGreet.h"
+#include "TFDInCombatGreet.h"
 
 #include <atomic>
 #include <cmath>
@@ -15,6 +15,7 @@
 #include "SKSE/SKSE.h"
 #include "TFDInCombat.h"
 #include "TFDTransition.h"
+#include "TFDPayModel.h"
 
 namespace TFD::InCombatGreet
 {
@@ -31,6 +32,7 @@ namespace TFD::InCombatGreet
 			int retryCount = 0;
 			RE::FormID truceSessionId = 0;
 			bool assignSent = false;
+			bool pleasureCycleActive = false;
 		};
 
 		std::atomic_bool g_installed{ false };
@@ -117,18 +119,21 @@ namespace TFD::InCombatGreet
 			g_runtime.retryCount = 0;
 			g_runtime.truceSessionId = 0;
 			g_runtime.assignSent = false;
+			g_runtime.pleasureCycleActive = false;
 		}
 
 		void ReleaseTrackedSession(TFD::HostilityController::ReleaseReason releaseReason)
 		{
 			RE::FormID sessionId = 0;
 			bool assignSent = false;
+			bool pleasureCycleActive = false;
 			{
 				std::scoped_lock lk(g_runtime.lock);
 				sessionId = g_runtime.truceSessionId;
 				assignSent = g_runtime.assignSent;
 				g_runtime.truceSessionId = 0;
 				g_runtime.assignSent = false;
+			g_runtime.pleasureCycleActive = false;
 			}
 
 			const auto speakerFormID = g_speakerFormID.load(std::memory_order_acquire);
@@ -257,9 +262,125 @@ namespace TFD::InCombatGreet
 			std::scoped_lock lk(g_runtime.lock);
 			g_runtime.truceSessionId = result.sessionId;
 			g_runtime.assignSent = result.dialogueRequested;
+			g_runtime.pleasureCycleActive = false;
 		}
 
 		return true;
+	}
+
+	bool BeginForPleasureCycleActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::None;
+		}
+
+		if (!IsCandidate(speaker, player)) {
+			spdlog::info(
+				"[TFD][InCombatGreet][R94B] BeginForPleasureCycleActor blocked actor={:08X} reason=invalid_candidate",
+				speaker ? speaker->GetFormID() : 0u);
+			return false;
+		}
+
+		const double now = NowSec();
+		bool promotedExistingSession = false;
+		auto sessionId = TFD::HostilityController::PromoteTruceActorForCycle(
+			speaker,
+			"pleasure_cycle_incombat_promote_existing");
+		if (sessionId && *sessionId != 0) {
+			promotedExistingSession = true;
+		} else {
+			sessionId = TFD::HostilityController::BeginTruceInCombatSession(
+				player,
+				speaker,
+				now,
+				true,
+				true,
+				false);
+		}
+
+		if (!sessionId || *sessionId == 0) {
+			spdlog::info(
+				"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor blocked actor={:08X} reason=session_failed",
+				speaker ? speaker->GetFormID() : 0u);
+			return false;
+		}
+
+		if (!TFD::HostilityController::CanOpenDialogue(speaker)) {
+			if (!promotedExistingSession) {
+				TFD::HostilityController::ReleaseSession(*sessionId, TFD::HostilityController::ReleaseReason::Generic);
+			}
+			spdlog::info(
+				"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor blocked actor={:08X} session={} reason=cannot_open_dialogue promotedExisting={}",
+				speaker ? speaker->GetFormID() : 0u,
+				*sessionId,
+				promotedExistingSession ? 1 : 0);
+			return false;
+		}
+
+		{
+			const auto previousFormID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
+			ResetRuntime("pleasure_cycle_incombat_begin_replace_no_native_release");
+			TFD::InteractionRouter::DialogueOpen::Cancel();
+			g_state.store(State::Idle, std::memory_order_release);
+			spdlog::info(
+				"[TFD][InCombatGreet][R94C] cycle runtime replaced previous={:08X} session={} promotedExisting={}",
+				previousFormID,
+				*sessionId,
+				promotedExistingSession ? 1 : 0);
+		}
+
+		if (!TFD::InCombat::BeginTruce(speaker->GetFormID(), true, "pleasure_cycle_incombat_begin")) {
+			if (!promotedExistingSession) {
+				TFD::HostilityController::ReleaseSession(*sessionId, TFD::HostilityController::ReleaseReason::Generic);
+			}
+			spdlog::warn(
+				"[TFD][InCombatGreet][R94B] BeginForPleasureCycleActor rejected by flow actor={:08X} session={}",
+				speaker->GetFormID(),
+				*sessionId);
+			return false;
+		}
+
+		if (player && player->IsInCombat()) {
+			player->StopCombat();
+		}
+		if (!Begin(speaker, "pleasure_cycle_incombat_dialogue_begin")) {
+			if (!promotedExistingSession) {
+				TFD::HostilityController::ReleaseSession(*sessionId, TFD::HostilityController::ReleaseReason::Generic);
+			}
+			TFD::InCombat::Complete("pleasure_cycle_incombat_begin_failed");
+			return false;
+		}
+
+		{
+			std::scoped_lock lk(g_runtime.lock);
+			g_runtime.truceSessionId = *sessionId;
+			g_runtime.assignSent = true;
+			g_runtime.pleasureCycleActive = true;
+		}
+
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::TruceInCombat;
+		}
+
+		spdlog::info(
+			"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor actor={:08X} action=TruceInCombat session={} dialogueRequested=1 promotedExisting={}",
+			speaker->GetFormID(),
+			*sessionId,
+			promotedExistingSession ? 1 : 0);
+		return true;
+	}
+
+	bool IsPleasureCycleActiveForActor(RE::Actor* speaker)
+	{
+		if (!speaker) {
+			return false;
+		}
+
+		std::scoped_lock lk(g_runtime.lock);
+		return g_runtime.pleasureCycleActive &&
+			g_runtime.truceSessionId != 0 &&
+			g_speakerFormID.load(std::memory_order_acquire) == speaker->GetFormID();
 	}
 
 	bool Begin(RE::Actor* speaker, const char* reason)
@@ -273,6 +394,19 @@ namespace TFD::InCombatGreet
 		ResetRuntime("begin");
 		g_state.store(State::Armed, std::memory_order_release);
 		g_speakerFormID.store(formID, std::memory_order_release);
+
+		// R93U: mirror PreCombat quote preparation. InCombat Pay must enter
+		// a real pay follow-up branch, and that branch depends on TFDPayGold
+		// already being published before the root Pay line is selected.
+		(void)TFD::PayModel::PrimeEncounterQuote(speaker, TFD::PayModel::PayContext::InCombat);
+		const bool payPublished = TFD::PayModel::PublishSharedGold(speaker, TFD::PayModel::PayContext::InCombat, "incombat_dialogue_begin");
+		spdlog::info(
+			"[TFD][InCombatGreet][R93U] pay prepared actor={:08X} published={} gold={} reason={}",
+			formID,
+			payPublished ? 1 : 0,
+			TFD::PayModel::GetCachedEncounterQuote(speaker, TFD::PayModel::PayContext::InCombat),
+			reason ? reason : "incombat");
+
 		TFD::InteractionRouter::DialogueOpen::BeginInCombatTruce(speaker);
 
 		spdlog::info("[TFD][InCombatGreet] Begin speaker={:08X} reason={}", formID, reason ? reason : "incombat");

@@ -10,6 +10,7 @@
 #include "TFDSettings.h"
 #include "TFDBleedout.h"
 #include "TFDInteractionRouter.h"
+#include "TFDInCombat.h"
 
 #include <RE/Skyrim.h>
 #include <RE/A/ActorValues.h>
@@ -594,6 +595,7 @@ namespace TFD::HostilityController
 
         constexpr const char* kCreatureTeammateAssignEvent = "TFDCreatureTeammateAssign";
         constexpr const char* kCreatureTeammateUnassignEvent = "TFDCreatureTeammateUnassign";
+        constexpr const char* kInCombatResumeCombatEvent = "TFDInCombatResumeCombat";
         constexpr double kCompanionInitialHours = 3.0;
         constexpr double kCompanionExtendHours = 3.0;
         constexpr double kCompanionMaxHours = 9.0;
@@ -633,7 +635,7 @@ namespace TFD::HostilityController
         constexpr double kMaxTameTotalSec = 180.0;
         constexpr double kTruceHiddenFailsafeSec = 120.0;
         constexpr double kFlowHandoffHoldMinSec = 2.0;
-        constexpr double kFlowHandoffHoldMaxSec = 12.0;
+        constexpr double kFlowHandoffHoldMaxSec = 90.0;
 
         constexpr double kSuppressionApplyIntervalSec = 0.25;
         constexpr double kPackageEvalIntervalSec = 1.0;
@@ -684,6 +686,14 @@ namespace TFD::HostilityController
             return mode == Mode::Tame;
         }
 
+        bool ShouldResumeCombatAfterTruceRelease(Mode mode, ReleaseReason reason)
+        {
+            return mode == Mode::TruceInCombat &&
+                (reason == ReleaseReason::DialogueClosed ||
+                    reason == ReleaseReason::PlayerArmed ||
+                    reason == ReleaseReason::FightChoice);
+        }
+
         double ResolveSessionDurationSec(Mode mode, double requestedDurationSec)
         {
             if (mode == Mode::Tame) {
@@ -723,7 +733,9 @@ namespace TFD::HostilityController
                 process->ClearCachedFactionFightReactions();
             }
 
-            if (reason == ReleaseReason::DialogueClosed) {
+            if (reason == ReleaseReason::DialogueClosed ||
+                reason == ReleaseReason::PlayerArmed ||
+                reason == ReleaseReason::FightChoice) {
                 PulseGlobalDetection(ToString(reason));
             }
 
@@ -739,8 +751,30 @@ namespace TFD::HostilityController
 
             actor->EvaluatePackage(false, true);
             actor->EvaluatePackage(true, true);
-            actor->UpdateCombat();
-            player->UpdateCombat();
+
+            // R93U: Do not call Actor::UpdateCombat directly while an InCombat truce
+            // session is active. R93T crash logs pointed at TFDEngine from the engine
+            // combat update path with the current truce speaker on stack. During this
+            // phase Papyrus already receives TFDInCombatResumeCombat and calls
+            // StartCombat() after aliases/factions are released, which is safer than
+            // forcing UpdateCombat from native while the suppression hook is still
+            // intercepting UpdateCombat.
+            const bool deferredUnsafeCombatUpdate =
+                TFD::InCombat::IsActive() &&
+                (reason == ReleaseReason::DialogueClosed ||
+                    reason == ReleaseReason::PlayerArmed ||
+                    reason == ReleaseReason::FightChoice);
+
+            if (!deferredUnsafeCombatUpdate) {
+                actor->UpdateCombat();
+                player->UpdateCombat();
+            } else {
+                spdlog::info(
+                    "TFDHostilityController: [R93U] deferred direct UpdateCombat actor={:08X} player={:08X} reason={} activeInCombat=1",
+                    actor->GetFormID(),
+                    player->GetFormID(),
+                    ToString(reason));
+            }
 
             const auto* combatTarget = ResolveCurrentCombatTarget(actor);
             const bool inCombat = actor->IsInCombat();
@@ -756,7 +790,7 @@ namespace TFD::HostilityController
                 inCombat ? 1 : 0,
                 targetingPlayer ? 1 : 0);
 
-            return inCombat || targetingPlayer;
+            return inCombat || targetingPlayer || (deferredUnsafeCombatUpdate && hostile);
         }
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon);
         void ProcessRehostileRetries(double nowSec);
@@ -1656,6 +1690,63 @@ namespace TFD::HostilityController
             return SharesSpeakerCrowdSide(actor, primaryTarget, player);
         }
 
+        bool IsEligibleInCombatAmbientHoldActor(
+            RE::Actor* actor,
+            RE::Actor* player,
+            RE::Actor* primaryTarget,
+            float scanRadius)
+        {
+            if (!IsActorStillValid(actor) || !player || !primaryTarget) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0 || actorId == player->GetFormID()) {
+                return false;
+            }
+
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+
+            if (IsRecentOrCurrentTeammateLikeForDialogueCrowd(actor)) {
+                return false;
+            }
+
+            const float distToPlayer = actor->GetPosition().GetDistance(player->GetPosition());
+            const float distToPrimary = actor->GetPosition().GetDistance(primaryTarget->GetPosition());
+            if (distToPlayer > scanRadius && distToPrimary > scanRadius) {
+                return false;
+            }
+
+            auto* playerCell = player->GetParentCell();
+            auto* actorCell = actor->GetParentCell();
+            auto* primaryCell = primaryTarget->GetParentCell();
+            const bool sameCell = playerCell && actorCell && primaryCell && actorCell == playerCell && primaryCell == playerCell;
+
+            auto* playerWs = player->GetWorldspace();
+            auto* actorWs = actor->GetWorldspace();
+            auto* primaryWs = primaryTarget->GetWorldspace();
+            const bool sameWorldspace = playerWs && actorWs && primaryWs && actorWs == playerWs && primaryWs == playerWs;
+            if (!sameCell && !sameWorldspace) {
+                return false;
+            }
+
+            if (actorId == primaryTarget->GetFormID()) {
+                return true;
+            }
+
+            if (!IsEnemyToPlayer(player, actor)) {
+                return false;
+            }
+
+            // R94D: this is suppression-only, not dialogue assignment. Do not require
+            // LoS or active targeting. If an actor is on the same hostile side and
+            // close enough to interrupt OStim/dialogue, HostilityHooks must be able
+            // to suppress DoDetect / UpdateCombat just like PreCombat.
+            return SharesSpeakerCrowdSide(actor, primaryTarget, player);
+        }
+
         bool IsEligibleTruceClusterActor(
             RE::Actor* actor,
             RE::Actor* player,
@@ -2478,7 +2569,23 @@ namespace TFD::HostilityController
             std::size_t localSplashCount = 0;
             std::size_t truceClusterCount = 0;
             std::vector<RE::FormID> curatedTruceIds;
+            std::vector<RE::FormID> inCombatDialogueEventIds;
             std::vector<RE::FormID> preCombatDialogueEventIds;
+            auto addUniqueId = [](std::vector<RE::FormID>& ids, RE::FormID actorId) {
+                if (actorId == 0) {
+                    return;
+                }
+                if (std::find(ids.begin(), ids.end(), actorId) != ids.end()) {
+                    return;
+                }
+                ids.push_back(actorId);
+                };
+            auto addInCombatDialogueEventId = [&](RE::FormID actorId) {
+                if (!(mode == Mode::TruceInCombat && allowDialogue)) {
+                    return;
+                }
+                addUniqueId(inCombatDialogueEventIds, actorId);
+                };
             auto addPreCombatDialogueEventId = [&](RE::FormID actorId) {
                 if (!(mode == Mode::TrucePreCombat && allowDialogue)) {
                     return;
@@ -2494,6 +2601,9 @@ namespace TFD::HostilityController
 
             if (mode == Mode::TrucePreCombat && allowDialogue) {
                 addPreCombatDialogueEventId(targetId);
+            }
+            if (mode == Mode::TruceInCombat && allowDialogue) {
+                addInCombatDialogueEventId(targetId);
             }
 
             if (mode == Mode::TruceInCombat) {
@@ -2513,7 +2623,7 @@ namespace TFD::HostilityController
                         continue;
                     }
                     const bool isPrimary = actorId == targetId;
-                    AddOrRefreshEntry(
+                    if (AddOrRefreshEntry(
                         actor,
                         mode,
                         sessionId,
@@ -2524,7 +2634,65 @@ namespace TFD::HostilityController
                         isPrimary,
                         mode == Mode::Tame ? TameDisposition::Calm : TameDisposition::None,
                         0.0,
-                        false);
+                        false)) {
+                        addInCombatDialogueEventId(actorId);
+                    }
+                }
+
+                // R94A: PreCombat relies on TFDHostilityHooks through ambient
+                // g_entries in the same cell bubble. InCombat previously skipped
+                // that path and only suppressed curated dialogue actors, so nearby
+                // combatants could keep normal detection/combat and collide with
+                // OStim during the pleasure handoff. Mirror PreCombat here: keep
+                // ambient actors in the native suppression session, but do not send
+                // them dialogue/approach aliases.
+                if (applyCellBubble) {
+                    const float ambientScanRadius = GetCellBubbleRadius(cellBubbleRadius);
+                    auto snapshot = TFD::Actor::BuildSnapshot(ambientScanRadius, false);
+                    std::uint32_t ambientInCombatHold = 0;
+                    std::uint32_t ambientScanned = 0;
+                    for (const auto& info : snapshot.actors) {
+                        auto* actor = info.get();
+                        if (!IsEligibleInCombatAmbientHoldActor(actor, player, primaryTarget, ambientScanRadius)) {
+                            continue;
+                        }
+                        ++ambientScanned;
+
+                        const RE::FormID actorId = actor->GetFormID();
+                        const bool existedInSession = [&]() {
+                            auto it = g_entries.find(actorId);
+                            return it != g_entries.end() && it->second.sessionId == sessionId;
+                            }();
+
+                        const bool isPrimary = actorId == targetId;
+                        const bool entryAllowsDialogue = existedInSession && allowDialogue;
+                        if (!AddOrRefreshEntry(
+                            actor,
+                            mode,
+                            sessionId,
+                            targetId,
+                            nowSec,
+                            endTimeSec,
+                            entryAllowsDialogue,
+                            isPrimary,
+                            TameDisposition::None,
+                            0.0,
+                            false)) {
+                            continue;
+                        }
+
+                        if (!existedInSession && !isPrimary) {
+                            ++ambientInCombatHold;
+                        }
+                    }
+
+                    if (ambientInCombatHold > 0 || ambientScanned > 0) {
+                        spdlog::info(
+                            "TFDHostilityController: [R94D] incombat ambient suppression participants target={:08X} ambientHold={} ambientScanned={} reason=hooks_broad_hostile_bubble",
+                            targetId,
+                            ambientInCombatHold,
+                            ambientScanned);
+                    }
                 }
             }
             else if (mode == Mode::TrucePreCombat && allowDialogue) {
@@ -2717,18 +2885,13 @@ namespace TFD::HostilityController
             g_sessions[sessionId] = session;
 
             std::vector<RE::FormID> applyIds;
-            if (mode == Mode::TruceInCombat && !curatedTruceIds.empty()) {
-                applyIds = curatedTruceIds;
-            }
-            else {
-                applyIds.reserve(g_entries.size());
-                for (const auto& [actorId, entry] : g_entries) {
-                    if (entry.sessionId == sessionId) {
-                        applyIds.push_back(actorId);
-                    }
+            applyIds.reserve(g_entries.size());
+            for (const auto& [actorId, entry] : g_entries) {
+                if (entry.sessionId == sessionId) {
+                    applyIds.push_back(actorId);
                 }
-                std::sort(applyIds.begin(), applyIds.end());
             }
+            std::sort(applyIds.begin(), applyIds.end());
 
             for (RE::FormID actorId : applyIds) {
                 auto it = g_entries.find(actorId);
@@ -2769,6 +2932,13 @@ namespace TFD::HostilityController
                         static_cast<unsigned int>(preCombatDialogueEventIds.size()),
                         static_cast<unsigned int>(applyIds.size()),
                         static_cast<unsigned int>(preCombatRecruitSlotsFree));
+                }
+                else if (mode == Mode::TruceInCombat && allowDialogue && !inCombatDialogueEventIds.empty()) {
+                    assignSourceIds = std::addressof(inCombatDialogueEventIds);
+                    spdlog::info(
+                        "TFDHostilityController: [R94A] incombat assign source dialogueCount={} suppressedPackSize={} reason=ambient_has_no_alias",
+                        static_cast<unsigned int>(inCombatDialogueEventIds.size()),
+                        static_cast<unsigned int>(applyIds.size()));
                 }
 
                 const auto splitTargets = PartitionTruceEventTargets(*assignSourceIds, player, targetId);
@@ -3182,6 +3352,52 @@ namespace TFD::HostilityController
         session.tameStartleSinceSec = 0.0;
         session.invalidSinceSec = 0.0;
 
+        std::uint32_t addedInCombatPleasureHold = 0;
+        if (session.primaryMode == Mode::TruceInCombat) {
+            auto* player = ResolveActor(session.playerId);
+            const float scanRadius = GetCellBubbleRadius(0.0f);
+            auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || actor->GetFormID() == targetId) {
+                    continue;
+                }
+
+                const auto actorId = actor->GetFormID();
+                const bool alreadyInSession = [&]() {
+                    auto it = g_entries.find(actorId);
+                    return it != g_entries.end() && it->second.sessionId == sessionId;
+                    }();
+                if (alreadyInSession) {
+                    continue;
+                }
+
+                // R93Z: InCombat pleasure must behave like PreCombat: once the
+                // player commits to the scene, nearby same-side hostiles in the
+                // active cell are not allowed to keep normal combat AI and bump
+                // OStim out of start.  They do not receive dialogue aliases; this
+                // is only ambient suppression for the handoff window.
+                if (!IsEligibleCellBubbleActor(actor, player, primaryTarget)) {
+                    continue;
+                }
+
+                if (AddOrRefreshEntry(
+                    actor,
+                    session.primaryMode,
+                    sessionId,
+                    targetId,
+                    nowSec,
+                    session.endTimeSec,
+                    false,
+                    false,
+                    TameDisposition::None,
+                    0.0,
+                    false)) {
+                    ++addedInCombatPleasureHold;
+                }
+            }
+        }
+
         std::uint32_t refreshed = 0;
         for (auto& [actorId, entry] : g_entries) {
             if (entry.sessionId != sessionId || !IsTruceMode(entry.mode)) {
@@ -3200,12 +3416,13 @@ namespace TFD::HostilityController
         }
 
         spdlog::info(
-            "TFDHostilityController: preserve truce for flow handoff session={} primary={:08X} duration={:.2f}s until={:.2f} refreshed={} reason={}",
+            "TFDHostilityController: [R93Z] preserve truce for flow handoff session={} primary={:08X} duration={:.2f}s until={:.2f} refreshed={} addedInCombatHold={} reason={}",
             sessionId,
             targetId,
             clampedDuration,
             session.flowHandoffHoldUntilSec,
             refreshed,
+            addedInCombatPleasureHold,
             reason ? reason : "unknown");
 
         return true;
@@ -3441,6 +3658,8 @@ namespace TFD::HostilityController
 
         std::vector<RE::FormID> releasedIds;
         releasedIds.reserve(actors.size());
+        std::vector<RE::FormID> resumeCombatIds;
+        resumeCombatIds.reserve(actors.size());
 
         for (auto* actor : actors) {
             if (!actor) {
@@ -3467,6 +3686,10 @@ namespace TFD::HostilityController
 
             Entry releasedEntry = entryIt->second;
             RemoveSuppression(actor, releasedEntry);
+
+            if (ShouldResumeCombatAfterTruceRelease(releasedEntry.mode, reason)) {
+                resumeCombatIds.push_back(actorId);
+            }
 
             const bool shouldRehostileTruce =
                 player &&
@@ -3510,6 +3733,16 @@ namespace TFD::HostilityController
                 GetCrowdUnassignEventName(primaryMode) ? GetCrowdUnassignEventName(primaryMode) : "<none>",
                 static_cast<unsigned int>(crowdSent),
                 ToString(reason));
+        }
+
+        if (!resumeCombatIds.empty()) {
+            const auto resumeSent = SendModEventToActors(kInCombatResumeCombatEvent, resumeCombatIds);
+            spdlog::info(
+                "TFDHostilityController: [R93R] resume combat events source=dialogue_release session={} reason={} sent={} count={}",
+                sessionId,
+                ToString(reason),
+                static_cast<unsigned int>(resumeSent),
+                static_cast<unsigned int>(resumeCombatIds.size()));
         }
 
         return releasedIds.size();
@@ -3589,7 +3822,10 @@ namespace TFD::HostilityController
 
         const double releaseNowSec = SuppressionNowSec();
         const bool suppressRehostile = reason == ReleaseReason::FlowHandoff;
-        const bool suppressUnassign = reason == ReleaseReason::FlowHandoff || primarySuppressBridgeEvents;
+        const bool suppressUnassign = reason == ReleaseReason::FlowHandoff || (primarySuppressBridgeEvents && reason == ReleaseReason::FlowHandoff);
+
+        std::vector<RE::FormID> resumeCombatIds;
+        resumeCombatIds.reserve(actorIds.size());
 
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);
@@ -3600,6 +3836,10 @@ namespace TFD::HostilityController
             Entry releasedEntry = it->second;
             if (auto* actor = ResolveActor(actorId)) {
                 RemoveSuppression(actor, releasedEntry);
+
+                if (ShouldResumeCombatAfterTruceRelease(releasedEntry.mode, reason)) {
+                    resumeCombatIds.push_back(actorId);
+                }
 
                 const bool shouldRehostileTame =
                     releasedEntry.mode == Mode::Tame &&
@@ -3717,6 +3957,16 @@ namespace TFD::HostilityController
                 primaryTargetId,
                 ToString(primaryDisposition));
         }
+        if (!resumeCombatIds.empty()) {
+            const auto resumeSent = SendModEventToActors(kInCombatResumeCombatEvent, resumeCombatIds);
+            spdlog::info(
+                "TFDHostilityController: [R93R] resume combat events source=session_release session={} reason={} sent={} count={}",
+                sessionId,
+                ToString(reason),
+                static_cast<unsigned int>(resumeSent),
+                static_cast<unsigned int>(resumeCombatIds.size()));
+        }
+
         spdlog::info(
             "TFDHostilityController: release session id={} reason={} mode={} disposition={} target={:08X} packSize={}",
             sessionId,
@@ -3725,6 +3975,267 @@ namespace TFD::HostilityController
             ToString(primaryDisposition),
             primaryTargetId,
             static_cast<unsigned int>(actorIds.size()));
+    }
+
+
+    std::optional<RE::FormID> PromoteTruceActorForCycle(RE::Actor* actor, const char* debugReason)
+    {
+        if (!actor) {
+            return std::nullopt;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return std::nullopt;
+        }
+
+        auto entryIt = g_entries.find(actorId);
+        if (entryIt == g_entries.end() || !IsTruceMode(entryIt->second.mode)) {
+            return std::nullopt;
+        }
+
+        const auto sessionId = entryIt->second.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || !IsTruceMode(sessionIt->second.primaryMode)) {
+            return std::nullopt;
+        }
+
+        auto& session = sessionIt->second;
+        const auto mode = session.primaryMode;
+        auto* player = Runtime::ResolveActor(session.playerId);
+        const double nowSec = SuppressionNowSec();
+
+        auto& assignedDialogueIds = session.dialogueAssignedActorIds;
+        if (std::find(assignedDialogueIds.begin(), assignedDialogueIds.end(), actorId) == assignedDialogueIds.end()) {
+            assignedDialogueIds.insert(assignedDialogueIds.begin(), actorId);
+        }
+        assignedDialogueIds.erase(
+            std::remove(assignedDialogueIds.begin(), assignedDialogueIds.end(), RE::FormID{ 0 }),
+            assignedDialogueIds.end());
+
+        session.primaryTargetId = actorId;
+        session.dialogueRequested = true;
+        session.dialogueOpened = false;
+        session.suppressBridgeEvents = false;
+        session.flowHandoffHold = false;
+        session.flowHandoffHoldUntilSec = 0.0;
+        session.pendingReleaseReason = ReleaseReason::Generic;
+        session.armedSinceSec = 0.0;
+        session.tooFarSinceSec = 0.0;
+        session.tameStartleSinceSec = 0.0;
+        session.invalidSinceSec = 0.0;
+
+        std::vector<RE::FormID> crowdIds;
+        crowdIds.reserve(assignedDialogueIds.size());
+        for (auto candidateId : assignedDialogueIds) {
+            if (candidateId == actorId) {
+                continue;
+            }
+            auto entry = g_entries.find(candidateId);
+            if (entry == g_entries.end() || entry->second.sessionId != sessionId || !IsTruceMode(entry->second.mode)) {
+                continue;
+            }
+            if (Runtime::ResolveActor(candidateId)) {
+                crowdIds.push_back(candidateId);
+            }
+        }
+        std::sort(crowdIds.begin(), crowdIds.end());
+
+        for (auto& [candidateId, entry] : g_entries) {
+            if (entry.sessionId != sessionId || !IsTruceMode(entry.mode)) {
+                continue;
+            }
+            entry.primaryTargetId = actorId;
+            entry.isPrimaryTarget = candidateId == actorId;
+            entry.allowDialogue = candidateId == actorId || std::find(crowdIds.begin(), crowdIds.end(), candidateId) != crowdIds.end();
+            entry.lastSuppressionApplySec = 0.0;
+            entry.lastPackageEvalSec = 0.0;
+            if (auto* entryActor = Runtime::ResolveActor(candidateId)) {
+                ApplySuppression(entryActor, entry, nowSec);
+            }
+        }
+
+        const char* primaryEvent = GetPrimaryAssignEventName(mode);
+        const char* crowdEvent = GetCrowdAssignEventName(mode);
+        const auto primarySent = primaryEvent ? SendModEventToActors(primaryEvent, std::vector<RE::FormID>{ actorId }) : 0;
+        const auto crowdSent = crowdEvent && !crowdIds.empty() ? SendModEventToActors(crowdEvent, crowdIds) : 0;
+
+        if (player && player->IsInCombat()) {
+            player->StopCombat();
+        }
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
+
+        spdlog::info(
+            "TFDHostilityController: [R94C] promote truce actor for cycle session={} actor={:08X} crowd={} primaryEvent={} primarySent={} crowdEvent={} crowdSent={} reason={}",
+            sessionId,
+            actorId,
+            static_cast<unsigned int>(crowdIds.size()),
+            primaryEvent ? primaryEvent : "<none>",
+            static_cast<unsigned int>(primarySent),
+            crowdEvent ? crowdEvent : "<none>",
+            static_cast<unsigned int>(crowdSent),
+            debugReason ? debugReason : "-");
+
+        return sessionId;
+    }
+
+    bool DemoteTruceActorForCycleHold(RE::Actor* actor, const char* debugReason)
+    {
+        if (!actor) {
+            return false;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return false;
+        }
+
+        auto entryIt = g_entries.find(actorId);
+        if (entryIt == g_entries.end() || !IsTruceMode(entryIt->second.mode)) {
+            return false;
+        }
+
+        auto& entry = entryIt->second;
+        const auto sessionId = entry.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || !IsTruceMode(sessionIt->second.primaryMode)) {
+            return false;
+        }
+
+        auto& session = sessionIt->second;
+        auto& assignedDialogueIds = session.dialogueAssignedActorIds;
+        assignedDialogueIds.erase(
+            std::remove(assignedDialogueIds.begin(), assignedDialogueIds.end(), actorId),
+            assignedDialogueIds.end());
+
+        const bool wasPrimary = session.primaryTargetId == actorId || entry.isPrimaryTarget;
+        entry.allowDialogue = false;
+        entry.isPrimaryTarget = false;
+        entry.lastSuppressionApplySec = 0.0;
+        entry.lastPackageEvalSec = 0.0;
+        g_rehostileRequests.erase(actorId);
+
+        const double nowSec = SuppressionNowSec();
+        ApplySuppression(actor, entry, nowSec);
+
+        spdlog::info(
+            "TFDHostilityController: [R94G] demote truce actor to cycle hold session={} actor={:08X} wasPrimary={} remainingDialogue={} reason={}",
+            sessionId,
+            actorId,
+            wasPrimary ? 1 : 0,
+            static_cast<unsigned int>(assignedDialogueIds.size()),
+            debugReason ? debugReason : "-");
+
+        return true;
+    }
+
+    bool ReleaseSingleTruceActorForCycle(RE::Actor* actor, ReleaseReason reason, const char* debugReason)
+    {
+        if (!actor) {
+            return false;
+        }
+
+        const auto actorId = actor->GetFormID();
+        if (actorId == 0) {
+            return false;
+        }
+
+        auto entryIt = g_entries.find(actorId);
+        if (entryIt == g_entries.end() || !IsTruceMode(entryIt->second.mode)) {
+            return false;
+        }
+
+        Entry releasedEntry = entryIt->second;
+        const auto sessionId = releasedEntry.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || !IsTruceMode(sessionIt->second.primaryMode)) {
+            return false;
+        }
+
+        auto& session = sessionIt->second;
+        const auto primaryMode = session.primaryMode;
+        const bool wasPrimary = session.primaryTargetId == actorId || releasedEntry.isPrimaryTarget;
+        auto* player = Runtime::ResolveActor(session.playerId);
+
+        std::vector<RE::FormID> remainingIds;
+        remainingIds.reserve(g_entries.size());
+        for (const auto& [candidateId, entry] : g_entries) {
+            if (candidateId == actorId || entry.sessionId != sessionId || !IsTruceMode(entry.mode)) {
+                continue;
+            }
+            if (Runtime::ResolveActor(candidateId)) {
+                remainingIds.push_back(candidateId);
+            }
+        }
+        std::sort(remainingIds.begin(), remainingIds.end());
+
+        RemoveSuppression(actor, releasedEntry);
+        g_entries.erase(entryIt);
+
+        auto& assignedDialogueIds = session.dialogueAssignedActorIds;
+        assignedDialogueIds.erase(
+            std::remove(assignedDialogueIds.begin(), assignedDialogueIds.end(), actorId),
+            assignedDialogueIds.end());
+
+        RE::FormID newPrimaryId = 0;
+        if (wasPrimary) {
+            for (auto candidateId : assignedDialogueIds) {
+                if (candidateId != actorId && std::find(remainingIds.begin(), remainingIds.end(), candidateId) != remainingIds.end()) {
+                    newPrimaryId = candidateId;
+                    break;
+                }
+            }
+            if (newPrimaryId == 0 && !remainingIds.empty()) {
+                newPrimaryId = remainingIds.front();
+            }
+
+            if (newPrimaryId != 0) {
+                session.primaryTargetId = newPrimaryId;
+                for (auto& [candidateId, entry] : g_entries) {
+                    if (entry.sessionId != sessionId) {
+                        continue;
+                    }
+                    entry.primaryTargetId = newPrimaryId;
+                    entry.isPrimaryTarget = candidateId == newPrimaryId;
+                    entry.allowDialogue = entry.allowDialogue || candidateId == newPrimaryId;
+                }
+            }
+            else {
+                session.finished = true;
+            }
+        }
+
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
+
+        const char* eventName = wasPrimary ? GetPrimaryUnassignEventName(primaryMode) : GetCrowdUnassignEventName(primaryMode);
+        std::size_t sent = 0;
+        if (eventName) {
+            sent = SendModEventToActors(eventName, std::vector<RE::FormID>{ actorId });
+        }
+
+        if (player && ShouldResumeCombatAfterTruceRelease(releasedEntry.mode, reason)) {
+            const bool drawWeapon = true;
+            const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
+            if (!satisfied || !actor->IsInCombat()) {
+                QueueRehostileRetry(actor, player, sessionId, reason, SuppressionNowSec(), drawWeapon);
+            }
+        }
+
+        spdlog::info(
+            "TFDHostilityController: [R94C] release single truce actor session={} actor={:08X} wasPrimary={} newPrimary={:08X} remaining={} event={} sent={} reason={} debug={}",
+            sessionId,
+            actorId,
+            wasPrimary ? 1 : 0,
+            newPrimaryId,
+            static_cast<unsigned int>(remainingIds.size()),
+            eventName ? eventName : "<none>",
+            static_cast<unsigned int>(sent),
+            ToString(reason),
+            debugReason ? debugReason : "-");
+
+        return true;
     }
 
     bool ReleaseActiveTruceSessionForActor(RE::Actor* actor, ReleaseReason reason, bool onlyIfStillHostile)

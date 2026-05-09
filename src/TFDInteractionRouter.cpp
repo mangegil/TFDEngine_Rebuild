@@ -1730,6 +1730,43 @@ namespace TFD::InteractionRouter
                 return info;
             }
 
+            RE::TESTopicInfo* ResolveInCombatGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // R93P: INFO record behind TFD_TIF__0506FEA8, the root
+                    // response for TFDDialogueInCombatGreet. InCombat truce can
+                    // otherwise report SetDialogueWithPlayer(ok=1) without the
+                    // Papyrus greet fragment entering, same class of failure as
+                    // Victory-after-PreCombat before R93O.
+                    constexpr RE::FormID kInCombatGreetInfoLocalFormID = 0x0006FEA8;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kInCombatGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen][R93P] TFDDialogueInCombatGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kInCombatGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen][R93P] TFDDialogueInCombatGreet INFO {:06X} not found in {}; in-combat hard dialogue will fall back to default topic selection",
+                            kInCombatGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
+            }
+
             RE::TESTopicInfo* ResolveAfterPleasureGreetTopicInfo()
             {
                 static RE::TESTopicInfo* info = nullptr;
@@ -2332,6 +2369,21 @@ namespace TFD::InteractionRouter
             }
 
             if (dialogueOpen) {
+                // R94F: Do not treat an unrelated/stale dialogue menu as success for
+                // a pending truce forcegreet. During InCombat pleasure cycling the
+                // previous after-pleasure dialogue can still be closing when the next
+                // crowd actor is queued; the old logic marked success with
+                // attempts=0/requestIssued=0, so no forcegreet was actually opened.
+                if (!g_pending.requestIssued && IsTruceMode(g_pending.mode)) {
+                    SyncDialogueStateLocked(true);
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R94F] wait existing dialogue before truce open mode={} speaker={:08X} attempts={} requestIssued=0",
+                        ModeName(g_pending.mode),
+                        PendingSpeakerFormID(),
+                        g_pending.attempts);
+                    return;
+                }
+
                 const auto completedMode = g_pending.mode;
                 const auto completedSpeaker = PendingSpeakerFormID();
                 g_pending.succeeded = true;
@@ -2518,15 +2570,21 @@ namespace TFD::InteractionRouter
             }
 
             const bool preCombatTruceMode = g_pending.mode == Mode::PreCombatTruce;
+            const bool inCombatTruceMode = g_pending.mode == Mode::InCombatTruce;
             const bool afterPleasureMode = g_pending.mode == Mode::AfterPleasure;
             const bool forceGreet =
                 preCombatTruceMode ||
-                g_pending.mode == Mode::InCombatTruce ||
+                inCombatTruceMode ||
                 afterPleasureMode;
 
             RE::TESTopicInfo* topicInfo = nullptr;
+            bool hardDialogueReset = false;
             if (preCombatTruceMode) {
                 topicInfo = ResolvePreCombatGreetTopicInfo();
+            }
+            else if (inCombatTruceMode) {
+                topicInfo = ResolveInCombatGreetTopicInfo();
+                hardDialogueReset = true;
             }
             else if (afterPleasureMode) {
                 topicInfo = ResolveAfterPleasureGreetTopicInfo();
@@ -2534,6 +2592,9 @@ namespace TFD::InteractionRouter
 
             if (forceGreet) {
                 PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                if (hardDialogueReset) {
+                    speaker->SetDialogueWithPlayer(false, false, nullptr);
+                }
                 SetDialogueStateValue(1);
             }
 
@@ -2555,7 +2616,7 @@ namespace TFD::InteractionRouter
                 kPreCombatForceGreetMaxDistance :
                 (g_pending.mode == Mode::InCombatTruce ? kInCombatForceGreetMaxDistance : 0.0f);
             spdlog::info(
-                "[TFD][DialogueOpen] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X}",
+                "[TFD][DialogueOpen][R93P] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X} explicit={} reset={}",
                 ModeName(g_pending.mode),
                 speaker->GetFormID(),
                 g_pending.attempts,
@@ -2564,7 +2625,9 @@ namespace TFD::InteractionRouter
                 tryDist,
                 tryMaxDist,
                 forceGreet ? 1 : 0,
-                topicInfo ? topicInfo->GetFormID() : 0u);
+                topicInfo ? topicInfo->GetFormID() : 0u,
+                topicInfo ? 1 : 0,
+                hardDialogueReset ? 1 : 0);
 
             if (firstIssued) {
                 spdlog::info(

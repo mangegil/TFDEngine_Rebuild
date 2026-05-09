@@ -27,7 +27,8 @@ namespace TFD::PleasureRuntime
 		Bleedout,
 		Captive,
 		Victory,
-		Teammate
+		Teammate,
+		InCombat
 	};
 
 	enum class AfterChoice : std::uint8_t
@@ -59,6 +60,9 @@ namespace TFD::PleasureRuntime
 	void ResetForLoad(std::string_view reason);
 
 	bool BeginPleasure(RE::Actor* speaker, SourceContext source, std::string_view reason);
+	bool QueueNextCycleAfterTerminal(RE::Actor* currentActor, SourceContext source, std::string_view reason);
+	bool HasQueuedCycleForConsumedActor(RE::Actor* currentActor, SourceContext source);
+	bool HasQueuedCycleForConsumedActor(std::uint32_t currentActorFormID, SourceContext source);
 	bool HandleModEvent(const RE::BSFixedString& name, const RE::BSFixedString& strArg, float numArg, RE::TESForm* sender);
 
 	void NoteAfterPleasureDialogueCommitted(std::string_view reason);
@@ -83,4 +87,6 @@ namespace TFD::PleasureRuntime
 
 	bool IsActorTracked(RE::Actor* actor);
 	bool ShouldProtectPendingDialogue(RE::Actor* actor);
+	bool IsInCombatPleasureChainActive();
+	std::size_t FlushDeferredInCombatRecruits(std::string_view reason);
 }
