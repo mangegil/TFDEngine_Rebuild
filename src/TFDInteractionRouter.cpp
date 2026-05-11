@@ -1635,7 +1635,7 @@ namespace TFD::InteractionRouter
             constexpr auto kDefaultTimeout = std::chrono::milliseconds(2500);
             constexpr auto kInCombatTimeout = std::chrono::milliseconds(12000);
             constexpr auto kPreCombatTimeout = std::chrono::milliseconds(12000);
-            constexpr auto kBleedoutTimeout = std::chrono::milliseconds(4000);
+            constexpr auto kBleedoutTimeout = std::chrono::milliseconds(12000);
             constexpr auto kAfterPleasureTimeout = std::chrono::milliseconds(12000);
             constexpr auto kCommitQuietWindow = std::chrono::milliseconds(1200);
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
@@ -1646,6 +1646,8 @@ namespace TFD::InteractionRouter
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
             constexpr float kInCombatForceGreetMaxDistance = 160.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
+            constexpr float kBleedoutForceGreetMaxDistance = 320.0f;
+            constexpr float kBleedoutForceGreetMaxDistanceSq = kBleedoutForceGreetMaxDistance * kBleedoutForceGreetMaxDistance;
 
             struct PendingState
             {
@@ -1760,6 +1762,42 @@ namespace TFD::InteractionRouter
                         spdlog::warn(
                             "[TFD][DialogueOpen][R93P] TFDDialogueInCombatGreet INFO {:06X} not found in {}; in-combat hard dialogue will fall back to default topic selection",
                             kInCombatGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
+            }
+
+            RE::TESTopicInfo* ResolveBleedoutGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // R100A: INFO record behind TFD_TIF__0506FEAA, the root
+                    // response for TFDDialogueBleedoutGreet. Bleedout must be
+                    // forced like precombat/in-combat, otherwise the downed player
+                    // can sit in bleedout without receiving the enemy greet.
+                    constexpr RE::FormID kBleedoutGreetInfoLocalFormID = 0x0006FEAA;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kBleedoutGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen][R100A] TFDDialogueBleedoutGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kBleedoutGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen][R100A] TFDDialogueBleedoutGreet INFO {:06X} not found in {}; bleedout hard dialogue will fall back to default topic selection",
+                            kBleedoutGreetInfoLocalFormID,
                             kPluginName);
                     }
                 }
@@ -1894,6 +1932,11 @@ namespace TFD::InteractionRouter
             bool IsInCombatForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
                 return IsForceGreetRangeReady(player, speaker, kInCombatForceGreetMaxDistanceSq);
+            }
+
+            bool IsBleedoutForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                return IsForceGreetRangeReady(player, speaker, kBleedoutForceGreetMaxDistanceSq);
             }
 
             constexpr const char* kPreCombatCrowdApproachAssistEvent = "TFDTruceApproachAssist";
@@ -2175,6 +2218,19 @@ namespace TFD::InteractionRouter
                 return mode == Mode::PreCombatTruce || mode == Mode::InCombatTruce;
             }
 
+            bool IsApproachPackageMode(Mode mode)
+            {
+                return mode == Mode::PreCombatTruce || mode == Mode::InCombatTruce || mode == Mode::Bleedout;
+            }
+
+            bool IsNativeForceGreetMode(Mode mode)
+            {
+                return mode == Mode::PreCombatTruce ||
+                    mode == Mode::InCombatTruce ||
+                    mode == Mode::Bleedout ||
+                    mode == Mode::AfterPleasure;
+            }
+
             void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
             {
                 if (!player || !speaker) {
@@ -2288,7 +2344,7 @@ namespace TFD::InteractionRouter
                 g_pending.nextApproachAssist = mode == Mode::PreCombatTruce ? now + kPreCombatApproachAssistDelay : Clock::time_point{};
                 g_pending.approachAssistUsed = false;
 
-                if (IsTruceMode(mode)) {
+                if (IsApproachPackageMode(mode)) {
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                         RefreshApproachPackage(player, speaker);
                     }
@@ -2374,7 +2430,7 @@ namespace TFD::InteractionRouter
                 // previous after-pleasure dialogue can still be closing when the next
                 // crowd actor is queued; the old logic marked success with
                 // attempts=0/requestIssued=0, so no forcegreet was actually opened.
-                if (!g_pending.requestIssued && IsTruceMode(g_pending.mode)) {
+                if (!g_pending.requestIssued && IsNativeForceGreetMode(g_pending.mode)) {
                     SyncDialogueStateLocked(true);
                     spdlog::info(
                         "[TFD][DialogueOpen][R94F] wait existing dialogue before truce open mode={} speaker={:08X} attempts={} requestIssued=0",
@@ -2421,11 +2477,11 @@ namespace TFD::InteractionRouter
             }
 
             if (now >= g_pending.deadline) {
-                if (g_pending.mode == Mode::PreCombatTruce) {
-                    g_pending.deadline = now + kPreCombatTimeout;
+                if (g_pending.mode == Mode::PreCombatTruce || g_pending.mode == Mode::Bleedout) {
+                    g_pending.deadline = now + (g_pending.mode == Mode::Bleedout ? kBleedoutTimeout : kPreCombatTimeout);
                     RefreshApproachPackage(player, speaker);
                     spdlog::warn(
-                        "[TFD][DialogueOpen] timeout converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
+                        "[TFD][DialogueOpen][R100A] timeout converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         g_pending.attempts,
@@ -2447,9 +2503,10 @@ namespace TFD::InteractionRouter
                 return;
             }
 
-            if (g_pending.requestIssued && IsTruceMode(g_pending.mode)) {
+            if (g_pending.requestIssued && IsApproachPackageMode(g_pending.mode)) {
                 const bool preCombatMode = g_pending.mode == Mode::PreCombatTruce;
                 const bool inCombatMode = g_pending.mode == Mode::InCombatTruce;
+                const bool bleedoutMode = g_pending.mode == Mode::Bleedout;
                 bool rangeReady = true;
                 float targetDist = 0.0f;
                 if (preCombatMode) {
@@ -2458,6 +2515,9 @@ namespace TFD::InteractionRouter
                 } else if (inCombatMode) {
                     rangeReady = IsInCombatForceGreetRangeReady(player, speaker);
                     targetDist = kInCombatForceGreetMaxDistance;
+                } else if (bleedoutMode) {
+                    rangeReady = IsBleedoutForceGreetRangeReady(player, speaker);
+                    targetDist = kBleedoutForceGreetMaxDistance;
                 }
 
                 if (!rangeReady) {
@@ -2486,8 +2546,12 @@ namespace TFD::InteractionRouter
                 g_pending.mode == Mode::InCombatTruce &&
                 !g_pending.requestIssued &&
                 !IsInCombatForceGreetRangeReady(player, speaker);
+            const bool needsBleedoutRangeGate =
+                g_pending.mode == Mode::Bleedout &&
+                !g_pending.requestIssued &&
+                !IsBleedoutForceGreetRangeReady(player, speaker);
 
-            if (needsPreCombatRangeGate || needsInCombatRangeGate) {
+            if (needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
@@ -2508,7 +2572,7 @@ namespace TFD::InteractionRouter
                     RefreshApproachPackage(player, speaker);
                     const float targetDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
-                        kPreCombatForceGreetMaxDistance;
+                        (needsBleedoutRangeGate ? kBleedoutForceGreetMaxDistance : kPreCombatForceGreetMaxDistance);
                     spdlog::info(
                         "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f}",
                         ModeName(g_pending.mode),
@@ -2523,7 +2587,7 @@ namespace TFD::InteractionRouter
                     const float dist = std::sqrt(DistanceSquared(player, speaker));
                     const float maxDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
-                        kPreCombatForceGreetMaxDistance;
+                        (needsBleedoutRangeGate ? kBleedoutForceGreetMaxDistance : kPreCombatForceGreetMaxDistance);
                     spdlog::info(
                         "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} max={:.1f}",
                         ModeName(g_pending.mode),
@@ -2571,11 +2635,9 @@ namespace TFD::InteractionRouter
 
             const bool preCombatTruceMode = g_pending.mode == Mode::PreCombatTruce;
             const bool inCombatTruceMode = g_pending.mode == Mode::InCombatTruce;
+            const bool bleedoutMode = g_pending.mode == Mode::Bleedout;
             const bool afterPleasureMode = g_pending.mode == Mode::AfterPleasure;
-            const bool forceGreet =
-                preCombatTruceMode ||
-                inCombatTruceMode ||
-                afterPleasureMode;
+            const bool forceGreet = IsNativeForceGreetMode(g_pending.mode);
 
             RE::TESTopicInfo* topicInfo = nullptr;
             bool hardDialogueReset = false;
@@ -2586,8 +2648,18 @@ namespace TFD::InteractionRouter
                 topicInfo = ResolveInCombatGreetTopicInfo();
                 hardDialogueReset = true;
             }
+            else if (bleedoutMode) {
+                topicInfo = ResolveBleedoutGreetTopicInfo();
+                hardDialogueReset = true;
+            }
             else if (afterPleasureMode) {
                 topicInfo = ResolveAfterPleasureGreetTopicInfo();
+                // R111: Bleedout AfterPleasure can be opened after OStim and a
+                // failed package-owned greet attempt. Reset stale dialogue state
+                // before forcing the root topic, same safety pattern as Bleedout
+                // and InCombat native forcegreet. Without this, SetDialogueWithPlayer
+                // can return ok=1 but the Dialogue Menu closes before choices settle.
+                hardDialogueReset = true;
             }
 
             if (forceGreet) {
@@ -2614,7 +2686,9 @@ namespace TFD::InteractionRouter
             const float tryDist = std::sqrt(DistanceSquared(player, speaker));
             const float tryMaxDist = g_pending.mode == Mode::PreCombatTruce ?
                 kPreCombatForceGreetMaxDistance :
-                (g_pending.mode == Mode::InCombatTruce ? kInCombatForceGreetMaxDistance : 0.0f);
+                (g_pending.mode == Mode::InCombatTruce ?
+                    kInCombatForceGreetMaxDistance :
+                    (g_pending.mode == Mode::Bleedout ? kBleedoutForceGreetMaxDistance : 0.0f));
             spdlog::info(
                 "[TFD][DialogueOpen][R93P] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X} explicit={} reset={}",
                 ModeName(g_pending.mode),

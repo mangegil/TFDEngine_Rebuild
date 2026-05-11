@@ -17,6 +17,7 @@
 #include <tuple>
 #include <array>
 #include <random>
+#include <limits>
 
 #include <RE/Skyrim.h>
 #include <type_traits>
@@ -122,6 +123,11 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_bleedPauseStarted{};
 		std::chrono::steady_clock::time_point g_bleedLastCalmPulse{};
 
+		bool g_bleedStickyReopenGraceActive = false;
+		std::chrono::steady_clock::time_point g_bleedStickyReopenGraceUntil{};
+		std::uint32_t g_bleedStickyReopenGraceSpeakerID = 0;
+		float g_bleedStickyReopenGraceDistance = 99999.0f;
+
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
 
@@ -138,12 +144,149 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
+		static RE::PlayerCharacter* Player();
+		static bool IsCaptiveSupportedAggressor(RE::Actor* actor);
+		static bool IsStandingEnemyThresholdActor(RE::Actor* actor);
+		static bool IsBleedSpaceCompatible(RE::Actor* actor, RE::Actor* player);
+		static RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
+		static bool IsActiveFollowerActor(RE::Actor* actor);
+		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
+
+		RE::ActorHandle g_lastAggressor{};
+
 		static RE::Actor* FindBestBleedoutSpeaker(float radius, float maxDist, RE::Actor* preferred)
 		{
-			(void)radius;
-			(void)maxDist;
-			(void)preferred;
-			return nullptr;
+			auto* player = Player();
+			if (!player) {
+				return nullptr;
+			}
+
+			const float scanRadius = (std::max)(12000.0f, (std::max)(radius, maxDist));
+			auto isCandidate = [&](RE::Actor* actor, float* outDistance = nullptr) -> bool {
+				if (outDistance) {
+					*outDistance = -1.0f;
+				}
+				if (!actor || actor == player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					return false;
+				}
+				if (!IsCaptiveSupportedAggressor(actor)) {
+					return false;
+				}
+				if (!IsStandingEnemyThresholdActor(actor)) {
+					return false;
+				}
+				if (!IsBleedSpaceCompatible(actor, player)) {
+					return false;
+				}
+
+				const auto actorPos = actor->GetPosition();
+				const auto playerPos = player->GetPosition();
+				const float dx = actorPos.x - playerPos.x;
+				const float dy = actorPos.y - playerPos.y;
+				const float dz = actorPos.z - playerPos.z;
+				const float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+				if (outDistance) {
+					*outDistance = dist;
+				}
+				if (dist > scanRadius) {
+					return false;
+				}
+
+				auto* currentTarget = ResolveCurrentCombatTarget(actor);
+				if (currentTarget == player) {
+					return true;
+				}
+				if (currentTarget && IsActiveFollowerActor(currentTarget)) {
+					return true;
+				}
+				if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
+					return true;
+				}
+				if (preferred && actor == preferred) {
+					return true;
+				}
+				if (g_lastAggressor) {
+					auto lastSp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
+					if (lastSp.get() == actor) {
+						return true;
+					}
+				}
+				return false;
+				};
+
+			float preferredDist = -1.0f;
+			if (preferred && isCandidate(preferred, &preferredDist)) {
+				spdlog::info("[TFD][Defeat][R100A] bleed speaker preferred actor={:08X} dist={:.1f}",
+					preferred->GetFormID(), preferredDist);
+				return preferred;
+			}
+
+			auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+			if (preferred) {
+				if (const auto* preferredInfo = TFD::Actor::FindActorInfo(snapshot, preferred); preferredInfo && preferredInfo->coalitionID >= 0) {
+					if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, preferredInfo->coalitionID)) {
+						float coalitionDist = -1.0f;
+						if (isCandidate(coalitionSpeaker, &coalitionDist)) {
+							spdlog::info("[TFD][Defeat][R100A] bleed speaker preferred coalition actor={:08X} dist={:.1f}",
+								coalitionSpeaker->GetFormID(), coalitionDist);
+							return coalitionSpeaker;
+						}
+					}
+				}
+			}
+
+			if (snapshot.winningCoalitionCandidateID >= 0) {
+				if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, snapshot.winningCoalitionCandidateID)) {
+					float coalitionDist = -1.0f;
+					if (isCandidate(coalitionSpeaker, &coalitionDist)) {
+						spdlog::info("[TFD][Defeat][R100A] bleed speaker winning coalition actor={:08X} dist={:.1f}",
+							coalitionSpeaker->GetFormID(), coalitionDist);
+						return coalitionSpeaker;
+					}
+				}
+			}
+
+			RE::Actor* best = nullptr;
+			float bestScore = std::numeric_limits<float>::max();
+			RE::Actor* last = nullptr;
+			if (g_lastAggressor) {
+				auto lastSp = RE::Actor::LookupByHandle(g_lastAggressor.native_handle());
+				last = lastSp.get();
+			}
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
+				float dist = -1.0f;
+				if (!isCandidate(actor, &dist)) {
+					continue;
+				}
+
+				auto* currentTarget = ResolveCurrentCombatTarget(actor);
+				const bool targetsPlayer = currentTarget == player;
+				const bool targetsFollower = currentTarget && IsActiveFollowerActor(currentTarget);
+				const bool hostile = info.hostileToPlayer || actor->IsHostileToActor(player);
+				const bool inCombat = info.inCombat || actor->IsInCombat();
+				const bool front = IsActorCloseAndFront(actor, player, 448.0f);
+				const bool los = ActorHasLineOfSightToPlayer(actor, player);
+
+				float score = dist;
+				if (targetsPlayer) score -= 1200.0f;
+				if (targetsFollower) score -= 850.0f;
+				if (hostile) score -= 360.0f;
+				if (inCombat) score -= 250.0f;
+				if (front) score -= 160.0f;
+				if (los) score -= 80.0f;
+				if (actor == preferred) score -= 600.0f;
+				if (last && last == actor) score -= 300.0f;
+
+				if (score < bestScore) {
+					bestScore = score;
+					best = actor;
+				}
+			}
+
+			spdlog::info("[TFD][Defeat][R100A] bleed speaker scan radius={:.1f} best={:08X} score={:.1f}",
+				scanRadius, best ? best->GetFormID() : 0u, best ? bestScore : 0.0f);
+			return best;
 		}
 
 		static void SetGraceSeconds(int seconds)
@@ -156,8 +299,6 @@ namespace TFD::DefeatMonitor
 			g_graceUntil = Now() + std::chrono::seconds(seconds);
 			g_grace.store(true, std::memory_order_release);
 		}
-
-		RE::ActorHandle g_lastAggressor{};
 
 		static std::uint32_t CurrentBleedSpeakerID()
 		{
@@ -815,6 +956,9 @@ namespace TFD::DefeatMonitor
 		static bool IsReasonableBleedoutSpeaker(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance = nullptr);
 		static void SetGraceSeconds(int seconds);
 		static bool IsGraceActive();
+		static void ClearBleedStickyReopenGrace(const char* reason);
+		static void ArmBleedStickyReopenGrace(std::uint32_t speakerID, float distance, std::chrono::steady_clock::time_point now, const char* reason);
+		static bool TickBleedStickyReopenGrace(RE::Actor* player, std::chrono::steady_clock::time_point now);
 		static void UpdatePreCombatState();
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance);
@@ -839,6 +983,7 @@ namespace TFD::DefeatMonitor
 
 		static void StartBleedWindow(RE::Actor* player, RE::Actor* aggressor)
 		{
+			ClearBleedStickyReopenGrace("start_bleed_window");
 			TFD::Bleedout::RuntimeHost::StartWindow(player, aggressor);
 		}
 
@@ -1065,23 +1210,23 @@ namespace TFD::DefeatMonitor
 			if (outDistance) {
 				*outDistance = -1.0f;
 			}
-			if (!actor || !player || !IsBleedCrowdSupportedAggressor(actor) || !IsBleedSpaceCompatible(actor, player)) {
+			if (!actor || !player || !IsCaptiveSupportedAggressor(actor) || !IsBleedSpaceCompatible(actor, player)) {
 				return false;
 			}
 			float dist = -1.0f;
-			if (!IsReasonableCombatAggressor(actor, player, maxDist, &dist)) {
+			if (!IsReasonableCombatAggressor(actor, player, (std::max)(12000.0f, maxDist), &dist)) {
 				return false;
 			}
 			if (outDistance) {
 				*outDistance = dist;
 			}
-			return ActorHasLineOfSightToPlayer(actor, player) || IsActorCloseAndFront(actor, player, (std::min)(maxDist, 900.0f));
+			return true;
 		}
 
 		static bool CanUseAggressorForBleedoutGreet(RE::Actor* player, RE::Actor* aggressor, float& outDistance)
 		{
 			outDistance = -1.0f;
-			return IsReasonableBleedoutSpeaker(aggressor, player, 1800.0f, &outDistance);
+			return IsReasonableBleedoutSpeaker(aggressor, player, 12000.0f, &outDistance);
 		}
 
 		static void PreparePlayerForBleedoutPleasureScene(const char* reason)
@@ -1453,7 +1598,7 @@ namespace TFD::DefeatMonitor
 		{
 			(void)player;
 			PlayerThresholdOutcomeScan scan{};
-			scan.scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+			scan.scanRadius = (std::max)(12000.0f, TFD::Settings::GetSweepRadius());
 			scan.initialAggressor = ResolveAggressor();
 			if (!scan.initialAggressor) {
 				scan.initialAggressor = FindBestAggressor(scan.scanRadius);
@@ -1483,6 +1628,18 @@ namespace TFD::DefeatMonitor
 		{
 			RememberAggressorForOutcome(classification.rememberedAggressor);
 
+			if (!classification.observeStandingFollowers) {
+				auto* immediateSpeaker = FindBestBleedoutSpeaker(scan.scanRadius, 12000.0f, classification.rememberedAggressor);
+				if (immediateSpeaker) {
+					RememberAggressorForOutcome(immediateSpeaker);
+					spdlog::info("[TFD][Defeat][R100A] player threshold -> immediate bleedout forcegreet speaker={:08X}",
+						immediateSpeaker->GetFormID());
+					StartBleedWindow(player, immediateSpeaker);
+					SetGraceSeconds(1);
+					return true;
+				}
+			}
+
 			if (classification.observeUnresolvedBattle) {
 				spdlog::info("[TFD][Defeat] delay outcome unresolved battle coalitions={} playerSideStanding={}",
 					scan.coalitionSnapshot.activeCoalitionCount,
@@ -1500,7 +1657,7 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			auto* speaker = FindBestBleedoutSpeaker(scan.scanRadius, 768.0f, classification.rememberedAggressor);
+			auto* speaker = FindBestBleedoutSpeaker(scan.scanRadius, 12000.0f, classification.rememberedAggressor);
 			RememberAggressorForOutcome(speaker);
 			if (!speaker) {
 				spdlog::info("[TFD][Defeat] no dialogue-capable aggressor and no standing follower -> bleed countdown without speaker");
@@ -2273,6 +2430,86 @@ namespace TFD::DefeatMonitor
 
 		// Temporary split module: bleed dialogue/runtime orchestration
 
+		static void ClearBleedStickyReopenGrace(const char* reason)
+		{
+			if (!g_bleedStickyReopenGraceActive) {
+				return;
+			}
+			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen grace cleared reason={} speaker={:08X}",
+				reason ? reason : "unknown",
+				g_bleedStickyReopenGraceSpeakerID);
+			g_bleedStickyReopenGraceActive = false;
+			g_bleedStickyReopenGraceUntil = {};
+			g_bleedStickyReopenGraceSpeakerID = 0;
+			g_bleedStickyReopenGraceDistance = 99999.0f;
+		}
+
+		static void ArmBleedStickyReopenGrace(std::uint32_t speakerID, float distance, std::chrono::steady_clock::time_point now, const char* reason)
+		{
+			if (speakerID == 0) {
+				ClearBleedStickyReopenGrace("arm_no_speaker");
+				return;
+			}
+			g_bleedStickyReopenGraceActive = true;
+			g_bleedStickyReopenGraceUntil = now + std::chrono::milliseconds(650);
+			g_bleedStickyReopenGraceSpeakerID = speakerID;
+			g_bleedStickyReopenGraceDistance = distance;
+			TFD::BleedoutGreet::MarkStickyReopenPending(false, "dialogue_closed_sticky_reopen_grace");
+			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed speaker={:08X} dist={:.1f} delayMs=650 reason={}",
+				speakerID,
+				distance,
+				reason ? reason : "unknown");
+		}
+
+		static bool TickBleedStickyReopenGrace(RE::Actor* player, std::chrono::steady_clock::time_point now)
+		{
+			if (!g_bleedStickyReopenGraceActive) {
+				return false;
+			}
+
+			const auto outcome = TFD::Bleedout::GetDialogueOutcome();
+			if (TFD::Bleedout::HasTerminalCommit() || outcome != BleedDialogueOutcome::None || TFD::PleasureRuntime::IsBlocking() || TFD::PleasureRuntime::IsActive()) {
+				ClearBleedStickyReopenGrace("terminal_or_runtime_claimed");
+				return true;
+			}
+
+			if (IsDialogueOpen()) {
+				ClearBleedStickyReopenGrace("dialogue_reopened_elsewhere");
+				return false;
+			}
+
+			if (now < g_bleedStickyReopenGraceUntil) {
+				g_bleedPaused = true;
+				g_bleedPauseStarted = now;
+				g_bleedLastSeconds = -1;
+				return true;
+			}
+
+			const auto speakerID = g_bleedStickyReopenGraceSpeakerID;
+			ClearBleedStickyReopenGrace("grace_elapsed");
+			if (speakerID == 0 || !player) {
+				return false;
+			}
+
+			auto* reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(speakerID);
+			float reopenDist = 99999.0f;
+			if (!(reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist))) {
+				spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed skip speaker={:08X} valid=0", speakerID);
+				return false;
+			}
+
+			ResetBleedSpeakerKickState();
+			g_bleedLastSeconds = -1;
+			TFD::Bleedout::ClearSystemEventOutcomeWindow("dialogue_closed_sticky_reopen_grace_elapsed");
+			ApplyBleedDialogueOverdrive(player, reopenSpeaker, "dialogue_closed_sticky_reopen_grace_elapsed", true);
+			g_bleedPaused = true;
+			g_bleedPauseStarted = now;
+			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen grace elapsed -> reopen speaker={:08X} dist={:.1f}",
+				speakerID,
+				reopenDist);
+			return true;
+		}
+
 		static void TickUI()
 		{
 			struct Guard {
@@ -2385,6 +2622,34 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
+			if (!g_inBleedState.load(std::memory_order_acquire)) {
+				const auto bleedAfterSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+				if (bleedAfterSnapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure) {
+					const bool dOpen = IsDialogueOpen();
+					const auto nowBleedAfter = Now();
+					if (dOpen) {
+						TFD::BleedoutGreet::NotifyDialogueOpened();
+					}
+					else if (TFD::BleedoutGreet::TryAfterPleasureWatchdog(g_prevDialogueOpen, dOpen, CurrentBleedSpeakerID(), nowBleedAfter,
+						[&](const char* reopenReason) -> bool {
+							auto* reopenSpeaker = CurrentBleedSpeaker();
+							if (!reopenSpeaker || reopenSpeaker->IsDead() || reopenSpeaker->IsDisabled()) {
+								return false;
+							}
+							const bool reopened = TFD::BleedoutGreet::BeginAfterPleasure(reopenSpeaker, reopenReason);
+							spdlog::info("[TFD][Defeat][R125] bleed after pleasure watchdog native reopen speaker={:08X} ok={}",
+								reopenSpeaker->GetFormID(),
+								reopened ? 1 : 0);
+							return reopened;
+						})) {
+						g_prevDialogueOpen = dOpen;
+						return;
+					}
+					g_prevDialogueOpen = dOpen;
+					return;
+				}
+			}
+
 			if (g_inBleedState.load(std::memory_order_acquire)) {
 				if (g_bleedBattleObservePending) {
 					TickBleedBattleObservePending();
@@ -2392,6 +2657,9 @@ namespace TFD::DefeatMonitor
 				}
 				if (g_bleedBattleObserveActive) {
 					TickBleedBattleObserve();
+					return;
+				}
+				if (TickBleedStickyReopenGrace(player, Now())) {
 					return;
 				}
 				if (g_minHp > 0.0f) {
@@ -2550,22 +2818,18 @@ namespace TFD::DefeatMonitor
 },
 [&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
 	g_prevDialogueOpen = false;
-	TFD::BleedoutGreet::ResetRuntime("bleed_reset");
-	ResetBleedSpeakerKickState();
 	g_bleedLastSeconds = -1;
-	TFD::Bleedout::ClearSystemEventOutcomeWindow("dialogue_closed_sticky_reopen");
-	auto* reopenSpeaker = probe.speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(probe.speakerFormID) : nullptr;
-	if (player && reopenSpeaker) {
-		ApplyBleedDialogueOverdrive(player, reopenSpeaker, "dialogue_closed_sticky_reopen", true);
-	}
+	const auto nowReopenGrace = Now();
 	g_bleedPaused = true;
-	g_bleedPauseStarted = Now();
-	spdlog::info("[TFD][Defeat] bleedout dialogue closed without committed outcome -> sticky reopen forced speaker={:08X} dist={:.1f}",
+	g_bleedPauseStarted = nowReopenGrace;
+	ArmBleedStickyReopenGrace(probe.speakerFormID, probe.distance, nowReopenGrace, "dialogue_closed_sticky_reopen");
+	spdlog::info("[TFD][Defeat][R113] bleedout dialogue closed without committed outcome -> sticky reopen delayed speaker={:08X} dist={:.1f}",
 		probe.speakerFormID,
 		probe.distance);
 },
 [&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
 	g_prevDialogueOpen = false;
+	ClearBleedStickyReopenGrace("sticky_reopen_unavailable");
 	TFD::BleedoutGreet::ResetRuntime("bleed_reset");
 	ResetBleedSpeakerKickState();
 	g_bleedLastSeconds = -1;

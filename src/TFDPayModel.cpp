@@ -383,12 +383,19 @@ namespace TFD::PayModel
                 return out;
             }
 
-            if (context == PayContext::PreCombat || context == PayContext::InCombat) {
+            if (context == PayContext::PreCombat || context == PayContext::InCombat || context == PayContext::Bleedout) {
                 addUnique(speaker);
 
                 const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
                 for (auto* actor : dialogueTruceActors) {
                     addUnique(actor);
+                }
+
+                if (context == PayContext::Bleedout && out.size() <= 1) {
+                    const auto activeTruceActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
+                    for (auto* actor : activeTruceActors) {
+                        addUnique(actor);
+                    }
                 }
 
                 const auto actorCount = out.size();
@@ -398,7 +405,7 @@ namespace TFD::PayModel
                 // so recruit capacity must never reduce the encounter price to zero.
                 // Recruit overflow is handled later by the recruit commit path.
                 spdlog::info(
-                    "[TFD][PayModel] dialogue assigned actors speaker={:08X} context={} actors={} slotsFree={} reason=pay_not_recruit_capacity_clamped",
+                    "[TFD][PayModel][R123] dialogue assigned actors speaker={:08X} context={} actors={} slotsFree={} reason=shared_truce_actor_list",
                     speaker->GetFormID(),
                     static_cast<int>(context),
                     static_cast<unsigned>(actorCount),
@@ -524,6 +531,18 @@ namespace TFD::PayModel
         auto* payGlobal = ResolveSharedGoldGlobal();
         if (!payGlobal) {
             return;
+        }
+
+        const std::string_view why{ reason ? reason : "" };
+        {
+            std::scoped_lock lk(gLock);
+            if (why == "precombat_clear_all_pending" && gCachedQuote.valid && gCachedQuote.context == PayContext::Bleedout) {
+                spdlog::info("[TFD][PayModel][R101] skip shared gold clear reason={} activeContext={} gold={}",
+                    reason ? reason : "unknown",
+                    PayContextName(gCachedQuote.context),
+                    gCachedQuote.quote.totalGold);
+                return;
+            }
         }
 
         if (payGlobal->value != 0.0f) {

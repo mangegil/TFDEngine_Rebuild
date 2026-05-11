@@ -48,69 +48,23 @@ namespace TFD::HostilityHooks
                 return actor && TFD::HostilityController::IsActorTemporarilySuppressed(actor);
             }
 
-            static RE::Actor* CurrentCombatTarget(RE::Actor* actor)
-            {
-                if (!actor) {
-                    return nullptr;
-                }
-                auto sp = actor->GetActorRuntimeData().currentCombatTarget.get();
-                return sp.get();
-            }
-
-            static std::uint32_t FormIDOrZero(RE::TESForm* form)
-            {
-                return form ? form->GetFormID() : 0u;
-            }
-
-            static void EnforceSuppressedActor(RE::Actor* actor, const char* phase)
-            {
-                if (!actor) {
-                    return;
-                }
-
-                const auto beforeTarget = FormIDOrZero(CurrentCombatTarget(actor));
-                const bool wasInCombat = actor->IsInCombat();
-                const bool wasWeaponDrawn = actor->IsWeaponDrawn();
-
-                if (auto* process = RE::ProcessLists::GetSingleton()) {
-                    const bool previousRunDetection = process->runDetection;
-                    process->runDetection = false;
-                    process->ClearCachedFactionFightReactions();
-                    process->StopCombatAndAlarmOnActor(actor, false);
-                    process->runDetection = previousRunDetection;
-                }
-
-                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
-
-                if (actor->IsInCombat()) {
-                    actor->StopCombat();
-                }
-
-                if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
-                }
-
-                actor->EvaluatePackage(false, true);
-                actor->EvaluatePackage(true, true);
-
-                const auto afterTarget = FormIDOrZero(CurrentCombatTarget(actor));
-                if (wasInCombat || wasWeaponDrawn || beforeTarget != 0 || afterTarget != 0) {
-                    spdlog::info(
-                        "[TFD][HostilityHooks] suppressed actor combat blocked actor={:08X} phase={} wasCombat={} wasDrawn={} beforeTarget={:08X} afterTarget={:08X}",
-                        actor->GetFormID(),
-                        phase ? phase : "unknown",
-                        wasInCombat ? 1 : 0,
-                        wasWeaponDrawn ? 1 : 0,
-                        beforeTarget,
-                        afterTarget);
-                }
-            }
+            // R100C: Keep the virtual UpdateCombat hook lightweight.
+            //
+            // This hook is entered from the engine combat update path. Calling heavy
+            // engine mutators from inside it (StopCombatAndAlarmOnActor, StopCombat,
+            // DrawWeaponMagicHands, EvaluatePackage, or spdlog formatting that touches
+            // actor state after those calls) can re-enter combat/package code while the
+            // engine is already iterating combat state. Crash logs from the bleedout
+            // hit transition pointed at this hook with phase=UpdateCombat on stack.
+            //
+            // The real suppression work is already done safely from
+            // HostilityController::Update() through ApplySuppression(). Here we only
+            // block the original UpdateCombat call for temporarily suppressed actors.
 
             static void UpdateCombat(RE::Character* character)
             {
                 auto* actor = static_cast<RE::Actor*>(character);
                 if (IsScopedSuppressed(actor)) {
-                    EnforceSuppressedActor(actor, "UpdateCombat");
                     return;
                 }
 

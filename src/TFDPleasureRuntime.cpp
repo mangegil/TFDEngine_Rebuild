@@ -206,6 +206,67 @@ namespace TFD::PleasureRuntime
 			return formID ? RE::TESForm::LookupByID<RE::Actor>(formID) : nullptr;
 		}
 
+		RE::TESFaction* ResolveAfterPleasureFaction()
+		{
+			static RE::TESFaction* faction = nullptr;
+			static bool tried = false;
+			if (!tried) {
+				tried = true;
+				faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDAfterPleasureFaction");
+				if (!faction) {
+					spdlog::warn("[TFD][PleasureRuntime][R109] TFDAfterPleasureFaction unresolved");
+				}
+			}
+			return faction;
+		}
+
+		void RemoveAfterPleasureFaction(RE::Actor* actor, std::string_view reason)
+		{
+			auto* faction = ResolveAfterPleasureFaction();
+			if (!actor || !faction) {
+				return;
+			}
+			if (actor->IsInFaction(faction)) {
+				actor->RemoveFromFaction(faction);
+				spdlog::info(
+					"[TFD][PleasureRuntime][R109] after pleasure faction removed actor={:08X} reason={}",
+					actor->GetFormID(),
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+			}
+		}
+
+		void PrepareAfterPleasurePackageActor(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			auto* faction = ResolveAfterPleasureFaction();
+			if (faction && !actor->IsInFaction(faction)) {
+				actor->AddToFaction(faction, 0);
+			}
+
+			if (!actor->IsAIEnabled()) {
+				actor->EnableAI(true);
+			}
+			actor->AllowPCDialogue(true);
+			actor->StopCombat();
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->StopCombatAndAlarmOnActor(actor, false);
+			}
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R109] after pleasure package actor prepared actor={:08X} factionApplied={} reason={}",
+				actor->GetFormID(),
+				faction ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
 		double NowSec()
 		{
 			using Clock = std::chrono::steady_clock;
@@ -388,6 +449,9 @@ namespace TFD::PleasureRuntime
 
 		void ClearSpeakerStateLocked()
 		{
+			if (auto* actor = LookupActor(g_state.afterPleasureSpeakerFormID ? g_state.afterPleasureSpeakerFormID : g_state.pleasureSpeakerFormID)) {
+				RemoveAfterPleasureFaction(actor, "clear_speaker_state");
+			}
 			g_state.pleasureSpeakerFormID = 0;
 			g_state.afterPleasureSpeakerFormID = 0;
 		}
@@ -472,6 +536,9 @@ namespace TFD::PleasureRuntime
 
 		void BeginNewCycleLocked(RE::Actor* speaker, SourceContext source, std::string_view reason)
 		{
+			if (auto* oldActor = LookupActor(g_state.afterPleasureSpeakerFormID ? g_state.afterPleasureSpeakerFormID : g_state.pleasureSpeakerFormID)) {
+				RemoveAfterPleasureFaction(oldActor, "begin_new_cycle");
+			}
 			++g_state.sessionCycleId;
 			g_state.source = source;
 			g_state.flowOwnerToken = g_state.sessionCycleId;
@@ -1409,8 +1476,12 @@ namespace TFD::PleasureRuntime
 					g_state.redoPending = false;
 					g_state.blocking = true;
 
+					if (auto* afterActor = LookupActor(afterSpeakerFormID)) {
+						PrepareAfterPleasurePackageActor(afterActor, "scene_end_await_after_dialogue");
+					}
+
 					AdvancePhaseLocked(Phase::AfterPleasureAwaitQuest, eventName);
-					LogEventAcceptedLocked(eventName, info, "await_after_dialogue");
+					LogEventAcceptedLocked(eventName, info, "await_after_dialogue_package_owned");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);
@@ -1454,6 +1525,14 @@ namespace TFD::PleasureRuntime
 			}
 
 			if (IsAfterPleasureChoiceEvent(eventName)) {
+				if (g_state.phase == Phase::AfterPleasureAwaitQuest) {
+					// R109: package-owned Bleedout AfterPleasure can receive a branch
+					// choice before native sees a separate enter/open event. Promote the
+					// runtime to dialogue here instead of dropping the terminal choice.
+					AdvancePhaseLocked(Phase::AfterPleasureDialogue, "after_pleasure_choice_promote_from_await");
+					g_state.afterPleasureCommitted = true;
+					g_state.afterPleasureDialogueExpireSec = 0.0;
+				}
 				if (g_state.phase != Phase::AfterPleasureDialogue) {
 					LogEventIgnoredLocked(eventName, "wrong_phase", info);
 					return;

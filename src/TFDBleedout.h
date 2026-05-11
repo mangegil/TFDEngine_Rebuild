@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <chrono>
 #include <unordered_set>
@@ -246,6 +246,8 @@ namespace TFD::Bleedout
 	int& BleedBattleObserveActiveEmptyEnemyTicksRef();
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
+	void ApplyBleedoutDialogueFactions(RE::Actor* actor, const char* role = nullptr, const char* reason = nullptr);
+	void ClearBleedoutDialogueFactions(const char* reason = nullptr);
 	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers);
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);
 	void ApplyDialogueOverdrive(RE::Actor* player, RE::Actor* speaker, const char* reason, bool restartDialogue, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers);

@@ -300,8 +300,59 @@ namespace TFDMenu
 				return activePrimary || truceInCombat;
 			}
 
+			static bool IsAfterPleasureActivationActor(RE::Actor* actor)
+			{
+				if (!actor || actor == RE::PlayerCharacter::GetSingleton()) {
+					return false;
+				}
+
+				const auto phase = TFD::PleasureRuntime::GetPhase();
+				if (phase != TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest &&
+					phase != TFD::PleasureRuntime::Phase::AfterPleasureDialogue) {
+					return false;
+				}
+
+				auto* primary = TFD::PleasureRuntime::GetPrimarySpeaker();
+				return primary && primary->GetFormID() == actor->GetFormID();
+			}
+
+			static bool PrepareAfterPleasureActivationActor(RE::Actor* actor, const char* reason)
+			{
+				if (!IsAfterPleasureActivationActor(actor)) {
+					return false;
+				}
+
+				if (!actor->IsAIEnabled()) {
+					actor->EnableAI(true);
+				}
+				actor->AllowPCDialogue(true);
+				actor->StopCombat();
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+
+				spdlog::info(
+					"[TFD][Menu][R109] after pleasure activation prepared actor={:08X} phase={} source={} reason={} action=allow_vanilla_activation",
+					actor->GetFormID(),
+					TFD::PleasureRuntime::GetPhaseName(),
+					TFD::PleasureRuntime::GetSourceContextName(),
+					reason ? reason : "after_pleasure_activation");
+				return true;
+			}
+
 			static bool OpenInCombatTruceDialogueFromActivation(RE::Actor* actor, const char* reason)
 			{
+				if (PrepareAfterPleasureActivationActor(actor, reason ? reason : "incombat_activation_after_pleasure")) {
+					// Let vanilla activation continue.  The actor is the active AfterPleasure speaker,
+					// not an InCombat crowd target, so R94F must not close/block dialogue here.
+					return false;
+				}
+
 				if (!IsInCombatTruceActivationActor(actor)) {
 					return false;
 				}
@@ -2387,9 +2438,14 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 											return RE::BSEventNotifyControl::kStop;
 										}
 									}
+									else if (PrepareAfterPleasureActivationActor(crosshairActor, "after_pleasure_crosshair_activate_dialogue")) {
+										return RE::BSEventNotifyControl::kContinue;
+									}
 									else if (IsInCombatTruceActivationActor(crosshairActor)) {
-										(void)OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue");
-										return RE::BSEventNotifyControl::kStop;
+										if (OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue")) {
+											return RE::BSEventNotifyControl::kStop;
+										}
+										return RE::BSEventNotifyControl::kContinue;
 									}
 									else {
 										spdlog::info("[TFD][Menu] activate crosshair actor not owned by TFD actor={:08X} action=allow_vanilla_activation",

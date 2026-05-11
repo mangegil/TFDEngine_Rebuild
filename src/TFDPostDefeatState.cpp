@@ -15,6 +15,7 @@
 #include "TFDTeammateManager.h"
 #include "TFDTransition.h"
 #include "TFDVictory.h"
+#include "TFDPleasureRuntime.h"
 
 namespace TFD::PostDefeatState
 {
@@ -217,6 +218,7 @@ namespace TFD::PostDefeatState
         }
 
         static constexpr int kVictoryStateNeutral = 0;
+        static constexpr int kVictoryStateNo = 1;
         static constexpr int kVictoryStateYes = 2;
         static constexpr int kVictoryRecruitGlobalRefreshIntervalMs = 1000;
         static constexpr int kStaleVictoryNeutralConfirmTicks = 2;
@@ -225,6 +227,30 @@ namespace TFD::PostDefeatState
         std::chrono::steady_clock::time_point g_nextVictoryRecruitGlobalRefresh{};
         std::chrono::steady_clock::time_point g_nextVictoryPreserveLog{};
         int g_staleVictoryNeutralTicks = 0;
+
+        bool IsBleedoutPleasureLockActive()
+        {
+            if (TFD::PleasureRuntime::GetSourceContext() != TFD::PleasureRuntime::SourceContext::Bleedout) {
+                return false;
+            }
+
+            // R121: only the actual OStim scene handoff should preserve the old
+            // Defeat global.  Once the scene has ended and the flow is waiting
+            // for AfterPleasure dialogue, the Bleedout decision is already
+            // terminally resolved.  Keeping TFDDefeatState at 2 during
+            // AfterPleasure makes the shared AfterPleasure dialogue behave like
+            // it is still inside the defeat/bleedout dialogue phase, which can
+            // pass the root greet and then immediately close before player
+            // choices settle.
+            switch (TFD::PleasureRuntime::GetPhase()) {
+            case TFD::PleasureRuntime::Phase::PleasureStartPending:
+            case TFD::PleasureRuntime::Phase::PleasureActive:
+            case TFD::PleasureRuntime::Phase::PleasureEnding:
+                return true;
+            default:
+                return false;
+            }
+        }
 
         bool IsDialogueMenuOpen()
         {
@@ -365,6 +391,25 @@ namespace TFD::PostDefeatState
 
         if (input.pleasurePassiveLock) {
             result.routerCombatContextActive = false;
+
+            if (IsBleedoutPleasureLockActive()) {
+                SetGlobalInt(g_defeatStateGlobal, 2);
+                TFD::Victory::ResetObservedContext();
+                TFD::Victory::SetStateValue(kVictoryStateNo);
+                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
+                g_staleVictoryNeutralTicks = 0;
+                SetGlobalInt(g_hostileStateGlobal, 0);
+                SetGlobalInt(g_enemyFactionStateGlobal, 0);
+                SetGlobalInt(g_enemyRaceStateGlobal, 0);
+                SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+                SetGlobalInt(g_leftForDeadStateGlobal, 0);
+                spdlog::info(
+                    "[TFD][PostDefeatState][R108] preserving Bleedout state during pleasure lock phase={} source={} defeat=2 victory=No",
+                    TFD::PleasureRuntime::GetPhaseName(),
+                    TFD::PleasureRuntime::GetSourceContextName());
+                return result;
+            }
+
             SetGlobalInt(g_defeatStateGlobal, 0);
             TFD::Victory::ResetObservedContext();
             if (!PreserveVictoryFlowIfBackedByDefeatedActor("pleasure_passive_lock_ignored_for_active_victory")) {
@@ -380,23 +425,31 @@ namespace TFD::PostDefeatState
             return result;
         }
 
+        const bool playerDownNow = ComputePlayerBleedOutState(input.player);
         SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
 
-        const bool playerCanOwnVictory = input.player && !ComputePlayerBleedOutState(input.player);
-        const bool preservedActiveVictoryFlow = playerCanOwnVictory &&
+        const bool forceVictoryNoForPlayerDefeat = input.player && playerDownNow && input.defeatContext;
+        const bool playerCanOwnVictory = input.player && !playerDownNow;
+        const bool preservedActiveVictoryFlow = !forceVictoryNoForPlayerDefeat && playerCanOwnVictory &&
             PreserveVictoryFlowIfBackedByDefeatedActor("active_victory_dialogue_actor_before_observed_refresh");
 
-        if (!preservedActiveVictoryFlow) {
+        if (forceVictoryNoForPlayerDefeat) {
+            TFD::Victory::ResetObservedContext();
+            TFD::Victory::SetStateValue(kVictoryStateNo);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
+            g_staleVictoryNeutralTicks = 0;
+        }
+        else if (!preservedActiveVictoryFlow) {
             TFD::Victory::RefreshObservedState(TFD::Victory::ObservedContext{
                 .hasPlayer = (input.player != nullptr),
-                .playerDown = ComputePlayerBleedOutState(input.player),
+                .playerDown = playerDownNow,
                 .combatContext = input.victoryContext,
                 .hasEnemies = !input.enemies.empty()
                 });
         }
 
         const int victoryState = TFD::Victory::GetStateValue();
-        if (!preservedActiveVictoryFlow) {
+        if (!preservedActiveVictoryFlow && !forceVictoryNoForPlayerDefeat) {
             RefreshRecruitGlobalsWhenVictoryReady(victoryState);
         }
         ClearStaleVictoryFlowWhenNeutral(victoryState, input);

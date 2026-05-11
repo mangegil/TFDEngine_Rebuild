@@ -47,32 +47,95 @@ namespace
     {
         inline std::atomic<std::uint32_t> g_waveGeneration{ 1 };
 
-        void SweepOnce(float radius, bool npcOnly)
+        std::size_t StopCombatOnlyActor(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return 0;
+            }
+
+            actor->StopCombat();
+            return 1;
+        }
+
+        std::size_t StopCombatAndAlarmActor(RE::Actor* actor, RE::ProcessLists* process, bool drawWeapon, bool evaluatePackage)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return 0;
+            }
+
+            if (process) {
+                process->StopCombatAndAlarmOnActor(actor, false);
+            }
+            actor->StopAlarmOnActor();
+            actor->StopCombat();
+
+            if (drawWeapon && actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(false);
+            }
+            if (evaluatePackage) {
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+            }
+            return 1;
+        }
+
+        std::size_t SweepCombatOnlyOnce(float radius, bool npcOnly)
         {
             if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
-                return;
+                return 0;
             }
 
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
-                return;
+                return 0;
             }
 
-            player->StopCombat();
-
+            std::size_t processed = StopCombatOnlyActor(player);
             const auto snapshot = TFD::Actor::BuildSnapshot(radius, npcOnly);
 
             for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor) {
-                    continue;
-                }
-                if (actor->IsDead() || actor->IsDisabled()) {
-                    continue;
-                }
-
-                actor->StopCombat();
+                processed += StopCombatOnlyActor(info.get());
             }
+            return processed;
+        }
+
+        std::size_t SweepCombatAndAlarmOnce(float radius, bool npcOnly, bool ignoreBleedHoldBlock, const char* reason)
+        {
+            if (!ignoreBleedHoldBlock && TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
+                return 0;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return 0;
+            }
+
+            auto* process = RE::ProcessLists::GetSingleton();
+            bool oldRunDetection = false;
+            bool changedRunDetection = false;
+            if (process) {
+                oldRunDetection = process->runDetection;
+                process->runDetection = false;
+                process->ClearCachedFactionFightReactions();
+                changedRunDetection = true;
+            }
+
+            std::size_t processed = StopCombatAndAlarmActor(player, process, true, true);
+            const auto snapshot = TFD::Actor::BuildSnapshot(radius, npcOnly);
+            for (const auto& info : snapshot.actors) {
+                processed += StopCombatAndAlarmActor(info.get(), process, true, true);
+            }
+
+            if (process && changedRunDetection) {
+                process->runDetection = oldRunDetection;
+            }
+
+            spdlog::info("[TFD][HostilityController][R107] hard stop combat/alarm sweep radius={:.0f} npcOnly={} processed={} reason={}",
+                radius,
+                npcOnly ? 1 : 0,
+                static_cast<unsigned int>(processed),
+                reason ? reason : "unknown");
+            return processed;
         }
 
         void CancelPending()
@@ -102,13 +165,47 @@ namespace
                             if (generation != g_waveGeneration.load(std::memory_order_acquire)) {
                                 return;
                             }
-                            SweepOnce(radius, npcOnly);
+                            (void)SweepCombatOnlyOnce(radius, npcOnly);
                             });
                     }
                 }
                 }).detach();
 
             spdlog::info("[TFD][HostilityController] scheduled {} waves ({}ms) generation={}", waves, intervalMs, generation);
+        }
+
+        void ScheduleCombatAndAlarmWaves(float radius, bool npcOnly, int waves, int intervalMs, std::string reason)
+        {
+            if (waves <= 0) {
+                return;
+            }
+
+            const auto generation = g_waveGeneration.load(std::memory_order_acquire);
+
+            std::thread([radius, npcOnly, waves, intervalMs, generation, reason = std::move(reason)]() {
+                for (int i = 0; i < waves; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
+
+                    if (generation != g_waveGeneration.load(std::memory_order_acquire)) {
+                        return;
+                    }
+
+                    if (auto* tasks = SKSE::GetTaskInterface()) {
+                        tasks->AddUITask([radius, npcOnly, generation, reason]() {
+                            if (generation != g_waveGeneration.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                            (void)SweepCombatAndAlarmOnce(radius, npcOnly, true, reason.c_str());
+                            });
+                    }
+                }
+                }).detach();
+
+            spdlog::info("[TFD][HostilityController][R107] scheduled {} combat/alarm waves ({}ms) generation={} reason={}",
+                waves,
+                intervalMs,
+                generation,
+                reason.empty() ? "unknown" : reason.c_str());
         }
     }
 
@@ -392,7 +489,7 @@ namespace TFD::HostilityController
 {
     void StopCombatSweep(float radius, bool npcOnly)
     {
-        AntiAggroInternal::SweepOnce(radius, npcOnly);
+        (void)AntiAggroInternal::SweepCombatOnlyOnce(radius, npcOnly);
     }
 
     void CancelPendingWaves()
@@ -403,6 +500,16 @@ namespace TFD::HostilityController
     void ScheduleStopCombatWaves(float radius, bool npcOnly, int waves, int intervalMs)
     {
         AntiAggroInternal::ScheduleWaves(radius, npcOnly, waves, intervalMs);
+    }
+
+    void StopCombatAndAlarmSweep(float radius, bool npcOnly, const char* reason)
+    {
+        (void)AntiAggroInternal::SweepCombatAndAlarmOnce(radius, npcOnly, true, reason ? reason : "manual");
+    }
+
+    void ScheduleStopCombatAndAlarmWaves(float radius, bool npcOnly, int waves, int intervalMs, const char* reason)
+    {
+        AntiAggroInternal::ScheduleCombatAndAlarmWaves(radius, npcOnly, waves, intervalMs, reason ? std::string{ reason } : std::string{ "manual" });
     }
 
     void ApplyAggressionClamp(RE::Actor* actor)
@@ -3425,6 +3532,80 @@ namespace TFD::HostilityController
             true);
     }
 
+    std::vector<RE::Actor*> CollectInCombatStyleTruceActors(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        float radius)
+    {
+        std::vector<RE::Actor*> result;
+        if (!IsActorStillValid(player) || !IsActorStillValid(primaryTarget)) {
+            return result;
+        }
+
+        const float scanRadius = (std::max)(radius, kTruceActiveCombatRadius);
+        std::size_t cellBubbleCount = 0;
+        std::size_t truceClusterCount = 0;
+        auto actorIds = BuildTruceInCombatMemberIds(player, primaryTarget, scanRadius, cellBubbleCount, truceClusterCount);
+
+        std::vector<RE::FormID> sourceIds;
+        sourceIds.reserve(actorIds.size() + 1);
+        auto addSourceUnique = [&](RE::FormID actorId) {
+            if (actorId == 0) {
+                return;
+            }
+            if (std::find(sourceIds.begin(), sourceIds.end(), actorId) != sourceIds.end()) {
+                return;
+            }
+            sourceIds.push_back(actorId);
+        };
+
+        // Keep the primary target first, then run the same split/filter used by
+        // TruceInCombat dialogue assignment.  This reuses the collector behavior
+        // without creating or stealing a TruceInCombat session.
+        addSourceUnique(primaryTarget->GetFormID());
+        for (const auto actorId : actorIds) {
+            addSourceUnique(actorId);
+        }
+
+        const auto splitTargets = PartitionTruceEventTargets(sourceIds, player, primaryTarget->GetFormID(), Mode::TruceInCombat);
+        const auto assignedIds = BuildAssignedTruceDialogueIds(splitTargets);
+
+        auto addActorUnique = [&](RE::Actor* actor) {
+            if (!IsActorStillValid(actor)) {
+                return;
+            }
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                return;
+            }
+            const auto found = std::find_if(result.begin(), result.end(), [actorId](RE::Actor* existing) {
+                return existing && existing->GetFormID() == actorId;
+            });
+            if (found != result.end()) {
+                return;
+            }
+            result.push_back(actor);
+        };
+
+        for (const auto actorId : assignedIds) {
+            addActorUnique(Runtime::ResolveActor(actorId));
+        }
+
+        spdlog::info(
+            "TFDHostilityController: [R105B] collect incombat-style truce actors primary={:08X} radius={:.0f} rawIds={} sourceIds={} assigned={} crowd={} actors={} cellBubble={} truceCluster={} ownership=caller",
+            primaryTarget->GetFormID(),
+            scanRadius,
+            static_cast<unsigned int>(actorIds.size()),
+            static_cast<unsigned int>(sourceIds.size()),
+            static_cast<unsigned int>(assignedIds.size()),
+            static_cast<unsigned int>(splitTargets.crowdIds.size()),
+            static_cast<unsigned int>(result.size()),
+            static_cast<unsigned int>(cellBubbleCount),
+            static_cast<unsigned int>(truceClusterCount));
+
+        return result;
+    }
+
 
     bool IsSuppressed(RE::Actor* actor)
     {
@@ -4001,7 +4182,19 @@ namespace TFD::HostilityController
         auto* targetActor = targetRef ? targetRef->As<RE::Actor>() : nullptr;
         auto* causeActor = causeRef ? causeRef->As<RE::Actor>() : nullptr;
 
-        if (!targetActor && !causeActor) {
+        // R99D: hit interrupt must be target-driven, not cause-driven.
+        // TESHitEvent can arrive with a valid cause but a null target during AI/package
+        // transitions.  Treating that as "speaker/crowd/player was hit" creates false
+        // emergency cancels while the in-combat speaker is merely approaching or while
+        // the pleasure handoff is being armed.  Only cancel when the actual hit target
+        // is the player or an actor currently owned by an active TruceInCombat session.
+        if (!targetActor) {
+            if (causeActor) {
+                spdlog::info(
+                    "TFDHostilityController: [R99D] ignore incombat hit interrupt without target cause={:08X} reason={}",
+                    causeActor->GetFormID(),
+                    reason && reason[0] ? reason : "hit_damage_interrupt");
+            }
             return false;
         }
 
@@ -4009,19 +4202,24 @@ namespace TFD::HostilityController
         sessionIds.reserve(4);
 
         const bool targetIsPlayer = targetActor && targetActor->GetFormID() == player->GetFormID();
-        const bool causeIsPlayer = causeActor && causeActor->GetFormID() == player->GetFormID();
 
         // Player damage during an active in-combat truce is always unsafe: even if
         // the hitter was outside the current crowd alias list, the truce has already
         // been violated and the whole in-combat negotiation/pleasure handoff must end.
-        if (targetIsPlayer || causeIsPlayer) {
+        if (targetIsPlayer) {
             AddAllActiveInCombatSessions(sessionIds);
+        } else {
+            AddInCombatSessionForActor(sessionIds, targetActor);
         }
 
-        AddInCombatSessionForActor(sessionIds, targetActor);
-        AddInCombatSessionForActor(sessionIds, causeActor);
-
         if (sessionIds.empty()) {
+            if (causeActor) {
+                spdlog::info(
+                    "TFDHostilityController: [R99D] ignore incombat hit interrupt target not in session target={:08X} cause={:08X} reason={}",
+                    targetActor ? targetActor->GetFormID() : 0u,
+                    causeActor->GetFormID(),
+                    reason && reason[0] ? reason : "hit_damage_interrupt");
+            }
             return false;
         }
 

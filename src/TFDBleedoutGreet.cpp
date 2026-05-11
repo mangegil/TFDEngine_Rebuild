@@ -9,6 +9,7 @@
 
 #include "TFDBleedout.h"
 #include "TFDInteractionRouter.h"
+#include "TFDPayModel.h"
 #include "TFDPleasureRuntime.h"
 
 namespace TFD::BleedoutGreet
@@ -93,12 +94,29 @@ namespace TFD::BleedoutGreet
 
 	bool Begin(RE::Actor* speaker, const char* reason)
 	{
+		const auto speakerFormID = speaker ? speaker->GetFormID() : 0u;
 		if (!HasBleedoutOwnership()) {
-			spdlog::warn("[TFD][BleedoutGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", speaker ? speaker->GetFormID() : 0u, reason ? reason : "bleedout");
+			spdlog::warn("[TFD][BleedoutGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", speakerFormID, reason ? reason : "bleedout");
 			return false;
 		}
+
+		// Bleedout uses the same shared pay text/global pipeline as PreCombat and InCombat.
+		// Without this, the CK line that displays <Global=TFDPayGold> can stay at 0.
+		bool quotePrimed = false;
+		bool payPublished = false;
+		if (speaker) {
+			quotePrimed = TFD::PayModel::PrimeEncounterQuote(speaker, TFD::PayModel::PayContext::Bleedout);
+			payPublished = TFD::PayModel::PublishSharedGold(speaker, TFD::PayModel::PayContext::Bleedout, "bleedout_dialogue_begin");
+		}
+
 		TFD::InteractionRouter::DialogueOpen::BeginBleedout(speaker);
-		spdlog::info("[TFD][BleedoutGreet] begin speaker={:08X} reason={}", speaker ? speaker->GetFormID() : 0u, reason ? reason : "bleedout");
+		spdlog::info(
+			"[TFD][BleedoutGreet][R100P] begin speaker={:08X} quotePrimed={} payPublished={} gold={} reason={}",
+			speakerFormID,
+			quotePrimed ? 1 : 0,
+			payPublished ? 1 : 0,
+			TFD::PayModel::GetCachedEncounterQuote(speaker, TFD::PayModel::PayContext::Bleedout),
+			reason ? reason : "bleedout");
 		return true;
 	}
 

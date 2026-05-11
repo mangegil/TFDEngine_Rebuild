@@ -127,6 +127,10 @@ namespace TFD::HostilityController
     bool IsFlowHandoffHoldActive(RE::Actor* actor);
     [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
     [[nodiscard]] std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget);
+    [[nodiscard]] std::vector<RE::Actor*> CollectInCombatStyleTruceActors(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        float radius);
     std::size_t ReleaseDialogueTruceActors(
         RE::Actor* primaryTarget,
         const std::vector<RE::Actor*>& actors,
@@ -171,8 +175,10 @@ namespace TFD::HostilityController
     const char* ToString(TFD::Tame::TameDisposition disposition);
 
     void StopCombatSweep(float radius, bool npcOnly);
+    void StopCombatAndAlarmSweep(float radius, bool npcOnly, const char* reason = nullptr);
     void CancelPendingWaves();
     void ScheduleStopCombatWaves(float radius, bool npcOnly, int waves, int intervalMs);
+    void ScheduleStopCombatAndAlarmWaves(float radius, bool npcOnly, int waves, int intervalMs, const char* reason = nullptr);
 
     void ApplyAggressionClamp(RE::Actor* actor);
     void ClearAggressionClamp();

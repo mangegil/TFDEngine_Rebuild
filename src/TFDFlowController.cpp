@@ -75,6 +75,7 @@ namespace
     constexpr const char* kBleedoutOutcomeCaptiveEvent = "TFDBleedoutOutcomeCaptive";
     constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
     constexpr const char* kBleedoutOutcomeReleaseEvent = "TFDBleedoutOutcomeRelease";
+    constexpr const char* kBleedoutOutcomeDoNothingEvent = "TFDBleedoutOutcomeDoNothing";
     constexpr const char* kInCombatOutcomePayEvent = "TFDInCombatOutcomePay";
     constexpr const char* kInCombatOutcomePleasureEvent = "TFDInCombatOutcomePleasure";
     constexpr const char* kInCombatOutcomeCaptiveEvent = "TFDInCombatOutcomeCaptive";
@@ -101,6 +102,7 @@ namespace
     constexpr const char* kVictoryOutcomeCancelEvent = "TFDVictoryOutcomeCancel";
     constexpr const char* kVictoryOutcomePleasureEvent = "TFDVictoryOutcomePleasure";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
+    constexpr const char* kAfterPleasureForceOpenEvent = "TFDAfterPleasureForceOpen";
     constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
     constexpr const char* kAfterPleasureChoiceRecruitEvent = "TFDAfterPleasureChoiceRecruit";
     constexpr const char* kAfterPleasureChoiceFinishEvent = "TFDAfterPleasureChoiceFinish";
@@ -161,762 +163,785 @@ namespace
 }
 
 
-    static bool IsBleedoutRuntimeActive()
-    {
-        return g_passiveRuntimeProviders.isBleedoutActive && g_passiveRuntimeProviders.isBleedoutActive();
+static bool IsBleedoutRuntimeActive()
+{
+    return g_passiveRuntimeProviders.isBleedoutActive && g_passiveRuntimeProviders.isBleedoutActive();
+}
+
+static bool HasReleaseFollowGraceRuntime()
+{
+    return g_passiveRuntimeProviders.hasReleaseFollowGrace && g_passiveRuntimeProviders.hasReleaseFollowGrace();
+}
+
+static int GetGlobalValueInt(RE::TESGlobal* global)
+{
+    if (!global) {
+        return 0;
     }
+    return static_cast<int>(std::lround(global->value));
+}
 
-    static bool HasReleaseFollowGraceRuntime()
-    {
-        return g_passiveRuntimeProviders.hasReleaseFollowGrace && g_passiveRuntimeProviders.hasReleaseFollowGrace();
+static void ResolveObservedDiagnosticGlobals()
+{
+    ResolveGlobal(g_preCombatState, "TFDPreCombatState");
+    ResolveGlobal(g_inCombatState, "TFDInCombatState");
+    ResolveGlobal(g_captiveState, "TFDCaptiveState");
+    ResolveGlobal(g_pleasureState, "TFDPleasureState");
+    ResolveGlobal(g_defeatState, "TFDDefeatState");
+    ResolveGlobal(g_victoryState, "TFDVictoryState");
+    ResolveGlobal(g_dialogueState, "TFDDialogueState");
+}
+
+static void AddObservedReasonFlag(std::uint32_t& flags, TFD::FlowController::ObservedReasonFlag flag)
+{
+    flags |= static_cast<std::uint32_t>(flag);
+}
+
+static bool HasObservedReasonFlag(std::uint32_t flags, TFD::FlowController::ObservedReasonFlag flag)
+{
+    return (flags & static_cast<std::uint32_t>(flag)) != 0;
+}
+
+static const char* ObservedStateName(TFD::FlowController::ObservedMainState value)
+{
+    switch (value) {
+    case TFD::FlowController::ObservedMainState::Neutral:
+        return "Neutral";
+    case TFD::FlowController::ObservedMainState::Precombat:
+        return "Precombat";
+    case TFD::FlowController::ObservedMainState::Incombat:
+        return "Incombat";
+    case TFD::FlowController::ObservedMainState::Victory:
+        return "Victory";
+    case TFD::FlowController::ObservedMainState::Defeat:
+        return "Defeat";
+    case TFD::FlowController::ObservedMainState::Captive:
+        return "Captive";
+    default:
+        return "Unknown";
     }
+}
 
-    static int GetGlobalValueInt(RE::TESGlobal* global)
-    {
-        if (!global) {
-            return 0;
-        }
-        return static_cast<int>(std::lround(global->value));
+static TFD::FlowController::ObservedMainState ProjectMainStateFromRoot(TFD::FlowController::RootFlow root)
+{
+    using TFD::FlowController::ObservedMainState;
+    using TFD::FlowController::RootFlow;
+
+    switch (root) {
+    case RootFlow::Captive:
+        return ObservedMainState::Captive;
+    case RootFlow::Bleedout:
+    case RootFlow::LeftForDead:
+        return ObservedMainState::Defeat;
+    case RootFlow::InCombat:
+        return ObservedMainState::Incombat;
+    case RootFlow::Victory:
+        return ObservedMainState::Victory;
+    case RootFlow::PreCombat:
+        return ObservedMainState::Precombat;
+    case RootFlow::Rescue:
+    case RootFlow::Recovery:
+    case RootFlow::None:
+    default:
+        return ObservedMainState::Neutral;
     }
+}
 
-    static void ResolveObservedDiagnosticGlobals()
-    {
-        ResolveGlobal(g_preCombatState, "TFDPreCombatState");
-        ResolveGlobal(g_inCombatState, "TFDInCombatState");
-        ResolveGlobal(g_captiveState, "TFDCaptiveState");
-        ResolveGlobal(g_pleasureState, "TFDPleasureState");
-        ResolveGlobal(g_defeatState, "TFDDefeatState");
-        ResolveGlobal(g_victoryState, "TFDVictoryState");
-        ResolveGlobal(g_dialogueState, "TFDDialogueState");
+static TFD::FlowController::RootFlow ProjectObservedExternalRootFlow(const TFD::FlowController::Snapshot& snapshot)
+{
+    using TFD::FlowController::RootFlow;
+
+    if (snapshot.root != RootFlow::None) {
+        return snapshot.root;
     }
-
-    static void AddObservedReasonFlag(std::uint32_t& flags, TFD::FlowController::ObservedReasonFlag flag)
-    {
-        flags |= static_cast<std::uint32_t>(flag);
-    }
-
-    static bool HasObservedReasonFlag(std::uint32_t flags, TFD::FlowController::ObservedReasonFlag flag)
-    {
-        return (flags & static_cast<std::uint32_t>(flag)) != 0;
-    }
-
-    static const char* ObservedStateName(TFD::FlowController::ObservedMainState value)
-    {
-        switch (value) {
-        case TFD::FlowController::ObservedMainState::Neutral:
-            return "Neutral";
-        case TFD::FlowController::ObservedMainState::Precombat:
-            return "Precombat";
-        case TFD::FlowController::ObservedMainState::Incombat:
-            return "Incombat";
-        case TFD::FlowController::ObservedMainState::Victory:
-            return "Victory";
-        case TFD::FlowController::ObservedMainState::Defeat:
-            return "Defeat";
-        case TFD::FlowController::ObservedMainState::Captive:
-            return "Captive";
-        default:
-            return "Unknown";
-        }
-    }
-
-    static TFD::FlowController::ObservedMainState ProjectMainStateFromRoot(TFD::FlowController::RootFlow root)
-    {
-        using TFD::FlowController::ObservedMainState;
-        using TFD::FlowController::RootFlow;
-
-        switch (root) {
-        case RootFlow::Captive:
-            return ObservedMainState::Captive;
-        case RootFlow::Bleedout:
-        case RootFlow::LeftForDead:
-            return ObservedMainState::Defeat;
-        case RootFlow::InCombat:
-            return ObservedMainState::Incombat;
-        case RootFlow::Victory:
-            return ObservedMainState::Victory;
-        case RootFlow::PreCombat:
-            return ObservedMainState::Precombat;
-        case RootFlow::Rescue:
-        case RootFlow::Recovery:
-        case RootFlow::None:
-        default:
-            return ObservedMainState::Neutral;
-        }
-    }
-
-    static TFD::FlowController::RootFlow ProjectObservedExternalRootFlow(const TFD::FlowController::Snapshot& snapshot)
-    {
-        using TFD::FlowController::RootFlow;
-
-        if (snapshot.root != RootFlow::None) {
-            return snapshot.root;
-        }
-        if (!TFD::Transition::IsRecoveryActive()) {
-            return RootFlow::None;
-        }
-
-        switch (TFD::Transition::GetCurrentFallbackBranch()) {
-        case TFD::Transition::FallbackBranch::RescueCached:
-            return RootFlow::Rescue;
-        case TFD::Transition::FallbackBranch::RecoveryFollower:
-        case TFD::Transition::FallbackBranch::RecoveryPotion:
-            return RootFlow::Recovery;
-        case TFD::Transition::FallbackBranch::LeftForDeadSolo:
-        case TFD::Transition::FallbackBranch::LeftForDeadWithFollower:
-            return RootFlow::LeftForDead;
-        case TFD::Transition::FallbackBranch::None:
-        default:
-            break;
-        }
+    if (!TFD::Transition::IsRecoveryActive()) {
         return RootFlow::None;
     }
 
-    static TFD::FlowController::Snapshot ProjectObservedExternalSnapshot(TFD::FlowController::Snapshot snapshot)
-    {
-        using TFD::FlowController::RootFlow;
+    switch (TFD::Transition::GetCurrentFallbackBranch()) {
+    case TFD::Transition::FallbackBranch::RescueCached:
+        return RootFlow::Rescue;
+    case TFD::Transition::FallbackBranch::RecoveryFollower:
+    case TFD::Transition::FallbackBranch::RecoveryPotion:
+        return RootFlow::Recovery;
+    case TFD::Transition::FallbackBranch::LeftForDeadSolo:
+    case TFD::Transition::FallbackBranch::LeftForDeadWithFollower:
+        return RootFlow::LeftForDead;
+    case TFD::Transition::FallbackBranch::None:
+    default:
+        break;
+    }
+    return RootFlow::None;
+}
 
-        const auto projectedRoot = ProjectObservedExternalRootFlow(snapshot);
-        if (projectedRoot != RootFlow::None && snapshot.root == RootFlow::None) {
-            snapshot.root = projectedRoot;
-            if (snapshot.contextRoot == RootFlow::None) {
-                snapshot.contextRoot = projectedRoot;
-            }
+static TFD::FlowController::Snapshot ProjectObservedExternalSnapshot(TFD::FlowController::Snapshot snapshot)
+{
+    using TFD::FlowController::RootFlow;
+
+    const auto projectedRoot = ProjectObservedExternalRootFlow(snapshot);
+    if (projectedRoot != RootFlow::None && snapshot.root == RootFlow::None) {
+        snapshot.root = projectedRoot;
+        if (snapshot.contextRoot == RootFlow::None) {
+            snapshot.contextRoot = projectedRoot;
         }
-        return snapshot;
+    }
+    return snapshot;
+}
+
+static TFD::FlowController::ObservedMainState ProjectMainStateFromGlobals(const TFD::FlowController::ObservedMainStateSnapshot& observed)
+{
+    using TFD::FlowController::ObservedMainState;
+
+    if (observed.captiveGlobal > 0) {
+        return ObservedMainState::Captive;
+    }
+    if (observed.defeatGlobal >= 2) {
+        return ObservedMainState::Defeat;
+    }
+    if (observed.inCombatGlobal > 0) {
+        return ObservedMainState::Incombat;
+    }
+    if (observed.victoryGlobal >= 2) {
+        return ObservedMainState::Victory;
+    }
+    if (observed.preCombatGlobal > 0) {
+        return ObservedMainState::Precombat;
+    }
+    return ObservedMainState::Neutral;
+}
+
+static bool IsObservedPlayerSideActor(RE::Actor* actor, RE::Actor* player)
+{
+    if (!actor || !player) {
+        return false;
+    }
+    if (actor == player) {
+        return true;
+    }
+    return actor->IsPlayerTeammate() ||
+        TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+        TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+        TFD::Tame::IsCompanion(actor);
+}
+
+static bool HasLineOfSightBetween(RE::Actor* from, RE::TESObjectREFR* to)
+{
+    if (!from || !to) {
+        return false;
+    }
+    bool hasLOSData = false;
+    return from->HasLineOfSight(to, hasLOSData);
+}
+
+static std::string BuildObservedReasonString(std::uint32_t flags)
+{
+    struct Entry
+    {
+        TFD::FlowController::ObservedReasonFlag flag;
+        const char* name;
+    };
+
+    static constexpr Entry entries[] = {
+        { TFD::FlowController::ObservedReasonFlag::CaptiveRuntime, "captive_runtime" },
+        { TFD::FlowController::ObservedReasonFlag::CaptiveGlobal, "captive_global" },
+        { TFD::FlowController::ObservedReasonFlag::CaptiveRoot, "captive_root" },
+        { TFD::FlowController::ObservedReasonFlag::PlayerBleedRuntime, "player_bleed_runtime" },
+        { TFD::FlowController::ObservedReasonFlag::DefeatGlobal, "defeat_global" },
+        { TFD::FlowController::ObservedReasonFlag::BleedoutRoot, "bleedout_root" },
+        { TFD::FlowController::ObservedReasonFlag::ActiveHostile, "active_hostile" },
+        { TFD::FlowController::ObservedReasonFlag::DefeatedLivingEnemy, "defeated_living_enemy" },
+        { TFD::FlowController::ObservedReasonFlag::MutualLosHostile, "mutual_los_hostile" },
+        { TFD::FlowController::ObservedReasonFlag::RootInCombat, "root_incombat" },
+        { TFD::FlowController::ObservedReasonFlag::RootVictory, "root_victory" },
+        { TFD::FlowController::ObservedReasonFlag::RootPreCombat, "root_precombat" }
+    };
+
+    std::ostringstream out;
+    bool first = true;
+    for (const auto& entry : entries) {
+        if (!HasObservedReasonFlag(flags, entry.flag)) {
+            continue;
+        }
+        if (!first) {
+            out << '|';
+        }
+        out << entry.name;
+        first = false;
+    }
+    if (first) {
+        return "none";
+    }
+    return out.str();
+}
+
+static TFD::FlowController::ObservedMainStateSnapshot BuildObservedMainStateSnapshotImpl(
+    const TFD::FlowController::Snapshot& flowSnapshot,
+    bool combatActive,
+    RE::Actor* player)
+{
+    using TFD::FlowController::ObservedMainState;
+    using TFD::FlowController::ObservedReasonFlag;
+    using TFD::FlowController::RootFlow;
+
+    ResolveObservedDiagnosticGlobals();
+
+    TFD::FlowController::ObservedMainStateSnapshot observed{};
+    observed.flow = ProjectObservedExternalSnapshot(flowSnapshot);
+    observed.combatActiveFlag = combatActive;
+    observed.preCombatGlobal = GetGlobalValueInt(g_preCombatState);
+    observed.inCombatGlobal = GetGlobalValueInt(g_inCombatState);
+    observed.victoryGlobal = GetGlobalValueInt(g_victoryState);
+    observed.defeatGlobal = GetGlobalValueInt(g_defeatState);
+    observed.captiveGlobal = GetGlobalValueInt(g_captiveState);
+    observed.pleasureGlobal = GetGlobalValueInt(g_pleasureState);
+    observed.dialogueGlobal = GetGlobalValueInt(g_dialogueState);
+    observed.rootProjected = ProjectMainStateFromRoot(observed.flow.root);
+
+    if (observed.flow.root == RootFlow::Captive) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveRoot);
+    }
+    if (observed.flow.root == RootFlow::Bleedout || observed.flow.root == RootFlow::LeftForDead) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::BleedoutRoot);
+    }
+    if (observed.flow.root == RootFlow::InCombat || combatActive) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootInCombat);
+    }
+    if (observed.flow.root == RootFlow::Victory) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootVictory);
+    }
+    if (observed.flow.root == RootFlow::PreCombat) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootPreCombat);
     }
 
-    static TFD::FlowController::ObservedMainState ProjectMainStateFromGlobals(const TFD::FlowController::ObservedMainStateSnapshot& observed)
-    {
-        using TFD::FlowController::ObservedMainState;
-
-        if (observed.captiveGlobal > 0) {
-            return ObservedMainState::Captive;
-        }
-        if (observed.defeatGlobal >= 2) {
-            return ObservedMainState::Defeat;
-        }
-        if (observed.inCombatGlobal > 0) {
-            return ObservedMainState::Incombat;
-        }
-        if (observed.victoryGlobal >= 2) {
-            return ObservedMainState::Victory;
-        }
-        if (observed.preCombatGlobal > 0) {
-            return ObservedMainState::Precombat;
-        }
-        return ObservedMainState::Neutral;
+    observed.captiveRuntimeActive = TFD::Captive::IsActive();
+    if (observed.captiveRuntimeActive) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveRuntime);
+    }
+    if (observed.captiveGlobal > 0) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveGlobal);
     }
 
-    static bool IsObservedPlayerSideActor(RE::Actor* actor, RE::Actor* player)
-    {
-        if (!actor || !player) {
-            return false;
-        }
-        if (actor == player) {
-            return true;
-        }
-        return actor->IsPlayerTeammate() ||
-            TFD::TeammateManager::IsActiveFollowerActor(actor) ||
-            TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
-            TFD::Tame::IsCompanion(actor);
+    observed.playerBleedRuntimeActive = IsBleedoutRuntimeActive();
+    if (observed.playerBleedRuntimeActive) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::PlayerBleedRuntime);
+    }
+    if (observed.defeatGlobal >= 2) {
+        AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::DefeatGlobal);
     }
 
-    static bool HasLineOfSightBetween(RE::Actor* from, RE::TESObjectREFR* to)
-    {
-        if (!from || !to) {
-            return false;
-        }
-        bool hasLOSData = false;
-        return from->HasLineOfSight(to, hasLOSData);
+    if (player) {
+        observed.playerInCombat = player->IsInCombat();
     }
 
-    static std::string BuildObservedReasonString(std::uint32_t flags)
-    {
-        struct Entry
-        {
-            TFD::FlowController::ObservedReasonFlag flag;
-            const char* name;
-        };
+    if (player && player->GetParentCell()) {
+        TFD::Actor::ScanOptions options{};
+        options.radius = (std::max)(4200.0f, TFD::Settings::GetScanRadius());
+        options.npcOnly = false;
 
-        static constexpr Entry entries[] = {
-            { TFD::FlowController::ObservedReasonFlag::CaptiveRuntime, "captive_runtime" },
-            { TFD::FlowController::ObservedReasonFlag::CaptiveGlobal, "captive_global" },
-            { TFD::FlowController::ObservedReasonFlag::CaptiveRoot, "captive_root" },
-            { TFD::FlowController::ObservedReasonFlag::PlayerBleedRuntime, "player_bleed_runtime" },
-            { TFD::FlowController::ObservedReasonFlag::DefeatGlobal, "defeat_global" },
-            { TFD::FlowController::ObservedReasonFlag::BleedoutRoot, "bleedout_root" },
-            { TFD::FlowController::ObservedReasonFlag::ActiveHostile, "active_hostile" },
-            { TFD::FlowController::ObservedReasonFlag::DefeatedLivingEnemy, "defeated_living_enemy" },
-            { TFD::FlowController::ObservedReasonFlag::MutualLosHostile, "mutual_los_hostile" },
-            { TFD::FlowController::ObservedReasonFlag::RootInCombat, "root_incombat" },
-            { TFD::FlowController::ObservedReasonFlag::RootVictory, "root_victory" },
-            { TFD::FlowController::ObservedReasonFlag::RootPreCombat, "root_precombat" }
-        };
+        const auto world = TFD::Actor::BuildSnapshot(player, options);
+        observed.scannedActorCount = static_cast<std::uint32_t>(world.actors.size());
+        const auto playerFormID = player->GetFormID();
 
-        std::ostringstream out;
-        bool first = true;
-        for (const auto& entry : entries) {
-            if (!HasObservedReasonFlag(flags, entry.flag)) {
+        for (const auto& info : world.actors) {
+            auto* actor = info.get();
+            if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
                 continue;
             }
-            if (!first) {
-                out << '|';
+
+            if (info.standing && info.playerSide) {
+                ++observed.playerSideStandingCount;
             }
-            out << entry.name;
-            first = false;
-        }
-        if (first) {
-            return "none";
-        }
-        return out.str();
-    }
 
-    static TFD::FlowController::ObservedMainStateSnapshot BuildObservedMainStateSnapshotImpl(
-        const TFD::FlowController::Snapshot& flowSnapshot,
-        bool combatActive,
-        RE::Actor* player)
-    {
-        using TFD::FlowController::ObservedMainState;
-        using TFD::FlowController::ObservedReasonFlag;
-        using TFD::FlowController::RootFlow;
+            if (IsObservedPlayerSideActor(actor, player)) {
+                continue;
+            }
 
-        ResolveObservedDiagnosticGlobals();
-
-        TFD::FlowController::ObservedMainStateSnapshot observed{};
-        observed.flow = ProjectObservedExternalSnapshot(flowSnapshot);
-        observed.combatActiveFlag = combatActive;
-        observed.preCombatGlobal = GetGlobalValueInt(g_preCombatState);
-        observed.inCombatGlobal = GetGlobalValueInt(g_inCombatState);
-        observed.victoryGlobal = GetGlobalValueInt(g_victoryState);
-        observed.defeatGlobal = GetGlobalValueInt(g_defeatState);
-        observed.captiveGlobal = GetGlobalValueInt(g_captiveState);
-        observed.pleasureGlobal = GetGlobalValueInt(g_pleasureState);
-        observed.dialogueGlobal = GetGlobalValueInt(g_dialogueState);
-        observed.rootProjected = ProjectMainStateFromRoot(observed.flow.root);
-
-        if (observed.flow.root == RootFlow::Captive) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveRoot);
-        }
-        if (observed.flow.root == RootFlow::Bleedout || observed.flow.root == RootFlow::LeftForDead) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::BleedoutRoot);
-        }
-        if (observed.flow.root == RootFlow::InCombat || combatActive) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootInCombat);
-        }
-        if (observed.flow.root == RootFlow::Victory) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootVictory);
-        }
-        if (observed.flow.root == RootFlow::PreCombat) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::RootPreCombat);
-        }
-
-        observed.captiveRuntimeActive = TFD::Captive::IsActive();
-        if (observed.captiveRuntimeActive) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveRuntime);
-        }
-        if (observed.captiveGlobal > 0) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::CaptiveGlobal);
-        }
-
-        observed.playerBleedRuntimeActive = IsBleedoutRuntimeActive();
-        if (observed.playerBleedRuntimeActive) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::PlayerBleedRuntime);
-        }
-        if (observed.defeatGlobal >= 2) {
-            AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::DefeatGlobal);
-        }
-
-        if (player) {
-            observed.playerInCombat = player->IsInCombat();
-        }
-
-        if (player && player->GetParentCell()) {
-            TFD::Actor::ScanOptions options{};
-            options.radius = (std::max)(4200.0f, TFD::Settings::GetScanRadius());
-            options.npcOnly = false;
-
-            const auto world = TFD::Actor::BuildSnapshot(player, options);
-            observed.scannedActorCount = static_cast<std::uint32_t>(world.actors.size());
-            const auto playerFormID = player->GetFormID();
-
-            for (const auto& info : world.actors) {
-                auto* actor = info.get();
-                if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
-                    continue;
+            const bool defeatedLivingEnemy = TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor);
+            if (defeatedLivingEnemy) {
+                ++observed.defeatedLivingEnemyCount;
+                if (!observed.reasonActorFormID) {
+                    observed.reasonActorFormID = info.formID;
                 }
+                AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::DefeatedLivingEnemy);
+                continue;
+            }
 
-                if (info.standing && info.playerSide) {
-                    ++observed.playerSideStandingCount;
-                }
+            if (!info.standing) {
+                continue;
+            }
 
-                if (IsObservedPlayerSideActor(actor, player)) {
-                    continue;
-                }
+            auto* target = info.getCurrentTarget();
+            const bool targetsPlayerSide =
+                info.currentTargetFormID == playerFormID ||
+                IsObservedPlayerSideActor(target, player);
+            const bool hostileToPlayer = info.hostileToPlayer || actor->IsHostileToActor(player);
+            const bool playerHasLosToActor = HasLineOfSightBetween(player, actor);
+            const bool actorHasLosToPlayer = HasLineOfSightBetween(actor, player);
+            const bool mutualLos = playerHasLosToActor && actorHasLosToPlayer;
 
-                const bool defeatedLivingEnemy = TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor);
-                if (defeatedLivingEnemy) {
-                    ++observed.defeatedLivingEnemyCount;
-                    if (!observed.reasonActorFormID) {
-                        observed.reasonActorFormID = info.formID;
-                    }
-                    AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::DefeatedLivingEnemy);
-                    continue;
+            if (targetsPlayerSide ||
+                (observed.playerInCombat && hostileToPlayer) ||
+                (info.inCombat && hostileToPlayer && (mutualLos || info.dist <= 1800.0f))) {
+                ++observed.activeHostileCount;
+                if (!observed.reasonActorFormID) {
+                    observed.reasonActorFormID = info.formID;
+                    observed.reasonTargetFormID = info.currentTargetFormID;
                 }
-
-                if (!info.standing) {
-                    continue;
+                AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::ActiveHostile);
+            }
+            else if (hostileToPlayer && mutualLos) {
+                ++observed.mutualLosHostileCount;
+                if (!observed.reasonActorFormID) {
+                    observed.reasonActorFormID = info.formID;
                 }
-
-                auto* target = info.getCurrentTarget();
-                const bool targetsPlayerSide =
-                    info.currentTargetFormID == playerFormID ||
-                    IsObservedPlayerSideActor(target, player);
-                const bool hostileToPlayer = info.hostileToPlayer || actor->IsHostileToActor(player);
-                const bool playerHasLosToActor = HasLineOfSightBetween(player, actor);
-                const bool actorHasLosToPlayer = HasLineOfSightBetween(actor, player);
-                const bool mutualLos = playerHasLosToActor && actorHasLosToPlayer;
-
-                if (targetsPlayerSide ||
-                    (observed.playerInCombat && hostileToPlayer) ||
-                    (info.inCombat && hostileToPlayer && (mutualLos || info.dist <= 1800.0f))) {
-                    ++observed.activeHostileCount;
-                    if (!observed.reasonActorFormID) {
-                        observed.reasonActorFormID = info.formID;
-                        observed.reasonTargetFormID = info.currentTargetFormID;
-                    }
-                    AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::ActiveHostile);
-                }
-                else if (hostileToPlayer && mutualLos) {
-                    ++observed.mutualLosHostileCount;
-                    if (!observed.reasonActorFormID) {
-                        observed.reasonActorFormID = info.formID;
-                    }
-                    AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::MutualLosHostile);
-                }
+                AddObservedReasonFlag(observed.reasonFlags, ObservedReasonFlag::MutualLosHostile);
             }
         }
-
-        // R93B: observed is now the FlowController-owned read-only world state.
-        // It is still separate from session root/globals so we can consolidate safely
-        // without changing gameplay behavior in this patch.
-        if (observed.captiveRuntimeActive) {
-            observed.observed = ObservedMainState::Captive;
-        }
-        else if (observed.playerBleedRuntimeActive) {
-            observed.observed = ObservedMainState::Defeat;
-        }
-        else if (observed.activeHostileCount > 0) {
-            observed.observed = ObservedMainState::Incombat;
-        }
-        else if (observed.defeatedLivingEnemyCount > 0) {
-            observed.observed = ObservedMainState::Victory;
-        }
-        else if (observed.mutualLosHostileCount > 0) {
-            observed.observed = ObservedMainState::Precombat;
-        }
-        else {
-            observed.observed = ObservedMainState::Neutral;
-        }
-
-        observed.globalsProjected = ProjectMainStateFromGlobals(observed);
-        return observed;
     }
 
-    static bool ShouldLogObservedMainStateDiagnostic(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::chrono::steady_clock::time_point now)
-    {
-        if (!g_hasObservedDiagnostic) {
-            return true;
+    // R93B: observed is now the FlowController-owned read-only world state.
+    // It is still separate from session root/globals so we can consolidate safely
+    // without changing gameplay behavior in this patch.
+    if (observed.captiveRuntimeActive) {
+        observed.observed = ObservedMainState::Captive;
+    }
+    else if (observed.playerBleedRuntimeActive) {
+        observed.observed = ObservedMainState::Defeat;
+    }
+    else if (observed.activeHostileCount > 0) {
+        observed.observed = ObservedMainState::Incombat;
+    }
+    else if (observed.defeatedLivingEnemyCount > 0) {
+        observed.observed = ObservedMainState::Victory;
+    }
+    else if (observed.mutualLosHostileCount > 0) {
+        observed.observed = ObservedMainState::Precombat;
+    }
+    else {
+        observed.observed = ObservedMainState::Neutral;
+    }
+
+    observed.globalsProjected = ProjectMainStateFromGlobals(observed);
+    return observed;
+}
+
+static bool ShouldLogObservedMainStateDiagnostic(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::chrono::steady_clock::time_point now)
+{
+    if (!g_hasObservedDiagnostic) {
+        return true;
+    }
+    if (observed.observed != g_lastObservedDiagnostic.observed ||
+        observed.rootProjected != g_lastObservedDiagnostic.rootProjected ||
+        observed.globalsProjected != g_lastObservedDiagnostic.globalsProjected ||
+        observed.reasonFlags != g_lastObservedDiagnostic.reasonFlags) {
+        return true;
+    }
+    if (observed.observed != observed.rootProjected || observed.observed != observed.globalsProjected) {
+        return (now - g_lastObservedDiagnosticLog) >= kObservedDiagnosticRepeatInterval;
+    }
+    return false;
+}
+
+static void LogObservedMainStateDiagnostic(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::string_view reason)
+{
+    const auto reasonText = BuildObservedReasonString(observed.reasonFlags);
+    const bool mismatchRoot = observed.observed != observed.rootProjected;
+    const bool mismatchGlobals = observed.observed != observed.globalsProjected;
+
+    spdlog::info(
+        "[TFD][Flow][R93B] observed={} rootProjected={} globalsProjected={} mismatchRoot={} mismatchGlobals={} reason={} flags={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} combatActive={} globals(pre={} in={} victory={} defeat={} captive={} pleasure={} dialogue={}) counts(scanned={} activeHostile={} mutualLos={} defeatedLiving={} playerSide={}) actor={:08X} target={:08X} tickReason={}",
+        ObservedStateName(observed.observed),
+        ObservedStateName(observed.rootProjected),
+        ObservedStateName(observed.globalsProjected),
+        mismatchRoot ? 1 : 0,
+        mismatchGlobals ? 1 : 0,
+        reasonText,
+        observed.reasonFlags,
+        TFD::FlowController::Controller::ToString(observed.flow.root),
+        TFD::FlowController::Controller::ToString(observed.flow.contextRoot),
+        TFD::FlowController::Controller::ToString(observed.flow.gate),
+        TFD::FlowController::Controller::ToString(observed.flow.sub),
+        TFD::FlowController::Controller::ToString(observed.flow.captiveMode),
+        observed.flow.token,
+        observed.flow.primaryActorFormID,
+        observed.combatActiveFlag ? 1 : 0,
+        observed.preCombatGlobal,
+        observed.inCombatGlobal,
+        observed.victoryGlobal,
+        observed.defeatGlobal,
+        observed.captiveGlobal,
+        observed.pleasureGlobal,
+        observed.dialogueGlobal,
+        observed.scannedActorCount,
+        observed.activeHostileCount,
+        observed.mutualLosHostileCount,
+        observed.defeatedLivingEnemyCount,
+        observed.playerSideStandingCount,
+        observed.reasonActorFormID,
+        observed.reasonTargetFormID,
+        reason.empty() ? std::string{ "-" } : std::string{ reason });
+}
+
+
+static bool IsAutoVictoryRootAllowed(TFD::FlowController::RootFlow root)
+{
+    using TFD::FlowController::RootFlow;
+    return root == RootFlow::None || root == RootFlow::InCombat || root == RootFlow::Victory;
+}
+
+static bool ShouldAutoEnterObservedVictory(const TFD::FlowController::ObservedMainStateSnapshot& observed)
+{
+    using TFD::FlowController::ObservedMainState;
+    using TFD::FlowController::RootFlow;
+    using TFD::FlowController::SubFlow;
+
+    if (observed.observed != ObservedMainState::Victory) {
+        return false;
+    }
+    if (observed.activeHostileCount > 0 || observed.defeatedLivingEnemyCount == 0 || observed.reasonActorFormID == 0) {
+        return false;
+    }
+    if (!IsAutoVictoryRootAllowed(observed.flow.root)) {
+        return false;
+    }
+    if (observed.flow.root == RootFlow::Victory && observed.flow.primaryActorFormID == observed.reasonActorFormID) {
+        return false;
+    }
+    if (observed.flow.sub != SubFlow::None || observed.flow.terminalResolved) {
+        return false;
+    }
+    if (observed.captiveRuntimeActive || observed.playerBleedRuntimeActive) {
+        return false;
+    }
+    return true;
+}
+
+static constexpr double kObservedVictoryDialogueReadyHoldSec = 8.0;
+
+static void AutoEnterObservedVictoryIfNeeded(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::string_view tickReason)
+{
+    if (!ShouldAutoEnterObservedVictory(observed)) {
+        return;
+    }
+
+    bool armedDialogueReadyHold = false;
+    if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(observed.reasonActorFormID)) {
+        TFD::Victory::ArmDialogueReadyHold(actor, kObservedVictoryDialogueReadyHoldSec, "observed_defeated_living_enemy");
+        armedDialogueReadyHold = true;
+    }
+
+    TFD::Victory::SetStateValue(2);
+    const bool ok = TFD::FlowController::Controller::GetSingleton().RequestVictory(
+        observed.reasonActorFormID,
+        "observed_defeated_living_enemy");
+    spdlog::info(
+        "[TFD][Flow][R93N] auto enter Victory observed actor={:08X} ok={} readyHold={} root={} ctx={} globalsVictory={} tickReason={} counts(activeHostile={} defeatedLiving={} mutualLos={})",
+        observed.reasonActorFormID,
+        ok ? 1 : 0,
+        armedDialogueReadyHold ? 1 : 0,
+        TFD::FlowController::Controller::ToString(observed.flow.root),
+        TFD::FlowController::Controller::ToString(observed.flow.contextRoot),
+        observed.victoryGlobal,
+        tickReason.empty() ? std::string{ "-" } : std::string{ tickReason },
+        observed.activeHostileCount,
+        observed.defeatedLivingEnemyCount,
+        observed.mutualLosHostileCount);
+}
+
+static RE::Actor* ResolveFallbackPassivePrimaryActor()
+{
+    if (g_passiveRuntimeProviders.resolveFallbackPassivePrimaryActor) {
+        return g_passiveRuntimeProviders.resolveFallbackPassivePrimaryActor();
+    }
+    return nullptr;
+}
+
+static RE::Actor* ResolveCurrentPassivePrimaryActor()
+{
+    const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+    if (snapshot.primaryActorFormID != 0) {
+        if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(snapshot.primaryActorFormID)) {
+            return actor;
         }
-        if (observed.observed != g_lastObservedDiagnostic.observed ||
-            observed.rootProjected != g_lastObservedDiagnostic.rootProjected ||
-            observed.globalsProjected != g_lastObservedDiagnostic.globalsProjected ||
-            observed.reasonFlags != g_lastObservedDiagnostic.reasonFlags) {
-            return true;
-        }
-        if (observed.observed != observed.rootProjected || observed.observed != observed.globalsProjected) {
-            return (now - g_lastObservedDiagnosticLog) >= kObservedDiagnosticRepeatInterval;
-        }
+    }
+
+    if (auto* speaker = TFD::PleasureRuntime::GetPrimarySpeaker()) {
+        return speaker;
+    }
+
+    return ResolveFallbackPassivePrimaryActor();
+}
+
+static bool IsActorCoveredByCurrentPassiveContext(RE::Actor* actor)
+{
+    if (!actor || actor == RE::PlayerCharacter::GetSingleton() || actor->IsDead() || actor->IsDisabled()) {
         return false;
     }
 
-    static void LogObservedMainStateDiagnostic(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::string_view reason)
-    {
-        const auto reasonText = BuildObservedReasonString(observed.reasonFlags);
-        const bool mismatchRoot = observed.observed != observed.rootProjected;
-        const bool mismatchGlobals = observed.observed != observed.globalsProjected;
-
-        spdlog::info(
-            "[TFD][Flow][R93B] observed={} rootProjected={} globalsProjected={} mismatchRoot={} mismatchGlobals={} reason={} flags={} root={} ctx={} gate={} sub={} captiveMode={} token={} primary={:08X} combatActive={} globals(pre={} in={} victory={} defeat={} captive={} pleasure={} dialogue={}) counts(scanned={} activeHostile={} mutualLos={} defeatedLiving={} playerSide={}) actor={:08X} target={:08X} tickReason={}",
-            ObservedStateName(observed.observed),
-            ObservedStateName(observed.rootProjected),
-            ObservedStateName(observed.globalsProjected),
-            mismatchRoot ? 1 : 0,
-            mismatchGlobals ? 1 : 0,
-            reasonText,
-            observed.reasonFlags,
-            TFD::FlowController::Controller::ToString(observed.flow.root),
-            TFD::FlowController::Controller::ToString(observed.flow.contextRoot),
-            TFD::FlowController::Controller::ToString(observed.flow.gate),
-            TFD::FlowController::Controller::ToString(observed.flow.sub),
-            TFD::FlowController::Controller::ToString(observed.flow.captiveMode),
-            observed.flow.token,
-            observed.flow.primaryActorFormID,
-            observed.combatActiveFlag ? 1 : 0,
-            observed.preCombatGlobal,
-            observed.inCombatGlobal,
-            observed.victoryGlobal,
-            observed.defeatGlobal,
-            observed.captiveGlobal,
-            observed.pleasureGlobal,
-            observed.dialogueGlobal,
-            observed.scannedActorCount,
-            observed.activeHostileCount,
-            observed.mutualLosHostileCount,
-            observed.defeatedLivingEnemyCount,
-            observed.playerSideStandingCount,
-            observed.reasonActorFormID,
-            observed.reasonTargetFormID,
-            reason.empty() ? std::string{ "-" } : std::string{ reason });
+    if (g_passiveRuntimeProviders.isActorCoveredByPassiveContext) {
+        return g_passiveRuntimeProviders.isActorCoveredByPassiveContext(actor);
     }
 
-
-    static bool IsAutoVictoryRootAllowed(TFD::FlowController::RootFlow root)
-    {
-        using TFD::FlowController::RootFlow;
-        return root == RootFlow::None || root == RootFlow::InCombat || root == RootFlow::Victory;
-    }
-
-    static bool ShouldAutoEnterObservedVictory(const TFD::FlowController::ObservedMainStateSnapshot& observed)
-    {
-        using TFD::FlowController::ObservedMainState;
-        using TFD::FlowController::RootFlow;
-        using TFD::FlowController::SubFlow;
-
-        if (observed.observed != ObservedMainState::Victory) {
-            return false;
-        }
-        if (observed.activeHostileCount > 0 || observed.defeatedLivingEnemyCount == 0 || observed.reasonActorFormID == 0) {
-            return false;
-        }
-        if (!IsAutoVictoryRootAllowed(observed.flow.root)) {
-            return false;
-        }
-        if (observed.flow.root == RootFlow::Victory && observed.flow.primaryActorFormID == observed.reasonActorFormID) {
-            return false;
-        }
-        if (observed.flow.sub != SubFlow::None || observed.flow.terminalResolved) {
-            return false;
-        }
-        if (observed.captiveRuntimeActive || observed.playerBleedRuntimeActive) {
-            return false;
-        }
+    if (TFD::HostilityController::IsSuppressed(actor)) {
         return true;
     }
 
-    static constexpr double kObservedVictoryDialogueReadyHoldSec = 8.0;
-
-    static void AutoEnterObservedVictoryIfNeeded(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::string_view tickReason)
-    {
-        if (!ShouldAutoEnterObservedVictory(observed)) {
-            return;
-        }
-
-        bool armedDialogueReadyHold = false;
-        if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(observed.reasonActorFormID)) {
-            TFD::Victory::ArmDialogueReadyHold(actor, kObservedVictoryDialogueReadyHoldSec, "observed_defeated_living_enemy");
-            armedDialogueReadyHold = true;
-        }
-
-        TFD::Victory::SetStateValue(2);
-        const bool ok = TFD::FlowController::Controller::GetSingleton().RequestVictory(
-            observed.reasonActorFormID,
-            "observed_defeated_living_enemy");
-        spdlog::info(
-            "[TFD][Flow][R93N] auto enter Victory observed actor={:08X} ok={} readyHold={} root={} ctx={} globalsVictory={} tickReason={} counts(activeHostile={} defeatedLiving={} mutualLos={})",
-            observed.reasonActorFormID,
-            ok ? 1 : 0,
-            armedDialogueReadyHold ? 1 : 0,
-            TFD::FlowController::Controller::ToString(observed.flow.root),
-            TFD::FlowController::Controller::ToString(observed.flow.contextRoot),
-            observed.victoryGlobal,
-            tickReason.empty() ? std::string{ "-" } : std::string{ tickReason },
-            observed.activeHostileCount,
-            observed.defeatedLivingEnemyCount,
-            observed.mutualLosHostileCount);
+    if (TFD::PleasureRuntime::IsActorTracked(actor)) {
+        return true;
     }
 
-    static RE::Actor* ResolveFallbackPassivePrimaryActor()
-    {
-        if (g_passiveRuntimeProviders.resolveFallbackPassivePrimaryActor) {
-            return g_passiveRuntimeProviders.resolveFallbackPassivePrimaryActor();
+    if (auto* primary = ResolveCurrentPassivePrimaryActor()) {
+        if (actor == primary) {
+            return true;
         }
+        if (TFD::Actor::SharesAllowedFactionExact(actor, primary)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg)
+{
+    if (arg.empty()) {
         return nullptr;
     }
 
-    static RE::Actor* ResolveCurrentPassivePrimaryActor()
-    {
-        const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
-        if (snapshot.primaryActorFormID != 0) {
-            if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(snapshot.primaryActorFormID)) {
-                return actor;
-            }
-        }
-
-        if (auto* speaker = TFD::PleasureRuntime::GetPrimarySpeaker()) {
-            return speaker;
-        }
-
-        return ResolveFallbackPassivePrimaryActor();
+    std::string parsedArg(arg);
+    char* end = nullptr;
+    const auto raw = std::strtoul(parsedArg.c_str(), &end, 0);
+    if (end == nullptr || end == parsedArg.c_str()) {
+        return nullptr;
     }
 
-    static bool IsActorCoveredByCurrentPassiveContext(RE::Actor* actor)
-    {
-        if (!actor || actor == RE::PlayerCharacter::GetSingleton() || actor->IsDead() || actor->IsDisabled()) {
-            return false;
-        }
+    return RE::TESForm::LookupByID<RE::Actor>(static_cast<RE::FormID>(raw));
+}
 
-        if (g_passiveRuntimeProviders.isActorCoveredByPassiveContext) {
-            return g_passiveRuntimeProviders.isActorCoveredByPassiveContext(actor);
-        }
-
-        if (TFD::HostilityController::IsSuppressed(actor)) {
-            return true;
-        }
-
-        if (TFD::PleasureRuntime::IsActorTracked(actor)) {
-            return true;
-        }
-
-        if (auto* primary = ResolveCurrentPassivePrimaryActor()) {
-            if (actor == primary) {
-                return true;
-            }
-            if (TFD::Actor::SharesAllowedFactionExact(actor, primary)) {
-                return true;
-            }
-        }
-
-        return false;
+static RE::FormID ResolveActorFormIDFromEventArg(const std::string_view& arg)
+{
+    if (auto* actor = ResolveActorFromEventArg(arg)) {
+        return actor->GetFormID();
     }
+    return 0;
+}
 
-    static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg)
-    {
-        if (arg.empty()) {
-            return nullptr;
-        }
 
-        std::string parsedArg(arg);
-        char* end = nullptr;
-        const auto raw = std::strtoul(parsedArg.c_str(), &end, 0);
-        if (end == nullptr || end == parsedArg.c_str()) {
-            return nullptr;
-        }
+static bool IsValidReleaseWakeActor(RE::Actor* actor, RE::Actor* player)
+{
+    return actor &&
+        player &&
+        actor != player &&
+        !actor->IsDead() &&
+        !actor->IsDisabled();
+}
 
-        return RE::TESForm::LookupByID<RE::Actor>(static_cast<RE::FormID>(raw));
-    }
-
-    static RE::FormID ResolveActorFormIDFromEventArg(const std::string_view& arg)
-    {
-        if (auto* actor = ResolveActorFromEventArg(arg)) {
-            return actor->GetFormID();
-        }
+static std::size_t WakeInCombatReleasePackForDetection(const std::vector<RE::Actor*>& actors, std::string_view reason)
+{
+    auto* player = RE::PlayerCharacter::GetSingleton();
+    if (!player || actors.empty()) {
         return 0;
     }
 
-
-    static bool IsValidReleaseWakeActor(RE::Actor* actor, RE::Actor* player)
-    {
-        return actor &&
-            player &&
-            actor != player &&
-            !actor->IsDead() &&
-            !actor->IsDisabled();
+    if (auto* process = RE::ProcessLists::GetSingleton()) {
+        process->runDetection = true;
+        process->ClearCachedFactionFightReactions();
     }
 
-    static std::size_t WakeInCombatReleasePackForDetection(const std::vector<RE::Actor*>& actors, std::string_view reason)
-    {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player || actors.empty()) {
-            return 0;
+    std::vector<RE::FormID> seen;
+    seen.reserve(actors.size());
+    std::size_t queued = 0;
+
+    for (auto* actor : actors) {
+        if (!IsValidReleaseWakeActor(actor, player)) {
+            continue;
         }
 
-        if (auto* process = RE::ProcessLists::GetSingleton()) {
-            process->runDetection = true;
-            process->ClearCachedFactionFightReactions();
+        const RE::FormID actorId = actor->GetFormID();
+        if (actorId == 0 || std::find(seen.begin(), seen.end(), actorId) != seen.end()) {
+            continue;
+        }
+        seen.push_back(actorId);
+
+        const bool hostileBefore = actor->IsHostileToActor(player);
+        const bool inCombatBefore = actor->IsInCombat();
+
+        actor->SetBeenAttacked(true);
+        player->SetBeenAttacked(true);
+        (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+        (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+        if (!actor->IsWeaponDrawn()) {
+            actor->DrawWeaponMagicHands(true);
         }
 
-        std::vector<RE::FormID> seen;
-        seen.reserve(actors.size());
-        std::size_t queued = 0;
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
 
-        for (auto* actor : actors) {
-            if (!IsValidReleaseWakeActor(actor, player)) {
-                continue;
-            }
-
-            const RE::FormID actorId = actor->GetFormID();
-            if (actorId == 0 || std::find(seen.begin(), seen.end(), actorId) != seen.end()) {
-                continue;
-            }
-            seen.push_back(actorId);
-
-            const bool hostileBefore = actor->IsHostileToActor(player);
-            const bool inCombatBefore = actor->IsInCombat();
-
-            actor->SetBeenAttacked(true);
-            player->SetBeenAttacked(true);
-            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
-            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
-
-            if (!actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(true);
-            }
-
-            actor->EvaluatePackage(false, true);
-            actor->EvaluatePackage(true, true);
-
-            const bool sent = TFD::FlowController::QueueBridgeModEvent(
-                "TFDInCombatResumeCombat",
-                actor,
-                "incombat_release_detection_wake",
-                1.0f);
-            if (sent) {
-                ++queued;
-            }
-
-            spdlog::info(
-                "[TFD][Flow][R93Y] incombat release detection wake actor={:08X} hostileBefore={} inCombatBefore={} eventQueued={} reason={}",
-                actorId,
-                hostileBefore ? 1 : 0,
-                inCombatBefore ? 1 : 0,
-                sent ? 1 : 0,
-                reason.empty() ? std::string{ "-" } : std::string{ reason });
-        }
-
-        if (auto* process = RE::ProcessLists::GetSingleton()) {
-            process->ClearCachedFactionFightReactions();
+        const bool sent = TFD::FlowController::QueueBridgeModEvent(
+            "TFDInCombatResumeCombat",
+            actor,
+            "incombat_release_detection_wake",
+            1.0f);
+        if (sent) {
+            ++queued;
         }
 
         spdlog::info(
-            "[TFD][Flow][R93Y] incombat release detection wake summary candidates={} queued={} reason={}",
-            static_cast<unsigned int>(actors.size()),
-            static_cast<unsigned int>(queued),
+            "[TFD][Flow][R93Y] incombat release detection wake actor={:08X} hostileBefore={} inCombatBefore={} eventQueued={} reason={}",
+            actorId,
+            hostileBefore ? 1 : 0,
+            inCombatBefore ? 1 : 0,
+            sent ? 1 : 0,
             reason.empty() ? std::string{ "-" } : std::string{ reason });
-
-        return queued;
     }
 
-    static RE::FormID ResolveActorFormIDFromEventArgOrSender(const std::string_view& arg, RE::TESForm* sender)
-    {
-        if (const auto actorFormID = ResolveActorFormIDFromEventArg(arg); actorFormID != 0) {
-            return actorFormID;
-        }
-
-        if (sender) {
-            if (auto* actor = sender->As<RE::Actor>()) {
-                return actor->GetFormID();
-            }
-            return sender->GetFormID();
-        }
-
-        return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
+    if (auto* process = RE::ProcessLists::GetSingleton()) {
+        process->ClearCachedFactionFightReactions();
     }
 
-    static int ResolveSourceFlowFromEventArg(const std::string_view& arg)
-    {
-        if (arg.empty()) {
-            return 0;
-        }
+    spdlog::info(
+        "[TFD][Flow][R93Y] incombat release detection wake summary candidates={} queued={} reason={}",
+        static_cast<unsigned int>(actors.size()),
+        static_cast<unsigned int>(queued),
+        reason.empty() ? std::string{ "-" } : std::string{ reason });
 
-        const auto firstSep = arg.find('|');
-        if (firstSep == std::string_view::npos || firstSep + 1 >= arg.size()) {
-            return 0;
-        }
+    return queued;
+}
 
-        auto sourceView = arg.substr(firstSep + 1);
-        const auto secondSep = sourceView.find('|');
-        if (secondSep != std::string_view::npos) {
-            sourceView = sourceView.substr(0, secondSep);
-        }
-
-        std::string sourceText(sourceView);
-        char* end = nullptr;
-        const auto raw = std::strtol(sourceText.c_str(), &end, 10);
-        if (end == nullptr || end == sourceText.c_str()) {
-            return 0;
-        }
-
-        return static_cast<int>(raw);
+static RE::FormID ResolveActorFormIDFromEventArgOrSender(const std::string_view& arg, RE::TESForm* sender)
+{
+    if (const auto actorFormID = ResolveActorFormIDFromEventArg(arg); actorFormID != 0) {
+        return actorFormID;
     }
 
-    static bool IsAfterPleasureTerminalChoiceEvent(std::string_view name)
-    {
-        return name == kAfterPleasureChoiceReleaseEvent ||
-            name == kAfterPleasureChoiceRecruitEvent ||
-            name == kAfterPleasureChoiceFinishEvent ||
-            name == kAfterPleasureChoiceJoinEnemyEvent ||
-            name == kAfterPleasureChoiceKidnapEvent ||
-            name == kAfterPleasureChoiceWorkEvent;
+    if (sender) {
+        if (auto* actor = sender->As<RE::Actor>()) {
+            return actor->GetFormID();
+        }
+        return sender->GetFormID();
     }
 
-    static bool IsInCombatSource(int sourceFlow)
-    {
-        return sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::InCombat);
+    return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
+}
+
+static int ResolveSourceFlowFromEventArg(const std::string_view& arg)
+{
+    if (arg.empty()) {
+        return 0;
     }
 
-    static TFD::HostilityController::ReleaseReason ResolveInCombatTerminalReleaseReason(std::string_view name)
-    {
-        using TFD::HostilityController::ReleaseReason;
-        if (name == kAfterPleasureChoiceFinishEvent) {
-            return ReleaseReason::DialogueClosed;
-        }
-        // R99A: recruit terminal from an InCombat after-pleasure chain is not a
-        // normal Generic cleanup. Generic releases only remove TFD suppression; they do
-        // not wake the engine detection/combat cache. After recruit, converted teammates
-        // must keep follow package, while any remaining hostile pack members must have
-        // detection rearmed after the truce aliases are cleared.
-        if (name == kAfterPleasureChoiceRecruitEvent) {
-            return ReleaseReason::InCombatPleasureEnd;
-        }
-        return ReleaseReason::Generic;
+    const auto firstSep = arg.find('|');
+    if (firstSep == std::string_view::npos || firstSep + 1 >= arg.size()) {
+        return 0;
     }
 
-    static const char* ResolveInCombatTerminalReason(std::string_view name)
-    {
-        if (name == kAfterPleasureChoiceReleaseEvent) {
-            return "incombat_after_pleasure_release";
-        }
-        if (name == kAfterPleasureChoiceRecruitEvent) {
-            return "incombat_after_pleasure_recruit";
-        }
-        if (name == kAfterPleasureChoiceFinishEvent) {
-            return "incombat_after_pleasure_finish";
-        }
-        if (name == kAfterPleasureChoiceJoinEnemyEvent) {
-            return "incombat_after_pleasure_join_enemy";
-        }
-        if (name == kAfterPleasureChoiceKidnapEvent) {
-            return "incombat_after_pleasure_kidnap";
-        }
-        if (name == kAfterPleasureChoiceWorkEvent) {
-            return "incombat_after_pleasure_work";
-        }
-        return "incombat_after_pleasure_terminal";
+    auto sourceView = arg.substr(firstSep + 1);
+    const auto secondSep = sourceView.find('|');
+    if (secondSep != std::string_view::npos) {
+        sourceView = sourceView.substr(0, secondSep);
     }
 
-    static std::uint32_t ResolveBleedFlowActorFormIDFromProviders()
-    {
-        if (g_outcomeRuntimeProviders.resolveBleedFlowActorFormID) {
-            return g_outcomeRuntimeProviders.resolveBleedFlowActorFormID();
-        }
-        return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
+    std::string sourceText(sourceView);
+    char* end = nullptr;
+    const auto raw = std::strtol(sourceText.c_str(), &end, 10);
+    if (end == nullptr || end == sourceText.c_str()) {
+        return 0;
     }
 
-    static bool IsBleedStateActiveFromProviders()
-    {
-        return g_outcomeRuntimeProviders.isBleedStateActive && g_outcomeRuntimeProviders.isBleedStateActive();
+    return static_cast<int>(raw);
+}
+
+static bool IsAfterPleasureTerminalChoiceEvent(std::string_view name)
+{
+    return name == kAfterPleasureChoiceReleaseEvent ||
+        name == kAfterPleasureChoiceRecruitEvent ||
+        name == kAfterPleasureChoiceFinishEvent ||
+        name == kAfterPleasureChoiceJoinEnemyEvent ||
+        name == kAfterPleasureChoiceKidnapEvent ||
+        name == kAfterPleasureChoiceWorkEvent;
+}
+
+static bool IsInCombatSource(int sourceFlow)
+{
+    return sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::InCombat);
+}
+
+static TFD::HostilityController::ReleaseReason ResolveInCombatTerminalReleaseReason(std::string_view name)
+{
+    using TFD::HostilityController::ReleaseReason;
+    if (name == kAfterPleasureChoiceFinishEvent) {
+        return ReleaseReason::DialogueClosed;
     }
+    // R99A: recruit terminal from an InCombat after-pleasure chain is not a
+    // normal Generic cleanup. Generic releases only remove TFD suppression; they do
+    // not wake the engine detection/combat cache. After recruit, converted teammates
+    // must keep follow package, while any remaining hostile pack members must have
+    // detection rearmed after the truce aliases are cleared.
+    if (name == kAfterPleasureChoiceRecruitEvent) {
+        return ReleaseReason::InCombatPleasureEnd;
+    }
+    return ReleaseReason::Generic;
+}
+
+static const char* ResolveInCombatTerminalReason(std::string_view name)
+{
+    if (name == kAfterPleasureChoiceReleaseEvent) {
+        return "incombat_after_pleasure_release";
+    }
+    if (name == kAfterPleasureChoiceRecruitEvent) {
+        return "incombat_after_pleasure_recruit";
+    }
+    if (name == kAfterPleasureChoiceFinishEvent) {
+        return "incombat_after_pleasure_finish";
+    }
+    if (name == kAfterPleasureChoiceJoinEnemyEvent) {
+        return "incombat_after_pleasure_join_enemy";
+    }
+    if (name == kAfterPleasureChoiceKidnapEvent) {
+        return "incombat_after_pleasure_kidnap";
+    }
+    if (name == kAfterPleasureChoiceWorkEvent) {
+        return "incombat_after_pleasure_work";
+    }
+    return "incombat_after_pleasure_terminal";
+}
+
+static const char* ResolveBleedoutAfterPleasureTerminalReason(std::string_view name)
+{
+    if (name == kAfterPleasureChoiceReleaseEvent) {
+        return "bleedout_after_pleasure_release";
+    }
+    if (name == kAfterPleasureChoiceRecruitEvent) {
+        return "bleedout_after_pleasure_recruit";
+    }
+    if (name == kAfterPleasureChoiceFinishEvent) {
+        return "bleedout_after_pleasure_finish";
+    }
+    if (name == kAfterPleasureChoiceJoinEnemyEvent) {
+        return "bleedout_after_pleasure_join_enemy";
+    }
+    if (name == kAfterPleasureChoiceKidnapEvent) {
+        return "bleedout_after_pleasure_kidnap";
+    }
+    if (name == kAfterPleasureChoiceWorkEvent) {
+        return "bleedout_after_pleasure_work";
+    }
+    return "bleedout_after_pleasure_terminal";
+}
+
+static std::uint32_t ResolveBleedFlowActorFormIDFromProviders()
+{
+    if (g_outcomeRuntimeProviders.resolveBleedFlowActorFormID) {
+        return g_outcomeRuntimeProviders.resolveBleedFlowActorFormID();
+    }
+    return TFD::FlowController::Controller::GetSingleton().GetSnapshot().primaryActorFormID;
+}
+
+static bool IsBleedStateActiveFromProviders()
+{
+    return g_outcomeRuntimeProviders.isBleedStateActive && g_outcomeRuntimeProviders.isBleedStateActive();
+}
 
 namespace TFD::FlowController
 {
@@ -963,7 +988,7 @@ namespace TFD::FlowController
         }
     }
 
-void InstallRuntime()
+    void InstallRuntime()
     {
         g_flowRuntimeInstalled = true;
         TFD::Release::Install();
@@ -994,7 +1019,8 @@ void InstallRuntime()
         RE::Actor* player = nullptr;
         if (g_continuousRuntimeProviders.resolvePlayer) {
             player = g_continuousRuntimeProviders.resolvePlayer();
-        } else {
+        }
+        else {
             player = RE::PlayerCharacter::GetSingleton();
         }
         if (!player) {
@@ -1034,7 +1060,7 @@ void InstallRuntime()
         g_continuousRuntimeProviders = {};
     }
 
-        void Controller::RefreshFlowGlobalsLocked()
+    void Controller::RefreshFlowGlobalsLocked()
     {
         ResolveGlobal(g_preCombatState, "TFDPreCombatState");
         ResolveGlobal(g_inCombatState, "TFDInCombatState");
@@ -1050,8 +1076,8 @@ void InstallRuntime()
         const bool bleedoutAfterPleasure =
             runtimeSource == TFD::PleasureRuntime::SourceContext::Bleedout &&
             (runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest ||
-             runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue ||
-             runtimePhase == TFD::PleasureRuntime::Phase::Finalizing);
+                runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue ||
+                runtimePhase == TFD::PleasureRuntime::Phase::Finalizing);
 
         int inCombat = (defeat == 2) ? 0 : (_combatActive ? 1 : 0);
         if (_snapshot.sub == SubFlow::BleedoutAfterPleasure || bleedoutAfterPleasure) {
@@ -1092,7 +1118,8 @@ void InstallRuntime()
             default:
                 break;
             }
-        } else {
+        }
+        else {
             switch (_snapshot.sub) {
             case SubFlow::PreCombatPleasure:
             case SubFlow::InCombatPleasure:
@@ -1126,21 +1153,21 @@ void InstallRuntime()
     }
 
 
-	void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers)
-	{
-		InstallPassiveRuntimeProviders(std::move(providers.passive));
-		InstallOutcomeRuntimeProviders(std::move(providers.outcome));
-		InstallBattleObserverRuntimeProviders(std::move(providers.battleObserver));
+    void InstallDefeatLifecycleProviders(DefeatLifecycleProviders providers)
+    {
+        InstallPassiveRuntimeProviders(std::move(providers.passive));
+        InstallOutcomeRuntimeProviders(std::move(providers.outcome));
+        InstallBattleObserverRuntimeProviders(std::move(providers.battleObserver));
         InstallContinuousRuntimeProviders(std::move(providers.continuous));
-	}
+    }
 
-	void ResetDefeatLifecycleProviders()
-	{
-		ResetPassiveRuntimeProviders();
-		ResetOutcomeRuntimeProviders();
-		ResetBattleObserverRuntimeProviders();
+    void ResetDefeatLifecycleProviders()
+    {
+        ResetPassiveRuntimeProviders();
+        ResetOutcomeRuntimeProviders();
+        ResetBattleObserverRuntimeProviders();
         ResetContinuousRuntimeProviders();
-	}
+    }
 
     void InstallPassiveRuntimeProviders(PassiveRuntimeProviders providers)
     {
@@ -1285,7 +1312,7 @@ void InstallRuntime()
     bool ApplyObservedDefeatResolution(const ObservedDefeatInput& input, std::string_view reason)
     {
         const auto resolution = EvaluateObservedDefeatResolution(input);
-        const std::string reasonText = reason.empty() ? std::string{"observed_defeat_resolution"} : std::string{reason};
+        const std::string reasonText = reason.empty() ? std::string{ "observed_defeat_resolution" } : std::string{ reason };
         const auto* why = reasonText.c_str();
         spdlog::info(
             "[TFD][Flow] observed defeat input reason={} resolved={} hadEnemy={} playerSide={} teammate={} hostile={} marker={} fallback={} forceCaptive={} actor={:08X}",
@@ -1314,7 +1341,8 @@ void InstallRuntime()
             const bool ok = Controller::GetSingleton().RequestCaptive(actorFormID, CaptiveMode::Kidnapped, why);
             if (!ok) {
                 spdlog::warn("[TFD][Flow] observed defeat decision=captive reject actor={:08X} reason={}", actorFormID, why);
-            } else {
+            }
+            else {
                 spdlog::info("[TFD][Flow] observed defeat decision=captive actor={:08X} reason={}", actorFormID, why);
             }
             return ok;
@@ -1425,24 +1453,29 @@ void InstallRuntime()
             outcome = VictoryOutcome::RecruitEnemy;
             reason = "mod_event_victory_recruit";
             completeReason = "mod_event_victory_recruit_complete";
-        } else if (name == kVictoryOutcomeKillEvent) {
+        }
+        else if (name == kVictoryOutcomeKillEvent) {
             outcome = VictoryOutcome::KillEnemy;
             reason = "mod_event_victory_kill";
             completeReason = "mod_event_victory_kill_complete";
-        } else if (name == kVictoryOutcomeLootEvent) {
+        }
+        else if (name == kVictoryOutcomeLootEvent) {
             outcome = VictoryOutcome::Cancel;
             reason = "mod_event_victory_loot";
             completeReason = "mod_event_victory_loot_complete";
-        } else if (name == kVictoryOutcomeCancelEvent) {
+        }
+        else if (name == kVictoryOutcomeCancelEvent) {
             outcome = VictoryOutcome::Cancel;
             reason = "mod_event_victory_cancel";
             completeReason = "mod_event_victory_cancel_complete";
-        } else if (name == kVictoryOutcomePleasureEvent) {
+        }
+        else if (name == kVictoryOutcomePleasureEvent) {
             outcome = VictoryOutcome::Pleasure;
             reason = "mod_event_victory_pleasure";
             completeReason = "mod_event_victory_pleasure_complete";
             terminalOutcome = false;
-        } else {
+        }
+        else {
             return false;
         }
 
@@ -1453,9 +1486,11 @@ void InstallRuntime()
 
         if (before.root == RootFlow::Victory) {
             ok = flow.RequestResolveVictoryOutcome(outcome, actorFormID, reason);
-        } else if (before.contextRoot == RootFlow::Victory && before.terminalResolved) {
+        }
+        else if (before.contextRoot == RootFlow::Victory && before.terminalResolved) {
             ok = true;
-        } else {
+        }
+        else {
             spdlog::info(
                 "[TFD][Flow] victory outcome event={} actor={:08X} sender={:08X} ignored root={} ctx={} terminal={} primary={:08X}",
                 std::string(name),
@@ -1477,7 +1512,8 @@ void InstallRuntime()
                     forcedClear = true;
                 }
             }
-        } else if (!ok && terminalOutcome) {
+        }
+        else if (!ok && terminalOutcome) {
             const auto afterReject = flow.GetSnapshot();
             if (afterReject.root == RootFlow::Victory) {
                 flow.ResetRuntime(completeReason);
@@ -1518,7 +1554,8 @@ void InstallRuntime()
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::ReleasedWork);
             }
-        } else if (name == kCaptiveOutcomeReturnEvent) {
+        }
+        else if (name == kCaptiveOutcomeReturnEvent) {
             reason = "mod_event_captive_return";
             ok = flow.RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason);
             if (ok) {
@@ -1527,7 +1564,8 @@ void InstallRuntime()
                     TFD::Captive::SyncPlayerAlias(player, reason);
                 }
             }
-        } else if (name == kCaptiveOutcomeReleaseEvent) {
+        }
+        else if (name == kCaptiveOutcomeReleaseEvent) {
             reason = "mod_event_captive_release";
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Release, actorFormID, reason);
@@ -1536,10 +1574,12 @@ void InstallRuntime()
             TFD::Actor::Ops::ClearAggressorFactionContext();
             if (ok) {
                 (void)flow.RequestCompleteTerminalContext("mod_event_captive_release_complete");
-            } else {
+            }
+            else {
                 flow.ResetRuntime("mod_event_captive_release_force_clear");
             }
-        } else if (name == kCaptiveOutcomeCancelEvent) {
+        }
+        else if (name == kCaptiveOutcomeCancelEvent) {
             reason = "mod_event_captive_cancel";
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Cancel, actorFormID, reason);
@@ -1548,10 +1588,12 @@ void InstallRuntime()
             TFD::Actor::Ops::ClearAggressorFactionContext();
             if (ok) {
                 (void)flow.RequestCompleteTerminalContext("mod_event_captive_cancel_complete");
-            } else {
+            }
+            else {
                 flow.ResetRuntime("mod_event_captive_cancel_force_clear");
             }
-        } else if (name == kCaptiveOutcomeEscapeEvent) {
+        }
+        else if (name == kCaptiveOutcomeEscapeEvent) {
             reason = "mod_event_captive_escape";
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::EscapeStarted, actorFormID, reason);
@@ -1560,14 +1602,16 @@ void InstallRuntime()
                 TFD::HostilityController::ClearAggressionClamp();
                 TFD::Actor::Ops::ClearAggressorFactionContext();
             }
-        } else if (name == kCaptiveOutcomePleasureEvent) {
+        }
+        else if (name == kCaptiveOutcomePleasureEvent) {
             reason = "mod_event_captive_pleasure";
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Scene);
             }
-        } else {
+        }
+        else {
             return false;
         }
 
@@ -1691,6 +1735,19 @@ void InstallRuntime()
                     TFD::HostilityController::ToString(releaseReason));
                 return true;
             }
+            if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
+                const char* terminalReason = ResolveBleedoutAfterPleasureTerminalReason(name);
+                const bool completeFlow = TFD::Bleedout::CompleteAfterPleasure(terminalReason);
+                TFD::InteractionRouter::ClearInteractionStateValue();
+                spdlog::info(
+                    "[TFD][Flow][R114] bleedout after pleasure terminal event={} source={} actor={:08X} flowComplete={} reason={}",
+                    std::string(name),
+                    sourceFlow,
+                    actor->GetFormID(),
+                    completeFlow ? 1 : 0,
+                    terminalReason);
+                return true;
+            }
         }
 
         if (HandleVictoryOutcomeModEvent(name, arg, sender)) {
@@ -1701,18 +1758,52 @@ void InstallRuntime()
             return true;
         }
 
+        if (name == kAfterPleasureForceOpenEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
+                const bool beginAfter = TFD::Bleedout::HandleAfterPleasureEnter(actor, "bleedout_after_pleasure_force_open");
+                const bool nativeOpen = (beginAfter || TFD::Bleedout::OwnsCurrentFlow())
+                    ? TFD::BleedoutGreet::BeginAfterPleasure(actor, "bleedout_after_pleasure_force_open")
+                    : false;
+                spdlog::info(
+                    "[TFD][Flow][R125] bleedout after pleasure force-open follows native pattern source={} actor={:08X} flowBegin={} nativeHardOpen={}",
+                    sourceFlow,
+                    actor->GetFormID(),
+                    beginAfter ? 1 : 0,
+                    nativeOpen ? 1 : 0);
+            }
+            else {
+                spdlog::warn(
+                    "[TFD][Flow][R110] after pleasure force-open ignored source={} actor={:08X}",
+                    sourceFlow,
+                    actor ? actor->GetFormID() : 0u);
+            }
+            return true;
+        }
+
         if (name == kAfterPleasureEnterEvent) {
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
             auto& flow = TFD::FlowController::Controller::GetSingleton();
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
-                if (TFD::Bleedout::HandleAfterPleasureEnter(actor, "after_pleasure_enter")) {
-                    TFD::BleedoutGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
-                    spdlog::info("[TFD][Flow] bleedout after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
-                } else {
-                    spdlog::warn("[TFD][Flow] bleedout after pleasure flow reject source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
+                const bool beginAfter = TFD::Bleedout::HandleAfterPleasureEnter(actor, "bleedout_after_pleasure_enter");
+                const bool nativeOpen = (beginAfter || TFD::Bleedout::OwnsCurrentFlow())
+                    ? TFD::BleedoutGreet::BeginAfterPleasure(actor, "bleedout_after_pleasure_enter")
+                    : false;
+                if (beginAfter || nativeOpen) {
+                    spdlog::info(
+                        "[TFD][Flow][R125] bleedout after pleasure greet armed source={} actor={:08X} flowBegin={} nativeHardOpen={}",
+                        sourceFlow,
+                        actor->GetFormID(),
+                        beginAfter ? 1 : 0,
+                        nativeOpen ? 1 : 0);
                 }
-            } else if (actor && IsInCombatSource(sourceFlow)) {
+                else {
+                    spdlog::warn("[TFD][Flow][R125] bleedout after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
+                }
+            }
+            else if (actor && IsInCombatSource(sourceFlow)) {
                 const bool beginAfter = flow.RequestBeginAfterPleasure(actor->GetFormID(), "incombat_after_pleasure_enter");
                 if (beginAfter || flow.IsInCombatAfterPleasureContextActive()) {
                     (void)TFD::InCombat::HandleAfterPleasureEnter(
@@ -1723,16 +1814,20 @@ void InstallRuntime()
                             [&](RE::Actor* greetActor, const char* r) -> bool { return TFD::InCombatGreet::BeginAfterPleasure(greetActor, r); }
                         });
                     spdlog::info("[TFD][Flow][R93T] incombat after pleasure greet armed source={} actor={:08X} flowBegin={}", sourceFlow, actor->GetFormID(), beginAfter ? 1 : 0);
-                } else {
+                }
+                else {
                     spdlog::warn("[TFD][Flow][R93T] incombat after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor->GetFormID());
                 }
-            } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
+            }
+            else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
                 (void)TFD::CaptiveGreet::BeginAfterPleasure(actor, "after_pleasure_enter");
                 spdlog::info("[TFD][Flow] captive after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
-            } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Teammate)) {
+            }
+            else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Teammate)) {
                 TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
                 spdlog::info("[TFD][Flow] teammate after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
-            } else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::PreCombat)) {
+            }
+            else if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::PreCombat)) {
                 if (flow.RequestBeginAfterPleasure(actor->GetFormID(), "after_pleasure_enter")) {
                     TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
                     spdlog::info("[TFD][Flow] precombat after pleasure greet armed source={} actor={:08X}", sourceFlow, actor->GetFormID());
@@ -1756,7 +1851,8 @@ void InstallRuntime()
             if (actor && cycleReleaseGrace) {
                 TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnly(actor, "incombat_cycle_release_end");
                 graceRemoved = true;
-            } else if (actor && g_outcomeRuntimeProviders.removeReleaseFollowGrace) {
+            }
+            else if (actor && g_outcomeRuntimeProviders.removeReleaseFollowGrace) {
                 g_outcomeRuntimeProviders.removeReleaseFollowGrace(actor, "incombat_release_end");
                 graceRemoved = true;
             }
@@ -1903,6 +1999,77 @@ void InstallRuntime()
             return true;
         }
 
+        // Bleedout terminal outcomes must be consumed before the generic Release router.
+        // Otherwise TFDBleedoutOutcomeRelease is treated as a vanilla release and bypasses
+        // the Bleedout-owned cleanup/transition path.
+        if (name == kBleedoutOutcomeDoNothingEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            std::uint32_t actorFormID = actor ? actor->GetFormID() : 0;
+            if (!actorFormID) {
+                actorFormID = ResolveBleedFlowActorFormIDFromProviders();
+                actor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+            }
+
+            const bool bleedActive = IsBleedStateActiveFromProviders();
+            bool flowResolved = false;
+            bool leftForDeadStarted = false;
+            if (bleedActive) {
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                flowResolved = flow.RequestResolveBleedoutOutcome(BleedoutOutcome::Cancel, actorFormID, "bleedout_do_nothing_left_for_dead");
+                TFD::FlowController::HandleObservedLeftForDead("bleedout_do_nothing_left_for_dead");
+                leftForDeadStarted = true;
+            }
+
+            spdlog::info(
+                "[TFD][Flow][R100L] bleedout do-nothing -> left-for-dead actor={:08X} bleedActive={} flowResolved={} started={}",
+                actorFormID,
+                bleedActive ? 1 : 0,
+                flowResolved ? 1 : 0,
+                leftForDeadStarted ? 1 : 0);
+            return true;
+        }
+
+        if (name == kBleedoutOutcomeReleaseEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            std::uint32_t actorFormID = actor ? actor->GetFormID() : 0;
+            if (!actorFormID) {
+                actorFormID = ResolveBleedFlowActorFormIDFromProviders();
+                actor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+            }
+
+            const double durationSec = numArg > 0.0f ? static_cast<double>(numArg) : 10.0;
+            constexpr const char* graceReason = "bleedout_release";
+            if (actor && g_outcomeRuntimeProviders.applyReleaseFollowGrace) {
+                g_outcomeRuntimeProviders.applyReleaseFollowGrace(actor, durationSec, graceReason);
+            }
+            else if (!actor) {
+                spdlog::warn(
+                    "[TFD][Flow][R100C] bleedout release has no valid actor arg={} resolved={:08X}",
+                    strArg ? strArg : "",
+                    actorFormID);
+            }
+
+            const bool bleedActive = IsBleedStateActiveFromProviders();
+            bool flowResolved = false;
+            bool terminalComplete = false;
+            if (bleedActive) {
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                flowResolved = flow.RequestResolveBleedoutOutcome(BleedoutOutcome::Cancel, actorFormID, graceReason);
+                terminalComplete = TFD::Bleedout::CompletePayRelease(
+                    graceReason,
+                    TFD::Bleedout::Builders::BuildPayReleaseCompletionHandlers());
+            }
+
+            spdlog::info(
+                "[TFD][Flow][R100C] bleedout release terminal actor={:08X} seconds={:.1f} bleedActive={} flowResolved={} terminalComplete={}",
+                actorFormID,
+                durationSec,
+                bleedActive ? 1 : 0,
+                flowResolved ? 1 : 0,
+                terminalComplete ? 1 : 0);
+            return true;
+        }
+
         SKSE::ModCallbackEvent callbackEv{ eventName, strArg ? strArg : "", numArg, sender };
         if (TFD::Release::HandleModCallbackEvent(&callbackEv)) {
             return true;
@@ -1924,16 +2091,15 @@ void InstallRuntime()
             return true;
         }
 
-        if (name == kBleedoutOutcomeReleaseEvent || name == kPleasureOutcomeReleaseEvent) {
+        if (name == kPleasureOutcomeReleaseEvent) {
             auto* actor = ResolveActorFromEventArg(arg);
             const double durationSec = numArg > 0.0f ? static_cast<double>(numArg) : 20.0;
             if (!actor) {
                 spdlog::warn("[TFD][Flow] grace event={} ignored reason=invalid_actor arg={}", std::string(name), strArg ? strArg : "");
                 return true;
             }
-            const char* graceReason = name == kBleedoutOutcomeReleaseEvent ? "bleedout_release" : "pleasure_release";
             if (g_outcomeRuntimeProviders.applyReleaseFollowGrace) {
-                g_outcomeRuntimeProviders.applyReleaseFollowGrace(actor, durationSec, graceReason);
+                g_outcomeRuntimeProviders.applyReleaseFollowGrace(actor, durationSec, "pleasure_release");
             }
             return true;
         }
@@ -2305,7 +2471,8 @@ void InstallRuntime()
                 if (!outSender && senderFormID != 0) {
                     outSender = RE::TESForm::LookupByID(senderFormID);
                 }
-            } else if (senderFormID != 0) {
+            }
+            else if (senderFormID != 0) {
                 outSender = RE::TESForm::LookupByID(senderFormID);
             }
 
@@ -2322,7 +2489,7 @@ void InstallRuntime()
                 name,
                 senderFormID,
                 outSender ? outSender->GetFormID() : 0u);
-        });
+            });
 
         return true;
     }
@@ -3371,8 +3538,8 @@ void InstallRuntime()
         std::scoped_lock lk(_lock);
         return _snapshot.root == RootFlow::Captive &&
             (_snapshot.sub == SubFlow::EscapeAttempt ||
-             _snapshot.sub == SubFlow::EscapeFailed ||
-             _snapshot.sub == SubFlow::Recapture);
+                _snapshot.sub == SubFlow::EscapeFailed ||
+                _snapshot.sub == SubFlow::Recapture);
     }
 
     bool Controller::IsPleasureSubFlowActive() const
@@ -3427,7 +3594,7 @@ void InstallRuntime()
 
     bool Controller::BeginCaptiveFromModEvent(std::uint32_t actorFormID, std::string_view reason)
     {
-        return RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason.empty() ? std::string_view{"mod_event_captive"} : reason);
+        return RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason.empty() ? std::string_view{ "mod_event_captive" } : reason);
     }
 
     bool Controller::BeginCaptivePleasureFromModEvent(std::uint32_t actorFormID, std::string_view reason)
@@ -3436,7 +3603,7 @@ void InstallRuntime()
             spdlog::warn("[TFD][Flow] ignore mod_event_pleasure reason=begin_captive_reject actor={:08X}", actorFormID);
             return false;
         }
-        if (!RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason.empty() ? std::string_view{"mod_event_pleasure"} : reason)) {
+        if (!RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason.empty() ? std::string_view{ "mod_event_pleasure" } : reason)) {
             spdlog::warn("[TFD][Flow] ignore mod_event_pleasure reason=captive_flow_reject actor={:08X}", actorFormID);
             return false;
         }
