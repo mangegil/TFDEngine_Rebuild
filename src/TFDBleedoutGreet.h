@@ -64,8 +64,6 @@ struct DialogueClosedHandlers
 	void NotifyDialogueOpened();
 	void MarkAfterPleasureArmed(const char* reason = nullptr);
 	bool HasSeenDialogue();
-	bool CanTimeoutRearm();
-	void NoteTimeoutRearm(std::chrono::steady_clock::time_point nextRetry, const char* reason = nullptr);
 	void MarkStickyReopenPending(bool value, const char* reason = nullptr);
 	bool HasStickyReopenPending();
 	bool IsRetryDue(std::chrono::steady_clock::time_point now);
@@ -74,8 +72,6 @@ struct DialogueClosedHandlers
 
 	HoldDecision EvaluateHold(bool dialogueOpen, bool pleasureCommitted, bool ostimBridgeBlocking);
 	const char* GetHoldReasonName(HoldReason reason);
-	bool TryTimeoutRearm(bool prevDialogueOpen, bool hasTerminalCommit, bool pleasureBlocking, std::uint32_t speakerFormID,
-		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn);
 	bool TryStickyWatchdog(bool hasTerminalCommit, bool dialogueOpen, bool pleasureBlocking, std::uint32_t speakerFormID,
 		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn);
 	bool TryAfterPleasureWatchdog(bool prevDialogueOpen, bool dialogueOpen, std::uint32_t speakerFormID,

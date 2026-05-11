@@ -204,6 +204,26 @@ namespace TFD::PayModel
             return false;
         }
 
+        bool IsDialogueEncounterActor(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            if (TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+                return false;
+            }
+            if (ActorHasAnyKeyword(actor, {
+                    "ActorTypeCreature",
+                    "ActorTypeAnimal",
+                    "ActorTypeDragon",
+                    "ActorTypeDaedra",
+                    "ActorTypeGhost",
+                    "ActorTypeUndead" })) {
+                return false;
+            }
+            return ActorHasKeywordByEditorID(actor, "ActorTypeNPC");
+        }
+
         bool IsUnnaturalActor(RE::Actor* actor)
         {
             if (!actor) {
@@ -384,17 +404,30 @@ namespace TFD::PayModel
             }
 
             if (context == PayContext::PreCombat || context == PayContext::InCombat || context == PayContext::Bleedout) {
-                addUnique(speaker);
+                auto addEncounterActor = [&](RE::Actor* actor, const char* source) {
+                    if (context == PayContext::Bleedout && !IsDialogueEncounterActor(actor)) {
+                        if (actor) {
+                            spdlog::info(
+                                "[TFD][PayModel][R129] skip non-dialogue bleedout actor actor={:08X} source={}",
+                                actor->GetFormID(),
+                                source ? source : "unknown");
+                        }
+                        return;
+                    }
+                    addUnique(actor);
+                };
+
+                addEncounterActor(speaker, "speaker");
 
                 const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
                 for (auto* actor : dialogueTruceActors) {
-                    addUnique(actor);
+                    addEncounterActor(actor, "dialogue_truce");
                 }
 
                 if (context == PayContext::Bleedout && out.size() <= 1) {
                     const auto activeTruceActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
                     for (auto* actor : activeTruceActors) {
-                        addUnique(actor);
+                        addEncounterActor(actor, "active_truce_fallback");
                     }
                 }
 

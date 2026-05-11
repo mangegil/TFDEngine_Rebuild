@@ -637,21 +637,15 @@ namespace TFD::DefeatMonitor
 			if (IsActiveFollowerActor(actor)) {
 				return false;
 			}
-
-			if (ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
-				ActorHasKeywordByEditorID(actor, "ActorTypeGhost")) {
+			if (ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeGhost") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeUndead")) {
 				return false;
 			}
-
-			if (ActorHasKeywordByEditorID(actor, "ActorTypeNPC") ||
-				ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
-				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
-				ActorHasKeywordByEditorID(actor, "ActorTypeUndead") ||
-				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra")) {
-				return true;
-			}
-
-			return false;
+			return ActorHasKeywordByEditorID(actor, "ActorTypeNPC");
 		}
 
 		static RE::Actor* ResolveAggressor();
@@ -2526,8 +2520,13 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 			RefreshPostDefeatGlobals();
-			const bool captiveBleedOverlay = TFD::Captive::HasEscapeBreakRebleedPending() || g_inBleedState.load(std::memory_order_acquire);
 			const bool inCombatDialogueOpen = IsDialogueOpen();
+			if (!inCombatDialogueOpen &&
+				!TFD::InteractionRouter::DialogueOpen::IsActive() &&
+				TFD::Bleedout::TickQueuedAfterPleasureCrowdContinuation()) {
+				return;
+			}
+			const bool captiveBleedOverlay = TFD::Captive::HasEscapeBreakRebleedPending() || g_inBleedState.load(std::memory_order_acquire);
 			if (!captiveBleedOverlay && TFD::InCombat::IsActive() && inCombatDialogueOpen) {
 				TFD::InCombatGreet::NotifyDialogueOpened();
 			}
@@ -2747,27 +2746,9 @@ namespace TFD::DefeatMonitor
 					g_prevDialogueOpen = dOpen;
 					return;
 				}
-				if (g_bleedPaused && TFD::Bleedout::GetDialogueOutcome() == BleedDialogueOutcome::None) {
-					const auto nowBleed = Now();
-					if (TFD::BleedoutGreet::TryTimeoutRearm(g_prevDialogueOpen, TFD::Bleedout::HasTerminalCommit(), TFD::PleasureRuntime::IsBlocking(), CurrentBleedSpeakerID(), nowBleed,
-						[&](const char* reopenReason) -> bool {
-							auto* timeoutSpeaker = CurrentBleedSpeaker();
-							float timeoutDist = 99999.0f;
-							if (!(player && timeoutSpeaker && CanUseAggressorForBleedoutGreet(player, timeoutSpeaker, timeoutDist))) {
-								return false;
-							}
-							ApplyBleedDialogueOverdrive(player, timeoutSpeaker, reopenReason, true);
-							g_bleedPauseStarted = nowBleed;
-							g_bleedLastSeconds = -1;
-							ResetBleedSpeakerKickState();
-							spdlog::info("[TFD][Defeat] bleed dialogue overdrive timeout rearm speaker={:08X} dist={:.1f}",
-								timeoutSpeaker->GetFormID(),
-								timeoutDist);
-							return true;
-						})) {
-						return;
-					}
-				}
+				// R130: no destructive Bleedout forcegreet timeout/rearm.
+				// Long-distance or stuck speakers should be handled by approach assist / MoveTo,
+				// not by cancelling and restarting the dialogue lifecycle.
 				if (g_bleedPaused) {
 					g_bleedStart += (Now() - g_bleedPauseStarted);
 					g_bleedPaused = false;

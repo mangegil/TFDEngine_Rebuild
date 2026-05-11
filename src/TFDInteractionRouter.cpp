@@ -15,6 +15,8 @@
 
 #include <spdlog/spdlog.h>
 #include <SKSE/SKSE.h>
+#include <RE/B/BGSKeyword.h>
+#include <RE/T/TESForm.h>
 
 #include <algorithm>
 #include <chrono>
@@ -2134,6 +2136,34 @@ namespace TFD::InteractionRouter
             }
 
 
+            bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+            {
+                if (!actor || !editorID || !editorID[0]) {
+                    return false;
+                }
+                auto* kw = RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
+                return kw && actor->HasKeyword(kw);
+            }
+
+            bool IsBleedoutDialogueAssistActor(RE::Actor* actor)
+            {
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                    return false;
+                }
+                if (TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+                    return false;
+                }
+                if (ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+                    ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+                    ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
+                    ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") ||
+                    ActorHasKeywordByEditorID(actor, "ActorTypeGhost") ||
+                    ActorHasKeywordByEditorID(actor, "ActorTypeUndead")) {
+                    return false;
+                }
+                return ActorHasKeywordByEditorID(actor, "ActorTypeNPC");
+            }
+
             bool AssistBleedoutApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
             {
                 if (!player || !speaker || speaker == player) {
@@ -2153,6 +2183,10 @@ namespace TFD::InteractionRouter
                         continue;
                     }
                     if (!TFD::HostilityController::CanOpenDialogue(actor)) {
+                        continue;
+                    }
+                    if (!IsBleedoutDialogueAssistActor(actor)) {
+                        spdlog::info("[TFD][DialogueOpen][R129] skip bleedout approach assist actor={:08X} reason=not_dialogue_actor", actor->GetFormID());
                         continue;
                     }
                     AddUniqueDialogueAssistActor(actors, actor);
@@ -2441,7 +2475,7 @@ namespace TFD::InteractionRouter
                 SyncDialogueStateLocked(IsDialogueOpen());
 
                 spdlog::info(
-                    "[TFD][DialogueOpen] begin mode={} reason={} speaker={:08X} delayMs={} timeoutMs={}",
+                    "[TFD][DialogueOpen] begin mode={} reason={} speaker={:08X} delayMs={} deadlineMs={}",
                     ModeName(mode),
                     reason ? reason : "unknown",
                     speaker->GetFormID(),
@@ -2560,14 +2594,14 @@ namespace TFD::InteractionRouter
                     g_pending.deadline = now + (g_pending.mode == Mode::Bleedout ? kBleedoutTimeout : kPreCombatTimeout);
                     RefreshApproachPackage(player, speaker);
                     spdlog::warn(
-                        "[TFD][DialogueOpen][R100A] timeout converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
+                        "[TFD][DialogueOpen][R130] approach deadline converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         g_pending.attempts,
                         g_pending.requestIssued ? 1 : 0);
                 } else {
                     spdlog::warn(
-                        "[TFD][DialogueOpen] timeout mode={} speaker={:08X} attempts={} requestIssued={}",
+                        "[TFD][DialogueOpen] open deadline elapsed mode={} speaker={:08X} attempts={} requestIssued={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         g_pending.attempts,

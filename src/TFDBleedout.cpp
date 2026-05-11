@@ -19,6 +19,7 @@
 #include <vector>
 #include <utility>
 #include <thread>
+#include <mutex>
 
 #include "TFDFlowController.h"
 #include "TFDDefeatMonitor.h"
@@ -29,7 +30,9 @@
 #include "TFDBleedoutGreet.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDRecruit.h"
 #include "TFDCaptive.h"
+#include "RE/B/BGSKeyword.h"
 #include "RE/B/BGSRefAlias.h"
 #include "RE/T/TESQuest.h"
 
@@ -41,9 +44,84 @@ namespace TFD::Bleedout
 	{
 		using Clock = std::chrono::steady_clock;
 
+		struct QueuedAfterPleasureCrowdContinuation
+		{
+			std::uint32_t nextSpeakerFormID{ 0 };
+			std::uint32_t consumedActorFormID{ 0 };
+			bool recruitChoice{ false };
+			bool releaseSingle{ false };
+			bool demoteHold{ false };
+			bool flowComplete{ false };
+			std::string reason{};
+		};
+
+		std::mutex g_afterPleasureCrowdContinuationLock;
+		QueuedAfterPleasureCrowdContinuation g_afterPleasureCrowdContinuation{};
+
+		void QueueAfterPleasureCrowdContinuation(
+			RE::Actor* consumedActor,
+			RE::Actor* nextSpeaker,
+			const char* reason,
+			bool recruitChoice,
+			bool releaseSingle,
+			bool demoteHold,
+			bool flowComplete)
+		{
+			std::scoped_lock lk(g_afterPleasureCrowdContinuationLock);
+			g_afterPleasureCrowdContinuation.nextSpeakerFormID = nextSpeaker ? nextSpeaker->GetFormID() : 0;
+			g_afterPleasureCrowdContinuation.consumedActorFormID = consumedActor ? consumedActor->GetFormID() : 0;
+			g_afterPleasureCrowdContinuation.recruitChoice = recruitChoice;
+			g_afterPleasureCrowdContinuation.releaseSingle = releaseSingle;
+			g_afterPleasureCrowdContinuation.demoteHold = demoteHold;
+			g_afterPleasureCrowdContinuation.flowComplete = flowComplete;
+			g_afterPleasureCrowdContinuation.reason = reason && reason[0] ? reason : "bleedout_after_pleasure_cycle_next";
+		}
+
 		std::uint32_t ActorFormID(RE::Actor* actor)
 		{
 			return actor ? actor->GetFormID() : 0u;
+		}
+
+		bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+		{
+			if (!actor || !editorID || !editorID[0]) {
+				return false;
+			}
+			auto* kw = RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
+			return kw && actor->HasKeyword(kw);
+		}
+
+		bool IsDialogueCreatureKeyword(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			return ActorHasKeywordByEditorID(actor, "ActorTypeCreature") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeAnimal") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDragon") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeDaedra") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeGhost") ||
+				ActorHasKeywordByEditorID(actor, "ActorTypeUndead");
+		}
+
+		bool IsBleedoutDialogueCrowdActor(RE::Actor* actor, const RuntimeHostHandlers* handlers = nullptr)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return false;
+			}
+			if (TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
+				return false;
+			}
+			if (TFD::Recruit::IsRecruitLike(actor)) {
+				return false;
+			}
+			if (IsDialogueCreatureKeyword(actor)) {
+				return false;
+			}
+			if (handlers && handlers->isBleedCrowdSupportedAggressor && !handlers->isBleedCrowdSupportedAggressor(actor)) {
+				return false;
+			}
+			return ActorHasKeywordByEditorID(actor, "ActorTypeNPC");
 		}
 
 		constexpr const char* kPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
@@ -929,7 +1007,35 @@ namespace TFD::Bleedout
 				static_cast<unsigned int>(result.size()));
 		}
 
-		return result;
+		std::vector<RE::Actor*> filtered;
+		filtered.reserve(result.size());
+		std::unordered_set<std::uint32_t> seen;
+		const auto speakerID = ActorFormID(speaker);
+		for (auto* actor : result) {
+			if (!actor) {
+				continue;
+			}
+			const auto actorID = actor->GetFormID();
+			if (actorID == 0 || actorID == speakerID) {
+				continue;
+			}
+			if (!seen.insert(actorID).second) {
+				continue;
+			}
+			if (!IsBleedoutDialogueCrowdActor(actor, &handlers)) {
+				spdlog::info("[TFD][Bleedout][R129] reject non-dialogue bleed crowd actor={:08X} source=incombat_pattern", actorID);
+				continue;
+			}
+			if (handlers.isBleedSpaceCompatible && !handlers.isBleedSpaceCompatible(actor, player)) {
+				continue;
+			}
+			filtered.push_back(actor);
+		}
+		spdlog::info("[TFD][Bleedout][R129] filtered bleed crowd speaker={:08X} input={} output={}",
+			speaker ? speaker->GetFormID() : 0u,
+			static_cast<unsigned int>(result.size()),
+			static_cast<unsigned int>(filtered.size()));
+		return filtered;
 	}
 
 	std::size_t HardStopActorCombatAndAlarm(RE::Actor* actor, const char* reason)
@@ -2718,6 +2824,291 @@ namespace TFD::Bleedout
 		return ok;
 	}
 
+	bool IsPleasureCycleDialogueCandidate(RE::Actor* actor, RE::Actor* currentActor)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !actor || actor == player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			return false;
+		}
+
+		if (currentActor && actor->GetFormID() == currentActor->GetFormID()) {
+			return false;
+		}
+
+		auto handlers = TFD::Bleedout::RuntimeHost::BuildHandlers();
+		if (!IsBleedoutDialogueCrowdActor(actor, &handlers)) {
+			return false;
+		}
+
+		if (handlers.isBleedSpaceCompatible && !handlers.isBleedSpaceCompatible(actor, player)) {
+			return false;
+		}
+
+		return true;
+	}
+
+	bool CompletePleasureCycleChainNeutral(const char* reason)
+	{
+		const char* why = reason && reason[0] ? reason : "bleedout_pleasure_cycle_chain_neutral";
+
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		const auto before = flow.GetSnapshot();
+		const bool afterComplete = flow.RequestCompleteAfterPleasure(why);
+		if (!afterComplete) {
+			flow.ResetRuntime(why);
+		}
+
+		TFD::InteractionRouter::DialogueOpen::Cancel();
+		TFD::InteractionRouter::ClearInteractionStateValue();
+		TFD::BleedoutGreet::ResetRuntime(why);
+		ClearBleedoutDialogueFactionsInternal(why);
+		ClearBridgeAliases(nullptr, why);
+
+		if (g_truceSessionId != 0) {
+			TFD::HostilityController::ReleaseSession(g_truceSessionId, TFD::HostilityController::ReleaseReason::FlowHandoff);
+			spdlog::info(
+				"[TFD][Bleedout][R133] truce session released at chain neutral id={} reason={}",
+				g_truceSessionId,
+				why);
+			g_truceSessionId = 0;
+		}
+
+		g_bleedSpeakerId = 0;
+		g_bleedDialogueRetryCount = 0;
+		g_bleedPendingCaptiveOutcome = false;
+		g_bleedPendingNonCaptiveOutcome = false;
+		g_bleedBattleObservePending = false;
+		g_bleedBattleObserveActive = false;
+		g_inBleedState.store(false, std::memory_order_release);
+		ResetBleedSpeakerKick();
+		ClearBleedCrowdAssigned();
+		ClearBleedRejectedSpeakerIds();
+		TFD::Victory::ResetObservedContext();
+		TFD::Victory::SetStateValue(0);
+
+		auto setNeutralGlobal = [](const char* editorID) {
+			if (auto* global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID)) {
+				global->value = 0.0f;
+			}
+		};
+		setNeutralGlobal("TFDPreCombatState");
+		setNeutralGlobal("TFDInCombatState");
+		setNeutralGlobal("TFDDefeatState");
+		setNeutralGlobal("TFDPleasureState");
+		setNeutralGlobal("TFDCaptiveState");
+		setNeutralGlobal("TFDVictoryState");
+
+		spdlog::info(
+			"[TFD][Bleedout][R133] pleasure cycle chain neutralized reason={} completeAfter={} forcedReset={} oldRoot={} oldCtx={} oldGate={} oldSub={} oldTerminal={} oldPrimary={:08X}",
+			why,
+			afterComplete ? 1 : 0,
+			afterComplete ? 0 : 1,
+			TFD::FlowController::Controller::ToString(before.root),
+			TFD::FlowController::Controller::ToString(before.contextRoot),
+			TFD::FlowController::Controller::ToString(before.gate),
+			TFD::FlowController::Controller::ToString(before.sub),
+			before.terminalResolved ? 1 : 0,
+			before.primaryActorFormID);
+
+		return true;
+	}
+
+	bool BeginForPleasureCycleActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction)
+	{
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::None;
+		}
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !actor || actor == player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+			spdlog::info(
+				"[TFD][Bleedout][R132] BeginForPleasureCycleActor blocked actor={:08X} reason=invalid_candidate",
+				actor ? actor->GetFormID() : 0u);
+			return false;
+		}
+
+		auto handlers = TFD::Bleedout::RuntimeHost::BuildHandlers();
+		if (!IsBleedoutDialogueCrowdActor(actor, &handlers)) {
+			spdlog::info(
+				"[TFD][Bleedout][R132] BeginForPleasureCycleActor blocked actor={:08X} reason=not_dialogue_crowd",
+				actor->GetFormID());
+			return false;
+		}
+		if (handlers.isBleedSpaceCompatible && !handlers.isBleedSpaceCompatible(actor, player)) {
+			spdlog::info(
+				"[TFD][Bleedout][R132] BeginForPleasureCycleActor blocked actor={:08X} reason=space_incompatible",
+				actor->GetFormID());
+			return false;
+		}
+
+		// R132: this is a Bleedout-source dialogue cycle, not a new physical
+		// defeat. The player has already recovered for OStim/AfterPleasure.
+		// Do not call HostilityController::PromoteTruceActorForCycle here: that
+		// sends TFDInCombatAssign and starts TFDInCombatSession, producing the
+		// mixed state seen in logs: root=Bleedout but globals/HUD=Incombat.
+		// Also do not call StartWindow(), because it restarts the full physical
+		// bleedout runtime/animation. Arm only the Bleedout dialogue owner and
+		// open the Bleedout root natively.
+		TFD::InteractionRouter::DialogueOpen::Cancel();
+		TFD::BleedoutGreet::ResetRuntime("pleasure_cycle_bleedout_dialogue_reset");
+
+		const bool flowAccepted = BeginWindow(actor, "pleasure_cycle_bleedout_dialogue_begin");
+		if (!flowAccepted) {
+			spdlog::info(
+				"[TFD][Bleedout][R132] BeginForPleasureCycleActor blocked actor={:08X} reason=flow_rejected",
+				actor->GetFormID());
+			return false;
+		}
+
+		if (player->IsInCombat()) {
+			player->StopCombat();
+		}
+		if (actor->IsInCombat()) {
+			actor->StopCombat();
+		}
+		if (actor->IsWeaponDrawn()) {
+			actor->DrawWeaponMagicHands(false);
+		}
+
+		AssignBridgeActor(actor);
+		PrimeBridgeActor(actor, "pleasure_cycle_bleedout_dialogue_begin");
+		const bool dialogueRequested = TFD::BleedoutGreet::Begin(actor, "pleasure_cycle_bleedout_dialogue_begin");
+		if (!dialogueRequested) {
+			spdlog::info(
+				"[TFD][Bleedout][R132] BeginForPleasureCycleActor blocked actor={:08X} reason=dialogue_begin_failed",
+				actor->GetFormID());
+			return false;
+		}
+
+		if (outAction) {
+			*outAction = TFD::InteractionRouter::Action::None;
+		}
+
+		spdlog::info(
+			"[TFD][Bleedout][R132] BeginForPleasureCycleActor actor={:08X} action=BleedoutDialogueOnly flowAccepted={} dialogueRequested=1 noInCombatAssign=1 noPhysicalBleedWindow=1",
+			actor->GetFormID(),
+			flowAccepted ? 1 : 0);
+		return true;
+	}
+
+
+	bool TryContinueAfterPleasureCrowd(RE::Actor* consumedActor, const char* reason, bool recruitChoice)
+	{
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !consumedActor) {
+			return false;
+		}
+
+		auto handlers = TFD::Bleedout::RuntimeHost::BuildHandlers();
+		std::vector<RE::Actor*> candidates = TFD::HostilityController::CollectDialogueTruceActors(consumedActor);
+		if (candidates.empty()) {
+			candidates = TFD::HostilityController::CollectActiveTruceActors(consumedActor);
+		}
+
+		RE::Actor* nextSpeaker = nullptr;
+		std::unordered_set<std::uint32_t> seen;
+		const auto consumedID = consumedActor->GetFormID();
+		for (auto* candidate : candidates) {
+			if (!candidate || candidate == player) {
+				continue;
+			}
+			const auto candidateID = candidate->GetFormID();
+			if (candidateID == 0 || candidateID == consumedID || !seen.insert(candidateID).second) {
+				continue;
+			}
+			if (!IsBleedoutDialogueCrowdActor(candidate, &handlers)) {
+				spdlog::info("[TFD][Bleedout][R129] skip afterpleasure cycle candidate actor={:08X} reason=not_dialogue_crowd", candidateID);
+				continue;
+			}
+			if (handlers.isBleedSpaceCompatible && !handlers.isBleedSpaceCompatible(candidate, player)) {
+				spdlog::info("[TFD][Bleedout][R129] skip afterpleasure cycle candidate actor={:08X} reason=space_incompatible", candidateID);
+				continue;
+			}
+			nextSpeaker = candidate;
+			break;
+		}
+
+		if (!nextSpeaker) {
+			spdlog::info("[TFD][Bleedout][R129] no bleed crowd continuation candidate consumed={:08X} candidates={} reason={}",
+				consumedID,
+				static_cast<unsigned int>(candidates.size()),
+				reason ? reason : "unknown");
+			return false;
+		}
+
+		bool releasedSingle = false;
+		bool demoteHold = false;
+		if (recruitChoice) {
+			demoteHold = TFD::HostilityController::DemoteTruceActorForCycleHold(
+				consumedActor,
+				"bleedout_after_pleasure_recruit_cycle_hold");
+		}
+		else {
+			releasedSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+				consumedActor,
+				TFD::HostilityController::ReleaseReason::FlowHandoff,
+				reason ? reason : "bleedout_after_pleasure_cycle_next");
+		}
+
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		const bool oldFlowComplete = flow.RequestCompleteAfterPleasure("bleedout_after_pleasure_cycle_preserve_crowd");
+		TFD::InteractionRouter::ClearInteractionStateValue();
+		QueueAfterPleasureCrowdContinuation(
+			consumedActor,
+			nextSpeaker,
+			reason ? reason : "unknown",
+			recruitChoice,
+			releasedSingle,
+			demoteHold,
+			oldFlowComplete);
+		spdlog::info("[TFD][Bleedout][R129] queued afterpleasure next bleed crowd consumed={:08X} next={:08X} oldFlowComplete={} recruitChoice={} releasedSingle={} demoteHold={} reason={}",
+			consumedID,
+			nextSpeaker->GetFormID(),
+			oldFlowComplete ? 1 : 0,
+			recruitChoice ? 1 : 0,
+			releasedSingle ? 1 : 0,
+			demoteHold ? 1 : 0,
+			reason ? reason : "unknown");
+		return true;
+	}
+
+	bool TickQueuedAfterPleasureCrowdContinuation()
+	{
+		QueuedAfterPleasureCrowdContinuation queued{};
+		{
+			std::scoped_lock lk(g_afterPleasureCrowdContinuationLock);
+			if (g_afterPleasureCrowdContinuation.nextSpeakerFormID == 0) {
+				return false;
+			}
+			queued = g_afterPleasureCrowdContinuation;
+			g_afterPleasureCrowdContinuation = {};
+		}
+
+		auto* player = RE::PlayerCharacter::GetSingleton();
+		auto* nextSpeaker = RE::TESForm::LookupByID<RE::Actor>(queued.nextSpeakerFormID);
+		if (!player || !nextSpeaker || nextSpeaker->IsDead() || nextSpeaker->IsDisabled()) {
+			spdlog::info("[TFD][Bleedout][R129] queued afterpleasure crowd continuation dropped next={:08X} player={} valid=0 reason={}",
+				queued.nextSpeakerFormID,
+				player ? 1 : 0,
+				queued.reason.empty() ? std::string{ "unknown" } : queued.reason);
+			return false;
+		}
+
+		TFD::InteractionRouter::Action action = TFD::InteractionRouter::Action::None;
+		const bool began = BeginForPleasureCycleActor(nextSpeaker, &action);
+		spdlog::info("[TFD][Bleedout][R132] continued afterpleasure to next bleed crowd consumed={:08X} next={:08X} oldFlowComplete={} recruitChoice={} releasedSingle={} demoteHold={} began={} action={} reason={}",
+			queued.consumedActorFormID,
+			queued.nextSpeakerFormID,
+			queued.flowComplete ? 1 : 0,
+			queued.recruitChoice ? 1 : 0,
+			queued.releaseSingle ? 1 : 0,
+			queued.demoteHold ? 1 : 0,
+			began ? 1 : 0,
+			TFD::InteractionRouter::ToString(action),
+			queued.reason.empty() ? std::string{ "unknown" } : queued.reason);
+		return began;
+	}
+
 	bool HandleAfterPleasureEnter(RE::Actor* actor, const char* reason)
 	{
 		return BeginAfterPleasure(actor, reason ? reason : "after_pleasure_enter");
@@ -3145,6 +3536,25 @@ namespace TFD::Bleedout
 		if (!state.bleedSpeakerId || *state.bleedSpeakerId == 0) return;
 		if (!state.bleedPaused || *state.bleedPaused) return;
 		if (!state.bleedStart || state.bleedStart->time_since_epoch().count() == 0) return;
+		if (TFD::InteractionRouter::DialogueOpen::DidSucceed()) {
+			if (state.bleedPaused) {
+				*state.bleedPaused = true;
+			}
+			if (state.bleedPauseStarted) {
+				*state.bleedPauseStarted = Clock::now();
+			}
+			spdlog::info("[TFD][Bleedout][R129] speaker prime retry skipped reason=native_open_succeeded speaker={:08X}", *state.bleedSpeakerId);
+			return;
+		}
+		if (TFD::BleedoutGreet::HasSeenDialogue()) {
+			spdlog::info("[TFD][Bleedout][R129] speaker prime retry skipped reason=bleed_dialogue_seen speaker={:08X}", *state.bleedSpeakerId);
+			return;
+		}
+		if (TFD::InteractionRouter::DialogueOpen::IsActive() &&
+			TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout) {
+			spdlog::info("[TFD][Bleedout][R129] speaker prime retry skipped reason=native_open_pending speaker={:08X}", *state.bleedSpeakerId);
+			return;
+		}
 		const auto now = Clock::now();
 		if (state.bleedSpeakerKickCount && *state.bleedSpeakerKickCount >= 2) return;
 		if (state.bleedSpeakerKickCount && *state.bleedSpeakerKickCount == 0) {

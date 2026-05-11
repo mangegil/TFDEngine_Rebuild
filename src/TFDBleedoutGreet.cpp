@@ -169,19 +169,7 @@ namespace TFD::BleedoutGreet
 		return g_runtime.sawDialogue;
 	}
 
-	bool CanTimeoutRearm()
-	{
-		std::scoped_lock lk(g_runtime.lock);
-		return !g_runtime.sawDialogue && g_runtime.retryCount < 3;
-	}
 
-	void NoteTimeoutRearm(std::chrono::steady_clock::time_point nextRetry, const char* reason)
-	{
-		std::scoped_lock lk(g_runtime.lock);
-		++g_runtime.retryCount;
-		g_runtime.nextRetry = nextRetry;
-		spdlog::info("[TFD][BleedoutGreet] timeout rearm scheduled retry={} reason={}", g_runtime.retryCount, reason ? reason : "unknown");
-	}
 
 	void MarkStickyReopenPending(bool value, const char* reason)
 	{
@@ -241,21 +229,6 @@ namespace TFD::BleedoutGreet
 		}
 	}
 
-	bool TryTimeoutRearm(bool prevDialogueOpen, bool hasTerminalCommit, bool pleasureBlocking, std::uint32_t speakerFormID,
-		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn)
-	{
-		if (!CanTimeoutRearm() || prevDialogueOpen || hasTerminalCommit || pleasureBlocking || speakerFormID == 0 || !reopenFn) {
-			return false;
-		}
-		if (!reopenFn("dialogue_timeout_rearm")) {
-			return false;
-		}
-		NoteTimeoutRearm(now + std::chrono::milliseconds(650), "dialogue_timeout_rearm");
-		spdlog::info("[TFD][BleedoutGreet] timeout watchdog reopen speaker={:08X} retry={}",
-			speakerFormID,
-			GetRetryCount());
-		return true;
-	}
 
 	bool TryStickyWatchdog(bool hasTerminalCommit, bool dialogueOpen, bool pleasureBlocking, std::uint32_t speakerFormID,
 		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn)

@@ -1069,7 +1069,22 @@ namespace TFD::FlowController
         ResolveGlobal(g_defeatState, "TFDDefeatState");
 
         const int preCombat = (_snapshot.root == RootFlow::PreCombat) ? 1 : 0;
-        const int defeat = g_defeatState ? static_cast<int>(std::lround(g_defeatState->value)) : 0;
+
+        // R132: a Bleedout crowd continuation after AfterPleasure is a
+        // source-owned Bleedout decision, even though the player may already
+        // be physically standing after the OStim handoff/recovery.  The Bleedout
+        // root and child topics depend on the defeat globals matching the
+        // Bleedout decision context.  Without this override the native opener
+        // can fire the root line, but the choice stack closes immediately
+        // because TFDDefeatState has drifted back to the standing value.
+        const bool bleedoutDecisionRoot =
+            _snapshot.root == RootFlow::Bleedout &&
+            _snapshot.gate == DecisionGate::PlayerBleedout &&
+            _snapshot.sub == SubFlow::None &&
+            !_snapshot.terminalResolved;
+
+        const int observedDefeat = g_defeatState ? static_cast<int>(std::lround(g_defeatState->value)) : 0;
+        const int defeat = bleedoutDecisionRoot ? 2 : observedDefeat;
 
         const auto runtimePhase = TFD::PleasureRuntime::GetPhase();
         const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
@@ -1144,6 +1159,9 @@ namespace TFD::FlowController
         SetGlobalInt(g_inCombatState, inCombat);
         SetGlobalInt(g_captiveState, captive);
         SetGlobalInt(g_pleasureState, pleasure);
+        if (bleedoutDecisionRoot) {
+            SetGlobalInt(g_defeatState, defeat);
+        }
     }
 
     Controller& Controller::GetSingleton()
@@ -1737,14 +1755,50 @@ namespace TFD::FlowController
             }
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
                 const char* terminalReason = ResolveBleedoutAfterPleasureTerminalReason(name);
-                const bool completeFlow = TFD::Bleedout::CompleteAfterPleasure(terminalReason);
+                const bool cycleQueued = TFD::PleasureRuntime::HasQueuedCycleForConsumedActor(
+                    actor,
+                    TFD::PleasureRuntime::SourceContext::Bleedout);
+
+                if (cycleQueued) {
+                    bool releaseSingle = false;
+                    bool demoteHold = false;
+                    if (name == kAfterPleasureChoiceRecruitEvent) {
+                        demoteHold = TFD::HostilityController::DemoteTruceActorForCycleHold(
+                            actor,
+                            "bleedout_after_pleasure_recruit_cycle_hold");
+                    }
+                    else {
+                        releaseSingle = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
+                            actor,
+                            TFD::HostilityController::ReleaseReason::FlowHandoff,
+                            terminalReason);
+                    }
+
+                    // R130: Bleedout now follows the InCombat cycle pattern. PleasureRuntime
+                    // pre-selects the next crowd speaker before recruit cleanup, so do not run
+                    // the old late Bleedout crowd scan after the runtime has already finalized.
+                    TFD::Bleedout::CompleteAfterPleasure("bleedout_after_pleasure_cycle_preserve_crowd");
+                    spdlog::info(
+                        "[TFD][Flow][R130] bleedout after pleasure terminal preserved cycle event={} source={} actor={:08X} cycleQueued=1 releaseSingle={} demoteHold={} policy={}",
+                        std::string(name),
+                        sourceFlow,
+                        actor->GetFormID(),
+                        releaseSingle ? 1 : 0,
+                        demoteHold ? 1 : 0,
+                        name == kAfterPleasureChoiceRecruitEvent ? "recruit_hold_until_bleed_cycle_end" : "current_actor_only");
+                    return true;
+                }
+
+                const auto flushedDeferred = TFD::PleasureRuntime::FlushDeferredInCombatRecruits("bleedout_after_pleasure_terminal_final");
+                const bool completeFlow = TFD::Bleedout::CompletePleasureCycleChainNeutral(terminalReason);
                 TFD::InteractionRouter::ClearInteractionStateValue();
                 spdlog::info(
-                    "[TFD][Flow][R114] bleedout after pleasure terminal event={} source={} actor={:08X} flowComplete={} reason={}",
+                    "[TFD][Flow][R133] bleedout after pleasure terminal event={} source={} actor={:08X} cycleQueued=0 flowComplete={} deferredRegistered={} reason={}",
                     std::string(name),
                     sourceFlow,
                     actor->GetFormID(),
                     completeFlow ? 1 : 0,
+                    static_cast<unsigned int>(flushedDeferred),
                     terminalReason);
                 return true;
             }

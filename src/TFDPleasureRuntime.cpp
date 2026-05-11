@@ -4,6 +4,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombatGreet.h"
+#include "TFDBleedout.h"
 #include "TFDRecruit.h"
 #include "TFDTeammateManager.h"
 
@@ -350,9 +351,10 @@ namespace TFD::PleasureRuntime
 			}
 		}
 
-		void ArmTerminalNeutralFinalizeLocked(RE::Actor* consumedActor, std::string_view reason)
+		void ArmTerminalNeutralFinalizeLocked(RE::Actor* consumedActor, std::string_view reason, SourceContext sourceOverride = SourceContext::None)
 		{
-			if ((g_state.source != SourceContext::PreCombat && g_state.source != SourceContext::InCombat) || !consumedActor) {
+			const SourceContext source = sourceOverride != SourceContext::None ? sourceOverride : g_state.source;
+			if ((source != SourceContext::PreCombat && source != SourceContext::InCombat && source != SourceContext::Bleedout) || !consumedActor) {
 				return;
 			}
 
@@ -360,24 +362,30 @@ namespace TFD::PleasureRuntime
 			g_state.queuedTerminalNeutralActorFormID = consumedActor->GetFormID();
 			g_state.queuedTerminalNeutralCycleId = g_state.sessionCycleId;
 			g_state.queuedTerminalNeutralDueSec = NowSec() + kTerminalNeutralFinalizeDelaySec;
-			g_state.queuedTerminalNeutralSource = g_state.source;
+			g_state.queuedTerminalNeutralSource = source;
 
 			spdlog::info(
-				"[TFD][PleasureRuntime] terminal neutral finalize queued actor={:08X} cycle={} delay={:.2f}s reason={}",
+				"[TFD][PleasureRuntime] terminal neutral finalize queued actor={:08X} cycle={} source={} delay={:.2f}s reason={}",
 				g_state.queuedTerminalNeutralActorFormID,
 				g_state.queuedTerminalNeutralCycleId,
+				ToString(g_state.queuedTerminalNeutralSource),
 				kTerminalNeutralFinalizeDelaySec,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
-		bool IsInCombatChainSourceLocked()
+		bool IsDeferredPleasureChainSourceLocked()
 		{
-			return g_state.source == SourceContext::InCombat || g_state.queuedPreCombatSource == SourceContext::InCombat || g_state.queuedTerminalNeutralSource == SourceContext::InCombat;
+			return g_state.source == SourceContext::InCombat ||
+				g_state.source == SourceContext::Bleedout ||
+				g_state.queuedPreCombatSource == SourceContext::InCombat ||
+				g_state.queuedPreCombatSource == SourceContext::Bleedout ||
+				g_state.queuedTerminalNeutralSource == SourceContext::InCombat ||
+				g_state.queuedTerminalNeutralSource == SourceContext::Bleedout;
 		}
 
 		bool IsInCombatPleasureChainActiveLocked()
 		{
-			return IsInCombatChainSourceLocked() &&
+			return IsDeferredPleasureChainSourceLocked() &&
 				(g_state.active ||
 				g_state.blocking ||
 				g_state.passiveLockActive ||
@@ -869,9 +877,90 @@ namespace TFD::PleasureRuntime
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
-		RE::Actor* SelectNextPreCombatCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
+		void AppendUniqueCycleActor(std::vector<RE::Actor*>& actors, RE::Actor* candidate)
+		{
+			if (!candidate) {
+				return;
+			}
+
+			const auto candidateID = candidate->GetFormID();
+			if (candidateID == 0) {
+				return;
+			}
+
+			const auto found = std::find_if(
+				actors.begin(),
+				actors.end(),
+				[candidateID](RE::Actor* existing) {
+					return existing && existing->GetFormID() == candidateID;
+				});
+			if (found == actors.end()) {
+				actors.push_back(candidate);
+			}
+		}
+
+		void AppendUniqueCycleActorList(std::vector<RE::Actor*>& actors, const std::vector<RE::Actor*>& candidates)
+		{
+			for (auto* candidate : candidates) {
+				AppendUniqueCycleActor(actors, candidate);
+			}
+		}
+
+		RE::Actor* SelectNextBleedoutCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
 		{
 			scannedCount = 0;
+
+			std::vector<RE::Actor*> actors;
+			const auto stagedCrowdIds = TFD::Bleedout::GetBleedCrowdAssignedIDs();
+			for (const auto actorID : stagedCrowdIds) {
+				AppendUniqueCycleActor(actors, RE::TESForm::LookupByID<RE::Actor>(actorID));
+			}
+
+			// R131: Bleedout has its own staged crowd queue from the original defeat
+			// window.  Late HostilityController dialogue scans may only return the
+			// consumed speaker after OStim/AfterPleasure pacifies combat.  For this
+			// source, keep the staged Bleedout crowd as authoritative and append the
+			// truce session lists only as fallback/extra coverage.
+			AppendUniqueCycleActorList(actors, TFD::HostilityController::CollectDialogueTruceActors(currentActor));
+			AppendUniqueCycleActorList(actors, TFD::HostilityController::CollectActiveTruceActors(currentActor));
+
+			scannedCount = static_cast<unsigned>(actors.size());
+			for (auto* candidate : actors) {
+				if (IsValidPreCombatCycleCandidate(candidate, currentActor) &&
+					TFD::Bleedout::IsPleasureCycleDialogueCandidate(candidate, currentActor)) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R133] bleedout cycle candidate selected current={:08X} next={:08X} stagedCrowd={} scanned={}",
+						currentActor ? currentActor->GetFormID() : 0u,
+						candidate->GetFormID(),
+						static_cast<unsigned int>(stagedCrowdIds.size()),
+						scannedCount);
+					return candidate;
+				}
+
+				if (candidate && candidate->GetFormID() != 0) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R133] bleedout cycle candidate skipped current={:08X} candidate={:08X} stagedCrowd={} reason=not_dialogue_candidate",
+						currentActor ? currentActor->GetFormID() : 0u,
+						candidate->GetFormID(),
+						static_cast<unsigned int>(stagedCrowdIds.size()));
+				}
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R133] bleedout cycle candidate not found current={:08X} stagedCrowd={} scanned={}",
+				currentActor ? currentActor->GetFormID() : 0u,
+				static_cast<unsigned int>(stagedCrowdIds.size()),
+				scannedCount);
+			return nullptr;
+		}
+
+		RE::Actor* SelectNextCycleActorForSource(RE::Actor* currentActor, SourceContext source, unsigned& scannedCount)
+		{
+			scannedCount = 0;
+
+			if (source == SourceContext::Bleedout) {
+				return SelectNextBleedoutCycleActor(currentActor, scannedCount);
+			}
 
 			auto actors = TFD::HostilityController::CollectDialogueTruceActors(currentActor);
 			if (actors.empty()) {
@@ -886,6 +975,11 @@ namespace TFD::PleasureRuntime
 			}
 
 			return nullptr;
+		}
+
+		RE::Actor* SelectNextPreCombatCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
+		{
+			return SelectNextCycleActorForSource(currentActor, g_state.source, scannedCount);
 		}
 
 		void QueuePreCombatCycleLocked(RE::Actor* nextActor, RE::Actor* currentActor, unsigned scannedCount, std::string_view reason)
@@ -923,7 +1017,7 @@ namespace TFD::PleasureRuntime
 		bool QueueNextPreCombatCycleIfNeededLocked(RE::Actor* recruitedActor, bool commitClean)
 		{
 			if (!commitClean || !recruitedActor ||
-				(g_state.source != SourceContext::PreCombat && g_state.source != SourceContext::InCombat)) {
+				(g_state.source != SourceContext::PreCombat && g_state.source != SourceContext::InCombat && g_state.source != SourceContext::Bleedout)) {
 				return false;
 			}
 
@@ -945,12 +1039,24 @@ namespace TFD::PleasureRuntime
 			}
 
 			if (nowSec >= g_state.queuedPreCombatExpireSec || g_state.queuedPreCombatAttempts >= kPreCombatCycleMaxAttempts) {
+				const auto expiredSource = g_state.queuedPreCombatSource;
+				const auto consumedFormID = g_state.queuedPreCombatConsumedFormID;
 				spdlog::warn(
-					"[TFD][PleasureRuntime] after pleasure cycle queue expired actor={:08X} attempts={} now={:.2f} expire={:.2f}",
+					"[TFD][PleasureRuntime] after pleasure cycle queue expired actor={:08X} consumed={:08X} source={} attempts={} now={:.2f} expire={:.2f}",
 					g_state.queuedPreCombatSpeakerFormID,
+					consumedFormID,
+					ToString(expiredSource),
 					g_state.queuedPreCombatAttempts,
 					nowSec,
 					g_state.queuedPreCombatExpireSec);
+
+				if (expiredSource == SourceContext::Bleedout) {
+					ArmTerminalNeutralFinalizeLocked(
+						LookupActor(consumedFormID),
+						"after_pleasure_cycle_queue_expired_bleedout",
+						expiredSource);
+				}
+
 				ClearQueuedPreCombatCycleLocked("expired");
 				return attempt;
 			}
@@ -980,11 +1086,21 @@ namespace TFD::PleasureRuntime
 
 			if (terminalFailure || now >= g_state.queuedPreCombatExpireSec || g_state.queuedPreCombatAttempts >= kPreCombatCycleMaxAttempts) {
 				spdlog::warn(
-					"[TFD][PleasureRuntime] after pleasure cycle queue terminal actor={:08X} attempts={} terminal={} reason={}",
+					"[TFD][PleasureRuntime] after pleasure cycle queue terminal actor={:08X} consumed={:08X} source={} attempts={} terminal={} reason={}",
 					attempt.actorFormID,
+					attempt.consumedActorFormID,
+					ToString(attempt.source),
 					g_state.queuedPreCombatAttempts,
 					terminalFailure ? 1 : 0,
 					reason.empty() ? std::string{ "-" } : std::string{ reason });
+
+				if (attempt.source == SourceContext::Bleedout) {
+					ArmTerminalNeutralFinalizeLocked(
+						LookupActor(attempt.consumedActorFormID),
+						reason.empty() ? "after_pleasure_cycle_terminal_bleedout" : reason,
+						attempt.source);
+				}
+
 				ClearQueuedPreCombatCycleLocked(reason.empty() ? "terminal" : reason);
 				return;
 			}
@@ -1231,9 +1347,11 @@ namespace TFD::PleasureRuntime
 			}
 
 			const bool inCombatSource = g_state.source == SourceContext::InCombat;
+			const bool bleedoutSource = g_state.source == SourceContext::Bleedout;
+			const bool deferredChainSource = inCombatSource || bleedoutSource;
 			unsigned preCommitScannedCount = 0;
-			RE::Actor* predictedNextActor = inCombatSource ? SelectNextPreCombatCycleActor(actor, preCommitScannedCount) : nullptr;
-			const bool inCombatChainWillContinue = inCombatSource && predictedNextActor != nullptr;
+			RE::Actor* predictedNextActor = deferredChainSource ? SelectNextPreCombatCycleActor(actor, preCommitScannedCount) : nullptr;
+			const bool deferredChainWillContinue = deferredChainSource && predictedNextActor != nullptr;
 
 			TFD::Recruit::MarkRecruitCommitPending(
 				actor,
@@ -1243,18 +1361,21 @@ namespace TFD::PleasureRuntime
 
 			TFD::Recruit::CommitOptions options{};
 			options.sourceFlow = TFD::Recruit::SourceFlow::Pleasure;
-			options.reason = inCombatChainWillContinue ? "after_pleasure_recruit_commit_deferred_incombat_chain" : "after_pleasure_recruit_commit";
+			options.reason = deferredChainWillContinue ?
+				(bleedoutSource ? "after_pleasure_recruit_commit_deferred_bleedout_chain" : "after_pleasure_recruit_commit_deferred_incombat_chain") :
+				"after_pleasure_recruit_commit";
 			options.quarantineHostileFactions = true;
 			options.clearCombat = true;
-			options.evaluatePackage = !inCombatChainWillContinue;
+			options.evaluatePackage = !deferredChainWillContinue;
 			options.detailedLog = true;
 			options.throttleObserve = false;
 			options.ensurePacifyAlliance = true;
-			options.applyRuntimeProfile = !inCombatChainWillContinue;
+			options.applyRuntimeProfile = !deferredChainWillContinue;
 
-			if (inCombatChainWillContinue) {
+			if (deferredChainWillContinue) {
 				spdlog::info(
-					"[TFD][PleasureRuntime][R94G] incombat recruit chain precommit actor={:08X} predictedNext={:08X} scanned={} policy=no_package_eval_no_runtime_profile",
+					"[TFD][PleasureRuntime][R130] {} recruit chain precommit actor={:08X} predictedNext={:08X} scanned={} policy=no_package_eval_no_runtime_profile",
+					ToString(g_state.source),
 					actorFormID,
 					predictedNextActor ? predictedNextActor->GetFormID() : 0u,
 					preCommitScannedCount);
@@ -1267,12 +1388,11 @@ namespace TFD::PleasureRuntime
 			bool queuedNextCycle = false;
 			if (clean) {
 				queuedNextCycle = QueueNextPreCombatCycleIfNeededLocked(actor, true);
-				if (g_state.source == SourceContext::InCombat && queuedNextCycle) {
-					DeferInCombatRecruitAliasLocked(actor, "after_pleasure_recruit_chain_active");
-					(void)TFD::HostilityController::DemoteTruceActorForCycleHold(actor, "after_pleasure_recruit_chain_defer");
-					// R94H: do not refresh teammate capacity while holding PleasureRuntime state
-					// lock on the deferred chain path. No alias was registered yet, so slots
-					// are unchanged; final flush will refresh after the chain ends.
+				if ((g_state.source == SourceContext::InCombat || g_state.source == SourceContext::Bleedout) && queuedNextCycle) {
+					DeferInCombatRecruitAliasLocked(actor, g_state.source == SourceContext::Bleedout ? "after_pleasure_recruit_bleedout_chain_active" : "after_pleasure_recruit_chain_active");
+					(void)TFD::HostilityController::DemoteTruceActorForCycleHold(actor, g_state.source == SourceContext::Bleedout ? "after_pleasure_recruit_bleedout_chain_defer" : "after_pleasure_recruit_chain_defer");
+					// R130: Bleedout now follows the same deferred recruit/crowd-cycle pattern as InCombat.
+					// Do not evaluate or register the converted speaker until the next crowd speaker is armed.
 				}
 				else {
 					aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "after_pleasure_recruit_commit");
@@ -1699,15 +1819,18 @@ namespace TFD::PleasureRuntime
 				if (terminalFinalize.source == SourceContext::InCombat) {
 					QueueInCombatAliasClear(terminalActor, "after_pleasure_cycle_terminal_no_candidate");
 				}
-				else {
+				else if (terminalFinalize.source == SourceContext::PreCombat) {
 					QueuePreCombatAliasClear(terminalActor, "after_pleasure_cycle_terminal_no_candidate");
 				}
-				QueueTruceAliasUnassign(terminalActor, "after_pleasure_cycle_terminal_no_candidate");
+				QueueTruceAliasUnassign(terminalActor, terminalFinalize.source == SourceContext::Bleedout ? "after_pleasure_cycle_terminal_no_candidate_bleedout" : "after_pleasure_cycle_terminal_no_candidate");
 			}
 
-			const bool completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_no_candidate");
-			const auto flushedDeferred = terminalFinalize.source == SourceContext::InCombat ?
-				TFD::PleasureRuntime::FlushDeferredInCombatRecruits("after_pleasure_cycle_no_candidate") :
+			const bool completeFlow = terminalFinalize.source == SourceContext::Bleedout ?
+				TFD::Bleedout::CompletePleasureCycleChainNeutral("after_pleasure_cycle_no_candidate_bleedout") :
+				TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_no_candidate");
+			const bool flushDeferredSource = terminalFinalize.source == SourceContext::InCombat || terminalFinalize.source == SourceContext::Bleedout;
+			const auto flushedDeferred = flushDeferredSource ?
+				TFD::PleasureRuntime::FlushDeferredInCombatRecruits(terminalFinalize.source == SourceContext::Bleedout ? "after_pleasure_cycle_no_candidate_bleedout" : "after_pleasure_cycle_no_candidate") :
 				0u;
 			spdlog::info(
 				"[TFD][PleasureRuntime][R94G] terminal neutral finalize actor={:08X} cycle={} completeFlow={} deferredRegistered={} reason=after_pleasure_cycle_no_candidate",
@@ -1746,22 +1869,31 @@ namespace TFD::PleasureRuntime
 			terminalFailure = true;
 			reason = "actor_already_recruit_like";
 		}
+		else if (attempt.source == SourceContext::Bleedout &&
+			!TFD::Bleedout::IsPleasureCycleDialogueCandidate(actor, LookupActor(attempt.consumedActorFormID))) {
+			terminalFailure = true;
+			reason = "bleedout_candidate_invalid";
+		}
 		else {
 			auto* consumedActor = LookupActor(attempt.consumedActorFormID);
 			if (consumedActor && consumedActor->GetFormID() != attempt.actorFormID) {
-				if (attempt.source == SourceContext::InCombat) {
+				if (attempt.source == SourceContext::InCombat || attempt.source == SourceContext::Bleedout) {
 					FinalizeConsumedInCombatRecruitForCycle(
 						consumedActor,
 						actor,
-						"after_pleasure_cycle_consumed_recruit");
+						attempt.source == SourceContext::Bleedout ? "after_pleasure_cycle_consumed_bleedout_recruit" : "after_pleasure_cycle_consumed_recruit");
 				}
-				QueueTruceAliasUnassign(consumedActor, "after_pleasure_cycle_consumed_recruit");
+				QueueTruceAliasUnassign(consumedActor, attempt.source == SourceContext::Bleedout ? "after_pleasure_cycle_consumed_bleedout_recruit" : "after_pleasure_cycle_consumed_recruit");
 			}
-			QueueTruceAliasPromoteSpeaker(actor, "after_pleasure_cycle_promote_next_speaker");
+			QueueTruceAliasPromoteSpeaker(actor, attempt.source == SourceContext::Bleedout ? "after_pleasure_cycle_promote_next_bleedout_speaker" : "after_pleasure_cycle_promote_next_speaker");
 
 			if (attempt.source == SourceContext::InCombat) {
 				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_incombat");
 				success = TFD::InCombatGreet::BeginForPleasureCycleActor(actor, &action);
+			}
+			else if (attempt.source == SourceContext::Bleedout) {
+				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_bleedout");
+				success = TFD::Bleedout::BeginForPleasureCycleActor(actor, &action);
 			}
 			else {
 				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_precombat");
@@ -1839,12 +1971,12 @@ namespace TFD::PleasureRuntime
 
 	bool QueueNextCycleAfterTerminal(RE::Actor* currentActor, SourceContext source, std::string_view reason)
 	{
-		if (!currentActor || (source != SourceContext::PreCombat && source != SourceContext::InCombat)) {
+		if (!currentActor || (source != SourceContext::PreCombat && source != SourceContext::InCombat && source != SourceContext::Bleedout)) {
 			return false;
 		}
 
 		unsigned scannedCount = 0;
-		auto* nextActor = SelectNextPreCombatCycleActor(currentActor, scannedCount);
+		auto* nextActor = SelectNextCycleActorForSource(currentActor, source, scannedCount);
 		if (!nextActor) {
 			spdlog::info(
 				"[TFD][PleasureRuntime][R94C] terminal cycle queue skipped current={:08X} scanned={} source={} reason=no_candidate trigger={}",
@@ -1856,7 +1988,7 @@ namespace TFD::PleasureRuntime
 		}
 
 		const double now = NowSec();
-		const double initialDelay = source == SourceContext::InCombat ? 0.45 : kPreCombatCycleInitialDelaySec;
+		const double initialDelay = (source == SourceContext::InCombat || source == SourceContext::Bleedout) ? 0.45 : kPreCombatCycleInitialDelaySec;
 		{
 			std::scoped_lock lk(g_lock);
 			if (!g_state.installed) {

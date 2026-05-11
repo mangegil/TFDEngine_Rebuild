@@ -258,6 +258,16 @@ namespace TFD::PostDefeatState
             return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
         }
 
+        bool IsBleedoutDecisionRootActive()
+        {
+            const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+            return snapshot.root == TFD::FlowController::RootFlow::Bleedout &&
+                snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
+                snapshot.sub == TFD::FlowController::SubFlow::None &&
+                !snapshot.terminalResolved &&
+                snapshot.primaryActorFormID != 0;
+        }
+
         void RefreshRecruitGlobalsWhenVictoryReady(int victoryState)
         {
             if (victoryState != kVictoryStateYes) {
@@ -387,6 +397,22 @@ namespace TFD::PostDefeatState
             spdlog::info(
                 "[TFD][PostDefeatState] cleared transient hostile globals because only suppressed dialogue-phase enemies remain count={}",
                 input.suppressedEnemyCount);
+        }
+
+        if (IsBleedoutDecisionRootActive()) {
+            SetGlobalInt(g_defeatStateGlobal, 2);
+            TFD::Victory::ResetObservedContext();
+            TFD::Victory::SetStateValue(kVictoryStateNo);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
+            g_staleVictoryNeutralTicks = 0;
+            SetGlobalInt(g_hostileStateGlobal, 0);
+            SetGlobalInt(g_enemyFactionStateGlobal, 0);
+            SetGlobalInt(g_enemyRaceStateGlobal, 0);
+            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+            SetGlobalInt(g_leftForDeadStateGlobal, 0);
+            spdlog::info(
+                "[TFD][PostDefeatState][R132] preserving Bleedout decision root globals defeat=2 victory=No reason=bleedout_source_dialogue_active");
+            return result;
         }
 
         if (input.pleasurePassiveLock) {

@@ -2296,9 +2296,9 @@ namespace
 
         std::size_t CatchupRegisteredHumanoidTeammatesAfterLoad(const char* reason, std::size_t attempt)
         {
-            spdlog::info("[TFD][TeammateManager] R86 vanilla assist isolation: humanoid post-load catchup skipped reason={} attempt={}", reason ? reason : "post_load_humanoid_catchup", attempt);
-            return 0;
-
+            // R130: re-enable registered humanoid teammate post-load catchup.  This only
+            // touches actors already registered as TFD teammates; it does not scan hostiles
+            // or start new recruitment.
             std::scoped_lock lock(g_syncLock);
             ResolveRegistry();
 
@@ -2469,10 +2469,8 @@ namespace
 
         void QueueHumanoidTeammateCatchupAfterLoad(const char* reason)
         {
-            spdlog::info("[TFD][TeammateManager] R86 vanilla assist isolation: humanoid post-load catchup queue ignored reason={}", reason && reason[0] ? reason : "post_load_humanoid_catchup");
-            return;
-
             const std::string reasonText = reason && reason[0] ? reason : "post_load_humanoid_catchup";
+            spdlog::info("[TFD][TeammateManager][R130] humanoid post-load catchup queued reason={}", reasonText);
 
             std::thread([reasonText]() {
                 constexpr std::array delays{

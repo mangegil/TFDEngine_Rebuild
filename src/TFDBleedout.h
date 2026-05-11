@@ -25,6 +25,11 @@ namespace TFD::Transition
 	struct CaptiveHandlers;
 }
 
+namespace TFD::InteractionRouter
+{
+	enum class Action : std::uint8_t;
+}
+
 namespace TFD::Bleedout
 {
 	enum class DialogueOutcome : std::uint8_t
@@ -288,6 +293,11 @@ namespace TFD::Bleedout
 	bool BeginAfterPleasure(RE::Actor* actor, const char* reason = nullptr);
 	bool HandleAfterPleasureEnter(RE::Actor* actor, const char* reason = nullptr);
 	bool CompleteAfterPleasure(const char* reason = nullptr);
+	bool IsPleasureCycleDialogueCandidate(RE::Actor* actor, RE::Actor* currentActor = nullptr);
+	bool CompletePleasureCycleChainNeutral(const char* reason = nullptr);
+	bool BeginForPleasureCycleActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction = nullptr);
+	bool TryContinueAfterPleasureCrowd(RE::Actor* consumedActor, const char* reason = nullptr, bool recruitChoice = false);
+	bool TickQueuedAfterPleasureCrowdContinuation();
 
 	const char* GetDialogueOutcomeName(DialogueOutcome outcome);
 
