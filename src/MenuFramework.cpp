@@ -337,7 +337,7 @@ namespace TFDMenu
 				actor->EvaluatePackage(true, true);
 
 				spdlog::info(
-					"[TFD][Menu][R109] after pleasure activation prepared actor={:08X} phase={} source={} reason={} action=allow_vanilla_activation",
+					"[TFD][Menu][R109] after pleasure activation prepared actor={:08X} phase={} source={} reason={} action=prepared_for_native_activation",
 					actor->GetFormID(),
 					TFD::PleasureRuntime::GetPhaseName(),
 					TFD::PleasureRuntime::GetSourceContextName(),
@@ -345,12 +345,26 @@ namespace TFDMenu
 				return true;
 			}
 
+			static bool OpenAfterPleasureDialogueFromActivation(RE::Actor* actor, const char* reason)
+			{
+				if (!PrepareAfterPleasureActivationActor(actor, reason ? reason : "after_pleasure_activation_dialogue")) {
+					return false;
+				}
+
+				TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
+				spdlog::info(
+					"[TFD][Menu][R127] after pleasure activation native open actor={:08X} phase={} source={} reason={} action=native_activation_dialogue",
+					actor->GetFormID(),
+					TFD::PleasureRuntime::GetPhaseName(),
+					TFD::PleasureRuntime::GetSourceContextName(),
+					reason ? reason : "after_pleasure_activation_dialogue");
+				return true;
+			}
+
 			static bool OpenInCombatTruceDialogueFromActivation(RE::Actor* actor, const char* reason)
 			{
-				if (PrepareAfterPleasureActivationActor(actor, reason ? reason : "incombat_activation_after_pleasure")) {
-					// Let vanilla activation continue.  The actor is the active AfterPleasure speaker,
-					// not an InCombat crowd target, so R94F must not close/block dialogue here.
-					return false;
+				if (OpenAfterPleasureDialogueFromActivation(actor, reason ? reason : "incombat_activation_after_pleasure")) {
+					return true;
 				}
 
 				if (!IsInCombatTruceActivationActor(actor)) {
@@ -2438,8 +2452,8 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 											return RE::BSEventNotifyControl::kStop;
 										}
 									}
-									else if (PrepareAfterPleasureActivationActor(crosshairActor, "after_pleasure_crosshair_activate_dialogue")) {
-										return RE::BSEventNotifyControl::kContinue;
+									else if (OpenAfterPleasureDialogueFromActivation(crosshairActor, "after_pleasure_crosshair_activate_dialogue")) {
+										return RE::BSEventNotifyControl::kStop;
 									}
 									else if (IsInCombatTruceActivationActor(crosshairActor)) {
 										if (OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue")) {

@@ -102,7 +102,7 @@ namespace TFD::PleasureRuntime
 		constexpr double kPreCombatCycleExpireSec = 8.0;
 		constexpr unsigned kPreCombatCycleMaxAttempts = 12;
 		constexpr double kTerminalNeutralFinalizeDelaySec = 0.05;
-		constexpr double kAfterPleasureDialogueHardTimeoutSec = 20.0;
+		constexpr double kAfterPleasureDialogueHardTimeoutSec = 0.0; // R127: AfterPleasure waits for terminal choice; no destructive hard timeout.
 		constexpr double kSuppressSceneStartDialogueCooldownSec = 0.75;
 		constexpr double kMinimumSceneActiveSec = 1.50;
 		constexpr double kAbortedFlowCompleteDelaySec = 0.05;
@@ -1494,8 +1494,8 @@ namespace TFD::PleasureRuntime
 					g_state.afterPleasureCommitted = true;
 					g_state.pendingChoice = AfterChoice::None;
 					g_state.blocking = true;
-					g_state.afterPleasureDialogueExpireSec = NowSec() + kAfterPleasureDialogueHardTimeoutSec;
-					LogEventAcceptedLocked(eventName, info, "dialogue_open");
+					g_state.afterPleasureDialogueExpireSec = 0.0;
+					LogEventAcceptedLocked(eventName, info, "dialogue_open_no_hard_timeout");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);

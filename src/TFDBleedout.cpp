@@ -1253,7 +1253,7 @@ namespace TFD::Bleedout
 			handlers.clearBridgeAliases(why);
 		}
 		if (preserveSession) {
-			spdlog::info("[TFD][Bleedout][R125] preserve source bridge during pleasure commit speaker={:08X} captor={:08X} reason={}",
+			spdlog::info("[TFD][Bleedout][R127] preserve source bridge during pleasure commit speaker={:08X} captor={:08X} reason={}",
 				speakerId,
 				captorId,
 				why);
@@ -1277,7 +1277,7 @@ namespace TFD::Bleedout
 			handlers.clearLastEnemyTargetingPlayer();
 		}
 		if (preserveSession) {
-			spdlog::info("[TFD][Bleedout][R125] preserve source runtime during pleasure commit reason={}", why);
+			spdlog::info("[TFD][Bleedout][R127] preserve source runtime during pleasure commit reason={}", why);
 		}
 		if (handlers.clearOutcomeWindow) {
 			handlers.clearOutcomeWindow(why);
@@ -2334,7 +2334,7 @@ namespace TFD::Bleedout
 			handlers.clearPendingCinematicFadeIn();
 		}
 		if (handlers.clearBridgeAliases) {
-			spdlog::info("[TFD][Bleedout][R125] preserve bridge aliases during pleasure handoff reason={}", why);
+			spdlog::info("[TFD][Bleedout][R127] preserve bridge aliases during pleasure handoff reason={}", why);
 		}
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();

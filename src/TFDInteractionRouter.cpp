@@ -1641,6 +1641,7 @@ namespace TFD::InteractionRouter
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
             constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
             constexpr auto kPreCombatApproachAssistDelay = std::chrono::milliseconds(10000);
+            constexpr auto kBleedoutApproachAssistDelay = std::chrono::milliseconds(10000);
             constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
             constexpr float kPreCombatApproachAssistDistance = 240.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
@@ -2012,7 +2013,15 @@ namespace TFD::InteractionRouter
                 }
             }
 
-            bool MoveActorNearPlayerForApproach(RE::PlayerCharacter* player, RE::Actor* actor, float yawOffset, float distance, const char* role, const char* reason)
+            bool MoveActorNearPlayerForApproach(
+                RE::PlayerCharacter* player,
+                RE::Actor* actor,
+                float yawOffset,
+                float distance,
+                const char* role,
+                const char* reason,
+                const char* modeName,
+                float targetDistanceForLog)
             {
                 if (!player || !actor || actor == player) {
                     return false;
@@ -2044,12 +2053,13 @@ namespace TFD::InteractionRouter
 
                 const float afterDist = std::sqrt(DistanceSquared(player, actor));
                 spdlog::warn(
-                    "[TFD][DialogueOpen] approach assist moveto member mode=PreCombatTruce role={} actor={:08X} beforeDist={:.1f} afterDist={:.1f} targetDist={:.1f} reason={}",
+                    "[TFD][DialogueOpen][R127] approach assist moveto member mode={} role={} actor={:08X} beforeDist={:.1f} afterDist={:.1f} targetDist={:.1f} reason={}",
+                    modeName ? modeName : "Unknown",
                     role ? role : "member",
                     actor->GetFormID(),
                     beforeDist,
                     afterDist,
-                    kPreCombatForceGreetMaxDistance,
+                    targetDistanceForLog,
                     reason ? reason : "unknown");
 
                 return true;
@@ -2099,7 +2109,7 @@ namespace TFD::InteractionRouter
                         distance = kPreCombatApproachAssistDistance + 70.0f + (30.0f * ring);
                     }
 
-                    if (MoveActorNearPlayerForApproach(player, actor, yawOffset, distance, role, reason)) {
+                    if (MoveActorNearPlayerForApproach(player, actor, yawOffset, distance, role, reason, "PreCombatTruce", kPreCombatForceGreetMaxDistance)) {
                         ++movedCount;
                         if (i > 0) {
                             ++crowdMovedCount;
@@ -2119,6 +2129,69 @@ namespace TFD::InteractionRouter
                 if (movedCount > 0) {
                     SendPreCombatCrowdApproachAssistEvent(speaker, movedCount, crowdMovedCount, participantCount, reason);
                 }
+
+                return movedCount > 0;
+            }
+
+
+            bool AssistBleedoutApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
+            {
+                if (!player || !speaker || speaker == player) {
+                    return false;
+                }
+
+                if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+
+                std::vector<RE::Actor*> actors;
+                actors.push_back(speaker);
+
+                const auto activeActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
+                for (auto* actor : activeActors) {
+                    if (!actor || actor == speaker) {
+                        continue;
+                    }
+                    if (!TFD::HostilityController::CanOpenDialogue(actor)) {
+                        continue;
+                    }
+                    AddUniqueDialogueAssistActor(actors, actor);
+                }
+
+                unsigned movedCount = 0;
+                unsigned crowdMovedCount = 0;
+                for (std::size_t i = 0; i < actors.size(); ++i) {
+                    auto* actor = actors[i];
+                    if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                        continue;
+                    }
+
+                    float yawOffset = 0.0f;
+                    float distance = kPreCombatApproachAssistDistance;
+                    const char* role = i == 0 ? "speaker" : "crowd";
+
+                    if (i > 0) {
+                        const float side = (i % 2) == 1 ? 1.0f : -1.0f;
+                        const float ring = static_cast<float>((i - 1) / 2);
+                        yawOffset = side * (0.75f + (0.20f * ring));
+                        distance = kPreCombatApproachAssistDistance + 70.0f + (30.0f * ring);
+                    }
+
+                    if (MoveActorNearPlayerForApproach(player, actor, yawOffset, distance, role, reason, "Bleedout", kBleedoutForceGreetMaxDistance)) {
+                        ++movedCount;
+                        if (i > 0) {
+                            ++crowdMovedCount;
+                        }
+                    }
+                }
+
+                spdlog::warn(
+                    "[TFD][DialogueOpen][R127] approach assist moveto group mode=Bleedout speaker={:08X} moved={} crowdMoved={} participants={} reason={}",
+                    speaker->GetFormID(),
+                    movedCount,
+                    crowdMovedCount,
+                    static_cast<unsigned>(actors.size()),
+                    reason ? reason : "unknown");
 
                 return movedCount > 0;
             }
@@ -2341,7 +2414,13 @@ namespace TFD::InteractionRouter
                 g_pending.lastHardReset = {};
                 g_pending.lastRangeGateLog = {};
                 g_pending.lastApproachRefresh = {};
-                g_pending.nextApproachAssist = mode == Mode::PreCombatTruce ? now + kPreCombatApproachAssistDelay : Clock::time_point{};
+                if (mode == Mode::PreCombatTruce) {
+                    g_pending.nextApproachAssist = now + kPreCombatApproachAssistDelay;
+                } else if (mode == Mode::Bleedout) {
+                    g_pending.nextApproachAssist = now + kBleedoutApproachAssistDelay;
+                } else {
+                    g_pending.nextApproachAssist = Clock::time_point{};
+                }
                 g_pending.approachAssistUsed = false;
 
                 if (IsApproachPackageMode(mode)) {
@@ -2555,11 +2634,13 @@ namespace TFD::InteractionRouter
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
-                if (needsPreCombatRangeGate &&
+                if ((needsPreCombatRangeGate || needsBleedoutRangeGate) &&
                     !g_pending.approachAssistUsed &&
                     g_pending.nextApproachAssist.time_since_epoch().count() != 0 &&
                     now >= g_pending.nextApproachAssist) {
-                    g_pending.approachAssistUsed = AssistPreCombatApproach(player, speaker, "range_gate_stuck");
+                    g_pending.approachAssistUsed = needsBleedoutRangeGate ?
+                        AssistBleedoutApproach(player, speaker, "range_gate_stuck") :
+                        AssistPreCombatApproach(player, speaker, "range_gate_stuck");
                     g_pending.lastApproachRefresh = now;
                     g_pending.lastPackageRefresh = now;
                     g_pending.nextAttempt = now + kRetryDelay;

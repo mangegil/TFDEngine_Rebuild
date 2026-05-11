@@ -2534,7 +2534,76 @@ namespace TFD::DefeatMonitor
 			if (!captiveBleedOverlay && TFD::Rescue::IsActive() && inCombatDialogueOpen) {
 				TFD::RescueGreet::NotifyDialogueOpened();
 			}
+
+			// R127: Dialogue Menu pauses the game. Bleedout AfterPleasure must observe
+			// the open state before the pause gate, or the close transition is missed
+			// and the native forcegreet only flashes.
+			const auto bleedAfterPleasurePauseSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			if (!captiveBleedOverlay &&
+				bleedAfterPleasurePauseSnapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure &&
+				inCombatDialogueOpen) {
+				if (!g_prevDialogueOpen) {
+					auto* afterSpeaker = TFD::PleasureRuntime::GetPrimarySpeaker();
+					spdlog::info(
+						"[TFD][Defeat][R127] bleed after pleasure dialogue observed before pause gate speaker={:08X}",
+						afterSpeaker ? afterSpeaker->GetFormID() : 0u);
+				}
+				TFD::BleedoutGreet::NotifyDialogueOpened();
+				g_prevDialogueOpen = true;
+			}
+
 			if (!TFD::Captive::TickRuntime(Player(), captiveBleedOverlay, BuildCaptiveRuntimeTickHandlers())) {
+				return;
+			}
+
+			// R128: Bleedout AfterPleasure has to own the full open->close edge
+			// before the pause gate. R127 only observed the open edge before
+			// GameIsPaused(), then the close/no-commit edge could be missed until
+			// the player manually activated the speaker. Service the dialogue-open
+			// request here and reopen with the Pleasure/flow primary speaker.
+			const auto bleedAfterPleasurePrePauseSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			if (!captiveBleedOverlay &&
+				bleedAfterPleasurePrePauseSnapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure) {
+				TFD::InteractionRouter::DialogueOpen::Tick();
+				const bool dOpen = IsDialogueOpen();
+				const auto nowBleedAfter = Now();
+
+				RE::Actor* afterSpeaker = TFD::PleasureRuntime::GetPrimarySpeaker();
+				std::uint32_t afterSpeakerID = afterSpeaker ? afterSpeaker->GetFormID() : bleedAfterPleasurePrePauseSnapshot.primaryActorFormID;
+				if (!afterSpeaker && afterSpeakerID != 0) {
+					afterSpeaker = RE::TESForm::LookupByID<RE::Actor>(afterSpeakerID);
+				}
+				if (!afterSpeaker) {
+					afterSpeaker = CurrentBleedSpeaker();
+					afterSpeakerID = afterSpeaker ? afterSpeaker->GetFormID() : CurrentBleedSpeakerID();
+				}
+
+				if (dOpen) {
+					TFD::BleedoutGreet::NotifyDialogueOpened();
+					g_prevDialogueOpen = true;
+					return;
+				}
+
+				if (TFD::BleedoutGreet::TryAfterPleasureWatchdog(g_prevDialogueOpen, dOpen, afterSpeakerID, nowBleedAfter,
+					[&](const char* reopenReason) -> bool {
+						RE::Actor* reopenSpeaker = afterSpeaker;
+						if (!reopenSpeaker && afterSpeakerID != 0) {
+							reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(afterSpeakerID);
+						}
+						if (!reopenSpeaker || reopenSpeaker->IsDead() || reopenSpeaker->IsDisabled()) {
+							return false;
+						}
+						const bool reopened = TFD::BleedoutGreet::BeginAfterPleasure(reopenSpeaker, reopenReason);
+						spdlog::info("[TFD][Defeat][R128] bleed after pleasure pre-pause close watchdog native reopen speaker={:08X} ok={}",
+							reopenSpeaker->GetFormID(),
+							reopened ? 1 : 0);
+						return reopened;
+					})) {
+					g_prevDialogueOpen = false;
+					return;
+				}
+
+				g_prevDialogueOpen = false;
 				return;
 			}
 
@@ -2622,33 +2691,6 @@ namespace TFD::DefeatMonitor
 				}
 			}
 
-			if (!g_inBleedState.load(std::memory_order_acquire)) {
-				const auto bleedAfterSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
-				if (bleedAfterSnapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure) {
-					const bool dOpen = IsDialogueOpen();
-					const auto nowBleedAfter = Now();
-					if (dOpen) {
-						TFD::BleedoutGreet::NotifyDialogueOpened();
-					}
-					else if (TFD::BleedoutGreet::TryAfterPleasureWatchdog(g_prevDialogueOpen, dOpen, CurrentBleedSpeakerID(), nowBleedAfter,
-						[&](const char* reopenReason) -> bool {
-							auto* reopenSpeaker = CurrentBleedSpeaker();
-							if (!reopenSpeaker || reopenSpeaker->IsDead() || reopenSpeaker->IsDisabled()) {
-								return false;
-							}
-							const bool reopened = TFD::BleedoutGreet::BeginAfterPleasure(reopenSpeaker, reopenReason);
-							spdlog::info("[TFD][Defeat][R125] bleed after pleasure watchdog native reopen speaker={:08X} ok={}",
-								reopenSpeaker->GetFormID(),
-								reopened ? 1 : 0);
-							return reopened;
-						})) {
-						g_prevDialogueOpen = dOpen;
-						return;
-					}
-					g_prevDialogueOpen = dOpen;
-					return;
-				}
-			}
 
 			if (g_inBleedState.load(std::memory_order_acquire)) {
 				if (g_bleedBattleObservePending) {

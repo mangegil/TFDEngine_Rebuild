@@ -1767,7 +1767,7 @@ namespace TFD::FlowController
                     ? TFD::BleedoutGreet::BeginAfterPleasure(actor, "bleedout_after_pleasure_force_open")
                     : false;
                 spdlog::info(
-                    "[TFD][Flow][R125] bleedout after pleasure force-open follows native pattern source={} actor={:08X} flowBegin={} nativeHardOpen={}",
+                    "[TFD][Flow][R127] bleedout after pleasure force-open follows native pattern source={} actor={:08X} flowBegin={} nativeHardOpen={}",
                     sourceFlow,
                     actor->GetFormID(),
                     beginAfter ? 1 : 0,
@@ -1793,14 +1793,14 @@ namespace TFD::FlowController
                     : false;
                 if (beginAfter || nativeOpen) {
                     spdlog::info(
-                        "[TFD][Flow][R125] bleedout after pleasure greet armed source={} actor={:08X} flowBegin={} nativeHardOpen={}",
+                        "[TFD][Flow][R127] bleedout after pleasure greet armed source={} actor={:08X} flowBegin={} nativeHardOpen={}",
                         sourceFlow,
                         actor->GetFormID(),
                         beginAfter ? 1 : 0,
                         nativeOpen ? 1 : 0);
                 }
                 else {
-                    spdlog::warn("[TFD][Flow][R125] bleedout after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
+                    spdlog::warn("[TFD][Flow][R127] bleedout after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
                 }
             }
             else if (actor && IsInCombatSource(sourceFlow)) {
