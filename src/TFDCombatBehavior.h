@@ -17,13 +17,13 @@ namespace TFD::CombatBehavior
     void ResetForLoad();
     bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm);
 
-    // Diagnostic helpers. R73 also uses this runtime state as short-lived normal-combat ownership.
+    // Runtime diagnostics for short-lived combat advisory targets while the player is in bleedout battle observe.
     bool IsDiagnosticActor(RE::Actor* actor);
     bool IsDiagnosticPair(RE::Actor* actor, RE::Actor* target);
     const char* DiagnosticRole(RE::Actor* actor);
 
-    // Normal combat ownership helpers. These must return false during truce, bleedout, captive,
-    // pleasure, passive hold, terminal outcome, or release grace contexts.
+    // Normal combat ownership stays disabled. The current implementation only protects the bleedout
+    // battle-observe assist advisor so teammates keep pressure on standing threats while the player is down.
     bool IsNormalCombatAssistActive();
     bool IsActiveCombatAlly(RE::Actor* actor);
     bool IsActiveCombatThreat(RE::Actor* actor);

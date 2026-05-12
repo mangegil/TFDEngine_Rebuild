@@ -1,6 +1,7 @@
 #include "TFDPayModel.h"
 
 #include "TFDActor.h"
+#include "TFDBleedout.h"
 #include "TFDHostilityController.h"
 #include "TFDLocation.h"
 #include "TFDTeammateManager.h"
@@ -408,7 +409,7 @@ namespace TFD::PayModel
                     if (context == PayContext::Bleedout && !IsDialogueEncounterActor(actor)) {
                         if (actor) {
                             spdlog::info(
-                                "[TFD][PayModel][R129] skip non-dialogue bleedout actor actor={:08X} source={}",
+                                "[TFD][PayModel][CB07] skip non-dialogue bleedout actor actor={:08X} source={}",
                                 actor->GetFormID(),
                                 source ? source : "unknown");
                         }
@@ -419,15 +420,28 @@ namespace TFD::PayModel
 
                 addEncounterActor(speaker, "speaker");
 
-                const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
-                for (auto* actor : dialogueTruceActors) {
-                    addEncounterActor(actor, "dialogue_truce");
+                if (context == PayContext::Bleedout) {
+                    // CB07: Bleedout owns its own participant set. Do not rebuild the pay list
+                    // from HostilityController dialogue/active truce sessions; those sessions
+                    // can contain ambient or far actors that Bleedout already rejected.
+                    const auto lockedCrowdIds = TFD::Bleedout::GetBleedCrowdAssignedIDs();
+                    for (const auto actorId : lockedCrowdIds) {
+                        if (actorId == 0) {
+                            continue;
+                        }
+                        auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+                        addEncounterActor(actor, "bleedout_locked_participant");
+                    }
+                    spdlog::info(
+                        "[TFD][PayModel][CB07] bleedout quote locked participants speaker={:08X} lockedCrowd={} actors={} reason=no_truce_recollect",
+                        speaker->GetFormID(),
+                        static_cast<unsigned int>(lockedCrowdIds.size()),
+                        static_cast<unsigned int>(out.size()));
                 }
-
-                if (context == PayContext::Bleedout && out.size() <= 1) {
-                    const auto activeTruceActors = TFD::HostilityController::CollectActiveTruceActors(speaker);
-                    for (auto* actor : activeTruceActors) {
-                        addEncounterActor(actor, "active_truce_fallback");
+                else {
+                    const auto dialogueTruceActors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
+                    for (auto* actor : dialogueTruceActors) {
+                        addEncounterActor(actor, "dialogue_truce");
                     }
                 }
 
@@ -438,11 +452,12 @@ namespace TFD::PayModel
                 // so recruit capacity must never reduce the encounter price to zero.
                 // Recruit overflow is handled later by the recruit commit path.
                 spdlog::info(
-                    "[TFD][PayModel][R123] dialogue assigned actors speaker={:08X} context={} actors={} slotsFree={} reason=shared_truce_actor_list",
+                    "[TFD][PayModel][CB07] dialogue assigned actors speaker={:08X} context={} actors={} slotsFree={} reason={}",
                     speaker->GetFormID(),
                     static_cast<int>(context),
                     static_cast<unsigned>(actorCount),
-                    static_cast<unsigned>(slotsFree));
+                    static_cast<unsigned>(slotsFree),
+                    context == PayContext::Bleedout ? "bleedout_locked_participant_list" : "shared_truce_actor_list");
                 return out;
             }
 

@@ -80,6 +80,7 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kInCombatOutcomeResetEvent = "TFDInCombatOutcomeReset";
 		constexpr const char* kPleasureOutcomeReleaseEvent = "TFDPleasureOutcomeRelease";
 		constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
+		constexpr const char* kBleedoutGreetConfirmedEvent = "TFDBleedoutGreetConfirmed";
 
 		static std::uint32_t ResolveBleedFlowActorFormID();
 		static TFD::Bleedout::RuntimeHostStateRefs BuildBleedRuntimeHostStateRefs();
@@ -365,10 +366,12 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_bleedBattleObservePendingUntil{};
 		std::chrono::steady_clock::time_point g_bleedBattleObservePendingLastRedirect{};
 		int g_bleedBattleObservePendingEmptyEnemyTicks = 0;
+		int g_bleedBattleObservePendingEmptyAllyTicks = 0;
 		bool g_bleedBattleObserveActive = false;
 		std::chrono::steady_clock::time_point g_bleedBattleObserveSince{};
 		std::chrono::steady_clock::time_point g_bleedBattleObserveLastRedirect{};
 		int g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
+		int g_bleedBattleObserveActiveEmptyAllyTicks = 0;
 		RE::ActorHandle g_bleedBattlePreferredEnemy{};
 		BleedBattleObserverState g_bleedBattleObserver{};
 		thread_local std::uint32_t g_observedCombatCommitDepth = 0;
@@ -877,10 +880,12 @@ namespace TFD::DefeatMonitor
 				g_bleedBattleObservePendingUntil = {};
 				g_bleedBattleObservePendingLastRedirect = {};
 				g_bleedBattleObservePendingEmptyEnemyTicks = 0;
+				g_bleedBattleObservePendingEmptyAllyTicks = 0;
 				g_bleedBattleObserveActive = false;
 				g_bleedBattleObserveSince = {};
 				g_bleedBattleObserveLastRedirect = {};
 				g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
+				g_bleedBattleObserveActiveEmptyAllyTicks = 0;
 				};
 			handlers.clearEscapeBreakState = [&]() { TFD::Captive::ClearEscapeBreakRebleed(); };
 			handlers.clearLastEnemyTargetingPlayer = [&]() { ClearLastEnemyTargetingPlayerInternal(); };
@@ -926,10 +931,12 @@ namespace TFD::DefeatMonitor
 						g_bleedBattleObservePendingUntil = {};
 						g_bleedBattleObservePendingLastRedirect = {};
 						g_bleedBattleObservePendingEmptyEnemyTicks = 0;
+						g_bleedBattleObservePendingEmptyAllyTicks = 0;
 						g_bleedBattleObserveActive = false;
 						g_bleedBattleObserveSince = {};
 						g_bleedBattleObserveLastRedirect = {};
 						g_bleedBattleObserveActiveEmptyEnemyTicks = 0;
+						g_bleedBattleObserveActiveEmptyAllyTicks = 0;
 						g_bleedBattlePreferredEnemy.reset();
 						g_bleedBattleObserver = {};
 					},
@@ -1767,6 +1774,7 @@ namespace TFD::DefeatMonitor
 			const bool victoryContext = IsVictoryCombatContextActive(player, enemies);
 			const bool routerCombatContext = IsRouterCombatContextActive(player, enemies);
 			const bool pleasurePassiveLock = TFD::PleasureRuntime::IsPassiveLockActive();
+			const bool battleObserveHold = g_bleedBattleObservePending || g_bleedBattleObserveActive;
 			auto refreshResult = TFD::PostDefeatState::Refresh(TFD::PostDefeatState::RefreshInput{
 				.player = player,
 				.enemies = std::move(enemies),
@@ -1775,7 +1783,8 @@ namespace TFD::DefeatMonitor
 				.routerCombatContext = routerCombatContext,
 				.onlySuppressedDialogueEnemies = onlySuppressedDialogueEnemies,
 				.suppressedEnemyCount = suppressedEnemyCount,
-				.pleasurePassiveLock = pleasurePassiveLock
+				.pleasurePassiveLock = pleasurePassiveLock,
+				.battleObserveHold = battleObserveHold
 				});
 			g_lastRouterCombatContextActive = refreshResult.routerCombatContextActive;
 		}
@@ -2759,6 +2768,28 @@ namespace TFD::DefeatMonitor
 
 				{
 					const auto nowBleed = Now();
+					if (TFD::BleedoutGreet::TryInitialHandoffWatchdog(TFD::Bleedout::HasTerminalCommit(), IsDialogueOpen(), TFD::PleasureRuntime::IsBlocking(), CurrentBleedSpeakerID(), nowBleed,
+						[&](const char* reopenReason) -> bool {
+							auto* reopenSpeaker = CurrentBleedSpeaker();
+							float reopenDist = 99999.0f;
+							if (!(player && reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist))) {
+								return false;
+							}
+							ApplyBleedDialogueOverdrive(player, reopenSpeaker, reopenReason, true);
+							g_bleedPaused = true;
+							g_bleedPauseStarted = nowBleed;
+							g_bleedLastSeconds = -1;
+							spdlog::info("[TFD][Defeat][CB06B] bleed initial handoff retry speaker={:08X} dist={:.1f}",
+								reopenSpeaker->GetFormID(),
+								reopenDist);
+							return true;
+						})) {
+						return;
+					}
+				}
+
+				{
+					const auto nowBleed = Now();
 					if (TFD::BleedoutGreet::TryStickyWatchdog(TFD::Bleedout::HasTerminalCommit(), IsDialogueOpen(), TFD::PleasureRuntime::IsBlocking(), CurrentBleedSpeakerID(), nowBleed,
 						[&](const char* reopenReason) -> bool {
 							auto* reopenSpeaker = CurrentBleedSpeaker();
@@ -2956,6 +2987,12 @@ else {
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
+				if (std::strcmp(rawName, kBleedoutGreetConfirmedEvent) == 0) {
+					auto* speaker = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
+					TFD::BleedoutGreet::NotifyFlowGreetConfirmed(speaker, ev->strArg.c_str());
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
 				if (TFD::FlowController::HandleOutcomeModEvent(rawName, ev->strArg.c_str(), ev->numArg, ev->sender)) {
 					return RE::BSEventNotifyControl::kContinue;
 				}
@@ -3124,10 +3161,12 @@ else {
 			&g_bleedBattleObservePendingUntil,
 			&g_bleedBattleObservePendingLastRedirect,
 			&g_bleedBattleObservePendingEmptyEnemyTicks,
+			&g_bleedBattleObservePendingEmptyAllyTicks,
 			&g_bleedBattleObserveActive,
 			&g_bleedBattleObserveSince,
 			&g_bleedBattleObserveLastRedirect,
 			&g_bleedBattleObserveActiveEmptyEnemyTicks,
+			&g_bleedBattleObserveActiveEmptyAllyTicks,
 			[]() { return BuildLocalBleedRuntimeHostHandlers(); },
 			[]() { return BuildBleedDialogueHotkeyHandlers(); },
 			[]() -> RE::Actor* { return Player(); },

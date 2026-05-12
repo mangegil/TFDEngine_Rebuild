@@ -20,6 +20,7 @@ namespace TFD::PostDefeatState
         bool onlySuppressedDialogueEnemies{ false };
         std::size_t suppressedEnemyCount{ 0 };
         bool pleasurePassiveLock{ false };
+        bool battleObserveHold{ false };
     };
 
     struct RefreshResult

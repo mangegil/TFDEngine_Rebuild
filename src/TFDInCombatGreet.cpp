@@ -17,6 +17,7 @@
 #include "TFDFlowController.h"
 #include "TFDTransition.h"
 #include "TFDPayModel.h"
+#include "TFDBleedout.h"
 
 namespace TFD::InCombatGreet
 {
@@ -81,6 +82,19 @@ namespace TFD::InCombatGreet
 				SKSE::ModCallbackEvent ev{ name.c_str(), "", 0.0f, outSender };
 				src->SendEvent(&ev);
 			});
+		}
+
+		bool IsPlayerBleedoutInteractionOwned()
+		{
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (!player) {
+				return false;
+			}
+			if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
+				return true;
+			}
+			auto* state = player->AsActorState();
+			return state && state->IsBleedingOut();
 		}
 
 		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -228,6 +242,12 @@ namespace TFD::InCombatGreet
 		if (outAction) {
 			*outAction = TFD::InteractionRouter::Action::None;
 		}
+		if (IsPlayerBleedoutInteractionOwned()) {
+			spdlog::info(
+				"[TFD][InCombatGreet][CB05] BeginForActor blocked actor={:08X} reason=player_bleedout_owned_by_bleedout_route",
+				speaker ? speaker->GetFormID() : 0u);
+			return false;
+		}
 		if (!IsCandidate(speaker, player)) {
 			return false;
 		}
@@ -295,6 +315,13 @@ namespace TFD::InCombatGreet
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (outAction) {
 			*outAction = TFD::InteractionRouter::Action::None;
+		}
+
+		if (IsPlayerBleedoutInteractionOwned()) {
+			spdlog::info(
+				"[TFD][InCombatGreet][CB05] BeginForPleasureCycleActor blocked actor={:08X} reason=player_bleedout_owned_by_bleedout_route",
+				speaker ? speaker->GetFormID() : 0u);
+			return false;
 		}
 
 		if (!IsCandidate(speaker, player)) {
@@ -408,6 +435,10 @@ namespace TFD::InCombatGreet
 	bool Begin(RE::Actor* speaker, const char* reason)
 	{
 		const auto formID = speaker ? speaker->GetFormID() : 0u;
+		if (IsPlayerBleedoutInteractionOwned()) {
+			spdlog::info("[TFD][InCombatGreet][CB05] begin ignored speaker={:08X} reason={} player_bleedout_owned_by_bleedout_route=1", formID, reason ? reason : "incombat");
+			return false;
+		}
 		if (!OwnsCurrentFlow()) {
 			spdlog::warn("[TFD][InCombatGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", formID, reason ? reason : "incombat");
 			return false;
@@ -438,6 +469,10 @@ namespace TFD::InCombatGreet
 	bool BeginAfterPleasure(RE::Actor* speaker, const char* reason)
 	{
 		const auto formID = speaker ? speaker->GetFormID() : 0u;
+		if (IsPlayerBleedoutInteractionOwned()) {
+			spdlog::info("[TFD][InCombatGreet][CB05] after pleasure ignored speaker={:08X} reason={} player_bleedout_owned_by_bleedout_route=1", formID, reason ? reason : "after_pleasure");
+			return false;
+		}
 		if (!OwnsCurrentFlow()) {
 			spdlog::warn("[TFD][InCombatGreet] after pleasure ignored speaker={:08X} reason={} flowOwnerMismatch=1", formID, reason ? reason : "after_pleasure");
 			return false;

@@ -89,6 +89,18 @@ namespace TFD::InteractionRouter
             return IsPlayerSideActor(combatTarget, player);
         }
 
+        bool IsPlayerBleedoutInteractionOwned(RE::Actor* player)
+        {
+            if (!player || !player->IsPlayerRef()) {
+                return false;
+            }
+            if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
+                return true;
+            }
+            auto* state = player->AsActorState();
+            return state && state->IsBleedingOut();
+        }
+
         void ResolveSnapshotTargetContext(
             const TFD::Actor::Snapshot& snapshot,
             RE::Actor* actor,
@@ -544,6 +556,16 @@ namespace TFD::InteractionRouter
                 return MakeResolveFailure(FailReason::NoUsableAction, player->GetFormID(), target->GetFormID());
             }
 
+            if (IsPlayerBleedoutInteractionOwned(player)) {
+                spdlog::info(
+                    "[TFD][Router][CB05] reject target={:08X} reason=player_bleedout_owned_by_bleedout_route",
+                    target ? target->GetFormID() : 0u);
+                return MakeResolveFailure(
+                    FailReason::TargetRejected,
+                    player ? player->GetFormID() : 0u,
+                    target ? target->GetFormID() : 0u);
+            }
+
             if (IsPlayerSideActor(target, player->As<RE::PlayerCharacter>())) {
                 spdlog::info(
                     "[TFD][Router] reject target={:08X} reason=player_side_actor",
@@ -880,6 +902,18 @@ namespace TFD::InteractionRouter
             return result;
         }
 
+        if (IsPlayerBleedoutInteractionOwned(player)) {
+            result.kind = FlowOwnedPrimaryKind::Bleedout;
+            result.interactionState = 5;
+            result.handled = true;
+            result.success = TFD::Bleedout::DefeatGlue::BeginDialogueHotkey();
+            result.notification = result.success ? "TFD: BleedOut Truce" : "TFD: BleedOut Waiting";
+            spdlog::info(
+                "[TFD][Router][CB05] flow-owned primary routed to bleedout success={} reason=player_bleedout_owned_by_bleedout_route",
+                result.success ? 1 : 0);
+            return result;
+        }
+
         if (snapshot.root == TFD::FlowController::RootFlow::Bleedout || TFD::FlowController::Controller::GetSingleton().IsBleedDecisionActive()) {
             result.kind = FlowOwnedPrimaryKind::Bleedout;
             result.interactionState = 5;
@@ -909,6 +943,11 @@ namespace TFD::InteractionRouter
     {
         PrimaryHotkeyPickResult result{};
         if (!player) {
+            return result;
+        }
+
+        if (IsPlayerBleedoutInteractionOwned(player)) {
+            spdlog::info("[TFD][Router][CB05] primary pick blocked reason=player_bleedout_owned_by_bleedout_route");
             return result;
         }
 

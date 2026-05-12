@@ -916,13 +916,14 @@ namespace TFD::PleasureRuntime
 				AppendUniqueCycleActor(actors, RE::TESForm::LookupByID<RE::Actor>(actorID));
 			}
 
-			// R131: Bleedout has its own staged crowd queue from the original defeat
-			// window.  Late HostilityController dialogue scans may only return the
-			// consumed speaker after OStim/AfterPleasure pacifies combat.  For this
-			// source, keep the staged Bleedout crowd as authoritative and append the
-			// truce session lists only as fallback/extra coverage.
-			AppendUniqueCycleActorList(actors, TFD::HostilityController::CollectDialogueTruceActors(currentActor));
-			AppendUniqueCycleActorList(actors, TFD::HostilityController::CollectActiveTruceActors(currentActor));
+			// CB07: Bleedout crowd is locked by the original defeat handoff. Do not
+			// append HostilityController dialogue/active truce lists here; those lists can
+			// include ambient actors from the native suppression session and can reintroduce
+			// far/scripted actors that Bleedout already rejected.
+			spdlog::info(
+				"[TFD][PleasureRuntime][CB07] bleedout cycle using locked crowd only current={:08X} lockedCrowd={} reason=no_truce_recollect",
+				currentActor ? currentActor->GetFormID() : 0u,
+				static_cast<unsigned int>(stagedCrowdIds.size()));
 
 			scannedCount = static_cast<unsigned>(actors.size());
 			for (auto* candidate : actors) {

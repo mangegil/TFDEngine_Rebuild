@@ -22,6 +22,11 @@ namespace TFD::BleedoutGreet
 		{
 			std::mutex lock{};
 			bool sawDialogue = false;
+			bool flowGreetConfirmed = false;
+			std::uint32_t flowGreetSpeakerFormID = 0;
+			bool initialHandoffArmed = false;
+			Clock::time_point initialHandoffNextRetry{};
+			int initialHandoffRetryCount = 0;
 			bool stickyReopenPending = false;
 			Clock::time_point nextRetry{};
 			int retryCount = 0;
@@ -43,6 +48,11 @@ namespace TFD::BleedoutGreet
 		void ResetRuntimeLocked()
 		{
 			g_runtime.sawDialogue = false;
+			g_runtime.flowGreetConfirmed = false;
+			g_runtime.flowGreetSpeakerFormID = 0;
+			g_runtime.initialHandoffArmed = false;
+			g_runtime.initialHandoffNextRetry = {};
+			g_runtime.initialHandoffRetryCount = 0;
 			g_runtime.stickyReopenPending = false;
 			g_runtime.nextRetry = {};
 			g_runtime.retryCount = 0;
@@ -52,6 +62,12 @@ namespace TFD::BleedoutGreet
 			g_runtime.afterPleasureReopenPending = false;
 			g_runtime.afterPleasureNextRetry = {};
 			g_runtime.afterPleasureRetryCount = 0;
+		}
+
+		bool HasNativeBleedoutOpenSucceeded()
+		{
+			return TFD::InteractionRouter::DialogueOpen::DidSucceed() &&
+				TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout;
 		}
 
 		HoldDecision EvaluateHoldInternal(bool dialogueOpen, bool pleasureCommitted, bool ostimBridgeBlocking)
@@ -109,6 +125,15 @@ namespace TFD::BleedoutGreet
 			payPublished = TFD::PayModel::PublishSharedGold(speaker, TFD::PayModel::PayContext::Bleedout, "bleedout_dialogue_begin");
 		}
 
+		{
+			std::scoped_lock lk(g_runtime.lock);
+			g_runtime.flowGreetConfirmed = false;
+			g_runtime.flowGreetSpeakerFormID = 0;
+			g_runtime.initialHandoffArmed = speaker != nullptr;
+			g_runtime.initialHandoffNextRetry = Clock::now() + std::chrono::milliseconds(1200);
+			g_runtime.initialHandoffRetryCount = 0;
+		}
+
 		TFD::InteractionRouter::DialogueOpen::BeginBleedout(speaker);
 		spdlog::info(
 			"[TFD][BleedoutGreet][R100P] begin speaker={:08X} quotePrimed={} payPublished={} gold={} reason={}",
@@ -152,6 +177,21 @@ namespace TFD::BleedoutGreet
 		}
 	}
 
+	void NotifyFlowGreetConfirmed(RE::Actor* speaker, const char* reason)
+	{
+		const auto speakerFormID = speaker ? speaker->GetFormID() : 0u;
+		std::scoped_lock lk(g_runtime.lock);
+		g_runtime.sawDialogue = true;
+		g_runtime.flowGreetConfirmed = true;
+		g_runtime.flowGreetSpeakerFormID = speakerFormID;
+		g_runtime.initialHandoffArmed = false;
+		g_runtime.initialHandoffNextRetry = {};
+		g_runtime.stickyReopenPending = false;
+		spdlog::info("[TFD][BleedoutGreet][CB07] flow greet confirmed speaker={:08X} reason={}",
+			speakerFormID,
+			reason ? reason : "unknown");
+	}
+
 	void MarkAfterPleasureArmed(const char* reason)
 	{
 		std::scoped_lock lk(g_runtime.lock);
@@ -169,7 +209,61 @@ namespace TFD::BleedoutGreet
 		return g_runtime.sawDialogue;
 	}
 
+	bool HasFlowGreetConfirmed()
+	{
+		std::scoped_lock lk(g_runtime.lock);
+		return g_runtime.flowGreetConfirmed;
+	}
 
+	bool TryInitialHandoffWatchdog(bool hasTerminalCommit, bool dialogueOpen, bool pleasureBlocking, std::uint32_t speakerFormID,
+		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn)
+	{
+		if (!HasBleedoutOwnership() || hasTerminalCommit || dialogueOpen || pleasureBlocking || speakerFormID == 0 || !reopenFn) {
+			return false;
+		}
+		if (HasNativeBleedoutOpenSucceeded()) {
+			spdlog::info("[TFD][BleedoutGreet][CB07] initial handoff retry suppressed reason=native_open_succeeded speaker={:08X}", speakerFormID);
+			return false;
+		}
+
+		if (TFD::InteractionRouter::DialogueOpen::DidSucceed()) {
+			std::scoped_lock lk(g_runtime.lock);
+			g_runtime.initialHandoffArmed = false;
+			g_runtime.initialHandoffNextRetry = {};
+			spdlog::info("[TFD][BleedoutGreet][CB07] initial handoff watchdog suppressed reason=native_dialogue_open_succeeded speaker={:08X}", speakerFormID);
+			return false;
+		}
+
+		bool shouldRetry = false;
+		int retry = 0;
+		{
+			std::scoped_lock lk(g_runtime.lock);
+			if (g_runtime.flowGreetConfirmed || !g_runtime.initialHandoffArmed) {
+				return false;
+			}
+			if (g_runtime.initialHandoffRetryCount >= 4) {
+				return false;
+			}
+			if (g_runtime.initialHandoffNextRetry.time_since_epoch().count() != 0 && now < g_runtime.initialHandoffNextRetry) {
+				return false;
+			}
+			++g_runtime.initialHandoffRetryCount;
+			retry = g_runtime.initialHandoffRetryCount;
+			g_runtime.initialHandoffNextRetry = now + std::chrono::milliseconds(900);
+			shouldRetry = true;
+		}
+
+		if (!shouldRetry) {
+			return false;
+		}
+
+		const bool ok = reopenFn("initial_handoff_retry");
+		spdlog::info("[TFD][BleedoutGreet][CB07] initial handoff watchdog {} speaker={:08X} retry={}",
+			ok ? "reopen" : "unavailable",
+			speakerFormID,
+			retry);
+		return ok;
+	}
 
 	void MarkStickyReopenPending(bool value, const char* reason)
 	{
@@ -234,6 +328,11 @@ namespace TFD::BleedoutGreet
 		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn)
 	{
 		if (!HasStickyReopenPending() || hasTerminalCommit || dialogueOpen || pleasureBlocking) {
+			return false;
+		}
+		if (HasNativeBleedoutOpenSucceeded()) {
+			MarkStickyReopenPending(false, "cb07_native_open_succeeded");
+			spdlog::info("[TFD][BleedoutGreet][CB07] sticky watchdog suppressed reason=native_open_succeeded speaker={:08X}", speakerFormID);
 			return false;
 		}
 		if (!IsRetryDue(now)) {

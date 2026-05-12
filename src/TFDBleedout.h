@@ -162,10 +162,12 @@ namespace TFD::Bleedout
 		std::chrono::steady_clock::time_point* bleedBattleObservePendingUntil = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObservePendingLastRedirect = nullptr;
 		int* bleedBattleObservePendingEmptyEnemyTicks = nullptr;
+		int* bleedBattleObservePendingEmptyAllyTicks = nullptr;
 		bool* bleedBattleObserveActive = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObserveSince = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObserveLastRedirect = nullptr;
 		int* bleedBattleObserveActiveEmptyEnemyTicks = nullptr;
+		int* bleedBattleObserveActiveEmptyAllyTicks = nullptr;
 	};
 
 	struct RuntimeHostHandlers
@@ -215,6 +217,7 @@ namespace TFD::Bleedout
 		std::function<bool(RE::Actor*, RE::Actor*, const char*)> startTruceSessionForSpeaker;
 		std::function<bool(RE::Actor*, RE::Actor*, float*)> canUseAggressorForBleedoutGreet;
 		std::function<void(RE::Actor*, RE::Actor*, const char*, bool)> applyDialogueOverdrive;
+		std::function<bool(RE::Actor*)> isStandingEnemyThresholdActor;
 	};
 
 	void StartRuntimeWindow(RuntimeHostStateRefs state, RE::Actor* player, RE::Actor* aggressor, const RuntimeHostHandlers& handlers);
@@ -245,10 +248,12 @@ namespace TFD::Bleedout
 	std::chrono::steady_clock::time_point& BleedBattleObservePendingUntilRef();
 	std::chrono::steady_clock::time_point& BleedBattleObservePendingLastRedirectRef();
 	int& BleedBattleObservePendingEmptyEnemyTicksRef();
+	int& BleedBattleObservePendingEmptyAllyTicksRef();
 	bool& BleedBattleObserveActiveRef();
 	std::chrono::steady_clock::time_point& BleedBattleObserveSinceRef();
 	std::chrono::steady_clock::time_point& BleedBattleObserveLastRedirectRef();
 	int& BleedBattleObserveActiveEmptyEnemyTicksRef();
+	int& BleedBattleObserveActiveEmptyAllyTicksRef();
 
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason);
 	void ApplyBleedoutDialogueFactions(RE::Actor* actor, const char* role = nullptr, const char* reason = nullptr);
@@ -685,10 +690,12 @@ namespace TFD::Bleedout::RuntimeHost
 		std::chrono::steady_clock::time_point* bleedBattleObservePendingUntil = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObservePendingLastRedirect = nullptr;
 		int* bleedBattleObservePendingEmptyEnemyTicks = nullptr;
+		int* bleedBattleObservePendingEmptyAllyTicks = nullptr;
 		bool* bleedBattleObserveActive = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObserveSince = nullptr;
 		std::chrono::steady_clock::time_point* bleedBattleObserveLastRedirect = nullptr;
 		int* bleedBattleObserveActiveEmptyEnemyTicks = nullptr;
+		int* bleedBattleObserveActiveEmptyAllyTicks = nullptr;
 		std::function<TFD::Bleedout::RuntimeHostHandlers()> buildRuntimeHostHandlers;
 		std::function<TFD::Bleedout::DialogueHotkeyHandlers()> buildDialogueHotkeyHandlers;
 		std::function<RE::Actor*()> getPlayer;

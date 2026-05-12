@@ -801,20 +801,17 @@ namespace
         }
 
         auto* beforeTarget = ResolveCurrentCombatTarget(actor);
-        const bool hostileAfterRestore = actor->IsHostileToActor(player) ||
-            (beforeTarget && beforeTarget->GetFormID() == player->GetFormID());
+        const bool targetWasPlayer = beforeTarget && beforeTarget->GetFormID() == player->GetFormID();
+        const bool rawHostile = actor->IsHostileToActor(player);
+        const bool knownHostileSource = actor ? BuildFactionSummary(actor).hostileMatches > 0 : false;
+        const bool wakeCandidate = rawHostile || targetWasPlayer || knownHostileSource;
 
-        actor->SetBeenAttacked(true);
-        player->SetBeenAttacked(true);
-        (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
-        (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
 
-        actor->UpdateCombat();
-        player->UpdateCombat();
-
-        if (!hostileAfterRestore) {
+        if (!wakeCandidate) {
             spdlog::info(
-                "[TFD][Recruit][R96E] post-load detection refresh skipped actor={:08X} reason={} hostile=0 target={:08X} name='{}'",
+                "[TFD][Recruit][CB06B] post-load hostile wake skipped actor={:08X} reason={} hostile=0 knownHostile=0 target={:08X} name='{}'",
                 actor->GetFormID(),
                 reason ? reason : "unknown",
                 beforeTarget ? beforeTarget->GetFormID() : 0u,
@@ -822,31 +819,26 @@ namespace
             return false;
         }
 
-        const bool refreshed = TFD::HostilityController::ForceDetectionAndCombatRefresh(
-            actor,
-            player,
-            TFD::HostilityController::ReleaseReason::FightChoice,
-            true);
-
-        // R96E: after a save swap, native UpdateCombat can leave actors in Skyrim's
-        // search/combat limbo: target points at the player, but detection/LOS stays cold
-        // (voice line: "Is someone there?"). Reuse the existing Papyrus resume bridge,
-        // because it safely calls StartCombat(player) from Papyrus after aliases/factions
-        // have been cleared and the loaded world is ready.
+        // CB06B: keep the load cleanup away from native detection/combat mutation.
+        // The earlier R96E path used RequestDetectionLevel/UpdateCombat/ForceDetection
+        // directly and can leave AI passive or risk detection-worker races.  Queue the
+        // existing Papyrus resume bridge instead; it performs StartCombat(player) after
+        // the loaded world and aliases have settled.
         TFD::HostilityController::Runtime::SendModEvent("TFDInCombatResumeCombat", actor);
 
         auto* afterTarget = ResolveCurrentCombatTarget(actor);
         spdlog::info(
-            "[TFD][Recruit][R96E] post-load detection refresh actor={:08X} reason={} hostile=1 refreshed={} inCombat={} targetBefore={:08X} targetAfter={:08X} resumeBridge=1 name='{}'",
+            "[TFD][Recruit][CB06B] post-load hostile wake actor={:08X} reason={} rawHostile={} knownHostile={} targetBefore={:08X} targetAfter={:08X} inCombat={} resumeBridge=1 name='{}'",
             actor->GetFormID(),
             reason ? reason : "unknown",
-            refreshed ? 1 : 0,
-            actor->IsInCombat() ? 1 : 0,
+            rawHostile ? 1 : 0,
+            knownHostileSource ? 1 : 0,
             beforeTarget ? beforeTarget->GetFormID() : 0u,
             afterTarget ? afterTarget->GetFormID() : 0u,
+            actor->IsInCombat() ? 1 : 0,
             actor->GetName() ? actor->GetName() : "");
 
-        return refreshed;
+        return true;
     }
 
     RuntimeSnapshotApplyResult ApplyRuntimeSnapshot(

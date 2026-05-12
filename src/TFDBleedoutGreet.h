@@ -62,8 +62,12 @@ struct DialogueClosedHandlers
 	void Cancel(const char* reason = nullptr);
 
 	void NotifyDialogueOpened();
+	void NotifyFlowGreetConfirmed(RE::Actor* speaker = nullptr, const char* reason = nullptr);
 	void MarkAfterPleasureArmed(const char* reason = nullptr);
 	bool HasSeenDialogue();
+	bool HasFlowGreetConfirmed();
+	bool TryInitialHandoffWatchdog(bool hasTerminalCommit, bool dialogueOpen, bool pleasureBlocking, std::uint32_t speakerFormID,
+		std::chrono::steady_clock::time_point now, const std::function<bool(const char* reason)>& reopenFn);
 	void MarkStickyReopenPending(bool value, const char* reason = nullptr);
 	bool HasStickyReopenPending();
 	bool IsRetryDue(std::chrono::steady_clock::time_point now);

@@ -452,6 +452,27 @@ namespace TFD::PostDefeatState
         }
 
         const bool playerDownNow = ComputePlayerBleedOutState(input.player);
+
+        if (input.battleObserveHold && input.player && playerDownNow) {
+            // CB03: player is down, but Bleedout dialogue must stay closed while standing allies are still resolving combat.
+            // Keep globals in defeat-combat hold instead of advertising TFDDefeatState=2 to CK forcegreet conditions.
+            SetGlobalInt(g_defeatStateGlobal, 1);
+            TFD::Victory::ResetObservedContext();
+            TFD::Victory::SetStateValue(kVictoryStateNo);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
+            g_staleVictoryNeutralTicks = 0;
+            SetGlobalInt(g_hostileStateGlobal, 0);
+            SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
+            SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));
+            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+            SetGlobalInt(g_leftForDeadStateGlobal, 0);
+            result.routerCombatContextActive = input.routerCombatContext;
+            spdlog::info(
+                "[TFD][PostDefeatState][CB03] battle observe hold globals defeat=1 victory=No enemies={} reason=defer_bleedout_forcegreet",
+                static_cast<unsigned int>(input.enemies.size()));
+            return result;
+        }
+
         SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
 
         const bool forceVictoryNoForPlayerDefeat = input.player && playerDownNow && input.defeatContext;

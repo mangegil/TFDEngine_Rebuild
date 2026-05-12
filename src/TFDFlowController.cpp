@@ -49,6 +49,16 @@ namespace
 
     static std::unordered_set<RE::FormID> g_inCombatCycleReleaseGraceActors{};
 
+    static bool IsPlayerBleedoutInteractionOwnedForFlow()
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (TFD::Bleedout::DefeatGlue::IsPlayerBleedHoldTargetBlocked()) {
+            return true;
+        }
+        auto* state = player ? player->AsActorState() : nullptr;
+        return state && state->IsBleedingOut();
+    }
+
     static void MarkInCombatCycleReleaseGrace(RE::FormID actorFormID)
     {
         if (actorFormID != 0) {
@@ -1227,10 +1237,9 @@ namespace TFD::FlowController
             return ObservedDefeatResolution::ContinueObserve;
         }
 
-        if (!input.hasStandingHostileCoalition && input.hasStandingTeammate && !input.hadValidObservedEnemy) {
-            return ObservedDefeatResolution::LeftForDead;
-        }
-
+        // CB03: battle-observe Left For Dead is no longer resolved here.
+        // Left For Dead is owned by the Bleedout forcegreet "Do Nothing" outcome.
+        // A standing player-side actor means the observe phase should resolve to recovery/rescue fallback.
         if (input.hasStandingPlayerSide || input.hasStandingTeammate) {
             return ObservedDefeatResolution::NonCaptiveChoice;
         }
@@ -2211,6 +2220,14 @@ namespace TFD::FlowController
             auto actorFormID = ResolveActorFormIDFromEventArg(arg);
             if (!actorFormID) {
                 actorFormID = TFD::InCombat::GetPrimaryActorFormID();
+            }
+            if (IsPlayerBleedoutInteractionOwnedForFlow()) {
+                spdlog::warn(
+                    "[TFD][Flow][CB05] reject stale incombat pleasure while player bleedout actor={:08X} reason=block_incombat_pleasure_bleedout_owned",
+                    actorFormID);
+                TFD::InCombatGreet::CancelAll("reject_incombat_pleasure_player_bleedout");
+                TFD::InCombat::Complete("reject_incombat_pleasure_player_bleedout");
+                return true;
             }
             auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
             TFD::InCombat::OutcomeEventContext context{};
