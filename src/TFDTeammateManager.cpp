@@ -1640,13 +1640,37 @@ namespace
                 auto* playerTarget = ResolveCombatTarget(player);
                 const bool actorTargetsPlayer = player && actorTarget == player;
                 const bool playerTargetsActor = playerTarget == actor;
-                const bool actorHasExternalCombatTarget =
+                const bool actorHasExternalCombatTargetCandidate =
                     actorTarget &&
                     actorTarget != player &&
                     !actorTarget->IsDead() &&
                     !actorTarget->IsDisabled() &&
                     !IsPlayerSideTeammateAnchor(actorTarget) &&
                     !TFD::HostilityController::IsActorTemporarilySuppressed(actorTarget);
+                RE::Actor* externalTargetTarget = actorHasExternalCombatTargetCandidate ? ResolveCombatTarget(actorTarget) : nullptr;
+                const bool externalTargetTargetsPlayerSide =
+                    externalTargetTarget &&
+                    (externalTargetTarget == player || IsPlayerSideTeammateAnchor(externalTargetTarget));
+                const float externalTargetDistance = actorHasExternalCombatTargetCandidate ? actor->GetPosition().GetDistance(actorTarget->GetPosition()) : 0.0f;
+                constexpr float kCB10LocalExternalCombatDistance = 3500.0f;
+                const bool externalTargetLocalCombatPosture =
+                    actorHasExternalCombatTargetCandidate &&
+                    externalTargetDistance <= kCB10LocalExternalCombatDistance &&
+                    (actorTarget->IsInCombat() || actorTarget->IsWeaponDrawn());
+                const bool externalTargetActivelyEngaged =
+                    actorHasExternalCombatTargetCandidate &&
+                    (externalTargetTargetsPlayerSide || externalTargetLocalCombatPosture);
+                const bool actorHasExternalCombatTarget = actorHasExternalCombatTargetCandidate && externalTargetActivelyEngaged;
+                if (actorHasExternalCombatTargetCandidate && !actorHasExternalCombatTarget) {
+                    spdlog::info(
+                        "[TFD][TeammateManager][CB10] stale external combat target will not block resettle actor={:08X} target={:08X} targetTarget={:08X} targetCombat={} targetWeapon={} dist={:.1f} reason=post_battle_settle",
+                        actor->GetFormID(),
+                        actorTarget->GetFormID(),
+                        externalTargetTarget ? externalTargetTarget->GetFormID() : 0u,
+                        actorTarget->IsInCombat() ? 1 : 0,
+                        actorTarget->IsWeaponDrawn() ? 1 : 0,
+                        externalTargetDistance);
+                }
                 const bool activeCombatConflict =
                     actorTargetsPlayer ||
                     playerTargetsActor ||

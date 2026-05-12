@@ -1405,10 +1405,22 @@ namespace TFD::FlowController
         if (g_battleObserverRuntimeProviders.setPlayerBleedImmune) {
             g_battleObserverRuntimeProviders.setPlayerBleedImmune(false);
         }
-        if (g_battleObserverRuntimeProviders.queueNonCaptiveChoice) {
+
+        const bool fallbackCommitted = TFD::Transition::DefeatGlue::BeginResolvedNoMarkerFallback(why);
+        bool queuedLegacyChoice = false;
+        if (!fallbackCommitted && g_battleObserverRuntimeProviders.queueNonCaptiveChoice) {
             g_battleObserverRuntimeProviders.queueNonCaptiveChoice(why);
+            queuedLegacyChoice = true;
         }
-        spdlog::info("[TFD][Flow] observed battle resolved -> non-captive choice reason={}", why);
+
+        const bool settleQueued = QueueBridgeModEvent("TFDCombatBehaviorSettle", nullptr, why, 1.0f);
+
+        spdlog::info(
+            "[TFD][Flow][CB10] observed battle resolved -> recovery fallback committed={} queuedLegacyChoice={} settleQueued={} reason={}",
+            fallbackCommitted ? 1 : 0,
+            queuedLegacyChoice ? 1 : 0,
+            settleQueued ? 1 : 0,
+            why);
     }
 
     void HandleObservedLeftForDead(const char* reason)

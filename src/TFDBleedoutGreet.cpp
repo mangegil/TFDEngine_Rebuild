@@ -111,6 +111,16 @@ namespace TFD::BleedoutGreet
 	bool Begin(RE::Actor* speaker, const char* reason)
 	{
 		const auto speakerFormID = speaker ? speaker->GetFormID() : 0u;
+		if (speaker && TFD::PleasureRuntime::ShouldSuppressTruceDialogue(speaker)) {
+			spdlog::info(
+				"[TFD][BleedoutGreet][CB09] begin blocked speaker={:08X} reason={} phase={} source={} pleasure_dialogue_suppression=1",
+				speakerFormID,
+				reason ? reason : "bleedout",
+				TFD::PleasureRuntime::GetPhaseName(),
+				TFD::PleasureRuntime::GetSourceContextName());
+			return false;
+		}
+
 		if (!HasBleedoutOwnership()) {
 			spdlog::warn("[TFD][BleedoutGreet] begin ignored speaker={:08X} reason={} flowOwnerMismatch=1", speakerFormID, reason ? reason : "bleedout");
 			return false;

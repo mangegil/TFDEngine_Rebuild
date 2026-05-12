@@ -18,6 +18,7 @@
 #include "TFDTransition.h"
 #include "TFDPayModel.h"
 #include "TFDBleedout.h"
+#include "TFDPleasureRuntime.h"
 
 namespace TFD::InCombatGreet
 {
@@ -95,6 +96,22 @@ namespace TFD::InCombatGreet
 			}
 			auto* state = player->AsActorState();
 			return state && state->IsBleedingOut();
+		}
+
+		bool IsPleasureRuntimeDialogueSuppressed(RE::Actor* actor, const char* entry, const char* reason)
+		{
+			if (!actor || !TFD::PleasureRuntime::ShouldSuppressTruceDialogue(actor)) {
+				return false;
+			}
+
+			spdlog::info(
+				"[TFD][InCombatGreet][CB09] {} blocked actor={:08X} reason={} phase={} source={} pleasure_dialogue_suppression=1",
+				entry ? entry : "begin",
+				actor->GetFormID(),
+				reason ? reason : "incombat",
+				TFD::PleasureRuntime::GetPhaseName(),
+				TFD::PleasureRuntime::GetSourceContextName());
+			return true;
 		}
 
 		bool IsCandidate(RE::Actor* actor, RE::PlayerCharacter* player)
@@ -238,6 +255,13 @@ namespace TFD::InCombatGreet
 
 	bool BeginForActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
 	{
+		if (IsPleasureRuntimeDialogueSuppressed(speaker, "BeginForActor", "incombat_begin_for_actor")) {
+			if (outAction) {
+				*outAction = TFD::InteractionRouter::Action::None;
+			}
+			return false;
+		}
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (outAction) {
 			*outAction = TFD::InteractionRouter::Action::None;
@@ -312,6 +336,13 @@ namespace TFD::InCombatGreet
 
 	bool BeginForPleasureCycleActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
 	{
+		if (IsPleasureRuntimeDialogueSuppressed(speaker, "BeginForPleasureCycleActor", "incombat_pleasure_cycle")) {
+			if (outAction) {
+				*outAction = TFD::InteractionRouter::Action::None;
+			}
+			return false;
+		}
+
 		auto* player = RE::PlayerCharacter::GetSingleton();
 		if (outAction) {
 			*outAction = TFD::InteractionRouter::Action::None;
@@ -435,6 +466,9 @@ namespace TFD::InCombatGreet
 	bool Begin(RE::Actor* speaker, const char* reason)
 	{
 		const auto formID = speaker ? speaker->GetFormID() : 0u;
+		if (IsPleasureRuntimeDialogueSuppressed(speaker, "Begin", reason)) {
+			return false;
+		}
 		if (IsPlayerBleedoutInteractionOwned()) {
 			spdlog::info("[TFD][InCombatGreet][CB05] begin ignored speaker={:08X} reason={} player_bleedout_owned_by_bleedout_route=1", formID, reason ? reason : "incombat");
 			return false;

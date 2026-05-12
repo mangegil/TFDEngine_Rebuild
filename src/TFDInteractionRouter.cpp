@@ -2438,6 +2438,24 @@ namespace TFD::InteractionRouter
 
             void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
             {
+                if (speaker && mode != Mode::AfterPleasure && TFD::PleasureRuntime::ShouldSuppressTruceDialogue(speaker)) {
+                    const char* phase = TFD::PleasureRuntime::GetPhaseName();
+                    const char* source = TFD::PleasureRuntime::GetSourceContextName();
+                    {
+                        std::scoped_lock lk(g_pending.lock);
+                        CancelLocked("pleasure_runtime_dialogue_suppression");
+                        SyncDialogueStateLocked(IsDialogueOpen());
+                    }
+                    spdlog::info(
+                        "[TFD][DialogueOpen][CB09] begin blocked by pleasure runtime mode={} reason={} speaker={:08X} phase={} source={}",
+                        ModeName(mode),
+                        reason ? reason : "unknown",
+                        speaker->GetFormID(),
+                        phase,
+                        source);
+                    return;
+                }
+
                 std::scoped_lock lk(g_pending.lock);
 
                 const auto now = Clock::now();

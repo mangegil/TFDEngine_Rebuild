@@ -87,6 +87,7 @@ namespace TFD::PleasureRuntime
 
 	bool IsActorTracked(RE::Actor* actor);
 	bool ShouldProtectPendingDialogue(RE::Actor* actor);
+	bool ShouldSuppressTruceDialogue(RE::Actor* actor);
 	bool IsInCombatPleasureChainActive();
 	std::size_t FlushDeferredInCombatRecruits(std::string_view reason);
 }

@@ -637,6 +637,29 @@ namespace TFD::PleasureRuntime
 			}
 		}
 
+		bool ShouldSuppressTruceDialogueLocked(std::uint32_t formID)
+		{
+			if (formID == 0) {
+				return false;
+			}
+
+			if (!g_state.active && !g_state.blocking && !g_state.passiveLockActive && !g_state.holdActive) {
+				return false;
+			}
+
+			switch (g_state.phase) {
+			case Phase::PleasureStartPending:
+			case Phase::PleasureActive:
+			case Phase::PleasureEnding:
+			case Phase::AfterPleasureAwaitQuest:
+			case Phase::AfterPleasureDialogue:
+			case Phase::RedoPending:
+				return true;
+			default:
+				return false;
+			}
+		}
+
 		std::uint32_t ParseActorFormIDToken(const std::string& token, std::uint32_t fallback = 0)
 		{
 			if (token.empty()) {
@@ -1665,21 +1688,18 @@ namespace TFD::PleasureRuntime
 
 				if (choice == AfterChoice::Redo) {
 					auto* redoActor = ResolveEventOrTrackedActorLocked(info);
-					if (IsSceneCombatUnsafe(redoActor)) {
-						spdlog::warn(
-							"[TFD][PleasureRuntime] redo rejected actor={:08X} cycle={} source={} reason=combat_unsafe",
+					const bool combatFlagged = IsSceneCombatUnsafe(redoActor);
+					if (combatFlagged) {
+						// CB09A: Redo is requested from an already-owned AfterPleasure dialogue.
+						// InCombat/Bleedout sources can legitimately still report combat flags while
+						// the runtime is holding/pacifying the encounter. Rejecting here closes the
+						// pleasure runtime before the Papyrus ArmRedoStart timer can start OStim.
+						spdlog::info(
+							"[TFD][PleasureRuntime][CB09A] redo allowed despite combat flag actor={:08X} cycle={} source={} phase={} reason=owned_afterpleasure_redo",
 							redoActor ? redoActor->GetFormID() : info.actorFormID,
 							g_state.sessionCycleId,
-							ToString(g_state.source));
-						AdvancePhaseLocked(Phase::Finalizing, "redo_combat_unsafe");
-						AdvancePhaseLocked(Phase::Closed, "redo_combat_unsafe");
-						ClearBridgeStateLocked();
-						ClearHoldStateLocked();
-						g_state.redoPending = false;
-						g_state.pendingChoice = AfterChoice::None;
-						QueueAbortedFlowCompleteLocked(redoActor, "redo_combat_unsafe");
-						LogEventAcceptedLocked(eventName, info, "redo_rejected_combat_unsafe");
-						return;
+							ToString(g_state.source),
+							ToString(g_state.phase));
 					}
 
 					g_state.redoPending = true;
@@ -1690,9 +1710,9 @@ namespace TFD::PleasureRuntime
 					g_state.passiveLockActive = true;
 					g_state.holdActive = true;
 					SuppressActorDialogueForSceneLocked(
-						info.actor ? info.actor : LookupActor(info.actorFormID),
+						redoActor ? redoActor : (info.actor ? info.actor : LookupActor(info.actorFormID)),
 						"after_pleasure_redo_suppress_teammate_dialogue");
-					LogEventAcceptedLocked(eventName, info, "redo_pending");
+					LogEventAcceptedLocked(eventName, info, combatFlagged ? "redo_pending_combat_flag_allowed" : "redo_pending");
 					return;
 				}
 
@@ -2177,6 +2197,12 @@ namespace TFD::PleasureRuntime
 	{
 		std::scoped_lock lk(g_lock);
 		return actor ? ShouldProtectPendingDialogueLocked(actor->GetFormID()) : false;
+	}
+
+	bool ShouldSuppressTruceDialogue(RE::Actor* actor)
+	{
+		std::scoped_lock lk(g_lock);
+		return actor ? ShouldSuppressTruceDialogueLocked(actor->GetFormID()) : false;
 	}
 
 	bool IsInCombatPleasureChainActive()

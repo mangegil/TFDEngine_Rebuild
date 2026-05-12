@@ -346,16 +346,20 @@ namespace
             }
 
             const bool activeHostile = entry.hostileSource && HasActiveHostileFactionRank(rank);
-            const bool playerSideState = entry.playerSideState;
+            const bool activePlayerSideState = entry.playerSideState && rank >= 0;
 
             if (activeHostile) {
                 ++summary.hostileMatches;
             }
-            if (playerSideState) {
+            if (activePlayerSideState) {
                 ++summary.stateMatches;
             }
 
-            if (!playerSideState) {
+            // CB08: rank -1 means the actor is not currently in this faction.
+            // The previous post-load classifier still treated inactive player-side
+            // state factions as recruit-like, so actors that should have been restored
+            // after a load could be skipped and remain passive.
+            if (!activePlayerSideState) {
                 continue;
             }
 
@@ -811,7 +815,7 @@ namespace
 
         if (!wakeCandidate) {
             spdlog::info(
-                "[TFD][Recruit][CB06B] post-load hostile wake skipped actor={:08X} reason={} hostile=0 knownHostile=0 target={:08X} name='{}'",
+                "[TFD][Recruit][CB08] post-load hostile wake skipped actor={:08X} reason={} hostile=0 knownHostile=0 target={:08X} name='{}'",
                 actor->GetFormID(),
                 reason ? reason : "unknown",
                 beforeTarget ? beforeTarget->GetFormID() : 0u,
@@ -825,10 +829,11 @@ namespace
         // existing Papyrus resume bridge instead; it performs StartCombat(player) after
         // the loaded world and aliases have settled.
         TFD::HostilityController::Runtime::SendModEvent("TFDInCombatResumeCombat", actor);
+        TFD::HostilityController::Runtime::SendModEvent("TFDPostLoadHostileWake", actor);
 
         auto* afterTarget = ResolveCurrentCombatTarget(actor);
         spdlog::info(
-            "[TFD][Recruit][CB06B] post-load hostile wake actor={:08X} reason={} rawHostile={} knownHostile={} targetBefore={:08X} targetAfter={:08X} inCombat={} resumeBridge=1 name='{}'",
+            "[TFD][Recruit][CB08] post-load hostile wake actor={:08X} reason={} rawHostile={} knownHostile={} targetBefore={:08X} targetAfter={:08X} inCombat={} resumeBridge=1 wakeBridge=1 name='{}'",
             actor->GetFormID(),
             reason ? reason : "unknown",
             rawHostile ? 1 : 0,
@@ -1469,7 +1474,7 @@ namespace TFD::Recruit
 
         if (snapshots.empty()) {
             spdlog::info(
-                "[TFD][Recruit][R96E] post-load runtime restore no pending actors reason={}",
+                "[TFD][Recruit][CB08] post-load runtime restore no pending actors reason={}",
                 reason ? reason : "unknown");
             return;
         }
@@ -1505,16 +1510,22 @@ namespace TFD::Recruit
             const bool isPlayer = actorId == playerId;
             const bool isRegisteredTeammate = !isPlayer && registeredTeammateIds.find(actorId) != registeredTeammateIds.end();
             const bool isLoadedTeammateLike = !isPlayer && IsRecruitLike(actor);
-            if (isRegisteredTeammate || isLoadedTeammateLike) {
+            if (isRegisteredTeammate) {
                 ++skippedRegistered;
                 spdlog::info(
-                    "[TFD][Recruit][R96E] post-load restore skipped loaded teammate actor={:08X} reason={} registered={} recruitLike={} name='{}'",
+                    "[TFD][Recruit][CB08] post-load restore skipped registered teammate actor={:08X} reason={} recruitLike={} name='{}'",
                     actorId,
                     reason ? reason : "unknown",
-                    isRegisteredTeammate ? 1 : 0,
                     isLoadedTeammateLike ? 1 : 0,
                     actor->GetName() ? actor->GetName() : "");
                 continue;
+            }
+            if (isLoadedTeammateLike) {
+                spdlog::info(
+                    "[TFD][Recruit][CB08] post-load restoring stale recruit-like actor actor={:08X} reason={} name='{}'",
+                    actorId,
+                    reason ? reason : "unknown",
+                    actor->GetName() ? actor->GetName() : "");
             }
 
             const auto applied = ApplyRuntimeSnapshot(actor, snapshot, reason, true, !isPlayer);
@@ -1537,7 +1548,7 @@ namespace TFD::Recruit
             }
 
             spdlog::info(
-                "[TFD][Recruit][R96E] post-load restored runtime actor actor={:08X} reason={} values={} factionRestores={} stateRemoves={} detectionAttempted={} detectionRefreshed={} name='{}'",
+                "[TFD][Recruit][CB08] post-load restored runtime actor actor={:08X} reason={} values={} factionRestores={} stateRemoves={} detectionAttempted={} detectionRefreshed={} name='{}'",
                 actorId,
                 reason ? reason : "unknown",
                 applied.actorValuesRestored ? 1 : 0,
@@ -1549,7 +1560,7 @@ namespace TFD::Recruit
         }
 
         spdlog::info(
-            "[TFD][Recruit][R96E] post-load runtime restore complete reason={} actors={} skippedRegistered={} values={} factionRestores={} stateRemoves={} detectionAttempts={} detectionRefreshed={} missing={}",
+            "[TFD][Recruit][CB08] post-load runtime restore complete reason={} actors={} skippedRegistered={} values={} factionRestores={} stateRemoves={} detectionAttempts={} detectionRefreshed={} missing={}",
             reason ? reason : "unknown",
             appliedActors,
             skippedRegistered,

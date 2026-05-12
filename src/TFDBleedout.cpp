@@ -3571,6 +3571,27 @@ namespace TFD::Bleedout
 	}
 
 
+	float RuntimeActorHealthPct(RE::Actor* actor)
+	{
+		if (!actor) {
+			return 0.0f;
+		}
+		const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+		return (actor->GetActorValue(RE::ActorValue::kHealth) / hpMax) * 100.0f;
+	}
+
+	bool IsRuntimeAboveDefeatThreshold(RE::Actor* actor)
+	{
+		if (!actor) {
+			return false;
+		}
+		if (actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f) {
+			return false;
+		}
+		const float thresholdPct = std::clamp(TFD::Settings::GetDefeatThresholdPct(), 1.0f, 95.0f);
+		return RuntimeActorHealthPct(actor) > thresholdPct;
+	}
+
 	bool IsRuntimeBattleObserveStandingActor(RE::Actor* actor, RE::Actor* player)
 	{
 		if (!actor || actor == player || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
@@ -3583,7 +3604,112 @@ namespace TFD::Bleedout
 		if (TFD::DefeatMonitor::IsThresholdDownedActor(actor)) {
 			return false;
 		}
-		return actor->GetActorValue(RE::ActorValue::kHealth) > 0.0f;
+		return IsRuntimeAboveDefeatThreshold(actor);
+	}
+
+	bool IsRuntimeBattleObserveEnemyThreat(RE::Actor* actor, RE::Actor* player, const RuntimeHostHandlers& handlers)
+	{
+		if (!IsRuntimeBattleObserveStandingActor(actor, player)) {
+			return false;
+		}
+		if (handlers.isObserverAlly && handlers.isObserverAlly(actor)) {
+			return false;
+		}
+		if (handlers.isStandingEnemyThresholdActor && !handlers.isStandingEnemyThresholdActor(actor)) {
+			return false;
+		}
+		if (handlers.isBleedSpaceCompatible && player && !handlers.isBleedSpaceCompatible(actor, player)) {
+			return false;
+		}
+		return true;
+	}
+
+	bool IsRuntimeBattleObserveBlockingEnemy(
+		RE::Actor* actor,
+		RE::Actor* player,
+		const std::vector<RE::Actor*>& followers,
+		RE::Actor* preferredEnemy,
+		const RuntimeHostHandlers& handlers)
+	{
+		if (!IsRuntimeBattleObserveStandingActor(actor, player)) {
+			return false;
+		}
+		if (handlers.isObserverAlly && handlers.isObserverAlly(actor)) {
+			return false;
+		}
+		if (handlers.isStandingEnemyThresholdActor && !handlers.isStandingEnemyThresholdActor(actor)) {
+			return false;
+		}
+
+		auto* target = TFD::Actor::GetCurrentTarget(actor);
+		if (target == player) {
+			return true;
+		}
+
+		bool hostileToPlayerSide = player && actor->IsHostileToActor(player);
+		bool targetsPlayerSide = false;
+		for (auto* follower : followers) {
+			if (!IsRuntimeBattleObserveStandingActor(follower, player)) {
+				continue;
+			}
+			if (target == follower) {
+				targetsPlayerSide = true;
+			}
+			if (actor->IsHostileToActor(follower)) {
+				hostileToPlayerSide = true;
+			}
+		}
+
+		if (targetsPlayerSide) {
+			return true;
+		}
+
+		const bool combatPosture = actor->IsInCombat() || actor->IsWeaponDrawn();
+		if (hostileToPlayerSide && combatPosture) {
+			return true;
+		}
+
+		// CB08: preferred/roster enemies are not allowed to block recovery by merely
+		// existing in the snapshot. They still need active combat posture or a target.
+		if (actor == preferredEnemy && combatPosture) {
+			return true;
+		}
+
+		return false;
+	}
+
+	void FilterRuntimeBattleObserveEnemies(
+		std::vector<RE::Actor*>& enemies,
+		RE::Actor* player,
+		const std::vector<RE::Actor*>& followers,
+		RE::Actor* preferredEnemy,
+		const RuntimeHostHandlers& handlers,
+		const char* reason)
+	{
+		const auto before = enemies.size();
+		enemies.erase(
+			std::remove_if(enemies.begin(), enemies.end(), [&](RE::Actor* actor) {
+				const bool keep = IsRuntimeBattleObserveBlockingEnemy(actor, player, followers, preferredEnemy, handlers);
+				if (!keep && actor) {
+					spdlog::info(
+						"[TFD][Bleedout][CB08] observed enemy ignored for battle resolution actor={:08X} reason={} inCombat={} weaponDrawn={} target={:08X}",
+						actor->GetFormID(),
+						reason ? reason : "observe_resolution",
+						actor->IsInCombat() ? 1 : 0,
+						actor->IsWeaponDrawn() ? 1 : 0,
+						TFD::Actor::GetCurrentTarget(actor) ? TFD::Actor::GetCurrentTarget(actor)->GetFormID() : 0u);
+				}
+				return !keep;
+			}),
+			enemies.end());
+		if (before != enemies.size()) {
+			spdlog::info(
+				"[TFD][Bleedout][CB08] observed enemy filter reason={} input={} output={} followers={}",
+				reason ? reason : "observe_resolution",
+				static_cast<unsigned int>(before),
+				static_cast<unsigned int>(enemies.size()),
+				static_cast<unsigned int>(followers.size()));
+		}
 	}
 
 	bool RuntimeActorVectorContains(const std::vector<RE::Actor*>& actors, RE::Actor* actor)
@@ -3610,6 +3736,99 @@ namespace TFD::Bleedout
 		for (auto* actor : in) {
 			AddRuntimeBattleObserveActor(out, actor, player);
 		}
+	}
+
+	bool IsRuntimeBattleObservePlayerSideTarget(RE::Actor* target, RE::Actor* player, const std::vector<RE::Actor*>& followers)
+	{
+		if (!target) {
+			return false;
+		}
+		if (target == player) {
+			return true;
+		}
+		return RuntimeActorVectorContains(followers, target);
+	}
+
+	bool IsRuntimeBattleObserveHostileToSide(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& followers)
+	{
+		if (!actor) {
+			return false;
+		}
+		if (player && (actor->IsHostileToActor(player) || player->IsHostileToActor(actor))) {
+			return true;
+		}
+		for (auto* follower : followers) {
+			if (follower && (actor->IsHostileToActor(follower) || follower->IsHostileToActor(actor))) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	float RuntimeBattleObserveMinSideDistSq(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& followers)
+	{
+		float best = std::numeric_limits<float>::max();
+		if (!actor) {
+			return best;
+		}
+		if (player) {
+			best = (std::min)(best, Distance3D(actor, player));
+		}
+		for (auto* follower : followers) {
+			if (follower) {
+				best = (std::min)(best, Distance3D(actor, follower));
+			}
+		}
+		return best;
+	}
+
+	bool IsRuntimeBattleObserveActiveThreatActor(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& followers)
+	{
+		if (!IsRuntimeBattleObserveStandingActor(actor, player)) {
+			return false;
+		}
+		auto* target = ResolveCombatTargetForBleedoutCrowd(actor);
+		if (IsRuntimeBattleObservePlayerSideTarget(target, player, followers)) {
+			return true;
+		}
+
+		const bool hostileToSide = IsRuntimeBattleObserveHostileToSide(actor, player, followers);
+		const bool inCombat = actor->IsInCombat();
+		const bool weaponDrawn = actor->IsWeaponDrawn();
+		if (inCombat && (hostileToSide || weaponDrawn)) {
+			return true;
+		}
+
+		constexpr float kLocalProofRadius = 3000.0f;
+		if (weaponDrawn && hostileToSide && RuntimeBattleObserveMinSideDistSq(actor, player, followers) <= kLocalProofRadius) {
+			return true;
+		}
+		return false;
+	}
+
+	std::vector<RE::Actor*> FilterRuntimeBattleObserveActiveEnemies(
+		const std::vector<RE::Actor*>& enemies,
+		RE::Actor* player,
+		const std::vector<RE::Actor*>& followers,
+		const char* phase)
+	{
+		std::vector<RE::Actor*> active{};
+		active.reserve(enemies.size());
+		for (auto* enemy : enemies) {
+			if (IsRuntimeBattleObserveActiveThreatActor(enemy, player, followers)) {
+				AddRuntimeBattleObserveActor(active, enemy, player);
+			}
+		}
+
+		if (active.size() != enemies.size()) {
+			spdlog::info(
+				"[TFD][Bleedout][CB08] battle observe active enemy filter phase={} enemies={} active={} followers={}",
+				phase ? phase : "unknown",
+				static_cast<unsigned int>(enemies.size()),
+				static_cast<unsigned int>(active.size()),
+				static_cast<unsigned int>(followers.size()));
+		}
+		return active;
 	}
 
 	std::vector<RE::Actor*> CollectRuntimeBattleObserveFollowers(float radius, RE::Actor* player, const RuntimeHostHandlers& handlers)
@@ -3653,6 +3872,7 @@ namespace TFD::Bleedout
 		if (preferredEnemy) {
 			AddRuntimeBattleObserveActor(enemies, preferredEnemy, player);
 		}
+		FilterRuntimeBattleObserveEnemies(enemies, player, followers, preferredEnemy, handlers, "collect_runtime_observe_enemies");
 		return enemies;
 	}
 
@@ -3816,6 +4036,7 @@ namespace TFD::Bleedout
 		auto followers = CollectRuntimeBattleObserveFollowers(radius, player, handlers);
 		auto* preferredEnemy = ResolveRuntimeBattleObservePreferredEnemy(player, radius, followers, handlers);
 		auto enemies = CollectRuntimeBattleObserveEnemies(player, radius, preferredEnemy, followers, handlers, true);
+		auto activeEnemies = FilterRuntimeBattleObserveActiveEnemies(enemies, player, followers, "pending");
 
 		if (followers.empty()) {
 			int emptyAllyTicks = 1;
@@ -3854,7 +4075,7 @@ namespace TFD::Bleedout
 		}
 
 		if (state.bleedBattleObservePendingEmptyAllyTicks) *state.bleedBattleObservePendingEmptyAllyTicks = 0;
-		if (!enemies.empty()) {
+		if (!activeEnemies.empty()) {
 			if (state.bleedBattleObservePendingEmptyEnemyTicks) *state.bleedBattleObservePendingEmptyEnemyTicks = 0;
 			ExtendRuntimeBattleObserveHold(state, now, std::chrono::milliseconds(750));
 			return;
@@ -3873,8 +4094,9 @@ namespace TFD::Bleedout
 
 		ClearRuntimeBattleObserveFlags(state);
 		spdlog::info(
-			"[TFD][Bleedout][CB03] battle observe pending resolved as player-side win followers={} enemies=0",
-			static_cast<unsigned int>(followers.size()));
+			"[TFD][Bleedout][CB08] battle observe pending resolved as player-side win followers={} enemies={} activeEnemies=0",
+			static_cast<unsigned int>(followers.size()),
+			static_cast<unsigned int>(enemies.size()));
 		if (handlers.enterObservedBattleWin) handlers.enterObservedBattleWin();
 	}
 
@@ -3890,15 +4112,16 @@ namespace TFD::Bleedout
 		auto followers = CollectRuntimeBattleObserveFollowers(radius, player, handlers);
 		auto* preferredEnemy = ResolveRuntimeBattleObservePreferredEnemy(player, radius, followers, handlers);
 		auto enemies = CollectRuntimeBattleObserveEnemies(player, radius, preferredEnemy, followers, handlers, true);
+		auto activeEnemies = FilterRuntimeBattleObserveActiveEnemies(enemies, player, followers, "active");
 
 		if (!followers.empty()) {
 			if (state.bleedBattleObserveActiveEmptyAllyTicks) *state.bleedBattleObserveActiveEmptyAllyTicks = 0;
 		}
-		if (!enemies.empty()) {
+		if (!activeEnemies.empty()) {
 			if (state.bleedBattleObserveActiveEmptyEnemyTicks) *state.bleedBattleObserveActiveEmptyEnemyTicks = 0;
 		}
 
-		if (!followers.empty() && !enemies.empty()) {
+		if (!followers.empty() && !activeEnemies.empty()) {
 			return;
 		}
 
@@ -3929,7 +4152,7 @@ namespace TFD::Bleedout
 			return;
 		}
 
-		if (enemies.empty()) {
+		if (activeEnemies.empty()) {
 			int emptyEnemyTicks = 1;
 			if (state.bleedBattleObserveActiveEmptyEnemyTicks) {
 				++(*state.bleedBattleObserveActiveEmptyEnemyTicks);
@@ -3940,8 +4163,9 @@ namespace TFD::Bleedout
 			}
 			ClearRuntimeBattleObserveFlags(state);
 			spdlog::info(
-				"[TFD][Bleedout][CB03] battle observe active resolved as player-side win followers={} enemies=0",
-				static_cast<unsigned int>(followers.size()));
+				"[TFD][Bleedout][CB08] battle observe active resolved as player-side win followers={} enemies={} activeEnemies=0",
+				static_cast<unsigned int>(followers.size()),
+				static_cast<unsigned int>(enemies.size()));
 			if (handlers.enterObservedBattleWin) handlers.enterObservedBattleWin();
 			return;
 		}
