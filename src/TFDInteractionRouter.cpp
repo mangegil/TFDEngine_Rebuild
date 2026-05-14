@@ -927,6 +927,15 @@ namespace TFD::InteractionRouter
             result.kind = FlowOwnedPrimaryKind::Captive;
             result.interactionState = 4;
             result.handled = true;
+
+            float remainingSeconds = 0.0f;
+            if (TFD::Captive::IsCaptorCallCooldownActive(&remainingSeconds)) {
+                result.success = false;
+                result.notification = "TFD: Wait a moment.";
+                spdlog::info("[TFD][Router] Captive call blocked by cooldown remaining={:.2f}s", remainingSeconds);
+                return result;
+            }
+
             result.success = TFD::Captive::BeginCaptorCallHotkey(player);
             result.notification = result.success ? "TFD: Calling Captor" : "TFD: No Response";
             return result;
@@ -1690,6 +1699,9 @@ namespace TFD::InteractionRouter
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
             constexpr float kBleedoutForceGreetMaxDistance = 320.0f;
             constexpr float kBleedoutForceGreetMaxDistanceSq = kBleedoutForceGreetMaxDistance * kBleedoutForceGreetMaxDistance;
+            constexpr float kCaptiveForceGreetMaxDistance = 360.0f;
+            constexpr float kCaptiveForceGreetMaxDistanceSq = kCaptiveForceGreetMaxDistance * kCaptiveForceGreetMaxDistance;
+            constexpr auto kCaptiveTimeout = std::chrono::milliseconds(30000);
 
             struct PendingState
             {
@@ -1847,6 +1859,41 @@ namespace TFD::InteractionRouter
                 return info;
             }
 
+            RE::TESTopicInfo* ResolveCaptiveGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // INFO record behind TFD_TIF__0506FEAC, the root response for
+                    // TFDDialogueCaptiveGreet / Calling Captor.  Use plugin-local ID
+                    // so runtime load order does not matter.
+                    constexpr RE::FormID kCaptiveGreetInfoLocalFormID = 0x0006FEAC;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kCaptiveGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen][CAPTIVE] TFDDialogueCaptiveGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kCaptiveGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen][CAPTIVE] TFDDialogueCaptiveGreet INFO {:06X} not found in {}; captive hard dialogue will fall back to default topic selection",
+                            kCaptiveGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
+            }
+
             RE::TESTopicInfo* ResolveAfterPleasureGreetTopicInfo()
             {
                 static RE::TESTopicInfo* info = nullptr;
@@ -1979,6 +2026,11 @@ namespace TFD::InteractionRouter
             bool IsBleedoutForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
                 return IsForceGreetRangeReady(player, speaker, kBleedoutForceGreetMaxDistanceSq);
+            }
+
+            bool IsCaptiveForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                return IsForceGreetRangeReady(player, speaker, kCaptiveForceGreetMaxDistanceSq);
             }
 
             constexpr const char* kPreCombatCrowdApproachAssistEvent = "TFDTruceApproachAssist";
@@ -2366,7 +2418,7 @@ namespace TFD::InteractionRouter
 
             bool IsApproachPackageMode(Mode mode)
             {
-                return mode == Mode::PreCombatTruce || mode == Mode::InCombatTruce || mode == Mode::Bleedout;
+                return mode == Mode::PreCombatTruce || mode == Mode::InCombatTruce || mode == Mode::Bleedout || mode == Mode::CaptiveMarker;
             }
 
             bool IsNativeForceGreetMode(Mode mode)
@@ -2374,6 +2426,7 @@ namespace TFD::InteractionRouter
                 return mode == Mode::PreCombatTruce ||
                     mode == Mode::InCombatTruce ||
                     mode == Mode::Bleedout ||
+                    mode == Mode::CaptiveMarker ||
                     mode == Mode::AfterPleasure;
             }
 
@@ -2486,11 +2539,13 @@ namespace TFD::InteractionRouter
 
                 const auto timeout = mode == Mode::Bleedout ?
                     kBleedoutTimeout :
-                    (mode == Mode::AfterPleasure ?
-                        kAfterPleasureTimeout :
-                        (mode == Mode::PreCombatTruce || mode == Mode::PreCombatFollowup ?
-                            kPreCombatTimeout :
-                            (mode == Mode::InCombatTruce ? kInCombatTimeout : kDefaultTimeout)));
+                    (mode == Mode::CaptiveMarker ?
+                        kCaptiveTimeout :
+                        (mode == Mode::AfterPleasure ?
+                            kAfterPleasureTimeout :
+                            (mode == Mode::PreCombatTruce || mode == Mode::PreCombatFollowup ?
+                                kPreCombatTimeout :
+                                (mode == Mode::InCombatTruce ? kInCombatTimeout : kDefaultTimeout))));
                 g_pending.speaker = speaker->GetHandle();
                 g_pending.mode = mode;
                 g_pending.active = true;
@@ -2647,8 +2702,10 @@ namespace TFD::InteractionRouter
             }
 
             if (now >= g_pending.deadline) {
-                if (g_pending.mode == Mode::PreCombatTruce || g_pending.mode == Mode::Bleedout) {
-                    g_pending.deadline = now + (g_pending.mode == Mode::Bleedout ? kBleedoutTimeout : kPreCombatTimeout);
+                if (g_pending.mode == Mode::PreCombatTruce || g_pending.mode == Mode::Bleedout || g_pending.mode == Mode::CaptiveMarker) {
+                    g_pending.deadline = now + (g_pending.mode == Mode::Bleedout ?
+                        kBleedoutTimeout :
+                        (g_pending.mode == Mode::CaptiveMarker ? kCaptiveTimeout : kPreCombatTimeout));
                     RefreshApproachPackage(player, speaker);
                     spdlog::warn(
                         "[TFD][DialogueOpen][R130] approach deadline converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
@@ -2677,6 +2734,7 @@ namespace TFD::InteractionRouter
                 const bool preCombatMode = g_pending.mode == Mode::PreCombatTruce;
                 const bool inCombatMode = g_pending.mode == Mode::InCombatTruce;
                 const bool bleedoutMode = g_pending.mode == Mode::Bleedout;
+                const bool captiveMode = g_pending.mode == Mode::CaptiveMarker;
                 bool rangeReady = true;
                 float targetDist = 0.0f;
                 if (preCombatMode) {
@@ -2688,6 +2746,9 @@ namespace TFD::InteractionRouter
                 } else if (bleedoutMode) {
                     rangeReady = IsBleedoutForceGreetRangeReady(player, speaker);
                     targetDist = kBleedoutForceGreetMaxDistance;
+                } else if (captiveMode) {
+                    rangeReady = IsCaptiveForceGreetRangeReady(player, speaker);
+                    targetDist = kCaptiveForceGreetMaxDistance;
                 }
 
                 if (!rangeReady) {
@@ -2720,8 +2781,12 @@ namespace TFD::InteractionRouter
                 g_pending.mode == Mode::Bleedout &&
                 !g_pending.requestIssued &&
                 !IsBleedoutForceGreetRangeReady(player, speaker);
+            const bool needsCaptiveRangeGate =
+                g_pending.mode == Mode::CaptiveMarker &&
+                !g_pending.requestIssued &&
+                !IsCaptiveForceGreetRangeReady(player, speaker);
 
-            if (needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate) {
+            if (needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
@@ -2744,7 +2809,9 @@ namespace TFD::InteractionRouter
                     RefreshApproachPackage(player, speaker);
                     const float targetDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
-                        (needsBleedoutRangeGate ? kBleedoutForceGreetMaxDistance : kPreCombatForceGreetMaxDistance);
+                        (needsBleedoutRangeGate ?
+                            kBleedoutForceGreetMaxDistance :
+                            (needsCaptiveRangeGate ? kCaptiveForceGreetMaxDistance : kPreCombatForceGreetMaxDistance));
                     spdlog::info(
                         "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f}",
                         ModeName(g_pending.mode),
@@ -2759,7 +2826,9 @@ namespace TFD::InteractionRouter
                     const float dist = std::sqrt(DistanceSquared(player, speaker));
                     const float maxDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
-                        (needsBleedoutRangeGate ? kBleedoutForceGreetMaxDistance : kPreCombatForceGreetMaxDistance);
+                        (needsBleedoutRangeGate ?
+                            kBleedoutForceGreetMaxDistance :
+                            (needsCaptiveRangeGate ? kCaptiveForceGreetMaxDistance : kPreCombatForceGreetMaxDistance));
                     spdlog::info(
                         "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} max={:.1f}",
                         ModeName(g_pending.mode),
@@ -2824,6 +2893,10 @@ namespace TFD::InteractionRouter
                 topicInfo = ResolveBleedoutGreetTopicInfo();
                 hardDialogueReset = true;
             }
+            else if (g_pending.mode == Mode::CaptiveMarker) {
+                topicInfo = ResolveCaptiveGreetTopicInfo();
+                hardDialogueReset = true;
+            }
             else if (afterPleasureMode) {
                 topicInfo = ResolveAfterPleasureGreetTopicInfo();
                 // R111: Bleedout AfterPleasure can be opened after OStim and a
@@ -2860,7 +2933,9 @@ namespace TFD::InteractionRouter
                 kPreCombatForceGreetMaxDistance :
                 (g_pending.mode == Mode::InCombatTruce ?
                     kInCombatForceGreetMaxDistance :
-                    (g_pending.mode == Mode::Bleedout ? kBleedoutForceGreetMaxDistance : 0.0f));
+                    (g_pending.mode == Mode::Bleedout ?
+                        kBleedoutForceGreetMaxDistance :
+                        (g_pending.mode == Mode::CaptiveMarker ? kCaptiveForceGreetMaxDistance : 0.0f)));
             spdlog::info(
                 "[TFD][DialogueOpen][R93P] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X} explicit={} reset={}",
                 ModeName(g_pending.mode),

@@ -1759,7 +1759,8 @@ namespace TFD::Actor::Ops
 				"TFDInCombatTruceFaction",
 				"TFDBleedOutFaction",
 				"TFDBleedoutFaction",
-				"TFDCaptiveFaction",
+				// TFDCaptiveFaction is a dialogue-condition tag only; do not
+				// preserve pacify/release grace because of it.
 				"TFDWorkingCaptiveFaction",
 				"TFDAfterPleasureFaction",
 				"TFDSaviorFaction"

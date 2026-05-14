@@ -132,6 +132,11 @@ namespace TFD::DefeatMonitor
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
 
+		bool g_pendingCaptiveRecaptureRecovery = false;
+		std::chrono::steady_clock::time_point g_pendingCaptiveRecaptureRecoveryUntil{};
+		std::chrono::steady_clock::time_point g_pendingCaptiveRecaptureRecoveryLastPulse{};
+		std::string g_pendingCaptiveRecaptureRecoveryReason{};
+
 		static bool IsGraceActive()
 		{
 			if (!g_grace.load(std::memory_order_acquire)) {
@@ -429,7 +434,7 @@ namespace TFD::DefeatMonitor
 
 		bool g_prevDialogueOpen = false;
 
-		static constexpr double kDefeatedEnemyKnockSeconds = 30.0;
+		static constexpr double kDefeatedEnemyKnockSeconds = 5.0;
 		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 		RE::ObjectRefHandle g_pendingDefeatedDialogueTarget{};
 		std::chrono::steady_clock::time_point g_pendingDefeatedDialogueExpiry{};
@@ -836,6 +841,26 @@ namespace TFD::DefeatMonitor
 		static std::vector<RE::Actor*> CollectBleedoutCrowd(float radius, RE::Actor* preferred, bool preserveAssigned = false)
 		{
 			return TFD::Bleedout::CollectCrowd(radius, preferred, preserveAssigned, BuildBleedoutSpeakerHandlers(preserveAssigned));
+		}
+
+		static void QueueCaptiveRecaptureBridgeCleanup(const char* reason)
+		{
+			const char* why = reason ? reason : "captive_recapture_cleanup";
+			(void)TFD::FlowController::QueueBridgeModEvent("TFDBleedoutClearAll", nullptr, why, 1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent("TFDTruceClearAll", nullptr, why, 1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent("TFDTruceHardClearAll", nullptr, why, 1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent("TFDSystemEventClearAfterPleasure", nullptr, why, 1.0f);
+		}
+
+		static void ArmCaptiveRecaptureRecoveryPulse(const char* reason)
+		{
+			const char* why = reason ? reason : "captive_recapture_post_teleport";
+			g_pendingCaptiveRecaptureRecovery = true;
+			g_pendingCaptiveRecaptureRecoveryUntil = Now() + std::chrono::milliseconds(4500);
+			g_pendingCaptiveRecaptureRecoveryLastPulse = {};
+			g_pendingCaptiveRecaptureRecoveryReason = why;
+			QueueCaptiveRecaptureBridgeCleanup(why);
+			ForceRecoverPlayerAfterCaptiveRecapture(why);
 		}
 
 		static void ReleasePlayerBleedLock(const char* reason, bool playGetUp);
@@ -1978,8 +2003,12 @@ namespace TFD::DefeatMonitor
 			}
 			const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
 			const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
-			const float thresh = std::clamp(thresholdPct / 100.0f, 0.05f, 0.95f);
-			const float safePct = std::clamp(thresh + bonusPct, minSafePct, maxSafePct);
+			auto pctToUnit = [](float v) { return v > 1.0f ? (v / 100.0f) : v; };
+			const float thresh = std::clamp(pctToUnit(thresholdPct), 0.05f, 0.95f);
+			const float bonus = std::clamp(pctToUnit(bonusPct), 0.0f, 0.95f);
+			const float minSafe = std::clamp(pctToUnit(minSafePct), 0.05f, 1.0f);
+			const float maxSafe = std::clamp(pctToUnit(maxSafePct), minSafe, 1.0f);
+			const float safePct = std::clamp(thresh + bonus, minSafe, maxSafe);
 			const float target = (std::max)(minAbsHp, hpMax * safePct);
 			if (hpNow + 0.001f < target) {
 				actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, (target - hpNow));
@@ -1989,6 +2018,37 @@ namespace TFD::DefeatMonitor
 					hpNow,
 					target,
 					thresholdPct);
+			}
+		}
+
+		static void TickPendingCaptiveRecaptureRecoveryPulse()
+		{
+			if (!g_pendingCaptiveRecaptureRecovery) {
+				return;
+			}
+			const auto now = Now();
+			if (now > g_pendingCaptiveRecaptureRecoveryUntil) {
+				g_pendingCaptiveRecaptureRecovery = false;
+				g_pendingCaptiveRecaptureRecoveryReason.clear();
+				g_pendingCaptiveRecaptureRecoveryLastPulse = {};
+				return;
+			}
+			if (g_pendingCaptiveRecaptureRecoveryLastPulse.time_since_epoch().count() != 0 &&
+				(now - g_pendingCaptiveRecaptureRecoveryLastPulse) < std::chrono::milliseconds(350)) {
+				return;
+			}
+			g_pendingCaptiveRecaptureRecoveryLastPulse = now;
+
+			auto* player = Player();
+			const char* why = g_pendingCaptiveRecaptureRecoveryReason.empty() ? "captive_recapture_recover_pulse" : g_pendingCaptiveRecaptureRecoveryReason.c_str();
+			ForceRecoverPlayerAfterCaptiveRecapture(why);
+			QueueCaptiveRecaptureBridgeCleanup(why);
+
+			if (player && !IsActorBleedingOut(player) && GetActorHealthPct(player) > std::clamp(TFD::Settings::GetDefeatThresholdPct() + 2.0f, 2.0f, 99.0f)) {
+				g_pendingCaptiveRecaptureRecovery = false;
+				g_pendingCaptiveRecaptureRecoveryReason.clear();
+				g_pendingCaptiveRecaptureRecoveryLastPulse = {};
+				spdlog::info("[TFD][Defeat] captive recapture recovery pulse completed hpPct={:.1f}", GetActorHealthPct(player));
 			}
 		}
 
@@ -2338,7 +2398,7 @@ namespace TFD::DefeatMonitor
 					if (actor->IsWeaponDrawn()) {
 						actor->DrawWeaponMagicHands(false);
 					}
-					if (entry.defeatedManaged && !IsDialogueOpen() && entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
+					if (entry.defeatedManaged && entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
 						if (!entry.defeatedAutoDeathIssued) {
 							if (actor->IsEssential() || actor->IsProtected()) {
 								spdlog::warn("[TFD][Defeat] defeated enemy auto-death skipped actor={:08X} reason=protected_or_essential", actor->GetFormID());
@@ -2453,14 +2513,21 @@ namespace TFD::DefeatMonitor
 				ClearBleedStickyReopenGrace("arm_no_speaker");
 				return;
 			}
+			const bool captiveEscapeBleedout = TFD::Captive::IsEscapeBleedoutActive() ||
+				TFD::Captive::HasEscapeBreakRebleedPending() ||
+				TFD::Captive::IsRecaptureCommitActive();
+			const auto delayMs = captiveEscapeBleedout ? 2200 : 650;
+
 			g_bleedStickyReopenGraceActive = true;
-			g_bleedStickyReopenGraceUntil = now + std::chrono::milliseconds(650);
+			g_bleedStickyReopenGraceUntil = now + std::chrono::milliseconds(delayMs);
 			g_bleedStickyReopenGraceSpeakerID = speakerID;
 			g_bleedStickyReopenGraceDistance = distance;
 			TFD::BleedoutGreet::MarkStickyReopenPending(false, "dialogue_closed_sticky_reopen_grace");
-			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed speaker={:08X} dist={:.1f} delayMs=650 reason={}",
+			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed speaker={:08X} dist={:.1f} delayMs={} captiveEscapeBleedout={} reason={}",
 				speakerID,
 				distance,
+				delayMs,
+				captiveEscapeBleedout ? 1 : 0,
 				reason ? reason : "unknown");
 		}
 
@@ -2535,6 +2602,7 @@ namespace TFD::DefeatMonitor
 				TFD::Bleedout::TickQueuedAfterPleasureCrowdContinuation()) {
 				return;
 			}
+			TickPendingCaptiveRecaptureRecoveryPulse();
 			const bool captiveBleedOverlay = TFD::Captive::HasEscapeBreakRebleedPending() || g_inBleedState.load(std::memory_order_acquire);
 			if (!captiveBleedOverlay && TFD::InCombat::IsActive() && inCombatDialogueOpen) {
 				TFD::InCombatGreet::NotifyDialogueOpened();
@@ -2855,9 +2923,20 @@ namespace TFD::DefeatMonitor
 							g_prevDialogueOpen = false;
 							ClearBleedDialogueOutcome("dialogue_closed_captive_commit");
 							TFD::HostilityController::ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::FlowHandoff);
+							if (TFD::Captive::IsEscapeBleedoutActive() || TFD::Captive::IsRecaptureCommitActive() || TFD::Captive::IsRecaptureRecentlyCommitted()) {
+								spdlog::info("[TFD][Defeat] bleedout dialogue closed after captive outcome -> captive recapture FSM");
+								if (TFD::Captive::CommitRecapture(CurrentBleedSpeaker(), "dialogue_closed_captive_commit")) {
+									ResetBleedRuntimeState();
+								}
+								g_bleedLastSeconds = -1;
+								return;
+							}
 							if (TFD::Transition::ResolveCaptiveMarkerForOutcome(BuildTransitionRuntimeHandlers())) {
 								spdlog::info("[TFD][Defeat] bleedout dialogue closed after captive outcome -> captive marker found");
-								(void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
+								const bool teleported = TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", BuildBleedBlackoutHandlers());
+								if (teleported) {
+									ArmCaptiveRecaptureRecoveryPulse("dialogue_closed_captive_blackout");
+								}
 								SetGraceSeconds(4);
 							}
  else {
@@ -2931,7 +3010,8 @@ else {
 				const int remain = bleedSeconds - static_cast<int>(elapsed);
 				if (remain != g_bleedLastSeconds) {
 					g_bleedLastSeconds = remain;
-					if (remain > 0) {
+					const bool suppressCaptiveRecaptureNotice = TFD::Captive::IsEscapeBleedoutActive() || TFD::Captive::IsRecaptureCommitActive() || TFD::Captive::IsRecaptureRecentlyCommitted();
+					if (remain > 0 && !suppressCaptiveRecaptureNotice) {
 						char msg[96]{};
 						std::snprintf(msg, sizeof(msg), "TFDEngine: Bleeding... (%ds)", remain);
 						RE::DebugNotification(msg);
@@ -3090,7 +3170,12 @@ else {
 			[](const char* r) { auto completion = TFD::Bleedout::Builders::BuildPayReleaseCompletionHandlers(); (void)TFD::Bleedout::CompletePayRelease(r, completion); },
 			[]() { TFD::HostilityController::ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::FlowHandoff); },
 			[]() -> bool { return TFD::Transition::ResolveCaptiveMarkerForOutcome(TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers()); },
-			[]() { (void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", TFD::Bleedout::Builders::BuildBlackoutHandlers()); },
+			[]() {
+				const bool teleported = TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", TFD::Bleedout::Builders::BuildBlackoutHandlers());
+				if (teleported) {
+					ArmCaptiveRecaptureRecoveryPulse("pending_system_event_blackout");
+				}
+			},
 			[](int seconds) { SetGraceSeconds(seconds); },
 			[](const char* r) { TFD::Tame::ReleaseBleedNoSpeakerTameSession(r); },
 			[]() { ExitBleedSystemEventRuntime(); },
@@ -3104,7 +3189,12 @@ else {
 			[]() { TFD::HostilityController::ReleaseBleedTruceSession(TFD::Tame::ReleaseReason::Generic); },
 			[]() -> bool { return TFD::Transition::ResolveCaptiveMarkerForOutcome(TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers()); },
 			[]() { ResetBleedRuntimeState(); },
-			[]() { (void)TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", TFD::Bleedout::Builders::BuildBlackoutHandlers()); },
+			[]() {
+				const bool teleported = TFD::Bleedout::DoBlackoutTeleport("blackout_teleport", TFD::Bleedout::Builders::BuildBlackoutHandlers());
+				if (teleported) {
+					ArmCaptiveRecaptureRecoveryPulse("timeout_blackout");
+				}
+			},
 			[](int seconds) { SetGraceSeconds(seconds); },
 			[](const char* r) { (void)TFD::Bleedout::EnterNonCaptiveChoice(r, TFD::Bleedout::Builders::BuildNonCaptiveChoiceHandlers()); }
 		},
@@ -3444,9 +3534,52 @@ else {
 		spdlog::info("[TFD][Defeat] ApplyQueuedProgressState state={} phase={} bleed={}", TFD::Captive::GetQueuedStateFlag() ? 1 : 0, static_cast<int>(TFD::Captive::GetQueuedPhase()), g_queuedBleedOutState ? 1 : 0);
 	}
 
+
+	void ForceRecoverPlayerAfterCaptiveRecapture(const char* reason)
+	{
+		const char* why = reason ? reason : "captive_recapture_recover_player";
+		auto* player = Player();
+		if (!player) {
+			ResetBleedRuntimeState(true);
+			TFD::Bleedout::ForceStopBleedRuntimeForCaptiveRecapture(why);
+			RefreshPostDefeatGlobals();
+			spdlog::warn("[TFD][Defeat] captive recapture player recover skipped: player missing reason={}", why);
+			return;
+		}
+
+		ReleasePlayerBleedLock(why, true);
+		RestoreActorHealthToSafePct(
+			player,
+			TFD::Settings::GetDefeatThresholdPct(),
+			10.0f,
+			90.0f,
+			95.0f,
+			25.0f,
+			why);
+		ResetBleedRuntimeState(true);
+		TFD::Bleedout::ForceStopBleedRuntimeForCaptiveRecapture(why);
+		SetPlayerBleedImmune(false);
+
+		if (!player->IsDead() && !player->IsDisabled()) {
+			player->NotifyAnimationGraph("BleedoutStop");
+			player->NotifyAnimationGraph("GetUpStart");
+			player->EvaluatePackage(false, true);
+			player->EvaluatePackage(true, true);
+		}
+
+		RefreshPostDefeatGlobals();
+		spdlog::info("[TFD][Defeat] captive recapture player recovered hpPct={:.1f} reason={}",
+			GetActorHealthPct(player),
+			why);
+	}
+
 	void ResetForLoad()
 	{
 		g_grace.store(false, std::memory_order_release);
+		g_pendingCaptiveRecaptureRecovery = false;
+		g_pendingCaptiveRecaptureRecoveryReason.clear();
+		g_pendingCaptiveRecaptureRecoveryUntil = {};
+		g_pendingCaptiveRecaptureRecoveryLastPulse = {};
 		SetPlayerBleedImmune(false);
 		ResetBleedRuntimeState();
 		ClearAllBleedLocks("reset_for_load");

@@ -126,6 +126,7 @@ namespace TFD::Bleedout
 	};
 
 	void ResetRuntimeState(bool preserveCaptive, const char* reason, const RuntimeResetHandlers& handlers);
+	void ForceStopBleedRuntimeForCaptiveRecapture(const char* reason = nullptr);
 	void TransitionRuntimeToPleasureCommit(const char* reason, std::uint32_t speakerId, bool preserveSession, std::uint32_t captorId, const RuntimePleasureCommitHandlers& handlers);
 
 

@@ -82,6 +82,24 @@ namespace TFD::Bleedout
 			return actor ? actor->GetFormID() : 0u;
 		}
 
+		bool IsCaptiveEscapeRebleedFlow()
+		{
+			if (TFD::Captive::IsEscapeBleedoutActive()) {
+				return true;
+			}
+			const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			return snapshot.root == TFD::FlowController::RootFlow::Captive &&
+				snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
+				(snapshot.sub == TFD::FlowController::SubFlow::EscapeAttempt ||
+					snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+					snapshot.sub == TFD::FlowController::SubFlow::Recapture);
+		}
+
+		bool IsCaptiveRecaptureGuardActive()
+		{
+			return TFD::Captive::IsRecaptureCommitActive() || TFD::Captive::IsRecaptureRecentlyCommitted();
+		}
+
 		bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
 		{
 			if (!actor || !editorID || !editorID[0]) {
@@ -187,6 +205,39 @@ namespace TFD::Bleedout
 		std::vector<std::uint32_t> g_bleedCrowdAssigned{};
 		Clock::time_point g_bleedNoSpeakerTameLastAttempt{};
 		std::uint32_t g_bleedSpeakerId = 0;
+
+		std::uint32_t ResolveCaptiveRecaptureActorID()
+		{
+			const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			if (snapshot.primaryActorFormID != 0) {
+				return snapshot.primaryActorFormID;
+			}
+			if (g_bleedSpeakerId != 0) {
+				return g_bleedSpeakerId;
+			}
+			if (g_activeCaptorFormID != 0) {
+				return g_activeCaptorFormID;
+			}
+			return 0;
+		}
+
+		void ReassertCaptiveIdleFlowAfterBlackout(std::uint32_t actorFormID, const char* reason)
+		{
+			if (actorFormID == 0) {
+				actorFormID = ResolveCaptiveRecaptureActorID();
+			}
+			if (actorFormID == 0) {
+				spdlog::warn("[TFD][Bleedout] recapture flow reassert skipped: no actor reason={}", reason ? reason : "unknown");
+				return;
+			}
+
+			auto& flow = TFD::FlowController::Controller::GetSingleton();
+			const bool ok = flow.RequestCaptive(actorFormID, TFD::FlowController::CaptiveMode::Kidnapped, reason ? reason : "blackout_recapture_reassert");
+			spdlog::info("[TFD][Bleedout] recapture flow reassert actor={:08X} ok={} reason={}",
+				actorFormID,
+				ok ? 1 : 0,
+				reason ? reason : "unknown");
+		}
 		Clock::time_point g_bleedSpeakerKickLast{};
 		int g_bleedSpeakerKickCount = 0;
 		std::unordered_set<std::uint32_t> g_bleedRejectedSpeakerIds{};
@@ -362,12 +413,17 @@ namespace TFD::Bleedout
 				return;
 			}
 
+			RE::BGSRefAlias* speakerAlias = nullptr;
 			for (auto* baseAlias : g_bleedoutQuestRegistry.quest->aliases) {
 				auto* refAlias = skyrim_cast<RE::BGSRefAlias*>(baseAlias);
 				if (!refAlias) {
 					continue;
 				}
 				const auto aliasName = std::string(refAlias->aliasName.c_str());
+				if (aliasName == "Speaker" || aliasName == "BleedoutSpeaker" || aliasName == "TFDBleedoutSpeaker") {
+					speakerAlias = refAlias;
+				}
+
 				if (aliasName.rfind("Captor", 0) != 0 || aliasName.size() <= 6) {
 					continue;
 				}
@@ -378,6 +434,14 @@ namespace TFD::Bleedout
 					}
 				}
 				catch (...) {}
+			}
+
+			// Current TFDBleedoutQuest uses a single Speaker alias rather than the older
+			// Captor01..Captor10 alias set. Treat Speaker as the primary captor alias
+			// so native faction/alias maintenance does not remove the Bleedout dialogue
+			// faction during Captive EscapeFailed forcegreet.
+			if (!g_bleedoutQuestRegistry.captorAliases[0] && speakerAlias) {
+				g_bleedoutQuestRegistry.captorAliases[0] = speakerAlias;
 			}
 
 			std::size_t found = 0;
@@ -475,7 +539,9 @@ namespace TFD::Bleedout
 			constexpr const char* kPreserveEditorIds[] = {
 				"TFDTeammateFaction",
 				"TFDTemporaryTeammateFaction",
-				"TFDCaptiveFaction",
+				// TFDCaptiveFaction is not a pacify-preserve faction.
+				// Escape must be able to remove TFDPacifyFaction while keeping
+				// TFDCaptiveFaction for dialogue conditions.
 				"TFDWorkingCaptiveFaction",
 				"TFDSaviorFaction"
 			};
@@ -1811,6 +1877,23 @@ namespace TFD::Bleedout
 		std::vector<RE::Actor*> staleActors{};
 		std::size_t primarySlot = 0;
 		bool bound = false;
+		bool hasNativeAlias = false;
+		for (auto* alias : g_bleedoutQuestRegistry.captorAliases) {
+			if (alias) {
+				hasNativeAlias = true;
+				break;
+			}
+		}
+		if (!hasNativeAlias) {
+			ApplyBleedoutCaptorFaction(actor, reason ? reason : "no_native_alias_fallback");
+			g_activeCaptorFormID = actor->GetFormID();
+			g_captorBindLast = Clock::now();
+			spdlog::info("[TFD][BleedQuest] captor bind fallback actor={:08X} bound=1 reason={} noNativeAlias=1",
+				actor->GetFormID(),
+				reason ? reason : "unknown");
+			return true;
+		}
+
 		for (std::size_t i = 0; i < g_bleedoutQuestRegistry.captorAliases.size(); ++i) {
 			auto* alias = g_bleedoutQuestRegistry.captorAliases[i];
 			if (!alias) {
@@ -2350,6 +2433,31 @@ namespace TFD::Bleedout
 		g_systemEventLastDeferredLog = {};
 	}
 
+	void ForceStopBleedRuntimeForCaptiveRecapture(const char* reason)
+	{
+		const char* why = reason ? reason : "captivity_recapture_stop";
+		g_inBleedState.store(false, std::memory_order_release);
+		g_minHp = 0.0f;
+		g_bleedStart = {};
+		g_bleedLastSeconds = -1;
+		g_bleedPaused = false;
+		g_bleedPauseStarted = {};
+		g_bleedLastCalmPulse = {};
+		g_bleedLastCrowdAssign = {};
+		g_bleedNoSpeakerTameLastAttempt = {};
+		g_bleedSpeakerId = 0;
+		g_bleedPendingCaptiveOutcome = false;
+		g_bleedPendingNonCaptiveOutcome = false;
+		ResetBleedSpeakerKick();
+		ClearBleedCrowdAssigned();
+		ClearBleedRejectedSpeakerIds();
+		ClearDialogueOutcome(why);
+		ClearSystemEventOutcomeWindow(why);
+		ClearTerminalCommit(why);
+		TFD::BleedoutGreet::ResetRuntime(why);
+		spdlog::info("[TFD][Bleedout] captive recapture bleed runtime force-stopped reason={}", why);
+	}
+
 	bool IsSystemEventOutcomeWindowActive()
 	{
 		if (!g_awaitingSystemEventOutcome) {
@@ -2514,6 +2622,8 @@ namespace TFD::Bleedout
 	bool CompleteCaptivePleasureHandoff(const char* reason, const CompletionHandlers& handlers)
 	{
 		const char* why = reason ? reason : "captive_pleasure_handoff";
+		RE::Actor* preservedSpeaker = handlers.resolveRuntimeSpeaker ? handlers.resolveRuntimeSpeaker() : nullptr;
+		const auto preservedSpeakerID = preservedSpeaker ? preservedSpeaker->GetFormID() : 0u;
 		if (handlers.clearOutcomeWindow) {
 			handlers.clearOutcomeWindow(why);
 		}
@@ -2566,9 +2676,9 @@ namespace TFD::Bleedout
 			handlers.updatePreCombatState();
 		}
 		if (handlers.beginPleasure) {
-			handlers.beginPleasure(handlers.resolveRuntimeSpeaker ? handlers.resolveRuntimeSpeaker() : nullptr, true, why);
+			handlers.beginPleasure(preservedSpeaker, true, why);
 		}
-		spdlog::info("[TFD][Bleedout] captive pleasure handoff complete reason={}", why);
+		spdlog::info("[TFD][Bleedout] captive pleasure handoff complete reason={} speaker={:08X}", why, preservedSpeakerID);
 		return true;
 	}
 
@@ -2737,6 +2847,15 @@ namespace TFD::Bleedout
 			if (handlers.clearDialogueOutcome) {
 				handlers.clearDialogueOutcome(reason ? reason : "system_event_captive");
 			}
+			if (IsCaptiveEscapeRebleedFlow()) {
+				auto* speaker = GetBleedSpeakerActor();
+				spdlog::info("[TFD][Bleedout] post-dialogue system event committed captive -> captive recapture FSM speaker={:08X}",
+					speaker ? speaker->GetFormID() : 0u);
+				if (TFD::Captive::CommitRecapture(speaker, reason ? reason : "system_event_captive_recapture")) {
+					ForceStopBleedRuntimeForCaptiveRecapture("system_event_captive_recapture");
+				}
+				return true;
+			}
 			if (handlers.releaseFlowHandoff) {
 				handlers.releaseFlowHandoff();
 			}
@@ -2807,6 +2926,13 @@ namespace TFD::Bleedout
 			handlers.setRetryCount(0);
 		}
 		if (handlers.resolveCaptiveMarker && handlers.resolveCaptiveMarker()) {
+			if (IsCaptiveEscapeRebleedFlow()) {
+				spdlog::info("[TFD][Bleedout] system-event window expired -> captive recapture FSM fallback");
+				if (TFD::Captive::CommitRecapture(GetBleedSpeakerActor(), reason ? reason : "system_event_window_expired_recapture")) {
+					ForceStopBleedRuntimeForCaptiveRecapture("system_event_window_expired_recapture");
+				}
+				return true;
+			}
 			spdlog::info("[TFD][Bleedout] system-event window expired -> fallback captive marker found");
 			if (handlers.doBlackoutTeleport) {
 				handlers.doBlackoutTeleport();
@@ -2832,6 +2958,14 @@ namespace TFD::Bleedout
 	bool HandleBleedTimeout(const TimeoutContext& context, const char* reason, const TimeoutHandlers& handlers)
 	{
 		const char* why = reason ? reason : "bleed_timeout";
+		if (IsCaptiveRecaptureGuardActive()) {
+			if (handlers.resetBleedRuntimeState) {
+				handlers.resetBleedRuntimeState();
+			}
+			ForceStopBleedRuntimeForCaptiveRecapture("late_bleed_timeout_after_recapture");
+			spdlog::info("[TFD][Bleedout] bleed timeout suppressed by captive recapture guard reason={}", why);
+			return true;
+		}
 		if (context.hasTerminalCommit) {
 			spdlog::info("[TFD][Bleedout] bleed timeout -> suppressed activeTerminalCommit={}",
 				context.terminalCommitName ? context.terminalCommitName : "unknown");
@@ -2846,6 +2980,13 @@ namespace TFD::Bleedout
 			handlers.releaseTruceGeneric();
 		}
 		if (context.pendingCaptive && handlers.resolveCaptiveMarker && handlers.resolveCaptiveMarker()) {
+			if (IsCaptiveEscapeRebleedFlow() || TFD::Captive::IsEscapeBleedoutActive()) {
+				spdlog::info("[TFD][Bleedout] bleed timeout -> captive recapture FSM");
+				if (TFD::Captive::CommitRecapture(GetBleedSpeakerActor(), why)) {
+					ForceStopBleedRuntimeForCaptiveRecapture("bleed_timeout_recapture");
+				}
+				return true;
+			}
 			if (handlers.resetBleedRuntimeState) {
 				handlers.resetBleedRuntimeState();
 			}
@@ -2927,19 +3068,72 @@ namespace TFD::Bleedout
 	bool DoBlackoutTeleport(const char* reason, const BlackoutHandlers& handlers)
 	{
 		const char* why = reason ? reason : "blackout_teleport";
+		if (IsCaptiveRecaptureGuardActive()) {
+			ForceStopBleedRuntimeForCaptiveRecapture("blackout_recapture_guard");
+			spdlog::info("[TFD][Bleedout] blackout teleport suppressed by captive recapture guard reason={}", why);
+			return true;
+		}
+		if (IsCaptiveEscapeRebleedFlow()) {
+			spdlog::info("[TFD][Bleedout] blackout teleport redirected to captive recapture FSM reason={}", why);
+			const bool committed = TFD::Captive::CommitRecapture(GetBleedSpeakerActor(), why);
+			if (committed) {
+				ForceStopBleedRuntimeForCaptiveRecapture("blackout_recapture_redirect");
+			}
+			return committed;
+		}
+		const auto recaptureActorID = ResolveCaptiveRecaptureActorID();
+
+		auto directCaptiveBlackout = [&]() -> bool {
+			auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
+			auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
+
+			if (!TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
+				spdlog::warn("[TFD][Bleedout] direct captive blackout fallback failed marker resolution reason={}", why);
+				return false;
+			}
+
+			if (handlers.resetBleedRuntimeState) {
+				handlers.resetBleedRuntimeState();
+			}
+			if (handlers.clearBridgeAliases) {
+				handlers.clearBridgeAliases(why);
+			}
+			if (handlers.clearLastAggressor) {
+				handlers.clearLastAggressor();
+			}
+			ClearDialogueOutcome(why);
+			ClearSystemEventOutcomeWindow(why);
+
+			const bool completed = TFD::Transition::CompleteCaptiveTransitionNow(why, runtimeHandlers, captiveHandlers);
+			if (completed) {
+				ReassertCaptiveIdleFlowAfterBlackout(recaptureActorID, why);
+			}
+			spdlog::info("[TFD][Bleedout] direct captive blackout fallback completed={} reason={}", completed ? 1 : 0, why);
+			return completed;
+		};
+
 		if (handlers.hasBlockingCommit && handlers.hasBlockingCommit()) {
 			spdlog::info("[TFD][Bleedout] blackout teleport suppressed activeTerminalCommit={}",
 				handlers.getBlockingCommitName ? handlers.getBlockingCommitName() : "unknown");
 			return false;
 		}
+
 		if (handlers.resolveCaptiveMarker && !handlers.resolveCaptiveMarker()) {
+			if (directCaptiveBlackout()) {
+				return true;
+			}
 			if (handlers.enterNonCaptiveChoice) {
 				handlers.enterNonCaptiveChoice("marker_not_found");
 			}
 			return false;
 		}
+
 		if (handlers.tryBeginCaptiveCommit && !handlers.tryBeginCaptiveCommit(why)) {
 			return false;
+		}
+
+		if (!handlers.queueCaptiveFadeTransition && !handlers.completeCaptiveTransitionNow) {
+			return directCaptiveBlackout();
 		}
 		if (handlers.resetBleedRuntimeState) {
 			handlers.resetBleedRuntimeState();
@@ -2963,14 +3157,25 @@ namespace TFD::Bleedout
 			handlers.showBlackoutFader();
 		}
 		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+		bool completed = false;
 		if (handlers.completeCaptiveTransitionNow) {
 			handlers.completeCaptiveTransitionNow("captive_blackout_fallback");
+			completed = true;
 		}
+		else {
+			completed = directCaptiveBlackout();
+		}
+
+		if (completed) {
+			ReassertCaptiveIdleFlowAfterBlackout(recaptureActorID, why);
+		}
+
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 		if (handlers.hideBlackoutFader) {
 			handlers.hideBlackoutFader();
 		}
-		return true;
+		return completed;
 	}
 
 	bool BeginWindow(RE::Actor* speaker, const char* reason)
@@ -2999,6 +3204,13 @@ namespace TFD::Bleedout
 
 	bool ResolveCaptive(RE::Actor* actor, const char* reason)
 	{
+		if (IsCaptiveEscapeRebleedFlow() || TFD::Captive::IsEscapeBleedoutActive()) {
+			const bool committed = TFD::Captive::CommitRecapture(actor, reason ? reason : "bleedout_captive_recapture");
+			if (committed) {
+				ForceStopBleedRuntimeForCaptiveRecapture("bleedout_captive_recapture");
+			}
+			return committed;
+		}
 		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		return flow.ResolveBleedoutOutcome(TFD::FlowController::BleedoutOutcome::Captive, ActorFormID(actor), reason ? reason : "bleedout_captive");
 	}
@@ -3486,10 +3698,25 @@ namespace TFD::Bleedout
 		}
 
 		const int bleedSeconds = TFD::Settings::GetBleedWindowSeconds();
-		char msg[96]{};
-		std::snprintf(msg, sizeof(msg), "TFDEngine: Bleeding... (%ds)", bleedSeconds);
-		if (handlers.debugNotification) handlers.debugNotification(msg);
-		spdlog::info("[TFD][Bleedout] bleed window started ({}s)", bleedSeconds);
+		if (IsCaptiveEscapeRebleedFlow()) {
+			constexpr int kCaptiveRecaptureFallbackSeconds = 6;
+			const int elapsedOffset = (std::max)(0, bleedSeconds - kCaptiveRecaptureFallbackSeconds);
+			if (state.bleedStart) {
+				*state.bleedStart = Clock::now() - std::chrono::seconds(elapsedOffset);
+			}
+			if (state.bleedLastSeconds) {
+				*state.bleedLastSeconds = -1;
+			}
+			spdlog::info("[TFD][Bleedout] captive escape-failed recapture window started fallbackSeconds={} baseSeconds={} notification=0",
+				kCaptiveRecaptureFallbackSeconds,
+				bleedSeconds);
+		}
+		else {
+			char msg[96]{};
+			std::snprintf(msg, sizeof(msg), "TFDEngine: Bleeding... (%ds)", bleedSeconds);
+			if (handlers.debugNotification) handlers.debugNotification(msg);
+			spdlog::info("[TFD][Bleedout] bleed window started ({}s)", bleedSeconds);
+		}
 	}
 
 	bool StartRuntimeBattleObservePending(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers)
@@ -4273,8 +4500,13 @@ namespace TFD::Bleedout
 	bool OwnsCurrentFlow()
 	{
 		const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+		const bool captiveEscapeRebleed =
+			snapshot.root == TFD::FlowController::RootFlow::Captive &&
+			(snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+				snapshot.sub == TFD::FlowController::SubFlow::Recapture);
 		return snapshot.root == TFD::FlowController::RootFlow::Bleedout ||
 			snapshot.contextRoot == TFD::FlowController::RootFlow::Bleedout ||
+			captiveEscapeRebleed ||
 			snapshot.sub == TFD::FlowController::SubFlow::BleedoutPleasure ||
 			snapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure;
 	}

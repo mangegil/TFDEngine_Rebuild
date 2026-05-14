@@ -8,6 +8,10 @@
 #include "TFDLocation.h"
 
 #include "TFDFlowController.h"
+#include "TFDInteractionRouter.h"
+#include "TFDPleasureRuntime.h"
+#include "TFDTransition.h"
+#include "TFDDefeatMonitor.h"
 
 #include <SKSE/SKSE.h>
 
@@ -19,6 +23,8 @@
 
 namespace TFD::Captive
 {
+	void EnsureCaptiveNavigationContext(RE::Actor* player, const char* reason);
+
 	namespace
 	{
 		static bool IsActorSameSpace(RE::Actor* actor, RE::Actor* player)
@@ -88,43 +94,93 @@ namespace TFD::Captive
 
 			RE::Actor* best = nullptr;
 			float bestScore = 1.0e30f;
+			std::uint32_t considered = 0;
+			std::uint32_t sameSpace = 0;
+			std::uint32_t supported = 0;
+			std::uint32_t suppressed = 0;
+			std::uint32_t losCount = 0;
 
 			for (const auto& info : snapshot.actors) {
 				auto* a = info.get();
-				if (!a) continue;
-				if (!IsCaptorSupportedActor(a)) continue;
-				if (!IsActorSameSpace(a, player)) continue;
-				if (info.dist > searchRadius) continue;
-				if (!ActorHasLOS(a, player)) continue;
+				if (!a) {
+					continue;
+				}
+				++considered;
+				if (!IsCaptorSupportedActor(a)) {
+					continue;
+				}
+				++supported;
+				if (!IsActorSameSpace(a, player)) {
+					continue;
+				}
+				++sameSpace;
+				if (info.dist > searchRadius) {
+					continue;
+				}
+
+				const bool hasLOS = ActorHasLOS(a, player);
+				if (hasLOS) {
+					++losCount;
+				}
+				const bool isSuppressed = TFD::HostilityController::IsActorTemporarilySuppressed(a);
+				if (isSuppressed) {
+					++suppressed;
+				}
+				const bool hostile = info.hostileToPlayer || a->IsHostileToActor(player);
+				const bool combat = info.inCombat || a->IsInCombat();
+
+				// Calling Captor is a captive-camp request.  A caged player can have
+				// a valid captor directly in front of the cell while LOS is blocked by
+				// bars, doors, or collision.  Prefer actors already held by captive
+				// suppression, then LOS/hostile/combat actors, but do not hard-require
+				// LOS for the hotkey candidate.
+				if (!isSuppressed && !hasLOS && !hostile && !combat) {
+					continue;
+				}
 
 				float score = info.dist;
-				if (info.hostileToPlayer || a->IsHostileToActor(player)) score -= 140.0f;
-				if (info.inCombat || a->IsInCombat()) score -= 100.0f;
+				if (isSuppressed) {
+					score -= 10000.0f;
+				}
+				if (hasLOS) {
+					score -= 3000.0f;
+				}
+				if (hostile) {
+					score -= 140.0f;
+				}
+				if (combat) {
+					score -= 100.0f;
+				}
+
 				if (score < bestScore) {
 					bestScore = score;
 					best = a;
 				}
 			}
 
+			if (best) {
+				spdlog::info("[TFD][Captive] Call Captor candidate selected actor={:08X} distScore={:.1f} considered={} supported={} sameSpace={} suppressed={} los={}",
+					best->GetFormID(),
+					bestScore,
+					considered,
+					supported,
+					sameSpace,
+					suppressed,
+					losCount);
+			} else {
+				spdlog::warn("[TFD][Captive] Call Captor no candidate considered={} supported={} sameSpace={} suppressed={} los={} radius={:.1f}",
+					considered,
+					supported,
+					sameSpace,
+					suppressed,
+					losCount,
+					searchRadius);
+			}
+
 			return best;
 		}
 
-		static void SendBridgeEvent(const char* eventName)
-		{
-			if (!eventName) {
-				return;
-			}
-
-			auto* src = SKSE::GetModCallbackEventSource();
-			if (!src) {
-				return;
-			}
-
-			SKSE::ModCallbackEvent e(eventName, "", 0.0f, nullptr);
-			src->SendEvent(&e);
-		}
-
-		static void SendBridgeAssignActor(const char* eventName, RE::Actor* actor)
+		static void SendBridgeAssignActor(const char* eventName, RE::Actor* actor, const char* reason = "")
 		{
 			if (!eventName || !actor) {
 				return;
@@ -135,9 +191,27 @@ namespace TFD::Captive
 				return;
 			}
 
-			SKSE::ModCallbackEvent e(eventName, "", 0.0f, actor);
+			SKSE::ModCallbackEvent e(eventName, reason ? reason : "", 0.0f, actor);
 			src->SendEvent(&e);
 		}
+
+		static void SendBridgeFormEvent(const char* eventName, RE::TESForm* sender, const char* reason = "", float numArg = 0.0f)
+		{
+			if (!eventName || !sender) {
+				return;
+			}
+
+			auto* src = SKSE::GetModCallbackEventSource();
+			if (!src) {
+				return;
+			}
+
+			SKSE::ModCallbackEvent e(eventName, reason ? reason : "", numArg, sender);
+			src->SendEvent(&e);
+		}
+
+		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason);
+		static void ApplyNativeCaptiveLocationRoleFactions(RE::Actor* player, const char* reason, bool force);
 
 		static void ApplyCallCaptorCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
 		{
@@ -183,8 +257,18 @@ namespace TFD::Captive
 				actor->EvaluatePackage(true, false);
 			}
 
-			SendBridgeEvent("TFDCaptiveClearAll");
-			SendBridgeAssignActor("TFDCaptiveAssign", primaryTarget);
+			// Do not clear the whole captive bridge here.  ClearAll also wipes
+			// CaptiveMarker, EscapeDoor, and LootTarget aliases, which can break
+			// the active captive cycle and recover-item objective.  AssignActor
+			// is allowed to replace only OwnerCaptor.
+			//
+			// TFDCaptiveFaction is a dialogue-condition role for every eligible
+			// actor in the active captive location, not just OwnerCaptor.  CK
+			// dialogue can then distinguish captive-location actors from normal
+			// hostiles while native still owns forcegreet/session routing.
+			ApplyNativeCaptiveLocationRoleFactions(player, "call_captor_hotkey", true);
+			ApplyNativeCaptorRoleFaction(primaryTarget, "call_captor_hotkey_primary");
+			SendBridgeAssignActor("TFDCaptiveAssign", primaryTarget, "call_captor_hotkey");
 		}
 
 		static constexpr int kCaptiveConfiscationInitialDelayMs = 300;
@@ -201,6 +285,9 @@ namespace TFD::Captive
 		{
 			return std::chrono::steady_clock::now();
 		}
+
+		static constexpr auto kCaptorCallCooldown = std::chrono::milliseconds(5000);
+		static std::chrono::steady_clock::time_point g_captorCallCooldownUntil{};
 
 		static RE::TESObjectREFR* LookupRefByFormID(std::uint32_t formID)
 		{
@@ -249,6 +336,213 @@ namespace TFD::Captive
 		RE::ObjectRefHandle g_boundEscapeDoor{};
 		RE::ObjectRefHandle g_lockpickDoorCandidate{};
 		bool g_lockpickDoorWasLocked = false;
+
+		bool g_escapeBleedoutActive = false;
+		bool g_recaptureCommitActive = false;
+		std::chrono::steady_clock::time_point g_recaptureCommitStarted{};
+		std::chrono::steady_clock::time_point g_lastRecaptureCompleted{};
+		std::uint32_t g_lastRecaptureActorID = 0;
+		std::uint32_t g_stashCycleID = 0;
+		struct NativeCaptiveRoleEntry
+		{
+			RE::ActorHandle actor{};
+			RE::FormID formID = 0;
+			bool addedByTFD = false;
+		};
+
+		RE::ActorHandle g_nativeCaptorRoleActor{};
+		bool g_nativeCaptorRoleFactionAdded = false;
+		std::vector<NativeCaptiveRoleEntry> g_nativeCaptiveRoleActors{};
+		std::chrono::steady_clock::time_point g_nextCaptiveRoleFactionSweep{};
+		static constexpr auto kCaptiveRoleFactionSweepInterval = std::chrono::milliseconds(1500);
+		static constexpr auto kRecaptureDuplicateGuard = std::chrono::milliseconds(8000);
+
+		static std::uint32_t ActorFormID(RE::Actor* actor)
+		{
+			return actor ? actor->GetFormID() : 0u;
+		}
+
+		static RE::TESFaction* ResolveNativeCaptiveFaction()
+		{
+			static RE::TESFaction* cached = nullptr;
+			static bool resolved = false;
+			if (!resolved) {
+				resolved = true;
+				cached = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDCaptiveFaction");
+				if (!cached) {
+					spdlog::warn("[TFD][Captive] native captor role faction missing editorId=TFDCaptiveFaction");
+				}
+			}
+			return cached;
+		}
+
+		static RE::Actor* ResolveNativeCaptorRoleActor()
+		{
+			if (!g_nativeCaptorRoleActor) {
+				return nullptr;
+			}
+			auto sp = RE::Actor::LookupByHandle(g_nativeCaptorRoleActor.native_handle());
+			if (!sp) {
+				g_nativeCaptorRoleActor.reset();
+				g_nativeCaptorRoleFactionAdded = false;
+				return nullptr;
+			}
+			return sp.get();
+		}
+
+		static bool IsNativeCaptiveFactionTracked(RE::FormID formID)
+		{
+			if (formID == 0) {
+				return false;
+			}
+			for (const auto& entry : g_nativeCaptiveRoleActors) {
+				if (entry.formID == formID) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static void ClearNativeCaptorRoleFaction(const char* reason)
+		{
+			auto* faction = ResolveNativeCaptiveFaction();
+			std::uint32_t removed = 0;
+			std::uint32_t preserved = 0;
+			std::uint32_t stale = 0;
+
+			if (faction) {
+				for (auto& entry : g_nativeCaptiveRoleActors) {
+					RE::Actor* actor = nullptr;
+					if (entry.actor) {
+						auto sp = RE::Actor::LookupByHandle(entry.actor.native_handle());
+						actor = sp ? sp.get() : nullptr;
+					}
+					if (!actor && entry.formID != 0) {
+						actor = RE::TESForm::LookupByID<RE::Actor>(entry.formID);
+					}
+					if (!actor) {
+						++stale;
+						continue;
+					}
+
+					if (entry.addedByTFD && actor->IsInFaction(faction)) {
+						actor->RemoveFromFaction(faction);
+						++removed;
+					} else {
+						++preserved;
+					}
+				}
+			}
+
+			g_nativeCaptiveRoleActors.clear();
+			g_nativeCaptorRoleActor.reset();
+			g_nativeCaptorRoleFactionAdded = false;
+			g_nextCaptiveRoleFactionSweep = {};
+
+			spdlog::info("[TFD][Captive] native captive location role faction cleared removed={} preserved={} stale={} reason={}",
+				removed,
+				preserved,
+				stale,
+				reason ? reason : "unknown");
+		}
+
+		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			auto* faction = ResolveNativeCaptiveFaction();
+			if (!faction) {
+				return;
+			}
+
+			const RE::FormID formID = actor->GetFormID();
+			const bool hadFaction = actor->IsInFaction(faction);
+			if (!hadFaction) {
+				actor->AddToFaction(faction, 0);
+			}
+
+			if (!IsNativeCaptiveFactionTracked(formID)) {
+				NativeCaptiveRoleEntry entry{};
+				entry.actor = actor->GetHandle();
+				entry.formID = formID;
+				entry.addedByTFD = !hadFaction;
+				g_nativeCaptiveRoleActors.push_back(entry);
+			}
+
+			g_nativeCaptorRoleActor = actor->GetHandle();
+			g_nativeCaptorRoleFactionAdded = !hadFaction;
+			spdlog::info("[TFD][Captive] native captive role faction applied actor={:08X} added={} hadFaction={} tracked={} reason={}",
+				actor->GetFormID(),
+				(!hadFaction) ? 1 : 0,
+				hadFaction ? 1 : 0,
+				static_cast<unsigned>(g_nativeCaptiveRoleActors.size()),
+				reason ? reason : "unknown");
+		}
+
+		static bool IsActorInNativeCaptiveLocationScope(RE::Actor* actor, RE::Actor* player)
+		{
+			if (!actor || !player) {
+				return false;
+			}
+
+			if (g_locationFormID != 0) {
+				auto* cell = actor->GetParentCell();
+				auto* loc = cell ? cell->GetLocation() : nullptr;
+				if (loc && loc->GetFormID() == g_locationFormID) {
+					return true;
+				}
+			}
+
+			return IsActorSameSpace(actor, player);
+		}
+
+		static void ApplyNativeCaptiveLocationRoleFactions(RE::Actor* player, const char* reason, bool force)
+		{
+			if (!g_state || !player) {
+				return;
+			}
+
+			const auto now = Now();
+			if (!force && g_nextCaptiveRoleFactionSweep != std::chrono::steady_clock::time_point{} && now < g_nextCaptiveRoleFactionSweep) {
+				return;
+			}
+			g_nextCaptiveRoleFactionSweep = now + kCaptiveRoleFactionSweepInterval;
+
+			EnsureCaptiveNavigationContext(player, reason ? reason : "native_captive_faction_sweep");
+
+			const float sweepRadius = (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f);
+			auto snapshot = TFD::Actor::BuildSnapshot(sweepRadius, false);
+			std::uint32_t applied = 0;
+			std::uint32_t considered = 0;
+			std::uint32_t inScope = 0;
+
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
+				if (!actor) {
+					continue;
+				}
+				++considered;
+				if (!IsCaptorSupportedActor(actor)) {
+					continue;
+				}
+				if (!IsActorInNativeCaptiveLocationScope(actor, player)) {
+					continue;
+				}
+				++inScope;
+				ApplyNativeCaptorRoleFaction(actor, reason ? reason : "native_captive_location");
+				++applied;
+			}
+
+			spdlog::info("[TFD][Captive] native captive location faction sweep applied={} inScope={} considered={} tracked={} loc={:08X} reason={}",
+				applied,
+				inScope,
+				considered,
+				static_cast<unsigned>(g_nativeCaptiveRoleActors.size()),
+				g_locationFormID,
+				reason ? reason : "unknown");
+		}
 	}
 
 	bool& StateRef() { return g_state; }
@@ -346,7 +640,49 @@ namespace TFD::Captive
 
 	bool IsStandardCaptiveActive()
 	{
-		return g_phase == PhaseValue::Captive;
+		return g_state && g_phase == PhaseValue::Captive;
+	}
+
+	bool IsCaptorCallCooldownActive(float* remainingSeconds)
+	{
+		const auto now = Now();
+		if (g_captorCallCooldownUntil <= now) {
+			if (remainingSeconds) {
+				*remainingSeconds = 0.0f;
+			}
+			return false;
+		}
+
+		if (remainingSeconds) {
+			*remainingSeconds = std::chrono::duration<float>(g_captorCallCooldownUntil - now).count();
+		}
+		return true;
+	}
+
+	void ClearCaptorCallCooldown()
+	{
+		g_captorCallCooldownUntil = {};
+	}
+
+	bool IsCaptivePassiveHoldActive()
+	{
+		return g_state && (g_phase == PhaseValue::Captive || g_phase == PhaseValue::ReleasedWork || g_phase == PhaseValue::Scene);
+	}
+
+	bool IsEscapeBleedoutActive()
+	{
+		return g_escapeBleedoutActive;
+	}
+
+	bool IsRecaptureCommitActive()
+	{
+		return g_recaptureCommitActive;
+	}
+
+	bool IsRecaptureRecentlyCommitted()
+	{
+		return g_lastRecaptureCompleted.time_since_epoch().count() != 0 &&
+			(Now() - g_lastRecaptureCompleted) < kRecaptureDuplicateGuard;
 	}
 
 	bool HasEscapeBreakRebleedPending()
@@ -436,6 +772,14 @@ namespace TFD::Captive
 				g_registry.playerCaptiveAlias = refAlias;
 				continue;
 			}
+			if (aliasName == "CaptiveMarker") {
+				g_registry.captiveMarkerAlias = refAlias;
+				continue;
+			}
+			if (aliasName == "EscapeDoor") {
+				g_registry.escapeDoorAlias = refAlias;
+				continue;
+			}
 			if (aliasName == "LootTarget") {
 				g_registry.lootTargetAlias = refAlias;
 				continue;
@@ -480,9 +824,11 @@ namespace TFD::Captive
 		for (auto* alias : g_registry.bossContainerAliases) { if (alias) ++bossContainerCount; }
 		for (auto* alias : g_registry.containerAliases) { if (alias) ++containerCount; }
 
-		spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
+		spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} captiveMarkerAlias={} escapeDoorAlias={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
 			g_registry.quest ? g_registry.quest->GetFormID() : 0u,
 			g_registry.playerCaptiveAlias ? g_registry.playerCaptiveAlias->aliasID : static_cast<std::uint32_t>(0),
+			g_registry.captiveMarkerAlias ? g_registry.captiveMarkerAlias->aliasID : static_cast<std::uint32_t>(0),
+			g_registry.escapeDoorAlias ? g_registry.escapeDoorAlias->aliasID : static_cast<std::uint32_t>(0),
 			bossCaptorCount,
 			bossContainerCount,
 			containerCount,
@@ -783,6 +1129,10 @@ namespace TFD::Captive
 
 	void QueuePendingConfiscation(const char* reason, bool starterKitWanted)
 	{
+		// Recapture is a new stash cycle even when the same BossContainer is reused.
+		// Without this reset, ProcessPendingConfiscation can discard the recapture
+		// queue as already_applied from the previous captive cycle.
+		g_confiscationApplied = false;
 		g_confiscationPending = true;
 		g_starterLockpickPending = starterKitWanted;
 		g_pendingConfiscationReason = reason ? reason : "unknown";
@@ -857,21 +1207,59 @@ namespace TFD::Captive
 			return;
 		}
 
+		const auto storageUnitsBefore = GetReferenceTotalInventoryCount(storage);
 		const bool moved = TransferPlayerInventoryToStorage(storage, reason);
+		const auto storageUnitsAfter = GetReferenceTotalInventoryCount(storage);
 		g_confiscationApplied = true;
-		if (moved && g_starterLockpickPending) {
-			EnsureStarterLockpicks(3, reason);
+		if (moved) {
+			++g_stashCycleID;
+			if (g_stashCycleID == 0) {
+				++g_stashCycleID;
+			}
+			const auto stashedUnits = (std::max)(0, storageUnitsAfter - storageUnitsBefore);
+			const std::string cycleArg = std::to_string(g_stashCycleID);
+			SendBridgeFormEvent("TFDCaptiveLootStashReady", storage, cycleArg.c_str(), static_cast<float>(storageUnitsBefore));
+			spdlog::info("[TFD][Captive] stash cycle published cycle={} target={:08X} preUnits={} afterUnits={} stashedUnits={} reason={}",
+				g_stashCycleID,
+				storage ? storage->GetFormID() : 0u,
+				storageUnitsBefore,
+				storageUnitsAfter,
+				stashedUnits,
+				reason ? reason : "unknown");
+		}
+		if (g_starterLockpickPending) {
+			EnsureStarterLockpicks(3, moved ? reason : "completed_no_items_starter_kit");
 		}
 		ClearPendingConfiscation(moved ? "completed" : "completed_no_items");
 	}
+
+	void SyncCaptiveNavigationAliases(const char* reason);
+	void ClearCaptiveNavigationAliases(const char* reason);
+	void EnsureCaptiveNavigationContext(RE::Actor* player, const char* reason);
 
 	void SetRuntimeState(bool stateActive, PhaseValue phase)
 	{
 		g_state = stateActive;
 		g_phase = phase;
 		if (!stateActive) {
+			ClearNativeCaptorRoleFaction("runtime_state_not_captive");
+		}
+		if (!IsCaptivePassiveHoldActive()) {
+			TFD::HostilityController::ResetCaptiveSuppression();
+		}
+		if (!stateActive) {
+			g_escapeBleedoutActive = false;
+			g_recaptureCommitActive = false;
+			g_recaptureCommitStarted = {};
+			ClearCaptorCallCooldown();
 			SyncPlayerAlias(nullptr, "captive_exit");
 			ClearStorageDebugAliases("captive_exit");
+			ClearCaptiveNavigationAliases("captive_exit");
+			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDSystemEventClearAfterPleasure",
+				nullptr,
+				"captive_exit",
+				1.0f);
 		}
 		if (!stateActive || phase != PhaseValue::Captive) {
 			g_confiscationApplied = false;
@@ -909,6 +1297,7 @@ namespace TFD::Captive
 		if (!door) return;
 		g_door.Bind(door);
 		g_boundEscapeDoor = door->GetHandle();
+		SyncCaptiveNavigationAliases("bind_door");
 	}
 
 	static RE::TESObjectREFR* FindNearestDoorNearCaptiveMarker()
@@ -942,8 +1331,237 @@ namespace TFD::Captive
 		return best;
 	}
 
+	void SyncCaptiveNavigationAliases(const char* reason)
+	{
+		ResolveQuestRegistry();
+		if (!g_registry.quest) {
+			return;
+		}
+
+		RE::TESObjectREFR* marker = nullptr;
+		if (g_marker) {
+			auto markerPtr = g_marker.get();
+			marker = markerPtr.get();
+		}
+		if (!marker) {
+			marker = TFD::Location::GetCachedCaptiveMarker();
+		}
+
+		RE::TESObjectREFR* door = ResolveBoundEscapeDoor();
+		WriteQuestAlias(g_registry.captiveMarkerAlias, marker);
+		WriteQuestAlias(g_registry.escapeDoorAlias, door);
+
+		spdlog::info("[TFD][Captive] navigation aliases synced reason={} marker={:08X} escapeDoor={:08X} markerAlias={} doorAlias={}",
+			reason ? reason : "unknown",
+			marker ? marker->GetFormID() : 0u,
+			door ? door->GetFormID() : 0u,
+			g_registry.captiveMarkerAlias ? 1 : 0,
+			g_registry.escapeDoorAlias ? 1 : 0);
+	}
+
+	void ClearCaptiveNavigationAliases(const char* reason)
+	{
+		ResolveQuestRegistry();
+		if (!g_registry.quest) {
+			return;
+		}
+
+		WriteQuestAlias(g_registry.captiveMarkerAlias, nullptr);
+		WriteQuestAlias(g_registry.escapeDoorAlias, nullptr);
+		spdlog::info("[TFD][Captive] navigation aliases cleared reason={} markerAlias={} doorAlias={}",
+			reason ? reason : "unknown",
+			g_registry.captiveMarkerAlias ? 1 : 0,
+			g_registry.escapeDoorAlias ? 1 : 0);
+	}
+
+	static RE::TESObjectREFR* ResolveCaptiveMarkerRef()
+	{
+		if (g_marker) {
+			auto ptr = g_marker.get();
+			if (auto* marker = ptr.get()) {
+				return marker;
+			}
+		}
+		return TFD::Location::GetCachedCaptiveMarker();
+	}
+
+	static RE::FormID ResolveLocationIDFromRef(RE::TESObjectREFR* ref)
+	{
+		if (!ref) {
+			return 0u;
+		}
+		if (auto* loc = TFD::Location::GetLocationFromRef(ref)) {
+			return loc->GetFormID();
+		}
+		if (auto* cell = ref->GetParentCell()) {
+			if (auto* loc = cell->GetLocation()) {
+				return loc->GetFormID();
+			}
+		}
+		return 0u;
+	}
+
+	static RE::FormID ResolveCaptiveAnchorLocationID()
+	{
+		if (auto* marker = ResolveCaptiveMarkerRef()) {
+			if (const RE::FormID markerLoc = ResolveLocationIDFromRef(marker); markerLoc != 0u) {
+				return markerLoc;
+			}
+		}
+		return g_locationFormID;
+	}
+
+	static RE::FormID ResolveCaptiveAnchorCellID()
+	{
+		if (auto* marker = ResolveCaptiveMarkerRef()) {
+			if (auto* cell = marker->GetParentCell()) {
+				return cell->GetFormID();
+			}
+		}
+		return g_cellFormID;
+	}
+
+	static bool HasPlayerLeftCaptiveLocation(RE::Actor* player, RE::FormID* oldLocationOut = nullptr, RE::FormID* newLocationOut = nullptr)
+	{
+		if (!g_state || !player) {
+			return false;
+		}
+
+		const RE::FormID captiveLoc = ResolveCaptiveAnchorLocationID();
+		const RE::FormID playerLoc = ResolveLocationIDFromRef(player);
+		if (oldLocationOut) {
+			*oldLocationOut = captiveLoc;
+		}
+		if (newLocationOut) {
+			*newLocationOut = playerLoc;
+		}
+
+		return captiveLoc != 0u && playerLoc != 0u && playerLoc != captiveLoc;
+	}
+
+	static bool ResolveCaptiveExitToFree(RE::Actor* player, const char* reason, const RuntimeTickHandlers& handlers)
+	{
+		if (!g_state || !player) {
+			return false;
+		}
+		if (g_recaptureCommitActive || g_escapeBleedoutActive) {
+			return false;
+		}
+		if (g_phase == PhaseValue::Scene) {
+			return false;
+		}
+
+		RE::FormID oldLoc = 0;
+		RE::FormID newLoc = 0;
+		if (!HasPlayerLeftCaptiveLocation(player, &oldLoc, &newLoc)) {
+			return false;
+		}
+
+		const char* why = reason ? reason : "escape_resolved_location";
+		TFD::HostilityController::ResetCaptiveSuppression();
+		TFD::HostilityController::ClearAggressionClamp();
+		TFD::Actor::Ops::ClearAggressorFactionContext();
+		ResetLockpickWatch();
+		ClearEscapeBreakRebleed();
+
+		const auto beforePhase = g_phase;
+		SetRuntimeState(false, PhaseValue::None);
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeSucceeded, 0u, why);
+		(void)TFD::FlowController::Controller::GetSingleton().CompleteTerminalContext(why);
+		ClearEscapeContext();
+		(void)TFD::FlowController::QueueBridgeModEvent("TFDBleedoutClearAll", nullptr, why, 1.0f);
+		(void)TFD::FlowController::QueueBridgeModEvent("TFDTruceHardClearAll", nullptr, why, 1.0f);
+		(void)TFD::FlowController::QueueBridgeModEvent("TFDSystemEventClearAfterPleasure", nullptr, why, 1.0f);
+		if (handlers.escape.updatePreCombatState) {
+			handlers.escape.updatePreCombatState();
+		}
+
+		spdlog::info("[TFD][Captive] CaptiveExitToFree by location reason={} phase={} oldLoc={:08X} newLoc={:08X}",
+			why,
+			GetPhaseName(true, beforePhase),
+			oldLoc,
+			newLoc);
+		return true;
+	}
+
+	void EnsureCaptiveNavigationContext(RE::Actor* player, const char* reason)
+	{
+		if (!player) {
+			return;
+		}
+
+		bool changed = false;
+		RE::TESObjectREFR* marker = nullptr;
+		if (g_marker) {
+			auto markerPtr = g_marker.get();
+			marker = markerPtr.get();
+		}
+		if (!marker) {
+			marker = TFD::Location::GetCachedCaptiveMarker();
+			if (!marker) {
+				TFD::Location::RescanCaptiveMarker();
+				marker = TFD::Location::GetCachedCaptiveMarker();
+			}
+			if (marker) {
+				g_marker = marker->GetHandle();
+				changed = true;
+			}
+		}
+
+		RE::FormID cellID = 0;
+		RE::FormID locID = 0;
+		if (marker) {
+			cellID = ResolveCaptiveAnchorCellID();
+			locID = ResolveCaptiveAnchorLocationID();
+		}
+
+		// The escape context belongs to the CaptiveMarker location, not to the
+		// player's current location.  Updating this anchor while the player is
+		// escaping makes ``leave captive location`` impossible to detect and keeps
+		// the HUD stuck in Captive after a successful escape.
+		if (cellID == 0 || locID == 0) {
+			auto* cell = player->GetParentCell();
+			if (cellID == 0) {
+				cellID = cell ? cell->GetFormID() : 0;
+			}
+			if (locID == 0) {
+				auto* loc = cell ? cell->GetLocation() : nullptr;
+				locID = loc ? loc->GetFormID() : 0;
+			}
+		}
+
+		if (g_cellFormID != cellID || g_locationFormID != locID) {
+			g_cellFormID = cellID;
+			g_locationFormID = locID;
+			changed = true;
+		}
+
+		if (!ResolveBoundEscapeDoor()) {
+			if (auto* door = FindNearestDoorNearCaptiveMarker()) {
+				BindDoor(door);
+				changed = true;
+				spdlog::info("[TFD][Captive] Bound nearest captive door {:08X} reason={}",
+					door->GetFormID(),
+					reason ? reason : "ensure_navigation");
+			}
+		}
+
+		if (changed) {
+			RE::TESObjectREFR* door = ResolveBoundEscapeDoor();
+			spdlog::info("[TFD][Captive] Escape context refreshed reason={} marker={:08X} cell={:08X} loc={:08X} door={:08X}",
+				reason ? reason : "ensure_navigation",
+				marker ? marker->GetFormID() : 0u,
+				g_cellFormID,
+				g_locationFormID,
+				door ? door->GetFormID() : 0u);
+			SyncCaptiveNavigationAliases(reason ? reason : "ensure_navigation");
+		}
+	}
+
 	void ClearEscapeContext()
 	{
+		ClearCaptiveNavigationAliases("clear_escape_context");
+		ClearNativeCaptorRoleFaction("clear_escape_context");
 		g_marker.reset();
 		g_cellFormID = 0;
 		g_locationFormID = 0;
@@ -962,10 +1580,18 @@ namespace TFD::Captive
 			marker = TFD::Location::GetCachedCaptiveMarker();
 		}
 		g_marker = marker ? marker->GetHandle() : RE::ObjectRefHandle{};
-		auto* cell = player->GetParentCell();
-		g_cellFormID = cell ? cell->GetFormID() : 0;
-		auto* loc = cell ? cell->GetLocation() : nullptr;
-		g_locationFormID = loc ? loc->GetFormID() : 0;
+		g_cellFormID = ResolveCaptiveAnchorCellID();
+		g_locationFormID = ResolveCaptiveAnchorLocationID();
+		if (g_cellFormID == 0 || g_locationFormID == 0) {
+			auto* cell = player->GetParentCell();
+			if (g_cellFormID == 0) {
+				g_cellFormID = cell ? cell->GetFormID() : 0;
+			}
+			if (g_locationFormID == 0) {
+				auto* loc = cell ? cell->GetLocation() : nullptr;
+				g_locationFormID = loc ? loc->GetFormID() : 0;
+			}
+		}
 		g_escapeRadiusActive = false;
 		g_escapeRadiusSince = {};
 		if (!g_door.HasDoor()) {
@@ -974,7 +1600,15 @@ namespace TFD::Captive
 				spdlog::info("[TFD][Captive] Bound nearest captive door {:08X} on captive enter", door->GetFormID());
 			}
 		}
-		spdlog::info("[TFD][Captive] Escape context armed marker={:08X} cell={:08X} loc={:08X}", marker ? marker->GetFormID() : 0, g_cellFormID, g_locationFormID);
+		EnsureCaptiveNavigationContext(player, "arm_escape_context");
+		SyncCaptiveNavigationAliases("arm_escape_context");
+		ApplyNativeCaptiveLocationRoleFactions(player, "arm_escape_context", true);
+		RE::TESObjectREFR* boundDoor = ResolveBoundEscapeDoor();
+		spdlog::info("[TFD][Captive] Escape context armed marker={:08X} cell={:08X} loc={:08X} door={:08X}",
+			marker ? marker->GetFormID() : 0,
+			g_cellFormID,
+			g_locationFormID,
+			boundDoor ? boundDoor->GetFormID() : 0u);
 	}
 
 	bool IsDoorNearMarker(RE::TESObjectREFR* door)
@@ -1104,11 +1738,7 @@ namespace TFD::Captive
 		if (!g_state || g_phase != PhaseValue::Escape || !player) {
 			return false;
 		}
-		auto* loc = TFD::Location::GetLocationFromRef(player);
-		const auto curLoc = loc ? loc->GetFormID() : 0u;
-		if (oldLocationOut) *oldLocationOut = g_locationFormID;
-		if (newLocationOut) *newLocationOut = curLoc;
-		return g_locationFormID != 0 && curLoc != 0 && curLoc != g_locationFormID;
+		return HasPlayerLeftCaptiveLocation(player, oldLocationOut, newLocationOut);
 	}
 
 	bool NormalizeInvalidCaptivePair()
@@ -1127,8 +1757,17 @@ namespace TFD::Captive
 		if (!g_state || g_phase != PhaseValue::Captive) {
 			return false;
 		}
+		if (g_escapeBleedoutActive || g_recaptureCommitActive) {
+			spdlog::info("[TFD][Captive] EscapeCommit ignored during recapture/escape-bleedout reason={} escapeBleedout={} recaptureCommit={}",
+				reason ? reason : "unknown",
+				g_escapeBleedoutActive ? 1 : 0,
+				g_recaptureCommitActive ? 1 : 0);
+			return false;
+		}
 
+		g_escapeBleedoutActive = false;
 		TFD::Actor::Ops::ClearAggressorFactionContext();
+		TFD::HostilityController::ResetCaptiveSuppression();
 		TFD::HostilityController::ClearAggressionClamp();
 		if (handlers.setGraceActive) {
 			handlers.setGraceActive(false);
@@ -1175,6 +1814,9 @@ namespace TFD::Captive
 		if (!g_state || g_phase != PhaseValue::Captive) {
 			return false;
 		}
+		if (g_escapeBleedoutActive || g_recaptureCommitActive) {
+			return false;
+		}
 
 		if (UpdateLockpickEscapeWatch(
 				[&](const char* reason, RE::TESObjectREFR* door) {
@@ -1197,6 +1839,12 @@ namespace TFD::Captive
 			return true;
 		}
 		if (!player) {
+			return false;
+		}
+		if (g_recaptureCommitActive) {
+			return false;
+		}
+		if (g_escapeBleedoutActive) {
 			return false;
 		}
 
@@ -1230,15 +1878,15 @@ namespace TFD::Captive
 
 		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, "escape_broken_threshold");
 		QueueEscapeBreakRebleed(preferred);
+		g_escapeBleedoutActive = true;
+		ResetLockpickWatch();
 		if (handlers.clearLastAggressor) {
 			handlers.clearLastAggressor();
 		}
-		SetRuntimeState(true, PhaseValue::Captive);
-		ClearEscapeContext();
 		if (handlers.updatePreCombatState) {
 			handlers.updatePreCombatState();
 		}
-		spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> revert to captive and schedule rebleed preferred={:08X}", pct, thresh, preferred ? preferred->GetFormID() : 0);
+		spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> escape-bleedout active, schedule rebleed preferred={:08X}", pct, thresh, preferred ? preferred->GetFormID() : 0);
 		return true;
 	}
 
@@ -1246,6 +1894,35 @@ namespace TFD::Captive
 	{
 		ProcessPendingConfiscation();
 		(void)NormalizeInvalidCaptivePair();
+
+		if (IsCaptivePassiveHoldActive()) {
+			if (IsStandardCaptiveActive()) {
+				EnsureCaptiveNavigationContext(player, "standard_captive_tick");
+			}
+			TFD::HostilityController::TickCaptiveSuppression();
+		} else {
+			TFD::HostilityController::ResetCaptiveSuppression();
+		}
+
+		// Captive runtime intentionally consumes the DefeatMonitor tick while active.
+		// Service shared native dialogue/pleasure runtimes here too, otherwise
+		// Calling Captor can arm DialogueOpen but never reach SetDialogueWithPlayer,
+		// and Captive Pleasure can leave the OStim handoff watchdog idle.
+		if (ResolveCaptiveExitToFree(player, "escape_resolved_location", handlers)) {
+			return false;
+		}
+
+		if (IsActive()) {
+			// TFDCaptiveFaction is a dialogue-condition tag for the active captive
+			// location.  Do not keep sweeping it while Escape is active/outside the
+			// captive location; that can retarget the anchor to the player's new
+			// location and leave the HUD stuck in Captive.
+			if (IsCaptivePassiveHoldActive()) {
+				ApplyNativeCaptiveLocationRoleFactions(player, "captive_runtime_tick", false);
+			}
+			TFD::InteractionRouter::DialogueOpen::Tick();
+			TFD::PleasureRuntime::Tick();
+		}
 
 		if (IsStandardCaptiveActive()) {
 			const bool dialogOpen = handlers.isDialogueOpen ? handlers.isDialogueOpen() : false;
@@ -1265,12 +1942,20 @@ namespace TFD::Captive
 				(void)TickCaptiveEscapePhase(player, handlers.escape);
 			}
 		} else if (IsEscapeActive()) {
+			// Once Escape has crossed into the EscapeFailed/bleedout overlay,
+			// Captive must stop consuming the DefeatMonitor tick.  The bleedout
+			// runtime owns the forcegreet / recapture window from here; consuming
+			// the tick leaves g_escapeBreakBleedPending armed but never serviced.
+			if (captiveBleedOverlay || g_escapeBleedoutActive || g_recaptureCommitActive) {
+				return true;
+			}
+
 			if (!TickEscapeActivePhase(player, handlers.escape)) {
 				return false;
 			}
 		}
 
-		if (IsActive() && !captiveBleedOverlay) {
+		if (IsActive() && !captiveBleedOverlay && !HasEscapeBreakRebleedPending()) {
 			return false;
 		}
 
@@ -1282,9 +1967,125 @@ namespace TFD::Captive
 		if (!g_state) {
 			return false;
 		}
+		if (g_escapeBleedoutActive || g_recaptureCommitActive) {
+			spdlog::info("[TFD][Captive] aggression escape ignored during recapture/escape-bleedout actor={:08X} reason={}",
+				actor ? actor->GetFormID() : 0u,
+				reason ? reason : "unknown");
+			return false;
+		}
 		SetRuntimeState(true, PhaseValue::Escape);
+		TFD::HostilityController::ResetCaptiveSuppression();
+		TFD::HostilityController::ClearAggressionClamp();
+		TFD::Actor::Ops::ClearAggressorFactionContext();
 		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeStarted, actor ? actor->GetFormID() : 0u, reason ? reason : "player_aggression_captive");
 		return true;
+	}
+
+	static std::uint32_t ResolveRecaptureActorFormID(RE::Actor* preferredCaptor)
+	{
+		if (preferredCaptor) {
+			return preferredCaptor->GetFormID();
+		}
+		const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+		if (snapshot.primaryActorFormID != 0) {
+			return snapshot.primaryActorFormID;
+		}
+		if (g_lastRecaptureActorID != 0) {
+			return g_lastRecaptureActorID;
+		}
+		return 0;
+	}
+
+	bool CommitRecapture(RE::Actor* preferredCaptor, const char* reason)
+	{
+		const char* why = reason ? reason : "recapture_commit";
+		const auto now = Now();
+		if (g_recaptureCommitActive) {
+			spdlog::info("[TFD][Captive] CommitRecapture duplicate ignored active=1 reason={} actor={:08X}",
+				why,
+				ActorFormID(preferredCaptor));
+			return true;
+		}
+		if (IsRecaptureRecentlyCommitted() && IsStandardCaptiveActive()) {
+			spdlog::info("[TFD][Captive] CommitRecapture duplicate ignored recent=1 elapsedMs={} reason={} actor={:08X}",
+				static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - g_lastRecaptureCompleted).count()),
+				why,
+				ActorFormID(preferredCaptor));
+			return true;
+		}
+
+		g_recaptureCommitActive = true;
+		g_recaptureCommitStarted = now;
+		const std::uint32_t actorFormID = ResolveRecaptureActorFormID(preferredCaptor);
+		g_lastRecaptureActorID = actorFormID;
+
+		ClearEscapeBreakRebleed();
+		g_escapeBleedoutActive = false;
+		ResetLockpickWatch();
+		TFD::HostilityController::ResetCaptiveSuppression();
+		TFD::HostilityController::ClearAggressionClamp();
+		TFD::Actor::Ops::ClearAggressorFactionContext();
+
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		const auto before = flow.GetSnapshot();
+		if (before.root == TFD::FlowController::RootFlow::Captive &&
+			before.gate == TFD::FlowController::DecisionGate::PlayerBleedout) {
+			(void)flow.ResolveBleedoutOutcome(TFD::FlowController::BleedoutOutcome::Captive, actorFormID, why);
+		} else if (before.root == TFD::FlowController::RootFlow::Captive) {
+			(void)flow.ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::Recaptured, actorFormID, why);
+		}
+
+		auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
+		auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
+		bool completed = false;
+		if (TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
+			completed = TFD::Transition::CompleteCaptiveTransitionNow(why, runtimeHandlers, captiveHandlers);
+		} else {
+			spdlog::warn("[TFD][Captive] CommitRecapture failed marker resolution reason={} actor={:08X}", why, actorFormID);
+		}
+
+		if (completed) {
+			if (actorFormID != 0) {
+				(void)flow.RequestCaptive(actorFormID, TFD::FlowController::CaptiveMode::Kidnapped, why);
+			}
+			SetRuntimeState(true, PhaseValue::Captive);
+			CaptureCurrentLockpickMenuState();
+			ResetLockpickWatch();
+			if (auto* player = Player()) {
+				ArmEscapeContextFromCurrentState(player);
+				SyncPlayerAlias(player, why);
+			}
+			SealDoorIfPresent();
+			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDSystemEventClearAfterPleasure",
+				nullptr,
+				why,
+				1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDBleedoutClearAll",
+				nullptr,
+				why,
+				1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDTruceClearAll",
+				nullptr,
+				why,
+				1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDTruceHardClearAll",
+				nullptr,
+				why,
+				1.0f);
+			TFD::DefeatMonitor::ForceRecoverPlayerAfterCaptiveRecapture(why);
+			g_lastRecaptureCompleted = Now();
+			spdlog::info("[TFD][Captive] CommitRecapture complete actor={:08X} reason={} clearBleedAliases=1 clearCrowdAliases=1 hardCrowdClear=1 recoverPlayer=1", actorFormID, why);
+		} else {
+			spdlog::warn("[TFD][Captive] CommitRecapture incomplete actor={:08X} reason={}", actorFormID, why);
+		}
+
+		g_recaptureCommitActive = false;
+		g_recaptureCommitStarted = {};
+		return completed;
 	}
 
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor)
@@ -1293,8 +2094,17 @@ namespace TFD::Captive
 			*outCaptor = nullptr;
 		}
 		if (!player) {
+			spdlog::warn("[TFD][Captive] Call Captor rejected: missing player");
 			return false;
 		}
+
+		float remainingSeconds = 0.0f;
+		if (IsCaptorCallCooldownActive(&remainingSeconds)) {
+			spdlog::info("[TFD][Captive] Call Captor rejected: cooldown remaining={:.2f}s", remainingSeconds);
+			return false;
+		}
+
+		EnsureCaptiveNavigationContext(player, "call_captor_hotkey");
 
 		auto* captor = PickCaptorSameCellLoaded(player, 12288.0f);
 		if (!captor) {
@@ -1306,6 +2116,9 @@ namespace TFD::Captive
 			spdlog::warn("[TFD][Captive] Call Captor greet failed actor={:08X}", captor->GetFormID());
 			return false;
 		}
+
+		g_captorCallCooldownUntil = Now() + kCaptorCallCooldown;
+		spdlog::info("[TFD][Captive] Call Captor begin actor={:08X} cooldownMs={} reason=call_captor_hotkey", captor->GetFormID(), static_cast<int>(kCaptorCallCooldown.count()));
 		if (outCaptor) {
 			*outCaptor = captor;
 		}
@@ -1319,7 +2132,7 @@ namespace TFD::Captive
 			handlers.setPrevDialogueOpen(handlers.isDialogueOpen());
 		}
 		CaptureCurrentLockpickMenuState();
-		if (GetQueuedStateFlag() && GetQueuedPhase() == PhaseValue::Captive) {
+		if (GetQueuedStateFlag() && (GetQueuedPhase() == PhaseValue::Captive || GetQueuedPhase() == PhaseValue::ReleasedWork)) {
 			TFD::Location::RescanCaptiveMarker();
 			if (handlers.getPlayer) {
 				ArmEscapeContextFromCurrentState(handlers.getPlayer());
@@ -1332,6 +2145,8 @@ namespace TFD::Captive
 
 	void ResetForLoad()
 	{
+		ClearNativeCaptorRoleFaction("reset_for_load");
+		TFD::HostilityController::ResetCaptiveSuppression();
 		g_state = false;
 		g_phase = PhaseValue::None;
 		g_confiscationApplied = false;
@@ -1340,6 +2155,7 @@ namespace TFD::Captive
 		g_pendingConfiscationReason.clear();
 		g_confiscationAttemptCount = 0;
 		g_confiscationNextAttempt = {};
+		ClearCaptiveNavigationAliases("reset_for_load");
 		g_registry = {};
 		g_door.Reset();
 		g_marker.reset();
@@ -1355,5 +2171,11 @@ namespace TFD::Captive
 		g_boundEscapeDoor.reset();
 		g_lockpickDoorCandidate.reset();
 		g_lockpickDoorWasLocked = false;
+		g_escapeBleedoutActive = false;
+		g_recaptureCommitActive = false;
+		g_recaptureCommitStarted = {};
+		g_lastRecaptureCompleted = {};
+		g_lastRecaptureActorID = 0;
+		g_stashCycleID = 0;
 	}
 }

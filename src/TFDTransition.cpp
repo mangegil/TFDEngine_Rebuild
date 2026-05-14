@@ -1,5 +1,6 @@
-﻿#include "TFDTransition.h"
+#include "TFDTransition.h"
 #include "TFDBleedout.h"
+#include "TFDCaptive.h"
 #include "TFDDefeatBridge.h"
 #include "TFDActor.h"
 #include "TFDFlowController.h"
@@ -1280,38 +1281,96 @@ namespace TFD::Transition
 		if (handlers.setGraceSeconds) {
 			handlers.setGraceSeconds(5);
 		}
+		const char* captiveReason = reason ? reason : "captive_enter";
+		auto* playerAfterTeleport = ResolvePlayer(handlers);
+
 		if (captiveHandlers.beginCaptiveFlow) {
-			captiveHandlers.beginCaptiveFlow(reason ? reason : "captive_enter");
+			captiveHandlers.beginCaptiveFlow(captiveReason);
 		}
+
+		const bool usedRuntimeHandler = static_cast<bool>(captiveHandlers.setCaptiveRuntimeCaptive);
 		if (captiveHandlers.setCaptiveRuntimeCaptive) {
 			captiveHandlers.setCaptiveRuntimeCaptive();
 		}
+		else {
+			// Captive transition can be started outside the old bleedout provider path
+			// (for example PreCombat -> Captive). In that route the provider table can
+			// be empty, so arm the captive runtime directly instead of only moving the
+			// player and flipping FlowController globals.
+			TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+		}
+
 		if (captiveHandlers.setPrevDialogueOpen && captiveHandlers.isDialogueOpen) {
 			captiveHandlers.setPrevDialogueOpen(captiveHandlers.isDialogueOpen());
 		}
+
+		const bool usedCaptureHandler = static_cast<bool>(captiveHandlers.captureCurrentLockpickMenuState);
 		if (captiveHandlers.captureCurrentLockpickMenuState) {
 			captiveHandlers.captureCurrentLockpickMenuState();
 		}
+		else {
+			TFD::Captive::CaptureCurrentLockpickMenuState();
+		}
+
+		const bool usedResetLockpickHandler = static_cast<bool>(captiveHandlers.resetLockpickWatch);
 		if (captiveHandlers.resetLockpickWatch) {
 			captiveHandlers.resetLockpickWatch();
 		}
+		else {
+			TFD::Captive::ResetLockpickWatch();
+		}
+
+		const bool usedEscapeContextHandler = static_cast<bool>(captiveHandlers.armEscapeContextFromCurrentState);
 		if (captiveHandlers.armEscapeContextFromCurrentState) {
 			captiveHandlers.armEscapeContextFromCurrentState();
 		}
+		else {
+			TFD::Captive::ArmEscapeContextFromCurrentState(playerAfterTeleport);
+		}
+
+		const bool usedDoorHandler = static_cast<bool>(captiveHandlers.sealCaptiveDoorIfPresent);
 		if (captiveHandlers.sealCaptiveDoorIfPresent) {
 			captiveHandlers.sealCaptiveDoorIfPresent();
 		}
+		else {
+			TFD::Captive::SealDoorIfPresent();
+		}
+
 		if (captiveHandlers.applyCalmBubble) {
 			captiveHandlers.applyCalmBubble((std::max)(2000.0f, TFD::Settings::GetSweepRadius()));
 		}
+
+		const bool usedConfiscationHandler = static_cast<bool>(captiveHandlers.queuePendingCaptiveConfiscation);
 		if (captiveHandlers.queuePendingCaptiveConfiscation) {
-			captiveHandlers.queuePendingCaptiveConfiscation(reason ? reason : "captive_enter", true);
+			captiveHandlers.queuePendingCaptiveConfiscation(captiveReason, true);
 		}
+		else {
+			TFD::Captive::QueuePendingConfiscation(captiveReason, true);
+		}
+
+		const bool usedAliasHandler = static_cast<bool>(captiveHandlers.syncPlayerCaptiveAlias);
 		if (captiveHandlers.syncPlayerCaptiveAlias) {
-			captiveHandlers.syncPlayerCaptiveAlias(ResolvePlayer(handlers), reason ? reason : "captive_enter");
+			captiveHandlers.syncPlayerCaptiveAlias(playerAfterTeleport, captiveReason);
 		}
-		spdlog::info("[TFD][Transition] captive transition complete reason={} confiscationQueued=1 starterKitPending=1",
-			reason ? reason : "unknown");
+		else {
+			TFD::Captive::SyncPlayerAlias(playerAfterTeleport, captiveReason);
+		}
+
+		TFD::HostilityController::TickCaptiveSuppression();
+
+		spdlog::info(
+			"[TFD][Transition] captive transition complete reason={} runtimeArmed=1 player={:08X} marker={:08X} handler(runtime={} capture={} lockpick={} escapeCtx={} door={} confiscation={} alias={}) starterKitPending=1",
+			captiveReason,
+			playerAfterTeleport ? playerAfterTeleport->GetFormID() : 0u,
+			TFD::Location::GetCachedCaptiveMarker() ? TFD::Location::GetCachedCaptiveMarker()->GetFormID() : 0u,
+			usedRuntimeHandler ? 1 : 0,
+			usedCaptureHandler ? 1 : 0,
+			usedResetLockpickHandler ? 1 : 0,
+			usedEscapeContextHandler ? 1 : 0,
+			usedDoorHandler ? 1 : 0,
+			usedConfiscationHandler ? 1 : 0,
+			usedAliasHandler ? 1 : 0);
+
 		return true;
 	}
 

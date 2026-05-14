@@ -32,7 +32,7 @@ namespace TFD::CaptiveGreet
 
 	bool OwnsCurrentFlow()
 	{
-		return TFD::Captive::IsStandardCaptiveActive();
+		return TFD::Captive::IsCaptivePassiveHoldActive();
 	}
 
 	void Install()

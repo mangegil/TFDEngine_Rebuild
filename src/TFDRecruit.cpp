@@ -92,7 +92,8 @@ namespace
         "TFDInCombatTruceFaction",
         "TFDBleedOutFaction",
         "TFDBleedoutFaction",
-        "TFDCaptiveFaction",
+        // TFDCaptiveFaction is dialogue-only; actors carrying it are not
+        // automatically player-side/recruit-safe.
         "TFDWorkingCaptiveFaction",
         "TFDAfterPleasureFaction",
         "TFDSaviorFaction",

@@ -292,13 +292,17 @@ namespace
 
         inline std::mutex g_mutex{};
         inline RE::BGSListForm* g_allowList = nullptr;
+        inline RE::TESFaction* g_pacifyFaction = nullptr;
         inline bool g_triedResolve = false;
+        inline bool g_triedResolvePacify = false;
 
         struct Entry
         {
             float origAgg{ 0.0f };
             bool hasOrig{ false };
             bool didStopCombat{ false };
+            bool hadPacifyFaction{ false };
+            bool addedPacifyFaction{ false };
         };
 
         inline std::unordered_map<std::uint32_t, Entry> g_cache{};
@@ -324,6 +328,23 @@ namespace
                 g_allowList->forms.size());
         }
 
+        void ResolvePacifyFaction()
+        {
+            if (g_pacifyFaction || g_triedResolvePacify) {
+                return;
+            }
+            g_triedResolvePacify = true;
+
+            g_pacifyFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPacifyFaction");
+            if (!g_pacifyFaction) {
+                spdlog::warn("[TFD][HostilityController] captive pacify faction missing editorId=TFDPacifyFaction");
+                return;
+            }
+
+            spdlog::info("[TFD][HostilityController] captive pacify faction resolved -> {:08X}",
+                g_pacifyFaction->GetFormID());
+        }
+
         bool IsAllowlistedActor(RE::Actor* actor)
         {
             if (!actor || !g_allowList) {
@@ -343,6 +364,32 @@ namespace
             return false;
         }
 
+        bool IsPlayerSideOrManagedAlly(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            return actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+                TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+                TFD::Recruit::IsRecruitLike(actor) ||
+                TFD::Tame::IsCompanion(actor) ||
+                TFD::Actor::Ops::HasReleaseFollowGrace(actor);
+        }
+
+        bool ShouldThrottleTick()
+        {
+            const auto now = Clock::now();
+            std::scoped_lock lock(g_mutex);
+            if (now < g_nextTick) {
+                return true;
+            }
+            g_nextTick = now + k_interval;
+            return false;
+        }
+
         void ApplyAggressionZero(RE::Actor* actor)
         {
             if (!actor) {
@@ -354,13 +401,45 @@ namespace
                 return;
             }
 
-            const std::uint32_t handle = actor->GetHandle().native_handle();
-            auto [it, inserted] = g_cache.emplace(handle, Entry{});
-            auto& entry = it->second;
+            ResolvePacifyFaction();
 
-            if (!entry.hasOrig) {
-                entry.origAgg = avo->GetActorValue(RE::ActorValue::kAggression);
-                entry.hasOrig = true;
+            const std::uint32_t handle = actor->GetHandle().native_handle();
+            const float originalAgg = avo->GetActorValue(RE::ActorValue::kAggression);
+            bool inserted = false;
+            bool addPacifyFaction = false;
+            bool stopCombat = false;
+            float loggedOrigAgg = originalAgg;
+            bool loggedAddedPacify = false;
+
+            {
+                std::scoped_lock lock(g_mutex);
+                auto [it, wasInserted] = g_cache.emplace(handle, Entry{});
+                inserted = wasInserted;
+                auto& entry = it->second;
+
+                if (!entry.hasOrig) {
+                    entry.origAgg = originalAgg;
+                    entry.hasOrig = true;
+                }
+                loggedOrigAgg = entry.origAgg;
+
+                if (g_pacifyFaction && !entry.hadPacifyFaction && !entry.addedPacifyFaction) {
+                    entry.hadPacifyFaction = actor->IsInFaction(g_pacifyFaction);
+                    if (!entry.hadPacifyFaction) {
+                        entry.addedPacifyFaction = true;
+                        addPacifyFaction = true;
+                    }
+                }
+                loggedAddedPacify = entry.addedPacifyFaction;
+
+                if (!entry.didStopCombat) {
+                    entry.didStopCombat = true;
+                    stopCombat = true;
+                }
+            }
+
+            if (addPacifyFaction && g_pacifyFaction) {
+                actor->AddToFaction(g_pacifyFaction, 0);
             }
 
             const float current = avo->GetActorValue(RE::ActorValue::kAggression);
@@ -368,29 +447,48 @@ namespace
                 avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
             }
 
-            if (!entry.didStopCombat && actor->IsInCombat()) {
+            if (stopCombat) {
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    const bool runDetection = process->runDetection;
+                    process->runDetection = false;
+                    process->ClearCachedFactionFightReactions();
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                    process->runDetection = runDetection;
+                }
+                actor->StopAlarmOnActor();
                 actor->StopCombat();
+                if (actor->IsWeaponDrawn()) {
+                    actor->DrawWeaponMagicHands(false);
+                }
                 actor->EvaluatePackage(true, false);
-                entry.didStopCombat = true;
             }
 
             if (inserted) {
-                spdlog::info("[TFD][HostilityController] captive clamp actor={:08X} handle={} origAgg={}",
+                spdlog::info("[TFD][HostilityController] captive clamp actor={:08X} handle={} origAgg={} addedPacify={}",
                     actor->GetFormID(),
                     handle,
-                    entry.origAgg);
+                    loggedOrigAgg,
+                    loggedAddedPacify ? 1 : 0);
             }
         }
 
         void RestoreAll()
         {
-            if (g_cache.empty()) {
-                return;
+            std::unordered_map<std::uint32_t, Entry> snapshot;
+            RE::TESFaction* pacifyFaction = nullptr;
+
+            {
+                std::scoped_lock lock(g_mutex);
+                if (g_cache.empty()) {
+                    return;
+                }
+                snapshot.swap(g_cache);
+                pacifyFaction = g_pacifyFaction;
             }
 
             std::int32_t restored = 0;
 
-            for (auto& entry : g_cache) {
+            for (auto& entry : snapshot) {
                 const auto handle = entry.first;
                 const auto& saved = entry.second;
 
@@ -410,17 +508,18 @@ namespace
                     restored++;
                 }
 
+                if (saved.addedPacifyFaction && pacifyFaction && actor->IsInFaction(pacifyFaction)) {
+                    actor->RemoveFromFaction(pacifyFaction);
+                }
+
                 actor->EvaluatePackage(true, false);
             }
 
             spdlog::info("[TFD][HostilityController] captive restored aggression for {} actor(s)", restored);
-            g_cache.clear();
         }
 
         void Tick()
         {
-            std::scoped_lock lock(g_mutex);
-
             if (!TFD::Settings::GetEnabled()) {
                 RestoreAll();
                 return;
@@ -431,7 +530,7 @@ namespace
                 return;
             }
 
-            if (!TFD::Captive::IsStandardCaptiveActive()) {
+            if (!TFD::Captive::IsCaptivePassiveHoldActive()) {
                 RestoreAll();
                 return;
             }
@@ -441,11 +540,9 @@ namespace
                 return;
             }
 
-            const auto now = Clock::now();
-            if (now < g_nextTick) {
+            if (ShouldThrottleTick()) {
                 return;
             }
-            g_nextTick = now + k_interval;
 
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
@@ -466,7 +563,10 @@ namespace
                 if (!IsAllowlistedActor(actor)) {
                     continue;
                 }
-                if (!info.hostileToPlayer && !info.inCombat) {
+                if (IsPlayerSideOrManagedAlly(actor) || info.playerSide) {
+                    continue;
+                }
+                if (!info.hostileToPlayer && !info.inCombat && !actor->IsHostileToActor(player)) {
                     continue;
                 }
 
@@ -474,12 +574,31 @@ namespace
             }
         }
 
+        bool IsSuppressed(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            if (!TFD::Captive::IsCaptivePassiveHoldActive()) {
+                return false;
+            }
+            if (IsPlayerSideOrManagedAlly(actor)) {
+                return false;
+            }
+
+            const std::uint32_t handle = actor->GetHandle().native_handle();
+            std::scoped_lock lock(g_mutex);
+            return g_cache.find(handle) != g_cache.end();
+        }
+
         void Reset()
         {
-            std::scoped_lock lock(g_mutex);
             RestoreAll();
+            std::scoped_lock lock(g_mutex);
             g_allowList = nullptr;
+            g_pacifyFaction = nullptr;
             g_triedResolve = false;
+            g_triedResolvePacify = false;
             g_nextTick = {};
         }
     }
@@ -585,7 +704,9 @@ namespace TFD::HostilityController
                 "TFDAfterPleasureFaction",
                 "TFDBleedOutFaction",
                 "TFDBleedoutFaction",
-                "TFDCaptiveFaction",
+                // TFDCaptiveFaction is a dialogue-condition tag only.
+                // Do not treat it as a hostility override; standard captive
+                // pacification is owned by TFDPacifyFaction/native suppression.
                 "TFDDefeatedFaction",
                 "TFDInCombatTruceFaction",
                 "TFDPacifyFaction",
@@ -3269,7 +3390,8 @@ namespace TFD::HostilityController
             "TFDInCombatTruceFaction",
             "TFDBleedOutFaction",
             "TFDBleedoutFaction",
-            "TFDCaptiveFaction",
+            // TFDCaptiveFaction is intentionally excluded: it must not suppress
+            // detection/combat once the player enters Escape.
             "TFDWorkingCaptiveFaction",
             "TFDAfterPleasureFaction",
             "TFDSaviorFaction"
@@ -3297,6 +3419,9 @@ namespace TFD::HostilityController
         // teammates and nearby enemies end up in a blind/search state with no target.
         if (IsPlayerSideActorAfterInCombatTruce(actor)) {
             return false;
+        }
+        if (CaptiveSuppressionInternal::IsSuppressed(actor)) {
+            return true;
         }
         if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
             return true;

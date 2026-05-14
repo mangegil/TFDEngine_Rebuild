@@ -26,6 +26,8 @@ namespace TFD::Captive
 	{
 		RE::TESQuest* quest{ nullptr };
 		RE::BGSRefAlias* playerCaptiveAlias{ nullptr };
+		RE::BGSRefAlias* captiveMarkerAlias{ nullptr };
+		RE::BGSRefAlias* escapeDoorAlias{ nullptr };
 		std::array<RE::BGSRefAlias*, 3> bossCaptorAliases{};
 		std::array<RE::BGSRefAlias*, 3> bossContainerAliases{};
 		std::array<RE::BGSRefAlias*, 3> containerAliases{};
@@ -81,6 +83,11 @@ namespace TFD::Captive
 	bool IsActive();
 	bool IsEscapeActive();
 	bool IsStandardCaptiveActive();
+	bool IsCaptivePassiveHoldActive();
+	bool IsEscapeBleedoutActive();
+	bool IsRecaptureCommitActive();
+	bool IsRecaptureRecentlyCommitted();
+	bool CommitRecapture(RE::Actor* preferredCaptor, const char* reason);
 	bool HasEscapeBreakRebleedPending();
 	void SetEscapeBreakRebleedPending(bool pending);
 	void QueueEscapeBreakRebleed(RE::Actor* preferredAggressor);
@@ -122,6 +129,8 @@ namespace TFD::Captive
 	bool TickRuntime(RE::Actor* player, bool captiveBleedOverlay, const RuntimeTickHandlers& handlers);
 	bool TriggerPlayerAggressionEscape(RE::Actor* actor, const char* reason);
 
+	bool IsCaptorCallCooldownActive(float* remainingSeconds = nullptr);
+	void ClearCaptorCallCooldown();
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
 
 	struct ApplyQueuedDefeatProgressHandlers

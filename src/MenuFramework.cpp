@@ -2582,8 +2582,22 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 					const int dialogueStateRaw = GetGlobalValueInt(gDialogueState);
 					const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
 					if (dialogueStateRaw == 1) {
-						RE::DebugNotification("TFD: Dialogue Busy");
-						continue;
+						const bool captiveOwnedHotkey =
+							flowSnapshot.root == TFD::FlowController::RootFlow::Captive &&
+							TFD::Captive::IsCaptivePassiveHoldActive();
+
+						if (captiveOwnedHotkey) {
+							if (gDialogueState) {
+								gDialogueState->value = 0.0f;
+							}
+							spdlog::info(
+								"[TFD][Menu] cleared stale dialogue busy flag for captive hotkey phase={} state={}",
+								TFD::Captive::GetPhaseRaw(),
+								dialogueStateRaw);
+						} else {
+							RE::DebugNotification("TFD: Dialogue Busy");
+							continue;
+						}
 					}
 
 					const auto ownedFlowResult = TFD::InteractionRouter::HandleFlowOwnedPrimaryHotkey(player, flowSnapshot);

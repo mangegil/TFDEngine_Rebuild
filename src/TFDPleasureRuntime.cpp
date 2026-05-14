@@ -5,6 +5,7 @@
 #include "TFDPreCombatGreet.h"
 #include "TFDInCombatGreet.h"
 #include "TFDBleedout.h"
+#include "TFDCaptive.h"
 #include "TFDRecruit.h"
 #include "TFDTeammateManager.h"
 
@@ -265,6 +266,25 @@ namespace TFD::PleasureRuntime
 				"[TFD][PleasureRuntime][R109] after pleasure package actor prepared actor={:08X} factionApplied={} reason={}",
 				actor->GetFormID(),
 				faction ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		void ReleaseAfterPleasurePackageActor(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			RemoveAfterPleasureFaction(actor, reason.empty() ? "after_pleasure_terminal_cleanup" : reason);
+			if (!actor->IsAIEnabled()) {
+				actor->EnableAI(true);
+			}
+			actor->AllowPCDialogue(true);
+			actor->EvaluatePackage(true, false);
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R109] after pleasure package actor released actor={:08X} reason={}",
+				actor->GetFormID(),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
@@ -806,6 +826,39 @@ namespace TFD::PleasureRuntime
 				"[TFD][PleasureRuntime] suppress actor dialogue actor={:08X} cooldown={:.2f}s phase={} cycle={} reason={}",
 				actor->GetFormID(),
 				cooldownSec,
+				ToString(g_state.phase),
+				g_state.sessionCycleId,
+				reasonText);
+		}
+
+		void PrepareActorForScenePassiveLocked(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			const std::string reasonText = reason.empty() ? "pleasure_scene_passive_lock" : std::string{ reason };
+
+			TFD::HostilityController::ApplyAggressionClamp(actor);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				const bool oldRunDetection = process->runDetection;
+				process->runDetection = false;
+				process->ClearCachedFactionFightReactions();
+				process->StopCombatAndAlarmOnActor(actor, false);
+				process->runDetection = oldRunDetection;
+			}
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+			actor->EvaluatePackage(true, false);
+			TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 5, 90);
+
+			spdlog::info(
+				"[TFD][PleasureRuntime] scene passive lock actor={:08X} source={} phase={} cycle={} reason={}",
+				actor->GetFormID(),
+				ToString(g_state.source),
 				ToString(g_state.phase),
 				g_state.sessionCycleId,
 				reasonText);
@@ -1556,6 +1609,7 @@ namespace TFD::PleasureRuntime
 					g_state.blocking = true;
 					g_state.passiveLockActive = true;
 					g_state.holdActive = true;
+					PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_passive_lock");
 					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_suppress_dialogue");
 					LogEventAcceptedLocked(eventName, info, "new_cycle");
 					return;
@@ -1573,6 +1627,7 @@ namespace TFD::PleasureRuntime
 					AdvancePhaseLocked(Phase::PleasureActive, eventName);
 					g_state.holdActive = true;
 					g_state.passiveLockActive = true;
+					PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_passive_lock");
 					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
 					LogEventAcceptedLocked(eventName, info, "scene_active");
 					return;
@@ -1723,9 +1778,26 @@ namespace TFD::PleasureRuntime
 				g_state.redoPending = false;
 				AdvancePhaseLocked(Phase::Finalizing, eventName);
 				AdvancePhaseLocked(Phase::Closed, eventName);
-				SuppressActorDialogueForSceneLocked(
-					info.actor ? info.actor : LookupActor(info.actorFormID),
-					"after_pleasure_terminal_suppress_teammate_dialogue");
+
+				{
+					auto* terminalActor = ResolveEventOrTrackedActorLocked(info);
+					const bool sourceIsCaptive =
+						g_state.source == SourceContext::Captive ||
+						info.sourceFlow == static_cast<int>(SourceContext::Captive);
+
+					if (sourceIsCaptive) {
+						// Captive returns to CaptiveIdle after AfterPleasure.  Do not leave
+						// TFDAfterPleasureFaction / dialogue suppression on the captor,
+						// otherwise that actor is still treated as temporarily suppressed
+						// after lockpick escape while the rest of the camp goes hostile.
+						ReleaseAfterPleasurePackageActor(terminalActor, eventName);
+					} else {
+						SuppressActorDialogueForSceneLocked(
+							terminalActor,
+							"after_pleasure_terminal_suppress_teammate_dialogue");
+					}
+				}
+
 				ClearBridgeStateLocked();
 				ClearHoldStateLocked();
 				g_state.pendingChoice = AfterChoice::None;
@@ -1963,7 +2035,11 @@ namespace TFD::PleasureRuntime
 		}
 
 		BeginNewCycleLocked(speaker, source, reason);
-		if (source == SourceContext::PreCombat && speaker) {
+		if ((source == SourceContext::PreCombat || source == SourceContext::Captive) && speaker) {
+			if (source == SourceContext::Captive) {
+				TFD::HostilityController::TickCaptiveSuppression();
+			}
+
 			TFD::HostilityController::ApplyAggressionClamp(speaker);
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				const bool oldRunDetection = process->runDetection;
@@ -1977,9 +2053,12 @@ namespace TFD::PleasureRuntime
 				speaker->DrawWeaponMagicHands(false);
 			}
 			speaker->EvaluatePackage(true, false);
-			TFD::HostilityController::ScheduleStopCombatWaves(1600.0f, false, 4, 85);
+
+			const float waveRadius = source == SourceContext::Captive ? 2400.0f : 1600.0f;
+			TFD::HostilityController::ScheduleStopCombatWaves(waveRadius, source == SourceContext::Captive, 4, 85);
 			spdlog::info(
-				"[TFD][PleasureRuntime] precombat hard passive lock actor={:08X} reason={}",
+				"[TFD][PleasureRuntime] {} hard passive lock actor={:08X} reason={}",
+				source == SourceContext::Captive ? "captive" : "precombat",
 				speaker->GetFormID(),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}

@@ -33,4 +33,6 @@ namespace TFD::DefeatMonitor
 	bool IsCaptiveFamily();
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
+
+	void ForceRecoverPlayerAfterCaptiveRecapture(const char* reason = nullptr);
 }
