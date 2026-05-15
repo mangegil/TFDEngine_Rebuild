@@ -1744,11 +1744,56 @@ namespace TFD::InteractionRouter
                     return "PreCombatFollowup";
                 case Mode::AfterPleasure:
                     return "AfterPleasure";
+                case Mode::PleasureFailed:
+                    return "PleasureFailed";
                 case Mode::Rescue:
                     return "Rescue";
                 default:
                     return "None";
                 }
+            }
+
+            RE::TESFaction* ResolveAfterPleasureDialogueFaction()
+            {
+                static RE::TESFaction* faction = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+                    faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDAfterPleasureFaction");
+                    if (!faction) {
+                        spdlog::warn("[TFD][DialogueOpen] TFDAfterPleasureFaction unresolved; after-pleasure/pleasure-failed CK conditions may reject dialogue");
+                    }
+                }
+
+                return faction;
+            }
+
+            bool EnsureAfterPleasureDialogueMarker(RE::Actor* speaker, Mode mode, const char* reason)
+            {
+                if (!speaker) {
+                    return false;
+                }
+
+                auto* faction = ResolveAfterPleasureDialogueFaction();
+                if (!faction) {
+                    return false;
+                }
+
+                const bool alreadyHadFaction = speaker->IsInFaction(faction);
+                if (!alreadyHadFaction) {
+                    speaker->AddToFaction(faction, 0);
+                }
+
+                spdlog::info(
+                    "[TFD][DialogueOpen] after-pleasure speaker marker ensured mode={} speaker={:08X} added={} hadFaction={} reason={}",
+                    ModeName(mode),
+                    speaker->GetFormID(),
+                    alreadyHadFaction ? 0 : 1,
+                    alreadyHadFaction ? 1 : 0,
+                    reason ? reason : "unknown");
+
+                return true;
             }
 
             RE::TESTopicInfo* ResolvePreCombatGreetTopicInfo()
@@ -1922,6 +1967,43 @@ namespace TFD::InteractionRouter
                         spdlog::warn(
                             "[TFD][DialogueOpen] TFDDialogueAfterPleasureGreet INFO {:06X} not found in {}; after-pleasure hard dialogue will fall back to default topic selection",
                             kAfterPleasureGreetInfoLocalFormID,
+                            kPluginName);
+                    }
+                }
+
+                return info;
+            }
+
+            RE::TESTopicInfo* ResolvePleasureFailedGreetTopicInfo()
+            {
+                static RE::TESTopicInfo* info = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+
+                    // INFO record behind TFD_TIF__051DC784, the root response for
+                    // TFDDialoguePleasureFailedGreet.  The older 0x001D2580 record is
+                    // now the terminal combat/aggro option under the Pleasure Failed
+                    // branch, so native must open the root greet instead of jumping
+                    // straight to the aggro fragment.
+                    constexpr RE::FormID kPleasureFailedGreetInfoLocalFormID = 0x001DC784;
+                    constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+                    if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                        info = dataHandler->LookupForm<RE::TESTopicInfo>(kPleasureFailedGreetInfoLocalFormID, kPluginName);
+                    }
+
+                    if (info) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen] TFDDialoguePleasureFailedGreet INFO resolved {:08X} local={:06X}",
+                            info->GetFormID(),
+                            kPleasureFailedGreetInfoLocalFormID);
+                    }
+                    else {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen] TFDDialoguePleasureFailedGreet INFO {:06X} not found in {}; pleasure-failed hard dialogue will fall back to default topic selection",
+                            kPleasureFailedGreetInfoLocalFormID,
                             kPluginName);
                     }
                 }
@@ -2427,7 +2509,8 @@ namespace TFD::InteractionRouter
                     mode == Mode::InCombatTruce ||
                     mode == Mode::Bleedout ||
                     mode == Mode::CaptiveMarker ||
-                    mode == Mode::AfterPleasure;
+                    mode == Mode::AfterPleasure ||
+                    mode == Mode::PleasureFailed;
             }
 
             void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
@@ -2491,7 +2574,7 @@ namespace TFD::InteractionRouter
 
             void BeginCommon(RE::Actor* speaker, Mode mode, const char* reason)
             {
-                if (speaker && mode != Mode::AfterPleasure && TFD::PleasureRuntime::ShouldSuppressTruceDialogue(speaker)) {
+                if (speaker && mode != Mode::AfterPleasure && mode != Mode::PleasureFailed && TFD::PleasureRuntime::ShouldSuppressTruceDialogue(speaker)) {
                     const char* phase = TFD::PleasureRuntime::GetPhaseName();
                     const char* source = TFD::PleasureRuntime::GetSourceContextName();
                     {
@@ -2510,6 +2593,17 @@ namespace TFD::InteractionRouter
                 }
 
                 std::scoped_lock lk(g_pending.lock);
+
+                if (speaker && mode == Mode::PleasureFailed && g_pending.active && g_pending.mode == Mode::PleasureFailed && PendingSpeakerFormID() == speaker->GetFormID()) {
+                    SyncDialogueStateLocked(IsDialogueOpen());
+                    spdlog::info(
+                        "[TFD][DialogueOpen] duplicate pleasure-failed begin ignored reason={} speaker={:08X} attempts={} requestIssued={}",
+                        reason ? reason : "unknown",
+                        speaker->GetFormID(),
+                        g_pending.attempts,
+                        g_pending.requestIssued ? 1 : 0);
+                    return;
+                }
 
                 const auto now = Clock::now();
                 double cooldownRemainingSec = 0.0;
@@ -2541,7 +2635,7 @@ namespace TFD::InteractionRouter
                     kBleedoutTimeout :
                     (mode == Mode::CaptiveMarker ?
                         kCaptiveTimeout :
-                        (mode == Mode::AfterPleasure ?
+                        ((mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) ?
                             kAfterPleasureTimeout :
                             (mode == Mode::PreCombatTruce || mode == Mode::PreCombatFollowup ?
                                 kPreCombatTimeout :
@@ -2574,13 +2668,15 @@ namespace TFD::InteractionRouter
                         RefreshApproachPackage(player, speaker);
                     }
                 }
-                else if (mode == Mode::AfterPleasure) {
+                else if (mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) {
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                         PrepareSpeakerForNativeDialogueOpen(player, speaker);
                     }
+                    EnsureAfterPleasureDialogueMarker(speaker, mode, reason);
                     SetDialogueStateValue(1);
                     spdlog::info(
-                        "[TFD][DialogueOpen] after pleasure native hard-open armed speaker={:08X} policy=force_topic_no_ai_package",
+                        "[TFD][DialogueOpen] {} native hard-open armed speaker={:08X} policy=force_topic_no_ai_package",
+                        ModeName(mode),
                         speaker->GetFormID());
                 }
 
@@ -2633,6 +2729,11 @@ namespace TFD::InteractionRouter
         void BeginAfterPleasure(RE::Actor* speaker)
         {
             BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
+        }
+
+        void BeginPleasureFailed(RE::Actor* speaker)
+        {
+            BeginCommon(speaker, Mode::PleasureFailed, "pleasure_failed");
         }
 
         void BeginRescue(RE::Actor* speaker)
@@ -2878,6 +2979,7 @@ namespace TFD::InteractionRouter
             const bool inCombatTruceMode = g_pending.mode == Mode::InCombatTruce;
             const bool bleedoutMode = g_pending.mode == Mode::Bleedout;
             const bool afterPleasureMode = g_pending.mode == Mode::AfterPleasure;
+            const bool pleasureFailedMode = g_pending.mode == Mode::PleasureFailed;
             const bool forceGreet = IsNativeForceGreetMode(g_pending.mode);
 
             RE::TESTopicInfo* topicInfo = nullptr;
@@ -2906,9 +3008,16 @@ namespace TFD::InteractionRouter
                 // can return ok=1 but the Dialogue Menu closes before choices settle.
                 hardDialogueReset = true;
             }
+            else if (pleasureFailedMode) {
+                topicInfo = ResolvePleasureFailedGreetTopicInfo();
+                hardDialogueReset = true;
+            }
 
             if (forceGreet) {
                 PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                if (afterPleasureMode || pleasureFailedMode) {
+                    EnsureAfterPleasureDialogueMarker(speaker, g_pending.mode, "dialogue_open_attempt");
+                }
                 if (hardDialogueReset) {
                     speaker->SetDialogueWithPlayer(false, false, nullptr);
                 }

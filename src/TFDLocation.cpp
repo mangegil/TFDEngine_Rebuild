@@ -6,11 +6,13 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <chrono>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <limits>
 #include <vector>
 
@@ -55,6 +57,9 @@ namespace TFD::Location
 		RE::TESGlobal* g_escapeRouteStateGlobal = nullptr;
 		RE::TESGlobal* g_rescueMarkerStateGlobal = nullptr;
 
+		RE::TESGlobal* g_workMiningStateGlobal = nullptr;
+		RE::TESGlobal* g_workCraftingStateGlobal = nullptr;
+
 		static RE::TESObjectREFR* ResolveSpecialRef(RE::BGSLocation* loc, RE::BGSLocationRefType* type, bool preferInterior);
 		TFD::Location::CaptiveStorageDebugSnapshot g_lastCaptiveStorageDebugSnapshot{};
 
@@ -82,6 +87,30 @@ namespace TFD::Location
 		static constexpr float kCheckpointBedScanRadius = 8192.0f;
 
 		using Clock = std::chrono::steady_clock;
+
+		static constexpr float kCaptiveWorkResourceScanRadius = 12000.0f;
+		static constexpr float kCaptiveWorkMineOccupiedRadius = 512.0f;
+		static constexpr auto kCaptiveWorkResourceScanMinInterval = std::chrono::milliseconds(750);
+
+		RE::FormID g_lastWorkResourceCellId = 0;
+		int g_lastWorkMiningState = -1;
+		int g_lastWorkCraftingState = -1;
+		RE::FormID g_lastWorkMiningRefId = 0;
+		RE::FormID g_lastWorkCraftingRefId = 0;
+		Clock::time_point g_lastWorkResourceScan{};
+		std::unordered_set<RE::FormID> g_depletedWorkMiningRefs{};
+
+		struct OccupiedWorkMineEntry
+		{
+			RE::FormID actorId{ 0 };
+			RE::FormID cellId{ 0 };
+			Clock::time_point expires{};
+		};
+
+		static constexpr auto kCaptiveWorkMineActivateOccupiedTTL = std::chrono::seconds(45);
+		static constexpr float kCaptiveWorkMineActivatedActorMaxDistance = 768.0f;
+		std::unordered_map<RE::FormID, OccupiedWorkMineEntry> g_occupiedWorkMiningRefs{};
+		bool g_activateSinkRegistered = false;
 
 		struct RescueResolveMemo
 		{
@@ -231,6 +260,12 @@ namespace TFD::Location
 			ResolveGlobal(g_containerMarkerStateGlobal, "TFDContainerMarkerState");
 			ResolveGlobal(g_escapeRouteStateGlobal, "TFDEscapeRouteState");
 			ResolveGlobal(g_rescueMarkerStateGlobal, "TFDRescueMarkerState");
+		}
+
+		static void ResolveCaptiveWorkResourceGlobals()
+		{
+			ResolveGlobal(g_workMiningStateGlobal, "TFDMiningState");
+			ResolveGlobal(g_workCraftingStateGlobal, "TFDCraftingState");
 		}
 
 		static int CountNonZero3(const std::array<std::uint32_t, 3>& ids)
@@ -701,6 +736,418 @@ namespace TFD::Location
 				}
 			}
 			return false;
+		}
+
+		static int CaptiveWorkMiningStatePriority(int state)
+		{
+			switch (state) {
+			case 1: return 10;   // Iron: safest fallback
+			case 2: return 20;   // Corundum
+			case 3: return 30;   // Silver
+			case 4: return 40;   // Gold
+			case 5: return 50;   // Quicksilver
+			case 6: return 60;   // Moonstone
+			case 7: return 70;   // Malachite
+			case 8: return 80;   // Orichalcum
+			default: return 100000;
+			}
+		}
+
+		static int CaptiveWorkMiningStateFromEditorID(std::string_view edid)
+		{
+			if (edid.empty()) {
+				return 0;
+			}
+
+			if (ContainsNoCase(edid, "MineOreIron")) {
+				return 1;
+			}
+			if (ContainsNoCase(edid, "MineOreCorundum")) {
+				return 2;
+			}
+			if (ContainsNoCase(edid, "MineOreSilver")) {
+				return 3;
+			}
+			if (ContainsNoCase(edid, "MineOreGold")) {
+				return 4;
+			}
+			if (ContainsNoCase(edid, "MineOreQuicksilver")) {
+				return 5;
+			}
+			if (ContainsNoCase(edid, "MineOreMoonstone")) {
+				return 6;
+			}
+			if (ContainsNoCase(edid, "MineOreMalachite")) {
+				return 7;
+			}
+			if (ContainsNoCase(edid, "MineOreOrichalcum")) {
+				return 8;
+			}
+			// Ebony and Stalhrim are intentionally not enabled for the first Work assignment pass.
+			// They can be detected later as explicit high-tier work, but default Captive Work
+			// must stay low-tier and level-1 friendly.
+
+			return 0;
+		}
+
+		static int CaptiveWorkCraftingStatePriority(int state)
+		{
+			switch (state) {
+			case 1: return 10; // Forge / anvil: Iron Dagger style task
+			case 2: return 20; // Smelter: Iron Ore -> Iron Ingot
+			case 3: return 30; // Tanning rack: Leather -> strips
+			case 4: return 40; // Grindstone: low-tier weapon temper
+			case 5: return 50; // Armor workbench: low-tier armor temper
+			default: return 100000;
+			}
+		}
+
+		static int CaptiveWorkCraftingStateFromEditorID(std::string_view edid)
+		{
+			if (edid.empty()) {
+				return 0;
+			}
+
+			if (ContainsNoCase(edid, "SkyForge") ||
+				ContainsNoCase(edid, "BlacksmithForge") ||
+				ContainsNoCase(edid, "SmithingForge") ||
+				ContainsNoCase(edid, "CraftingForge") ||
+				ContainsNoCase(edid, "CraftingSmithingForge") ||
+				ContainsNoCase(edid, "Anvil")) {
+				return 1;
+			}
+
+			if (ContainsNoCase(edid, "CraftingSmelter") || ContainsNoCase(edid, "Smelter")) {
+				return 2;
+			}
+
+			if (ContainsNoCase(edid, "CraftingTanningRack") || ContainsNoCase(edid, "TanningRack")) {
+				return 3;
+			}
+
+			if (ContainsNoCase(edid, "SharpeningWheel") || ContainsNoCase(edid, "Grindstone")) {
+				return 4;
+			}
+
+			if (ContainsNoCase(edid, "ArmorTable") ||
+				ContainsNoCase(edid, "BlacksmithArmor") ||
+				ContainsNoCase(edid, "SmithingArmor") ||
+				ContainsNoCase(edid, "ArmorWorkbench")) {
+				return 5;
+			}
+
+			return 0;
+		}
+
+		static void PruneExpiredCaptiveWorkMineOccupancy(const char* reason)
+		{
+			const auto now = Clock::now();
+			std::uint32_t removed = 0;
+
+			for (auto it = g_occupiedWorkMiningRefs.begin(); it != g_occupiedWorkMiningRefs.end();) {
+				if (it->second.expires.time_since_epoch().count() == 0 || it->second.expires <= now) {
+					it = g_occupiedWorkMiningRefs.erase(it);
+					++removed;
+				}
+				else {
+					++it;
+				}
+			}
+
+			if (removed > 0) {
+				spdlog::info(
+					"[TFD][Location] captive work occupied mine cache pruned removed={} reason={} remaining={}",
+					removed,
+					reason ? reason : "unknown",
+					g_occupiedWorkMiningRefs.size());
+			}
+		}
+
+		static bool IsActorStillOccupyingCachedMine(RE::TESObjectREFR* mineRef, const OccupiedWorkMineEntry& entry, RE::FormID& outActorId)
+		{
+			outActorId = 0;
+			if (!mineRef || entry.actorId == 0) {
+				return false;
+			}
+
+			auto* actor = RE::TESForm::LookupByID<RE::Actor>(entry.actorId);
+			if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+				return false;
+			}
+
+			auto* cell = mineRef->GetParentCell();
+			if (!cell || actor->GetParentCell() != cell) {
+				return false;
+			}
+
+			if (actor->IsInCombat() || actor->IsWeaponDrawn()) {
+				return false;
+			}
+
+			const float distance = actor->GetPosition().GetDistance(mineRef->GetPosition());
+			if (distance > kCaptiveWorkMineActivatedActorMaxDistance) {
+				return false;
+			}
+
+			outActorId = actor->GetFormID();
+			return true;
+		}
+
+		static bool MarkCaptiveWorkMineOccupiedByActivation(RE::TESObjectREFR* mineRef, RE::Actor* actor, const char* reason)
+		{
+			if (!mineRef || !actor) {
+				return false;
+			}
+
+			auto* player = Player();
+			if (player && actor == player) {
+				return false;
+			}
+
+			if (actor->IsDead() || actor->IsDisabled()) {
+				return false;
+			}
+
+			auto* base = mineRef->GetBaseObject();
+			if (!base) {
+				return false;
+			}
+
+			const auto edid = TFD::Util::GetEditorId(base);
+			const int miningState = CaptiveWorkMiningStateFromEditorID(edid);
+			if (miningState <= 0) {
+				return false;
+			}
+
+			OccupiedWorkMineEntry entry{};
+			entry.actorId = actor->GetFormID();
+			entry.cellId = mineRef->GetParentCell() ? mineRef->GetParentCell()->GetFormID() : 0;
+			entry.expires = Clock::now() + kCaptiveWorkMineActivateOccupiedTTL;
+			g_occupiedWorkMiningRefs[mineRef->GetFormID()] = entry;
+			g_lastWorkResourceScan = Clock::time_point{};
+
+			spdlog::info(
+				"[TFD][Location] captive work mine occupied by activation mine={:08X} actor={:08X} miningState={} mineEditor='{}' ttlMs={} reason={}",
+				mineRef->GetFormID(),
+				actor->GetFormID(),
+				miningState,
+				edid.c_str(),
+				static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(kCaptiveWorkMineActivateOccupiedTTL).count()),
+				reason ? reason : "unknown");
+			return true;
+		}
+
+		static bool IsCaptiveWorkMineOccupiedByActor(RE::TESObjectREFR* mineRef, RE::FormID& outActorId)
+		{
+			outActorId = 0;
+			if (!mineRef) {
+				return false;
+			}
+
+			PruneExpiredCaptiveWorkMineOccupancy("mine_occupancy_check");
+
+			const RE::FormID mineRefId = mineRef->GetFormID();
+			auto occupiedIt = g_occupiedWorkMiningRefs.find(mineRefId);
+			if (occupiedIt != g_occupiedWorkMiningRefs.end()) {
+				RE::FormID cachedActorId = 0;
+				if (IsActorStillOccupyingCachedMine(mineRef, occupiedIt->second, cachedActorId)) {
+					outActorId = cachedActorId;
+					return true;
+				}
+
+				spdlog::info(
+					"[TFD][Location] captive work occupied mine cache stale mine={:08X} actor={:08X}",
+					mineRefId,
+					occupiedIt->second.actorId);
+				g_occupiedWorkMiningRefs.erase(occupiedIt);
+			}
+
+			auto* cell = mineRef->GetParentCell();
+			auto* player = Player();
+			if (!cell || !player) {
+				return false;
+			}
+
+			const auto minePos = mineRef->GetPosition();
+			bool occupied = false;
+
+			cell->ForEachReferenceInRange(minePos, kCaptiveWorkMineOccupiedRadius, [&](RE::TESObjectREFR* nearby) -> RE::BSContainer::ForEachResult {
+				if (!nearby || nearby == mineRef || nearby == player) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				auto* actor = nearby->As<RE::Actor>();
+				if (!actor || actor == player) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (actor->GetParentCell() != cell) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (actor->IsInCombat() || actor->IsWeaponDrawn()) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				const float distance = actor->GetPosition().GetDistance(minePos);
+				if (distance > kCaptiveWorkMineOccupiedRadius) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				occupied = true;
+				outActorId = actor->GetFormID();
+				return RE::BSContainer::ForEachResult::kStop;
+			});
+
+			return occupied;
+		}
+
+		struct CaptiveWorkResourceScanResult
+		{
+			int miningState{ 0 };
+			int craftingState{ 0 };
+			RE::FormID cellId{ 0 };
+			RE::FormID miningRefId{ 0 };
+			RE::FormID miningBaseId{ 0 };
+			RE::FormID craftingRefId{ 0 };
+			RE::FormID craftingBaseId{ 0 };
+			std::string miningEditorId{};
+			std::string craftingEditorId{};
+		};
+
+		static bool ScanCaptiveWorkResources(CaptiveWorkResourceScanResult& out)
+		{
+			out = {};
+			auto* player = Player();
+			auto* cell = player ? player->GetParentCell() : nullptr;
+			if (!player || !cell) {
+				return false;
+			}
+
+			out.cellId = cell->GetFormID();
+			const auto origin = player->GetPosition();
+			int bestMiningPriority = 100000;
+			int bestCraftingPriority = 100000;
+			std::uint32_t considered = 0;
+			std::uint32_t skippedDepletedMines = 0;
+			std::uint32_t skippedOccupiedMines = 0;
+			RE::FormID lastOccupiedMineActorId = 0;
+
+			cell->ForEachReferenceInRange(origin, kCaptiveWorkResourceScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+				if (!candidate || candidate == player) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (candidate->IsDisabled()) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				auto* base = candidate->GetBaseObject();
+				if (!base) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				++considered;
+
+				const auto edid = TFD::Util::GetEditorId(base);
+				const int miningState = CaptiveWorkMiningStateFromEditorID(edid);
+				if (miningState > 0) {
+					const auto miningRefId = candidate->GetFormID();
+					if (miningRefId != 0 && g_depletedWorkMiningRefs.find(miningRefId) != g_depletedWorkMiningRefs.end()) {
+						++skippedDepletedMines;
+					}
+					else {
+						RE::FormID occupiedActorId = 0;
+						if (IsCaptiveWorkMineOccupiedByActor(candidate, occupiedActorId)) {
+							++skippedOccupiedMines;
+							lastOccupiedMineActorId = occupiedActorId;
+						}
+						else {
+							const int priority = CaptiveWorkMiningStatePriority(miningState);
+							if (priority < bestMiningPriority ||
+								(priority == bestMiningPriority && (out.miningRefId == 0 || miningRefId < out.miningRefId))) {
+								bestMiningPriority = priority;
+								out.miningState = miningState;
+								out.miningRefId = miningRefId;
+								out.miningBaseId = base->GetFormID();
+								out.miningEditorId = edid;
+							}
+						}
+					}
+				}
+
+				const int craftingState = CaptiveWorkCraftingStateFromEditorID(edid);
+				if (craftingState > 0) {
+					const int priority = CaptiveWorkCraftingStatePriority(craftingState);
+					if (priority < bestCraftingPriority ||
+						(priority == bestCraftingPriority && candidate->GetFormID() < out.craftingRefId)) {
+						bestCraftingPriority = priority;
+						out.craftingState = craftingState;
+						out.craftingRefId = candidate->GetFormID();
+						out.craftingBaseId = base->GetFormID();
+						out.craftingEditorId = edid;
+					}
+				}
+
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+
+			spdlog::info(
+				"[TFD][Location] captive work resource scan cell={:08X} considered={} miningState={} miningRef={:08X} miningBase={:08X} miningEditor='{}' depletedSkipped={} occupiedSkipped={} occupiedActor={:08X} craftingState={} craftingRef={:08X} craftingBase={:08X} craftingEditor='{}'",
+				out.cellId,
+				considered,
+				out.miningState,
+				out.miningRefId,
+				out.miningBaseId,
+				out.miningEditorId.c_str(),
+				skippedDepletedMines,
+				skippedOccupiedMines,
+				lastOccupiedMineActorId,
+				out.craftingState,
+				out.craftingRefId,
+				out.craftingBaseId,
+				out.craftingEditorId.c_str());
+
+			return true;
+		}
+
+		class CaptiveWorkActivateSink final : public RE::BSTEventSink<RE::TESActivateEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESActivateEvent* ev, RE::BSTEventSource<RE::TESActivateEvent>*) override
+			{
+				if (!ev) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* activatedRef = ev->objectActivated ? ev->objectActivated.get() : nullptr;
+				auto* actionRef = ev->actionRef ? ev->actionRef.get() : nullptr;
+				auto* actor = actionRef ? actionRef->As<RE::Actor>() : nullptr;
+				if (!activatedRef || !actor) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				(void)MarkCaptiveWorkMineOccupiedByActivation(activatedRef, actor, "tes_activate_event");
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		CaptiveWorkActivateSink g_captiveWorkActivateSink{};
+
+		static void RegisterCaptiveWorkActivateSink()
+		{
+			if (g_activateSinkRegistered) {
+				return;
+			}
+
+			auto* scripts = RE::ScriptEventSourceHolder::GetSingleton();
+			if (!scripts) {
+				spdlog::warn("[TFD][Location] TESActivateEvent sink registration failed source=null");
+				return;
+			}
+
+			scripts->AddEventSink<RE::TESActivateEvent>(&g_captiveWorkActivateSink);
+			g_activateSinkRegistered = true;
+			spdlog::info("[TFD][Location] TESActivateEvent sink registered for captive work mine occupancy");
 		}
 
 		static bool IsBedLikeBaseForCache(RE::TESBoundObject* base)
@@ -1423,6 +1870,8 @@ namespace TFD::Location
 			g_centerType ? "OK" : "NULL");
 
 		RefreshMarkerGlobals();
+		RegisterCaptiveWorkActivateSink();
+		ClearCaptiveWorkResourceState("initialize");
 	}
 
 	void ResetAmbientKidnapAvailabilityWatcher()
@@ -1433,6 +1882,118 @@ namespace TFD::Location
 		g_lastAmbientInterior = false;
 		g_lastAmbientWatcherPrimed = false;
 		g_lastAmbientMarkerAvailable = false;
+	}
+
+	void ClearCaptiveWorkResourceState(const char* reason)
+	{
+		ResolveCaptiveWorkResourceGlobals();
+		SetGlobalInt(g_workMiningStateGlobal, 0);
+		SetGlobalInt(g_workCraftingStateGlobal, 0);
+		g_lastWorkResourceCellId = 0;
+		g_lastWorkMiningState = -1;
+		g_lastWorkCraftingState = -1;
+		g_lastWorkMiningRefId = 0;
+		g_lastWorkCraftingRefId = 0;
+		g_lastWorkResourceScan = {};
+		spdlog::info("[TFD][Location] captive work resource state cleared reason={}", reason ? reason : "unknown");
+	}
+
+	bool RefreshCaptiveWorkResourceState(bool force, const char* reason)
+	{
+		ResolveCaptiveWorkResourceGlobals();
+
+		CaptiveWorkResourceScanResult result{};
+		auto* player = Player();
+		auto* cell = player ? player->GetParentCell() : nullptr;
+		const RE::FormID cellId = cell ? cell->GetFormID() : 0;
+		const auto now = Clock::now();
+
+		if (!force && cellId != 0 && g_lastWorkResourceCellId == cellId &&
+			g_lastWorkResourceScan.time_since_epoch().count() != 0 &&
+			now - g_lastWorkResourceScan < kCaptiveWorkResourceScanMinInterval) {
+			return true;
+		}
+
+		if (!ScanCaptiveWorkResources(result)) {
+			SetGlobalInt(g_workMiningStateGlobal, 0);
+			SetGlobalInt(g_workCraftingStateGlobal, 0);
+			g_lastWorkResourceCellId = 0;
+			g_lastWorkMiningState = 0;
+			g_lastWorkCraftingState = 0;
+			g_lastWorkMiningRefId = 0;
+			g_lastWorkCraftingRefId = 0;
+			g_lastWorkResourceScan = now;
+			spdlog::warn("[TFD][Location] captive work resource refresh failed reason={}", reason ? reason : "unknown");
+			return false;
+		}
+
+		SetGlobalInt(g_workMiningStateGlobal, result.miningState);
+		SetGlobalInt(g_workCraftingStateGlobal, result.craftingState);
+		g_lastWorkResourceCellId = result.cellId;
+		g_lastWorkMiningState = result.miningState;
+		g_lastWorkCraftingState = result.craftingState;
+		g_lastWorkMiningRefId = result.miningRefId;
+		g_lastWorkCraftingRefId = result.craftingRefId;
+		g_lastWorkResourceScan = now;
+
+		spdlog::info(
+			"[TFD][Location] captive work globals refreshed reason={} cell={:08X} TFDMiningState={} TFDCraftingState={}",
+			reason ? reason : "unknown",
+			result.cellId,
+			result.miningState,
+			result.craftingState);
+
+		return true;
+	}
+
+	std::uint32_t GetLastCaptiveWorkMiningRefFormID()
+	{
+		return g_lastWorkMiningRefId;
+	}
+
+	std::uint32_t GetLastCaptiveWorkCraftingRefFormID()
+	{
+		return g_lastWorkCraftingRefId;
+	}
+
+	bool MarkLastCaptiveWorkMiningRefDepleted(const char* reason)
+	{
+		if (g_lastWorkMiningRefId == 0) {
+			spdlog::info("[TFD][Location] captive work mining depleted mark skipped no last ref reason={}", reason ? reason : "unknown");
+			return false;
+		}
+
+		g_depletedWorkMiningRefs.insert(g_lastWorkMiningRefId);
+		g_lastWorkResourceScan = Clock::time_point{};
+		spdlog::info(
+			"[TFD][Location] captive work mining ref marked depleted ref={:08X} reason={} blockedCount={}",
+			g_lastWorkMiningRefId,
+			reason ? reason : "unknown",
+			g_depletedWorkMiningRefs.size());
+		return true;
+	}
+
+	void ClearCaptiveWorkMiningDepletedCache(const char* reason)
+	{
+		const auto count = g_depletedWorkMiningRefs.size();
+		g_depletedWorkMiningRefs.clear();
+		spdlog::info("[TFD][Location] captive work mining depleted cache cleared reason={} count={}", reason ? reason : "unknown", count);
+	}
+
+	RE::TESObjectREFR* GetLastCaptiveWorkMiningRef()
+	{
+		if (g_lastWorkMiningRefId == 0) {
+			return nullptr;
+		}
+		return RE::TESForm::LookupByID<RE::TESObjectREFR>(g_lastWorkMiningRefId);
+	}
+
+	RE::TESObjectREFR* GetLastCaptiveWorkCraftingRef()
+	{
+		if (g_lastWorkCraftingRefId == 0) {
+			return nullptr;
+		}
+		return RE::TESForm::LookupByID<RE::TESObjectREFR>(g_lastWorkCraftingRefId);
 	}
 
 	bool UpdateAmbientKidnapAvailability(bool force)

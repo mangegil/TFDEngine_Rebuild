@@ -55,6 +55,15 @@ namespace TFD::Location
 	bool UpdateAmbientKidnapAvailability(bool force = false);
 	void ResetAmbientKidnapAvailabilityWatcher();
 
+	bool RefreshCaptiveWorkResourceState(bool force = false, const char* reason = nullptr);
+	void ClearCaptiveWorkResourceState(const char* reason = nullptr);
+	bool MarkLastCaptiveWorkMiningRefDepleted(const char* reason = nullptr);
+	void ClearCaptiveWorkMiningDepletedCache(const char* reason = nullptr);
+	RE::TESObjectREFR* GetLastCaptiveWorkMiningRef();
+	RE::TESObjectREFR* GetLastCaptiveWorkCraftingRef();
+	std::uint32_t GetLastCaptiveWorkMiningRefFormID();
+	std::uint32_t GetLastCaptiveWorkCraftingRefFormID();
+
 	RE::TESObjectREFR* GetCachedCaptiveMarker();
 	std::uint32_t GetCachedCaptiveMarkerFormID();
 	RE::TESObjectREFR* ResolveNearestCaptiveStorageTarget(RE::Actor* preferredActor = nullptr);

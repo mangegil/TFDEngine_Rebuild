@@ -3573,6 +3573,43 @@ else {
 			why);
 	}
 
+	void SuppressDefeatedEnemyAutoDeathForActor(RE::Actor* actor, double seconds, const char* reason)
+	{
+		const char* why = reason ? reason : "suppress_defeated_enemy_auto_death";
+		if (!actor || actor->IsDisabled() || actor->IsDead()) {
+			spdlog::warn("[TFD][Defeat] defeated enemy auto-death suppress skipped actor={:08X} reason={} invalid=1",
+				actor ? actor->GetFormID() : 0u,
+				why);
+			return;
+		}
+
+		const double safeSeconds = (std::max)(2.0, seconds);
+		TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, safeSeconds, why);
+
+		bool releasedActiveLock = false;
+		auto it = g_bleedLocks.find(actor->GetFormID());
+		if (it != g_bleedLocks.end()) {
+			const auto kind = it->second.kind;
+			const bool defeatedManaged = it->second.defeatedManaged;
+			if (kind == BleedLockKind::Other || defeatedManaged) {
+				ReleaseBleedLock(actor, why, true);
+				releasedActiveLock = true;
+			}
+		}
+
+		actor->NotifyAnimationGraph("BleedoutStop");
+		actor->NotifyAnimationGraph("GetUpStart");
+		actor->EvaluatePackage(false, true);
+		actor->EvaluatePackage(true, true);
+
+		spdlog::info("[TFD][Defeat] defeated enemy auto-death suppressed actor={:08X} seconds={:.1f} releasedActiveLock={} reason={}",
+			actor->GetFormID(),
+			safeSeconds,
+			releasedActiveLock ? 1 : 0,
+			why);
+	}
+
+
 	void ResetForLoad()
 	{
 		g_grace.store(false, std::memory_order_release);

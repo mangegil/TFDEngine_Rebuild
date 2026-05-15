@@ -88,6 +88,7 @@ namespace TFD::PleasureRuntime
 
 		constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
 		constexpr const char* kAfterPleasureLoopEnterEvent = "TFDAfterPleasureLoopEnter";
+		constexpr const char* kPleasureFailedEnterEvent = "TFDPleasureFailedEnter";
 
 		constexpr const char* kAfterPleasureChoiceFinishEvent = "TFDAfterPleasureChoiceFinish";
 		constexpr const char* kAfterPleasureChoiceRecruitEvent = "TFDAfterPleasureChoiceRecruit";
@@ -1681,6 +1682,33 @@ namespace TFD::PleasureRuntime
 
 					AdvancePhaseLocked(Phase::AfterPleasureAwaitQuest, eventName);
 					LogEventAcceptedLocked(eventName, info, "await_after_dialogue_package_owned");
+					return;
+				}
+				LogEventIgnoredLocked(eventName, "wrong_phase", info);
+				return;
+			}
+
+			if (eventName == kPleasureFailedEnterEvent) {
+				if (g_state.phase == Phase::PleasureStartPending ||
+					g_state.phase == Phase::PleasureActive ||
+					g_state.phase == Phase::PleasureEnding ||
+					g_state.phase == Phase::AfterPleasureAwaitQuest ||
+					g_state.phase == Phase::AfterPleasureDialogue) {
+					auto* failedActor = ResolveEventOrTrackedActorLocked(info);
+					const auto failedActorFormID = failedActor ? failedActor->GetFormID() : (info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID);
+					g_state.afterPleasureSpeakerFormID = failedActorFormID;
+					g_state.afterPleasureCommitted = true;
+					g_state.pendingChoice = AfterChoice::None;
+					g_state.redoPending = false;
+					g_state.blocking = true;
+					g_state.holdActive = true;
+					g_state.passiveLockActive = true;
+					g_state.afterPleasureDialogueExpireSec = 0.0;
+					if (auto* actor = failedActor ? failedActor : LookupActor(failedActorFormID)) {
+						PrepareAfterPleasurePackageActor(actor, "pleasure_failed_dialogue");
+					}
+					AdvancePhaseLocked(Phase::AfterPleasureDialogue, eventName);
+					LogEventAcceptedLocked(eventName, info, "pleasure_failed_dialogue_open");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);

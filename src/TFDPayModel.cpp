@@ -582,6 +582,7 @@ namespace TFD::PayModel
         }
 
         const std::string_view why{ reason ? reason : "" };
+        bool hadCachedQuote = false;
         {
             std::scoped_lock lk(gLock);
             if (why == "precombat_clear_all_pending" && gCachedQuote.valid && gCachedQuote.context == PayContext::Bleedout) {
@@ -591,9 +592,24 @@ namespace TFD::PayModel
                     gCachedQuote.quote.totalGold);
                 return;
             }
+
+            hadCachedQuote = gCachedQuote.valid;
+            if (gCachedQuote.valid) {
+                spdlog::info("[TFD][PayModel] clear cached quote with shared gold clear speaker={:08X} context={} total={} reason={}",
+                    gCachedQuote.speakerFormID,
+                    static_cast<int>(gCachedQuote.context),
+                    gCachedQuote.quote.totalGold,
+                    reason ? reason : "unknown");
+            }
+            gCachedQuote = {};
         }
 
-        if (payGlobal->value != 0.0f) {
+        const bool hadSharedGold = payGlobal->value != 0.0f;
+        if (!hadSharedGold && !hadCachedQuote) {
+            return;
+        }
+
+        if (hadSharedGold) {
             spdlog::info("[TFD][PayModel] clear shared gold oldValue={:.0f} reason={}",
                 payGlobal->value,
                 reason ? reason : "unknown");

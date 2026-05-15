@@ -177,7 +177,8 @@ namespace TFD::InteractionRouter
             PreCombatTruce = 4,
             AfterPleasure = 5,
             Rescue = 6,
-            PreCombatFollowup = 7
+            PreCombatFollowup = 7,
+            PleasureFailed = 8
         };
 
         void Install();
@@ -188,6 +189,7 @@ namespace TFD::InteractionRouter
         void BeginPreCombatTruce(RE::Actor* speaker);
         void BeginPreCombatFollowup(RE::Actor* speaker);
         void BeginAfterPleasure(RE::Actor* speaker);
+        void BeginPleasureFailed(RE::Actor* speaker);
         void BeginRescue(RE::Actor* speaker);
 
         void Tick();

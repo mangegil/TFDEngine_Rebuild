@@ -137,6 +137,9 @@ namespace TFDMenu
 		static RE::TESGlobal* gInteractionState = nullptr;
 		static RE::TESGlobal* gJoinEnemyState = nullptr;
 		static RE::TESGlobal* gLeftForDeadState = nullptr;
+		static RE::TESGlobal* gMiningState = nullptr;
+		static RE::TESGlobal* gCraftingState = nullptr;
+		static RE::TESGlobal* gWorkAssignmentState = nullptr;
 		static RE::TESGlobal* gPleasureState = nullptr;
 		static RE::TESGlobal* gPreCombatState = nullptr;
 		static RE::TESGlobal* gRecoveryState = nullptr;
@@ -159,6 +162,9 @@ namespace TFDMenu
 		static bool gLoggedInteractionStateFound = false;
 		static bool gLoggedJoinEnemyStateFound = false;
 		static bool gLoggedLeftForDeadStateFound = false;
+		static bool gLoggedMiningStateFound = false;
+		static bool gLoggedCraftingStateFound = false;
+		static bool gLoggedWorkAssignmentStateFound = false;
 		static bool gLoggedPleasureStateFound = false;
 		static bool gLoggedPreCombatStateFound = false;
 		static bool gLoggedRecoveryStateFound = false;
@@ -182,6 +188,7 @@ namespace TFDMenu
 
 		static void ResolveGlobals();
 		static int GetGlobalValueInt(RE::TESGlobal* g);
+		static const char* DecodeWorkAssignmentState(int value);
 
 		static RE::TESTopicInfo* ResolveTeammateGreetTopicInfo()
 		{
@@ -246,6 +253,73 @@ namespace TFDMenu
 				else {
 					spdlog::warn("[TFD][Menu] TFDDialogueVictoryGreet INFO {:06X} not found in {}; victory hard dialogue will fall back to default topic selection",
 						kVictoryGreetInfoLocalFormID,
+						kPluginName);
+				}
+			}
+
+			return info;
+		}
+
+
+		static RE::TESTopicInfo* ResolveCaptiveWorkingGreetTopicInfo()
+		{
+			static RE::TESTopicInfo* info = nullptr;
+			static bool attempted = false;
+
+			if (!attempted) {
+				attempted = true;
+
+				// Work mode must not fall through to the normal Calling Captor
+				// topic selection. Use the explicit INFO behind TFD_TIF__0507A0C7
+				// under TFDDialogueWorkingGreet.
+				constexpr RE::FormID kWorkingGreetInfoLocalFormID = 0x0007A0C7;
+				constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+				if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+					info = dataHandler->LookupForm<RE::TESTopicInfo>(kWorkingGreetInfoLocalFormID, kPluginName);
+				}
+
+				if (info) {
+					spdlog::info("[TFD][Menu][Work] TFDDialogueWorkingGreet INFO resolved {:08X} local={:06X}",
+						info->GetFormID(),
+						kWorkingGreetInfoLocalFormID);
+				}
+				else {
+					spdlog::warn("[TFD][Menu][Work] TFDDialogueWorkingGreet INFO {:06X} not found in {}; Work activation will block vanilla Calling Captor leakage",
+						kWorkingGreetInfoLocalFormID,
+						kPluginName);
+				}
+			}
+
+			return info;
+		}
+
+		static RE::TESTopicInfo* ResolveCaptiveReportGreetTopicInfo()
+		{
+			static RE::TESTopicInfo* info = nullptr;
+			static bool attempted = false;
+
+			if (!attempted) {
+				attempted = true;
+
+				// Report mode must open the report GREET first, not the report
+				// completion response. This is the INFO behind TFD_TIF__051C8373
+				// under TFDDialogueReportGreet.
+				constexpr RE::FormID kReportGreetInfoLocalFormID = 0x001C8373;
+				constexpr std::string_view kPluginName{ "TFDEngine.esp" };
+
+				if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+					info = dataHandler->LookupForm<RE::TESTopicInfo>(kReportGreetInfoLocalFormID, kPluginName);
+				}
+
+				if (info) {
+					spdlog::info("[TFD][Menu][Work] TFDDialogueReportGreet INFO resolved {:08X} local={:06X}",
+						info->GetFormID(),
+						kReportGreetInfoLocalFormID);
+				}
+				else {
+					spdlog::warn("[TFD][Menu][Work] TFDDialogueReportGreet INFO {:06X} not found in {}; Report activation will block vanilla Calling Captor leakage",
+						kReportGreetInfoLocalFormID,
 						kPluginName);
 				}
 			}
@@ -358,6 +432,87 @@ namespace TFDMenu
 					TFD::PleasureRuntime::GetPhaseName(),
 					TFD::PleasureRuntime::GetSourceContextName(),
 					reason ? reason : "after_pleasure_activation_dialogue");
+				return true;
+			}
+
+
+			static bool OpenCaptiveWorkDialogueFromActivation(RE::Actor* actor, const char* reason)
+			{
+				if (!actor || actor == RE::PlayerCharacter::GetSingleton()) {
+					return false;
+				}
+				if (!TFD::Captive::IsReleasedWorkActive()) {
+					return false;
+				}
+
+				const bool isCurrentBoss = TFD::Captive::IsCurrentWorkBoss(actor);
+				const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
+				if (!isCurrentBoss && !inWorkScope) {
+					return false;
+				}
+
+				if (!isCurrentBoss) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked non-boss captive actor={:08X} reason={} action=block_calling_captor_leak",
+						actor->GetFormID(),
+						reason ? reason : "work_activation");
+					return true;
+				}
+
+				ResolveGlobals();
+				const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
+
+				if (assignmentState == 2) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked boss during active assignment boss={:08X} assignment={} ({}) reason={} action=block_until_work_done",
+						actor->GetFormID(),
+						assignmentState,
+						DecodeWorkAssignmentState(assignmentState),
+						reason ? reason : "work_activation");
+					return true;
+				}
+
+				if (assignmentState == 4) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked boss during pleasure assignment boss={:08X} assignment={} ({}) reason={} action=block_during_work_pleasure",
+						actor->GetFormID(),
+						assignmentState,
+						DecodeWorkAssignmentState(assignmentState),
+						reason ? reason : "work_activation");
+					return true;
+				}
+
+				if (!actor->IsAIEnabled()) {
+					actor->EnableAI(true);
+				}
+				actor->AllowPCDialogue(true);
+				actor->StopCombat();
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+
+				const bool openReport = assignmentState == 3;
+				auto* targetGreetInfo = openReport ? ResolveCaptiveReportGreetTopicInfo() : ResolveCaptiveWorkingGreetTopicInfo();
+				actor->SetDialogueWithPlayer(false, false, nullptr);
+				const bool opened = targetGreetInfo ? actor->SetDialogueWithPlayer(true, true, targetGreetInfo) : false;
+
+				spdlog::info("[TFD][Menu][Work] activate opened {} dialogue boss={:08X} opened={} reason={} assignment={} ({}) topicInfo={:08X} explicit={} action=block_vanilla",
+					openReport ? "report" : "working",
+					actor->GetFormID(),
+					opened ? 1 : 0,
+					reason ? reason : "work_activation",
+					assignmentState,
+					DecodeWorkAssignmentState(assignmentState),
+					targetGreetInfo ? targetGreetInfo->GetFormID() : 0u,
+					targetGreetInfo ? 1 : 0);
+
+				// Return true even if the explicit INFO failed to resolve, because falling
+				// through to vanilla topic selection reopens Calling Captor during Work.
 				return true;
 			}
 
@@ -637,6 +792,9 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			ResolveGlobal(gInteractionState, gLoggedInteractionStateFound, "TFDInteractionState");
 			ResolveGlobal(gJoinEnemyState, gLoggedJoinEnemyStateFound, "TFDJoinEnemyState");
 			ResolveGlobal(gLeftForDeadState, gLoggedLeftForDeadStateFound, "TFDLeftForDeadState");
+			ResolveGlobal(gMiningState, gLoggedMiningStateFound, "TFDMiningState");
+			ResolveGlobal(gCraftingState, gLoggedCraftingStateFound, "TFDCraftingState");
+			ResolveGlobal(gWorkAssignmentState, gLoggedWorkAssignmentStateFound, "TFDWorkAssignmentState");
 			ResolveGlobal(gPleasureState, gLoggedPleasureStateFound, "TFDPleasureState");
 			ResolveGlobal(gPreCombatState, gLoggedPreCombatStateFound, "TFDPreCombatState");
 			ResolveGlobal(gRecoveryState, gLoggedRecoveryStateFound, "TFDRecoveryState");
@@ -694,8 +852,56 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 				return "Kidnapped";
 			case 2:
 				return "Escape Phase";
+			case 3:
+				return "Working for Enemy";
+			case 4:
+				return "Captive Scene";
 			default:
 				return "Custom";
+			}
+		}
+
+		static const char* DecodeMiningState(int value)
+		{
+			switch (value) {
+			case 0: return "No Mine";
+			case 1: return "Iron Ore";
+			case 2: return "Corundum Ore";
+			case 3: return "Silver Ore";
+			case 4: return "Gold Ore";
+			case 5: return "Quicksilver Ore";
+			case 6: return "Moonstone Ore";
+			case 7: return "Malachite Ore";
+			case 8: return "Orichalcum Ore";
+			case 9: return "Ebony Ore";
+			case 10: return "Stalhrim";
+			default: return "Custom";
+			}
+		}
+
+		static const char* DecodeCraftingState(int value)
+		{
+			switch (value) {
+			case 0: return "No Station";
+			case 1: return "Forge / Anvil";
+			case 2: return "Smelter";
+			case 3: return "Tanning Rack";
+			case 4: return "Grindstone";
+			case 5: return "Armor Workbench";
+			default: return "Custom";
+			}
+		}
+
+		static const char* DecodeWorkAssignmentState(int value)
+		{
+			switch (value) {
+			case 0: return "None";
+			case 1: return "Talk Boss";
+			case 2: return "Doing Work";
+			case 3: return "Return Report";
+			case 4: return "Pleasure Active";
+			case 7: return "Cooldown";
+			default: return "Custom";
 			}
 		}
 
@@ -956,6 +1162,9 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			spdlog::info("[TFD][Menu][GlobalState] TFDInteractionState={} ({})", GetGlobalValueInt(gInteractionState), DecodeInteractionState(GetGlobalValueInt(gInteractionState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDJoinEnemyState={} ({})", GetGlobalValueInt(gJoinEnemyState), DecodeJoinEnemyState(GetGlobalValueInt(gJoinEnemyState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDLeftForDeadState={} ({})", GetGlobalValueInt(gLeftForDeadState), DecodeLeftForDeadState(GetGlobalValueInt(gLeftForDeadState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDMiningState={} ({})", GetGlobalValueInt(gMiningState), DecodeMiningState(GetGlobalValueInt(gMiningState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDCraftingState={} ({})", GetGlobalValueInt(gCraftingState), DecodeCraftingState(GetGlobalValueInt(gCraftingState)));
+			spdlog::info("[TFD][Menu][GlobalState] TFDWorkAssignmentState={} ({})", GetGlobalValueInt(gWorkAssignmentState), DecodeWorkAssignmentState(GetGlobalValueInt(gWorkAssignmentState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDPleasureState={} ({})", GetGlobalValueInt(gPleasureState), DecodePleasureState(GetGlobalValueInt(gPleasureState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDPreCombatState={} ({})", GetGlobalValueInt(gPreCombatState), DecodePreCombatState(GetGlobalValueInt(gPreCombatState)));
 			spdlog::info("[TFD][Menu][GlobalState] TFDRecoveryState={} ({})", GetGlobalValueInt(gRecoveryState), DecodeRecoveryState(GetGlobalValueInt(gRecoveryState)));
@@ -1836,6 +2045,11 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			ImGuiMCP::Text("Primary Actor: %08X", snap.primaryActorFormID);
 			ImGuiMCP::Text("Terminal Resolved: %s", YesNo(snap.terminalResolved));
 			ImGuiMCP::Text("Locked: %s", YesNo(snap.locked));
+			ImGuiMCP::Separator();
+			ImGuiMCP::Text("Work Resources");
+			ImGuiMCP::Text("Mining: %s (%d)", DecodeMiningState(GetGlobalValueInt(gMiningState)), GetGlobalValueInt(gMiningState));
+			ImGuiMCP::Text("Crafting: %s (%d)", DecodeCraftingState(GetGlobalValueInt(gCraftingState)), GetGlobalValueInt(gCraftingState));
+			ImGuiMCP::Text("Work Assignment: %s (%d)", DecodeWorkAssignmentState(GetGlobalValueInt(gWorkAssignmentState)), GetGlobalValueInt(gWorkAssignmentState));
 		}
 
 		static void RenderDebugGlobalsSection()
@@ -1855,6 +2069,9 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			RenderGlobalStateLine("Interaction", gInteractionState, DecodeInteractionState(GetGlobalValueInt(gInteractionState)));
 			RenderGlobalStateLine("Join Enemy", gJoinEnemyState, DecodeJoinEnemyState(GetGlobalValueInt(gJoinEnemyState)));
 			RenderGlobalStateLine("Left For Dead", gLeftForDeadState, DecodeLeftForDeadState(GetGlobalValueInt(gLeftForDeadState)));
+			RenderGlobalStateLine("Mining", gMiningState, DecodeMiningState(GetGlobalValueInt(gMiningState)));
+			RenderGlobalStateLine("Crafting", gCraftingState, DecodeCraftingState(GetGlobalValueInt(gCraftingState)));
+			RenderGlobalStateLine("Work Assignment", gWorkAssignmentState, DecodeWorkAssignmentState(GetGlobalValueInt(gWorkAssignmentState)));
 			RenderGlobalStateLine("Pleasure", gPleasureState, DecodePleasureState(GetGlobalValueInt(gPleasureState)));
 			RenderGlobalStateLine("Pre Combat", gPreCombatState, DecodePreCombatState(GetGlobalValueInt(gPreCombatState)));
 			RenderGlobalStateLine("Recovery", gRecoveryState, DecodeRecoveryState(GetGlobalValueInt(gRecoveryState)));
@@ -2453,6 +2670,9 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 										}
 									}
 									else if (OpenAfterPleasureDialogueFromActivation(crosshairActor, "after_pleasure_crosshair_activate_dialogue")) {
+										return RE::BSEventNotifyControl::kStop;
+									}
+									else if (OpenCaptiveWorkDialogueFromActivation(crosshairActor, "work_crosshair_activate_dialogue")) {
 										return RE::BSEventNotifyControl::kStop;
 									}
 									else if (IsInCombatTruceActivationActor(crosshairActor)) {

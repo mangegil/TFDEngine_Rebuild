@@ -28,6 +28,11 @@ namespace TFD::Captive
 		RE::BGSRefAlias* playerCaptiveAlias{ nullptr };
 		RE::BGSRefAlias* captiveMarkerAlias{ nullptr };
 		RE::BGSRefAlias* escapeDoorAlias{ nullptr };
+		RE::BGSRefAlias* escapeRouteAlias{ nullptr };
+		RE::BGSRefAlias* bossAlias{ nullptr };
+		RE::BGSRefAlias* workMineAlias{ nullptr };
+		RE::BGSRefAlias* workCraftingStationAlias{ nullptr };
+		RE::BGSRefAlias* workItemAlias{ nullptr };
 		std::array<RE::BGSRefAlias*, 3> bossCaptorAliases{};
 		std::array<RE::BGSRefAlias*, 3> bossContainerAliases{};
 		std::array<RE::BGSRefAlias*, 3> containerAliases{};
@@ -83,6 +88,10 @@ namespace TFD::Captive
 	bool IsActive();
 	bool IsEscapeActive();
 	bool IsStandardCaptiveActive();
+	bool IsReleasedWorkActive();
+	bool IsCurrentWorkBoss(RE::Actor* actor);
+	bool IsReleasedWorkActorInScope(RE::Actor* actor);
+	RE::Actor* GetCurrentWorkBoss();
 	bool IsCaptivePassiveHoldActive();
 	bool IsEscapeBleedoutActive();
 	bool IsRecaptureCommitActive();
@@ -94,6 +103,10 @@ namespace TFD::Captive
 	void ClearEscapeBreakRebleed();
 	RE::Actor* ResolveEscapeBreakPreferredAggressor(float radius, const std::function<RE::Actor*(float)>& fallbackResolver = {});
 	void QueueLoadedState(bool stateActive, PhaseValue phase);
+	void QueueLoadedWorkSession(std::uint32_t bossFormID, std::uint32_t jobType, std::uint32_t assignmentState);
+	std::uint32_t GetWorkBossFormIDForSave();
+	std::uint32_t GetWorkJobTypeForSave();
+	std::uint32_t GetWorkAssignmentStateForSave();
 	void ClearQueuedLoadedState();
 	bool GetQueuedStateFlag();
 	PhaseValue GetQueuedPhase();
@@ -104,6 +117,11 @@ namespace TFD::Captive
 	void SyncPlayerAlias(RE::Actor* actor, const char* reason);
 	void SyncStorageDebugAliases(const char* reason);
 	void ClearStorageDebugAliases(const char* reason);
+	void BeginReleasedWorkRuntime(RE::Actor* actor, const char* reason);
+	void SyncCaptiveWorkResourceAliases(const char* reason);
+	void ClearCaptiveWorkResourceAliases(const char* reason, bool clearItemAlias = false);
+	void HandleReleasedWorkNoJob(RE::Actor* actor, double cooldownSeconds, const char* reason);
+	void ClearReleasedWorkRuntime(const char* reason);
 	bool EnsureStarterLockpicks(std::int32_t targetCount, const char* reason);
 	bool TransferPlayerInventoryToStorage(RE::TESObjectREFR* target, const char* reason);
 	void ClearPendingConfiscation(const char* reason);

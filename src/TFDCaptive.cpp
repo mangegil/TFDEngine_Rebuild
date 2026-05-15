@@ -19,14 +19,85 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 namespace TFD::Captive
 {
 	void EnsureCaptiveNavigationContext(RE::Actor* player, const char* reason);
+	void SyncCaptiveNavigationAliases(const char* reason);
 
 	namespace
 	{
+		RE::TESGlobal* g_captiveStateGlobal{ nullptr };
+		RE::TESGlobal* g_workJobTypeGlobal{ nullptr };
+		RE::TESGlobal* g_workAssignmentStateGlobal{ nullptr };
+
+		static RE::TESGlobal* ResolveCaptiveStateGlobal()
+		{
+			if (!g_captiveStateGlobal) {
+				g_captiveStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDCaptiveState");
+			}
+			return g_captiveStateGlobal;
+		}
+
+		static RE::TESGlobal* ResolveWorkJobTypeGlobal()
+		{
+			if (!g_workJobTypeGlobal) {
+				g_workJobTypeGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDWorkJobType");
+			}
+			return g_workJobTypeGlobal;
+		}
+
+		static RE::TESGlobal* ResolveWorkAssignmentStateGlobal()
+		{
+			if (!g_workAssignmentStateGlobal) {
+				g_workAssignmentStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDWorkAssignmentState");
+			}
+			return g_workAssignmentStateGlobal;
+		}
+
+		static std::uint32_t ReadGlobalUInt(RE::TESGlobal* global)
+		{
+			if (!global) {
+				return 0;
+			}
+			return static_cast<std::uint32_t>(std::max(0L, std::lround(global->value)));
+		}
+
+		static void ForceWorkGlobals(std::uint32_t jobType, std::uint32_t assignmentState, const char* reason)
+		{
+			if (auto* job = ResolveWorkJobTypeGlobal()) {
+				job->value = static_cast<float>(jobType);
+			}
+			else {
+				spdlog::warn("[TFD][Captive] TFDWorkJobType global unavailable job={} reason={}", jobType, reason ? reason : "unknown");
+			}
+
+			if (auto* assignment = ResolveWorkAssignmentStateGlobal()) {
+				assignment->value = static_cast<float>(assignmentState);
+			}
+			else {
+				spdlog::warn("[TFD][Captive] TFDWorkAssignmentState global unavailable assignment={} reason={}", assignmentState, reason ? reason : "unknown");
+			}
+
+			spdlog::info("[TFD][Captive] work globals forced job={} assignment={} reason={}", jobType, assignmentState, reason ? reason : "unknown");
+		}
+
+		static void ForceCaptiveStateGlobal(std::uint32_t value, const char* reason)
+		{
+			auto* global = ResolveCaptiveStateGlobal();
+			if (!global) {
+				spdlog::warn("[TFD][Captive] TFDCaptiveState global unavailable value={} reason={}", value, reason ? reason : "unknown");
+				return;
+			}
+			const auto oldValue = static_cast<std::uint32_t>(std::lround(global->value));
+			global->value = static_cast<float>(value);
+			if (oldValue != value) {
+				spdlog::info("[TFD][Captive] TFDCaptiveState forced old={} new={} reason={}", oldValue, value, reason ? reason : "unknown");
+			}
+		}
+
 		static bool IsActorSameSpace(RE::Actor* actor, RE::Actor* player)
 		{
 			if (!actor || !player) {
@@ -83,6 +154,20 @@ namespace TFD::Captive
 			return isNPC || isCreature;
 		}
 
+		static bool ActorHasNativeCaptiveRole(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDCaptiveFaction");
+			if (!faction) {
+				return false;
+			}
+
+			return actor->IsInFaction(faction);
+		}
+
 		static RE::Actor* PickCaptorSameCellLoaded(RE::Actor* player, float radius)
 		{
 			if (!player) {
@@ -98,6 +183,7 @@ namespace TFD::Captive
 			std::uint32_t sameSpace = 0;
 			std::uint32_t supported = 0;
 			std::uint32_t suppressed = 0;
+			std::uint32_t captiveRole = 0;
 			std::uint32_t losCount = 0;
 
 			for (const auto& info : snapshot.actors) {
@@ -126,21 +212,28 @@ namespace TFD::Captive
 				if (isSuppressed) {
 					++suppressed;
 				}
+				const bool hasCaptiveRole = ActorHasNativeCaptiveRole(a);
+				if (hasCaptiveRole) {
+					++captiveRole;
+				}
 				const bool hostile = info.hostileToPlayer || a->IsHostileToActor(player);
 				const bool combat = info.inCombat || a->IsInCombat();
 
 				// Calling Captor is a captive-camp request.  A caged player can have
 				// a valid captor directly in front of the cell while LOS is blocked by
-				// bars, doors, or collision.  Prefer actors already held by captive
-				// suppression, then LOS/hostile/combat actors, but do not hard-require
-				// LOS for the hotkey candidate.
-				if (!isSuppressed && !hasLOS && !hostile && !combat) {
+				// bars, doors, furniture, or collision.  Captive-location actors marked
+				// with TFDCaptiveFaction must remain valid even after a save/load where
+				// runtime suppression has not been rebuilt yet.
+				if (!hasCaptiveRole && !isSuppressed && !hasLOS && !hostile && !combat) {
 					continue;
 				}
 
 				float score = info.dist;
 				if (isSuppressed) {
 					score -= 10000.0f;
+				}
+				if (hasCaptiveRole) {
+					score -= 7000.0f;
 				}
 				if (hasLOS) {
 					score -= 3000.0f;
@@ -159,19 +252,21 @@ namespace TFD::Captive
 			}
 
 			if (best) {
-				spdlog::info("[TFD][Captive] Call Captor candidate selected actor={:08X} distScore={:.1f} considered={} supported={} sameSpace={} suppressed={} los={}",
+				spdlog::info("[TFD][Captive] Call Captor candidate selected actor={:08X} distScore={:.1f} considered={} supported={} sameSpace={} captiveRole={} suppressed={} los={}",
 					best->GetFormID(),
 					bestScore,
 					considered,
 					supported,
 					sameSpace,
+					captiveRole,
 					suppressed,
 					losCount);
 			} else {
-				spdlog::warn("[TFD][Captive] Call Captor no candidate considered={} supported={} sameSpace={} suppressed={} los={} radius={:.1f}",
+				spdlog::warn("[TFD][Captive] Call Captor no candidate considered={} supported={} sameSpace={} captiveRole={} suppressed={} los={} radius={:.1f}",
 					considered,
 					supported,
 					sameSpace,
+					captiveRole,
 					suppressed,
 					losCount,
 					searchRadius);
@@ -328,6 +423,9 @@ namespace TFD::Captive
 		RE::FormID g_locationFormID = 0;
 		bool g_queuedState = false;
 		PhaseValue g_queuedPhase = PhaseValue::None;
+		std::uint32_t g_queuedWorkBossFormID = 0;
+		std::uint32_t g_queuedWorkJobType = 0;
+		std::uint32_t g_queuedWorkAssignmentState = 0;
 		bool g_escapeBreakBleedPending = false;
 		RE::ActorHandle g_escapeBreakPreferredAggressor{};
 		bool g_prevLockpickOpen = false;
@@ -350,9 +448,18 @@ namespace TFD::Captive
 			bool addedByTFD = false;
 		};
 
-		RE::ActorHandle g_nativeCaptorRoleActor{};
-		bool g_nativeCaptorRoleFactionAdded = false;
+		struct NativeWorkingRoleEntry
+		{
+			RE::ActorHandle actor{};
+			RE::FormID formID = 0;
+			bool addedByTFD = false;
+		};
+
 		std::vector<NativeCaptiveRoleEntry> g_nativeCaptiveRoleActors{};
+		std::vector<NativeWorkingRoleEntry> g_nativeWorkingRoleActors{};
+		RE::ActorHandle g_currentWorkBoss{};
+		RE::FormID g_currentWorkBossFormID = 0;
+		std::chrono::steady_clock::time_point g_workBossResumeAt{};
 		std::chrono::steady_clock::time_point g_nextCaptiveRoleFactionSweep{};
 		static constexpr auto kCaptiveRoleFactionSweepInterval = std::chrono::milliseconds(1500);
 		static constexpr auto kRecaptureDuplicateGuard = std::chrono::milliseconds(8000);
@@ -376,19 +483,20 @@ namespace TFD::Captive
 			return cached;
 		}
 
-		static RE::Actor* ResolveNativeCaptorRoleActor()
+		static RE::TESFaction* ResolveNativeWorkingCaptiveFaction()
 		{
-			if (!g_nativeCaptorRoleActor) {
-				return nullptr;
+			static RE::TESFaction* cached = nullptr;
+			static bool resolved = false;
+			if (!resolved) {
+				resolved = true;
+				cached = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDWorkingCaptiveFaction");
+				if (!cached) {
+					spdlog::warn("[TFD][Captive] native working captive faction missing editorId=TFDWorkingCaptiveFaction");
+				}
 			}
-			auto sp = RE::Actor::LookupByHandle(g_nativeCaptorRoleActor.native_handle());
-			if (!sp) {
-				g_nativeCaptorRoleActor.reset();
-				g_nativeCaptorRoleFactionAdded = false;
-				return nullptr;
-			}
-			return sp.get();
+			return cached;
 		}
+
 
 		static bool IsNativeCaptiveFactionTracked(RE::FormID formID)
 		{
@@ -435,8 +543,6 @@ namespace TFD::Captive
 			}
 
 			g_nativeCaptiveRoleActors.clear();
-			g_nativeCaptorRoleActor.reset();
-			g_nativeCaptorRoleFactionAdded = false;
 			g_nextCaptiveRoleFactionSweep = {};
 
 			spdlog::info("[TFD][Captive] native captive location role faction cleared removed={} preserved={} stale={} reason={}",
@@ -444,6 +550,231 @@ namespace TFD::Captive
 				preserved,
 				stale,
 				reason ? reason : "unknown");
+		}
+
+		static bool IsNativeWorkingFactionTracked(RE::FormID formID)
+		{
+			if (formID == 0) {
+				return false;
+			}
+			for (const auto& entry : g_nativeWorkingRoleActors) {
+				if (entry.formID == formID) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static void ClearNativeWorkingCaptiveFaction(const char* reason)
+		{
+			auto* faction = ResolveNativeWorkingCaptiveFaction();
+			std::uint32_t removed = 0;
+			std::uint32_t preserved = 0;
+			std::uint32_t stale = 0;
+
+			if (faction) {
+				for (auto& entry : g_nativeWorkingRoleActors) {
+					RE::Actor* actor = nullptr;
+					if (entry.actor) {
+						auto sp = RE::Actor::LookupByHandle(entry.actor.native_handle());
+						actor = sp ? sp.get() : nullptr;
+					}
+					if (!actor && entry.formID != 0) {
+						actor = RE::TESForm::LookupByID<RE::Actor>(entry.formID);
+					}
+					if (!actor) {
+						++stale;
+						continue;
+					}
+
+					if (entry.addedByTFD && actor->IsInFaction(faction)) {
+						actor->RemoveFromFaction(faction);
+						++removed;
+					} else {
+						++preserved;
+					}
+				}
+			}
+
+			g_nativeWorkingRoleActors.clear();
+			if (removed > 0 || preserved > 0 || stale > 0) {
+				spdlog::info("[TFD][Captive] working captive faction cleared removed={} preserved={} stale={} reason={}",
+					removed,
+					preserved,
+					stale,
+					reason ? reason : "unknown");
+			}
+		}
+
+		static void ApplyNativeWorkingCaptiveFaction(RE::Actor* actor, const char* reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			auto* faction = ResolveNativeWorkingCaptiveFaction();
+			if (!faction) {
+				return;
+			}
+
+			const RE::FormID formID = actor->GetFormID();
+			const bool hadFaction = actor->IsInFaction(faction);
+			if (!hadFaction) {
+				actor->AddToFaction(faction, 0);
+			}
+
+			if (!IsNativeWorkingFactionTracked(formID)) {
+				NativeWorkingRoleEntry entry{};
+				entry.actor = actor->GetHandle();
+				entry.formID = formID;
+				entry.addedByTFD = !hadFaction;
+				g_nativeWorkingRoleActors.push_back(entry);
+			}
+
+			spdlog::info("[TFD][Captive] working captive faction applied actor={:08X} added={} hadFaction={} tracked={} reason={}",
+				actor->GetFormID(),
+				(!hadFaction) ? 1 : 0,
+				hadFaction ? 1 : 0,
+				static_cast<unsigned>(g_nativeWorkingRoleActors.size()),
+				reason ? reason : "unknown");
+		}
+
+		static RE::Actor* LookupActorByFormID(RE::FormID formID)
+		{
+			if (formID == 0) {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByID<RE::Actor>(formID);
+		}
+
+		static std::vector<RE::FormID> GetSnapshotBossActorIDs()
+		{
+			std::vector<RE::FormID> result{};
+			TFD::Location::CaptiveStorageDebugSnapshot snapshot{};
+			if (!TFD::Location::GetLastCaptiveStorageDebugSnapshot(snapshot)) {
+				return result;
+			}
+
+			for (auto formID : snapshot.bossActorFormIDs) {
+				if (formID == 0) {
+					continue;
+				}
+				if (std::find(result.begin(), result.end(), formID) == result.end()) {
+					result.push_back(formID);
+				}
+			}
+			return result;
+		}
+
+		static bool IsActorInBossSnapshot(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+			const auto actorID = actor->GetFormID();
+			for (auto bossID : GetSnapshotBossActorIDs()) {
+				if (bossID == actorID) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static RE::Actor* SelectWorkBossActor(RE::Actor* fallbackActor, RE::FormID excludeFormID, bool allowFallback)
+		{
+			auto bossIDs = GetSnapshotBossActorIDs();
+			for (auto bossID : bossIDs) {
+				if (bossID == 0 || bossID == excludeFormID) {
+					continue;
+				}
+				auto* actor = LookupActorByFormID(bossID);
+				if (actor && !actor->IsDead() && !actor->IsDisabled()) {
+					return actor;
+				}
+			}
+
+			if (allowFallback) {
+				if (fallbackActor && !fallbackActor->IsDead() && !fallbackActor->IsDisabled()) {
+					return fallbackActor;
+				}
+				for (auto bossID : bossIDs) {
+					auto* actor = LookupActorByFormID(bossID);
+					if (actor && !actor->IsDead() && !actor->IsDisabled()) {
+						return actor;
+					}
+				}
+			}
+
+			return nullptr;
+		}
+
+		static void WriteCurrentWorkBossAlias(RE::Actor* boss, const char* reason)
+		{
+			ResolveQuestRegistry();
+			WriteQuestAlias(g_registry.bossAlias, boss);
+			if (boss) {
+				g_currentWorkBoss = boss->GetHandle();
+				g_currentWorkBossFormID = boss->GetFormID();
+			} else {
+				g_currentWorkBoss.reset();
+				g_currentWorkBossFormID = 0;
+			}
+
+			spdlog::info("[TFD][Captive] work boss alias {} actor={:08X} aliasPresent={} reason={}",
+				boss ? "assigned" : "cleared",
+				boss ? boss->GetFormID() : 0u,
+				g_registry.bossAlias ? 1 : 0,
+				reason ? reason : "unknown");
+		}
+
+		static void ApplyWorkingFactionToCurrentBoss(RE::Actor* boss, const char* reason)
+		{
+			ClearNativeWorkingCaptiveFaction(reason ? reason : "working_refresh");
+			WriteCurrentWorkBossAlias(boss, reason ? reason : "working_refresh");
+			if (boss) {
+				ApplyNativeWorkingCaptiveFaction(boss, reason);
+			}
+			spdlog::info("[TFD][Captive] working faction current boss refresh actor={:08X} reason={}",
+				boss ? boss->GetFormID() : 0u,
+				reason ? reason : "unknown");
+		}
+
+		static void ApplyWorkingFactionToBossActors(RE::Actor* fallbackActor, const char* reason)
+		{
+			RE::Actor* preferred = nullptr;
+			if (fallbackActor && IsActorInBossSnapshot(fallbackActor)) {
+				preferred = fallbackActor;
+			} else {
+				preferred = SelectWorkBossActor(nullptr, 0, true);
+			}
+			if (!preferred) {
+				preferred = fallbackActor;
+			}
+
+			g_workBossResumeAt = {};
+			ApplyWorkingFactionToCurrentBoss(preferred, reason ? reason : "released_work_runtime");
+		}
+
+		static void ProcessReleasedWorkBossResume(const char* reason)
+		{
+			if (!g_state || g_phase != PhaseValue::ReleasedWork) {
+				return;
+			}
+			if (g_workBossResumeAt.time_since_epoch().count() == 0) {
+				return;
+			}
+			if (Now() < g_workBossResumeAt) {
+				return;
+			}
+
+			g_workBossResumeAt = {};
+			RE::Actor* boss = LookupActorByFormID(g_currentWorkBossFormID);
+			if (!boss) {
+				boss = SelectWorkBossActor(nullptr, 0, true);
+			}
+			ApplyWorkingFactionToCurrentBoss(boss, reason ? reason : "work_no_job_cooldown_resume");
+			(void)TFD::Location::RefreshCaptiveWorkResourceState(true, reason ? reason : "work_no_job_cooldown_resume");
+			SyncCaptiveWorkResourceAliases(reason ? reason : "work_no_job_cooldown_resume");
 		}
 
 		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason)
@@ -471,8 +802,6 @@ namespace TFD::Captive
 				g_nativeCaptiveRoleActors.push_back(entry);
 			}
 
-			g_nativeCaptorRoleActor = actor->GetHandle();
-			g_nativeCaptorRoleFactionAdded = !hadFaction;
 			spdlog::info("[TFD][Captive] native captive role faction applied actor={:08X} added={} hadFaction={} tracked={} reason={}",
 				actor->GetFormID(),
 				(!hadFaction) ? 1 : 0,
@@ -643,6 +972,49 @@ namespace TFD::Captive
 		return g_state && g_phase == PhaseValue::Captive;
 	}
 
+	bool IsReleasedWorkActive()
+	{
+		return g_state && g_phase == PhaseValue::ReleasedWork;
+	}
+
+	RE::Actor* GetCurrentWorkBoss()
+	{
+		if (!IsReleasedWorkActive()) {
+			return nullptr;
+		}
+
+		if (g_currentWorkBoss) {
+			auto sp = RE::Actor::LookupByHandle(g_currentWorkBoss.native_handle());
+			if (sp) {
+				return sp.get();
+			}
+		}
+
+		if (g_currentWorkBossFormID != 0) {
+			return LookupActorByFormID(g_currentWorkBossFormID);
+		}
+
+		return nullptr;
+	}
+
+	bool IsCurrentWorkBoss(RE::Actor* actor)
+	{
+		auto* boss = GetCurrentWorkBoss();
+		return actor && boss && actor->GetFormID() == boss->GetFormID();
+	}
+
+	bool IsReleasedWorkActorInScope(RE::Actor* actor)
+	{
+		if (!IsReleasedWorkActive() || !actor) {
+			return false;
+		}
+		auto* player = Player();
+		if (!player) {
+			return false;
+		}
+		return IsActorInNativeCaptiveLocationScope(actor, player);
+	}
+
 	bool IsCaptorCallCooldownActive(float* remainingSeconds)
 	{
 		const auto now = Now();
@@ -727,10 +1099,45 @@ namespace TFD::Captive
 		g_queuedPhase = phase;
 	}
 
+	void QueueLoadedWorkSession(std::uint32_t bossFormID, std::uint32_t jobType, std::uint32_t assignmentState)
+	{
+		g_queuedWorkBossFormID = bossFormID;
+		g_queuedWorkJobType = jobType;
+		g_queuedWorkAssignmentState = assignmentState;
+		spdlog::info("[TFD][Captive] QueueLoadedWorkSession boss={:08X} job={} assignment={}",
+			g_queuedWorkBossFormID,
+			g_queuedWorkJobType,
+			g_queuedWorkAssignmentState);
+	}
+
+	std::uint32_t GetWorkBossFormIDForSave()
+	{
+		if (g_currentWorkBossFormID != 0) {
+			return g_currentWorkBossFormID;
+		}
+		if (auto* boss = GetCurrentWorkBoss()) {
+			return boss->GetFormID();
+		}
+		return 0;
+	}
+
+	std::uint32_t GetWorkJobTypeForSave()
+	{
+		return ReadGlobalUInt(ResolveWorkJobTypeGlobal());
+	}
+
+	std::uint32_t GetWorkAssignmentStateForSave()
+	{
+		return ReadGlobalUInt(ResolveWorkAssignmentStateGlobal());
+	}
+
 	void ClearQueuedLoadedState()
 	{
 		g_queuedState = false;
 		g_queuedPhase = PhaseValue::None;
+		g_queuedWorkBossFormID = 0;
+		g_queuedWorkJobType = 0;
+		g_queuedWorkAssignmentState = 0;
 	}
 
 	bool GetQueuedStateFlag()
@@ -780,14 +1187,34 @@ namespace TFD::Captive
 				g_registry.escapeDoorAlias = refAlias;
 				continue;
 			}
+			if (aliasName == "EscapeRoute") {
+				g_registry.escapeRouteAlias = refAlias;
+				continue;
+			}
 			if (aliasName == "LootTarget") {
 				g_registry.lootTargetAlias = refAlias;
 				continue;
 			}
-			if (aliasName == "OwnerCaptor") {
-				g_registry.bossCaptorAliases[0] = refAlias;
-				continue;
-			}
+				if (aliasName == "Boss") {
+					g_registry.bossAlias = refAlias;
+					continue;
+				}
+				if (aliasName == "Mine") {
+					g_registry.workMineAlias = refAlias;
+					continue;
+				}
+				if (aliasName == "CraftingStation") {
+					g_registry.workCraftingStationAlias = refAlias;
+					continue;
+				}
+				if (aliasName == "Item") {
+					g_registry.workItemAlias = refAlias;
+					continue;
+				}
+				if (aliasName == "OwnerCaptor") {
+					g_registry.bossCaptorAliases[0] = refAlias;
+					continue;
+				}
 			if (aliasName.rfind("BossCaptor", 0) == 0 && aliasName.size() >= 11) {
 				try {
 					int slot = std::stoi(aliasName.substr(10));
@@ -824,11 +1251,16 @@ namespace TFD::Captive
 		for (auto* alias : g_registry.bossContainerAliases) { if (alias) ++bossContainerCount; }
 		for (auto* alias : g_registry.containerAliases) { if (alias) ++containerCount; }
 
-		spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} captiveMarkerAlias={} escapeDoorAlias={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
+		spdlog::info("[TFD][Captive] captive quest registry resolved quest={:08X} playerAliasID={} captiveMarkerAlias={} escapeDoorAlias={} escapeRouteAlias={} bossAlias={} mineAlias={} craftingAlias={} itemAlias={} bossCaptorAliases={} bossContainerAliases={} containerAliases={} lootTarget={}",
 			g_registry.quest ? g_registry.quest->GetFormID() : 0u,
 			g_registry.playerCaptiveAlias ? g_registry.playerCaptiveAlias->aliasID : static_cast<std::uint32_t>(0),
 			g_registry.captiveMarkerAlias ? g_registry.captiveMarkerAlias->aliasID : static_cast<std::uint32_t>(0),
 			g_registry.escapeDoorAlias ? g_registry.escapeDoorAlias->aliasID : static_cast<std::uint32_t>(0),
+			g_registry.escapeRouteAlias ? g_registry.escapeRouteAlias->aliasID : static_cast<std::uint32_t>(0),
+			g_registry.bossAlias ? 1 : 0,
+			g_registry.workMineAlias ? 1 : 0,
+			g_registry.workCraftingStationAlias ? 1 : 0,
+			g_registry.workItemAlias ? 1 : 0,
 			bossCaptorCount,
 			bossContainerCount,
 			containerCount,
@@ -899,6 +1331,7 @@ namespace TFD::Captive
 			WriteQuestAlias(alias, LookupRefByFormID(formID));
 		};
 
+		assignByFormID(g_registry.bossAlias, hasSnapshot ? snapshot.bossActorFormIDs[0] : 0u);
 		for (std::size_t i = 0; i < g_registry.bossCaptorAliases.size(); ++i) {
 			assignByFormID(g_registry.bossCaptorAliases[i], hasSnapshot ? snapshot.bossActorFormIDs[i] : 0u);
 		}
@@ -939,6 +1372,138 @@ namespace TFD::Captive
 		WriteQuestAlias(g_registry.lootTargetAlias, nullptr);
 
 		spdlog::info("[TFD][Captive] debug aliases cleared reason={}", reason ? reason : "unknown");
+	}
+
+	void SyncCaptiveWorkResourceAliases(const char* reason)
+	{
+		ResolveQuestRegistry();
+		if (!g_registry.quest) {
+			return;
+		}
+
+		auto* mineRef = TFD::Location::GetLastCaptiveWorkMiningRef();
+		auto* craftRef = TFD::Location::GetLastCaptiveWorkCraftingRef();
+		WriteQuestAlias(g_registry.workMineAlias, mineRef);
+		WriteQuestAlias(g_registry.workCraftingStationAlias, craftRef);
+
+		spdlog::info("[TFD][Captive] work resource aliases synced reason={} mineAlias={} mineRef={:08X} craftingAlias={} craftingRef={:08X}",
+			reason ? reason : "unknown",
+			g_registry.workMineAlias ? 1 : 0,
+			mineRef ? mineRef->GetFormID() : 0u,
+			g_registry.workCraftingStationAlias ? 1 : 0,
+			craftRef ? craftRef->GetFormID() : 0u);
+	}
+
+	void ClearCaptiveWorkResourceAliases(const char* reason, bool clearItemAlias)
+	{
+		ResolveQuestRegistry();
+		if (!g_registry.quest) {
+			return;
+		}
+
+		WriteQuestAlias(g_registry.workMineAlias, nullptr);
+		WriteQuestAlias(g_registry.workCraftingStationAlias, nullptr);
+		if (clearItemAlias) {
+			WriteQuestAlias(g_registry.workItemAlias, nullptr);
+		}
+
+		spdlog::info("[TFD][Captive] work resource aliases cleared reason={} mineAlias={} craftingAlias={} itemAliasCleared={}",
+			reason ? reason : "unknown",
+			g_registry.workMineAlias ? 1 : 0,
+			g_registry.workCraftingStationAlias ? 1 : 0,
+			clearItemAlias ? 1 : 0);
+	}
+
+	void BeginReleasedWorkRuntime(RE::Actor* actor, const char* reason)
+	{
+		const char* useReason = reason ? reason : "released_work_runtime";
+		auto* player = Player();
+		if (player) {
+			EnsureCaptiveNavigationContext(player, useReason);
+			SyncCaptiveNavigationAliases(useReason);
+		}
+
+		ForceCaptiveStateGlobal(GetPhaseRaw(true, PhaseValue::ReleasedWork), useReason);
+		TFD::CaptiveGreet::Cancel("released_work_enter_cancel_calling_captor");
+
+		auto* door = ResolveBoundEscapeDoor();
+		if (door && DoorControllerRef().HasDoor()) {
+			DoorControllerRef().UnlockForRelease(3.0, true, false);
+			ResetLockpickWatch();
+			spdlog::info("[TFD][Captive] released work door unlocked/opened door={:08X} reason={}",
+				door->GetFormID(),
+				useReason);
+		}
+		else {
+			spdlog::warn("[TFD][Captive] released work door unlock skipped door={:08X} hasDoor={} reason={}",
+				door ? door->GetFormID() : 0u,
+				DoorControllerRef().HasDoor() ? 1 : 0,
+				useReason);
+		}
+
+		// ReleasedWork is still inside the captive ecosystem.
+		// Keep TFDCaptiveFaction on every eligible actor in the CaptiveMarker
+		// location; TFDWorkingCaptiveFaction is only an additional marker for the
+		// current Work Boss.  Calling Captor must be blocked by CK/global state
+		// conditions, not by stripping the captive-location faction.
+		if (player) {
+			ApplyNativeCaptiveLocationRoleFactions(player, "released_work_enter_keep_captive_location_roles", true);
+		}
+
+		// Refresh the captive-location special-ref snapshot so BossCaptor aliases and
+		// the working-dialogue faction point at the location leader, not necessarily
+		// the ordinary captor who opened the Work outcome.
+		(void)TFD::Location::ResolveNearestCaptiveStorageTarget(actor);
+		SyncStorageDebugAliases(useReason);
+		ApplyWorkingFactionToBossActors(actor, useReason);
+		(void)TFD::Location::RefreshCaptiveWorkResourceState(true, useReason);
+		SyncCaptiveWorkResourceAliases(useReason);
+	}
+
+	void HandleReleasedWorkNoJob(RE::Actor* actor, double cooldownSeconds, const char* reason)
+	{
+		if (!g_state || g_phase != PhaseValue::ReleasedWork) {
+			spdlog::info("[TFD][Captive] work no-job ignored phase={} active={} actor={:08X} reason={}",
+				GetPhaseName(),
+				g_state ? 1 : 0,
+				actor ? actor->GetFormID() : 0u,
+				reason ? reason : "unknown");
+			return;
+		}
+
+		(void)TFD::Location::ResolveNearestCaptiveStorageTarget(actor);
+		const auto excluded = actor ? actor->GetFormID() : g_currentWorkBossFormID;
+		auto* nextBoss = SelectWorkBossActor(nullptr, excluded, false);
+		if (nextBoss) {
+			g_workBossResumeAt = {};
+			ApplyWorkingFactionToCurrentBoss(nextBoss, reason ? reason : "work_no_job_next_boss");
+			spdlog::info("[TFD][Captive] work no-job redirected from={:08X} to={:08X} reason={}",
+				excluded,
+				nextBoss->GetFormID(),
+				reason ? reason : "unknown");
+			return;
+		}
+
+		RE::Actor* sameBoss = actor ? actor : LookupActorByFormID(g_currentWorkBossFormID);
+		if (!sameBoss) {
+			sameBoss = SelectWorkBossActor(nullptr, 0, true);
+		}
+		WriteCurrentWorkBossAlias(sameBoss, reason ? reason : "work_no_job_same_boss");
+		ClearNativeWorkingCaptiveFaction(reason ? reason : "work_no_job_cooldown");
+		const auto cooldown = cooldownSeconds > 0.0 ? cooldownSeconds : 10.0;
+		g_workBossResumeAt = Now() + std::chrono::milliseconds(static_cast<int>(cooldown * 1000.0));
+		spdlog::info("[TFD][Captive] work no-job cooldown boss={:08X} seconds={:.2f} reason={}",
+			sameBoss ? sameBoss->GetFormID() : 0u,
+			cooldown,
+			reason ? reason : "unknown");
+	}
+
+	void ClearReleasedWorkRuntime(const char* reason)
+	{
+		ClearNativeWorkingCaptiveFaction(reason ? reason : "clear_released_work_runtime");
+		WriteCurrentWorkBossAlias(nullptr, reason ? reason : "clear_released_work_runtime");
+		ClearCaptiveWorkResourceAliases(reason ? reason : "clear_released_work_runtime", true);
+		g_workBossResumeAt = {};
 	}
 
 	static RE::TESBoundObject* ResolveLockpickItem()
@@ -1241,8 +1806,13 @@ namespace TFD::Captive
 	{
 		g_state = stateActive;
 		g_phase = phase;
+		ForceCaptiveStateGlobal(GetPhaseRaw(stateActive, phase), "set_runtime_state");
 		if (!stateActive) {
 			ClearNativeCaptorRoleFaction("runtime_state_not_captive");
+		}
+		if (!stateActive || phase != PhaseValue::ReleasedWork) {
+			ClearReleasedWorkRuntime("runtime_state_leave_work");
+			TFD::Location::ClearCaptiveWorkResourceState("runtime_state_leave_work");
 		}
 		if (!IsCaptivePassiveHoldActive()) {
 			TFD::HostilityController::ResetCaptiveSuppression();
@@ -1350,13 +1920,15 @@ namespace TFD::Captive
 		RE::TESObjectREFR* door = ResolveBoundEscapeDoor();
 		WriteQuestAlias(g_registry.captiveMarkerAlias, marker);
 		WriteQuestAlias(g_registry.escapeDoorAlias, door);
+		WriteQuestAlias(g_registry.escapeRouteAlias, door);
 
-		spdlog::info("[TFD][Captive] navigation aliases synced reason={} marker={:08X} escapeDoor={:08X} markerAlias={} doorAlias={}",
+		spdlog::info("[TFD][Captive] navigation aliases synced reason={} marker={:08X} escapeDoor={:08X} markerAlias={} doorAlias={} routeAlias={}",
 			reason ? reason : "unknown",
 			marker ? marker->GetFormID() : 0u,
 			door ? door->GetFormID() : 0u,
 			g_registry.captiveMarkerAlias ? 1 : 0,
-			g_registry.escapeDoorAlias ? 1 : 0);
+			g_registry.escapeDoorAlias ? 1 : 0,
+			g_registry.escapeRouteAlias ? 1 : 0);
 	}
 
 	void ClearCaptiveNavigationAliases(const char* reason)
@@ -1368,10 +1940,12 @@ namespace TFD::Captive
 
 		WriteQuestAlias(g_registry.captiveMarkerAlias, nullptr);
 		WriteQuestAlias(g_registry.escapeDoorAlias, nullptr);
-		spdlog::info("[TFD][Captive] navigation aliases cleared reason={} markerAlias={} doorAlias={}",
+		WriteQuestAlias(g_registry.escapeRouteAlias, nullptr);
+		spdlog::info("[TFD][Captive] navigation aliases cleared reason={} markerAlias={} doorAlias={} routeAlias={}",
 			reason ? reason : "unknown",
 			g_registry.captiveMarkerAlias ? 1 : 0,
-			g_registry.escapeDoorAlias ? 1 : 0);
+			g_registry.escapeDoorAlias ? 1 : 0,
+			g_registry.escapeRouteAlias ? 1 : 0);
 	}
 
 	static RE::TESObjectREFR* ResolveCaptiveMarkerRef()
@@ -1562,6 +2136,8 @@ namespace TFD::Captive
 	{
 		ClearCaptiveNavigationAliases("clear_escape_context");
 		ClearNativeCaptorRoleFaction("clear_escape_context");
+		ClearReleasedWorkRuntime("clear_escape_context");
+		TFD::Location::ClearCaptiveWorkResourceState("clear_escape_context");
 		g_marker.reset();
 		g_cellFormID = 0;
 		g_locationFormID = 0;
@@ -1900,6 +2476,11 @@ namespace TFD::Captive
 				EnsureCaptiveNavigationContext(player, "standard_captive_tick");
 			}
 			TFD::HostilityController::TickCaptiveSuppression();
+			ProcessReleasedWorkBossResume("released_work_tick");
+			if (g_phase == PhaseValue::ReleasedWork) {
+				(void)TFD::Location::RefreshCaptiveWorkResourceState(false, "released_work_tick");
+				SyncCaptiveWorkResourceAliases("released_work_tick");
+			}
 		} else {
 			TFD::HostilityController::ResetCaptiveSuppression();
 		}
@@ -1913,11 +2494,14 @@ namespace TFD::Captive
 		}
 
 		if (IsActive()) {
-			// TFDCaptiveFaction is a dialogue-condition tag for the active captive
-			// location.  Do not keep sweeping it while Escape is active/outside the
-			// captive location; that can retarget the anchor to the player's new
-			// location and leave the HUD stuck in Captive.
-			if (IsCaptivePassiveHoldActive()) {
+			// TFDCaptiveFaction is the captive-location identity tag and must stay
+			// present until the player actually leaves/escapes the CaptiveMarker
+			// location.  ResolveCaptiveExitToFree runs before this block, so a real
+			// location escape clears the faction before any new sweep can happen.
+			if (g_state && (g_phase == PhaseValue::Captive ||
+				g_phase == PhaseValue::ReleasedWork ||
+				g_phase == PhaseValue::Scene ||
+				g_phase == PhaseValue::Escape)) {
 				ApplyNativeCaptiveLocationRoleFactions(player, "captive_runtime_tick", false);
 			}
 			TFD::InteractionRouter::DialogueOpen::Tick();
@@ -2127,12 +2711,85 @@ namespace TFD::Captive
 
 	void ApplyQueuedDefeatProgressState(const ApplyQueuedDefeatProgressHandlers& handlers)
 	{
-		SetRuntimeState(GetQueuedStateFlag(), GetQueuedPhase());
+		const bool queuedState = GetQueuedStateFlag();
+		const PhaseValue queuedPhase = GetQueuedPhase();
+
+		SetRuntimeState(queuedState, queuedPhase);
+
+		// Keep FlowController in sync with the restored captive globals.
+		// Before this, TFDCaptiveState could restore to Captive, while the
+		// SMF Flow Indicator stayed at Root=None / Neutral after loading a save.
+		// Calling Captor then worked, but the flow snapshot stayed stale until a
+		// fresh outcome was selected.
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		if (queuedState) {
+			(void)flow.RequestCaptive(0, TFD::FlowController::CaptiveMode::Kidnapped, "apply_queued_captive_load");
+
+			switch (queuedPhase) {
+			case PhaseValue::ReleasedWork:
+			{
+				RE::Actor* restoredBoss = LookupActorByFormID(g_queuedWorkBossFormID);
+				const std::uint32_t primaryID = restoredBoss ? restoredBoss->GetFormID() : g_queuedWorkBossFormID;
+				(void)flow.RequestResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::WorkForEnemy, primaryID, "apply_queued_released_work_load");
+
+				// Rehydrate ReleasedWork as a session, not just as a phase.
+				// This restores Boss alias, TFDWorkingCaptiveFaction, door/work resources,
+				// and the native work boss cache before Papyrus refreshes objectives.
+				BeginReleasedWorkRuntime(restoredBoss, "apply_queued_released_work_load_runtime");
+
+				if (g_queuedWorkAssignmentState != 0 || g_queuedWorkJobType != 0) {
+					ForceWorkGlobals(g_queuedWorkJobType, g_queuedWorkAssignmentState, "apply_queued_released_work_load");
+				}
+				else {
+					// Legacy v2 saves only stored phase=ReleasedWork. Fall back to idle Work.
+					ForceWorkGlobals(0, 1, "apply_queued_released_work_load_legacy_idle");
+				}
+
+				// Quest objective markers are CK/Papyrus-owned. Native can restore the
+				// runtime boss/working faction immediately, but the Quest Target for
+				// objective 20 must be refreshed after the Boss alias is valid. Reuse the
+				// already-registered captive work mod event with a load-restore reason so
+				// TFDSystemEventQuestScript does not start a new Work outcome.
+				if (restoredBoss) {
+					const bool restoreQueued = TFD::FlowController::QueueBridgeModEvent(
+						"TFDCaptiveRequestWork",
+						restoredBoss,
+						"restore_work_load",
+						static_cast<float>(g_queuedWorkAssignmentState));
+					spdlog::info("[TFD][Captive] queued Papyrus WorkSession objective restore boss={:08X} job={} assignment={} queued={}",
+						restoredBoss->GetFormID(),
+						g_queuedWorkJobType,
+						g_queuedWorkAssignmentState,
+						restoreQueued ? 1 : 0);
+				}
+				else {
+					spdlog::warn("[TFD][Captive] skipped Papyrus WorkSession objective restore: no restored boss bossForm={:08X} job={} assignment={}",
+						g_queuedWorkBossFormID,
+						g_queuedWorkJobType,
+						g_queuedWorkAssignmentState);
+				}
+				break;
+			}
+			case PhaseValue::Escape:
+				(void)flow.RequestResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeStarted, 0, "apply_queued_escape_load");
+				break;
+			case PhaseValue::Scene:
+				(void)flow.RequestResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::Pleasure, 0, "apply_queued_scene_load");
+				break;
+			case PhaseValue::Captive:
+			default:
+				break;
+			}
+		}
+		else {
+			flow.ResetRuntime("apply_queued_neutral_load");
+		}
+
 		if (handlers.setPrevDialogueOpen && handlers.isDialogueOpen) {
 			handlers.setPrevDialogueOpen(handlers.isDialogueOpen());
 		}
 		CaptureCurrentLockpickMenuState();
-		if (GetQueuedStateFlag() && (GetQueuedPhase() == PhaseValue::Captive || GetQueuedPhase() == PhaseValue::ReleasedWork)) {
+		if (queuedState && (queuedPhase == PhaseValue::Captive || queuedPhase == PhaseValue::ReleasedWork)) {
 			TFD::Location::RescanCaptiveMarker();
 			if (handlers.getPlayer) {
 				ArmEscapeContextFromCurrentState(handlers.getPlayer());
@@ -2146,6 +2803,8 @@ namespace TFD::Captive
 	void ResetForLoad()
 	{
 		ClearNativeCaptorRoleFaction("reset_for_load");
+		ClearReleasedWorkRuntime("reset_for_load");
+		TFD::Location::ClearCaptiveWorkResourceState("reset_for_load");
 		TFD::HostilityController::ResetCaptiveSuppression();
 		g_state = false;
 		g_phase = PhaseValue::None;
@@ -2161,8 +2820,17 @@ namespace TFD::Captive
 		g_marker.reset();
 		g_cellFormID = 0;
 		g_locationFormID = 0;
-		g_queuedState = false;
-		g_queuedPhase = PhaseValue::None;
+		// Do not clear g_queuedState/g_queuedPhase here.
+		// On save load, SKSE serialization queues the saved captive phase first,
+		// then the post-load transient reset runs before ApplyQueuedProgressState().
+		// Clearing the queued values here makes a saved Captive/ReleasedWork game
+		// wake up as Neutral, which breaks Calling Captor with "No Valid target".
+		spdlog::info("[TFD][Captive] ResetForLoad preserving queued captive state state={} phase={} workBoss={:08X} workJob={} workAssign={}",
+			g_queuedState ? 1 : 0,
+			static_cast<int>(g_queuedPhase),
+			g_queuedWorkBossFormID,
+			g_queuedWorkJobType,
+			g_queuedWorkAssignmentState);
 		g_escapeBreakBleedPending = false;
 		g_escapeBreakPreferredAggressor.reset();
 		g_prevLockpickOpen = false;

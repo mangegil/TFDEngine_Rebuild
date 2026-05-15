@@ -5,6 +5,7 @@
 #include "TFDCaptiveGreet.h"
 #include "TFDHostilityController.h"
 #include "TFDInteractionRouter.h"
+#include "TFDLocation.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
 #include "TFDPleasureRuntime.h"
@@ -14,6 +15,7 @@
 #include "TFDVictory.h"
 #include "TFDTame.h"
 #include "TFDActor.h"
+#include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
 
@@ -106,6 +108,9 @@ namespace
     constexpr const char* kCaptiveOutcomeEscapeEvent = "TFDCaptiveOutcomeEscape";
     constexpr const char* kCaptiveOutcomePleasureEvent = "TFDCaptiveOutcomePleasure";
     constexpr const char* kCaptiveOutcomeCancelEvent = "TFDCaptiveOutcomeCancel";
+    constexpr const char* kCaptiveWorkRefreshResourcesEvent = "TFDCaptiveWorkRefreshResources";
+    constexpr const char* kCaptiveWorkNoJobEvent = "TFDCaptiveWorkNoJob";
+    constexpr const char* kCaptiveWorkMiningCompletedEvent = "TFDCaptiveWorkMiningCompleted";
     constexpr const char* kVictoryOutcomeRecruitEvent = "TFDVictoryOutcomeRecruit";
     constexpr const char* kVictoryOutcomeKillEvent = "TFDVictoryOutcomeKill";
     constexpr const char* kVictoryOutcomeLootEvent = "TFDVictoryOutcomeLoot";
@@ -113,6 +118,9 @@ namespace
     constexpr const char* kVictoryOutcomePleasureEvent = "TFDVictoryOutcomePleasure";
     constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
     constexpr const char* kAfterPleasureForceOpenEvent = "TFDAfterPleasureForceOpen";
+    constexpr const char* kPleasureFailedEnterEvent = "TFDPleasureFailedEnter";
+    constexpr const char* kPleasureFailedAggroEvent = "TFDPleasureFailedAggro";
+    constexpr const char* kPleasureFailedStartCombatEvent = "TFDPleasureFailedStartCombat";
     constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
     constexpr const char* kAfterPleasureChoiceRecruitEvent = "TFDAfterPleasureChoiceRecruit";
     constexpr const char* kAfterPleasureChoiceFinishEvent = "TFDAfterPleasureChoiceFinish";
@@ -726,6 +734,63 @@ static RE::Actor* ResolveActorFromEventArg(const std::string_view& arg)
     }
 
     return RE::TESForm::LookupByID<RE::Actor>(static_cast<RE::FormID>(raw));
+}
+
+static RE::TESFaction* ResolveFactionByEditorID(const char* editorId)
+{
+    if (!editorId || !editorId[0]) {
+        return nullptr;
+    }
+    return RE::TESForm::LookupByEditorID<RE::TESFaction>(editorId);
+}
+
+static bool RemoveFactionByEditorID(RE::Actor* actor, const char* editorId, const char* reason)
+{
+    if (!actor || !editorId || !editorId[0]) {
+        return false;
+    }
+
+    auto* faction = ResolveFactionByEditorID(editorId);
+    if (!faction || !actor->IsInFaction(faction)) {
+        return false;
+    }
+
+    actor->RemoveFromFaction(faction);
+    spdlog::info(
+        "[TFD][Flow] actor phase faction removed actor={:08X} faction={} reason={}",
+        actor->GetFormID(),
+        editorId,
+        reason ? reason : "unknown");
+    return true;
+}
+
+static void ClearPleasureFailedFightSpeakerSuppressors(RE::Actor* actor, const char* reason)
+{
+    if (!actor) {
+        return;
+    }
+
+    // 02AA: Pleasure Failed -> Fight is a combat handoff, not a dialogue phase.
+    // TFDAfterPleasureFaction is required for the CK root greet condition, but if it
+    // survives into Fight it is treated by HostilityController as an active dialogue
+    // phase marker and suppresses UpdateCombat/StartCombat. Clear it before rehostile.
+    const bool afterRemoved = RemoveFactionByEditorID(actor, "TFDAfterPleasureFaction", reason);
+
+    // WorkingCaptive should already be cleared by ClearReleasedWorkRuntime(), but clear
+    // it here too as a hard guard before combat handoff.
+    const bool workingRemoved = RemoveFactionByEditorID(actor, "TFDWorkingCaptiveFaction", reason);
+
+    if (afterRemoved || workingRemoved) {
+        actor->AllowPCDialogue(true);
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
+        spdlog::info(
+            "[TFD][Flow] pleasure failed fight suppressors cleared actor={:08X} after={} working={} reason={}",
+            actor->GetFormID(),
+            afterRemoved ? 1 : 0,
+            workingRemoved ? 1 : 0,
+            reason ? reason : "unknown");
+    }
 }
 
 static RE::FormID ResolveActorFormIDFromEventArg(const std::string_view& arg)
@@ -1596,15 +1661,69 @@ namespace TFD::FlowController
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::WorkForEnemy, actorFormID, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::ReleasedWork);
+                TFD::Captive::BeginReleasedWorkRuntime(RE::TESForm::LookupByID<RE::Actor>(actorFormID), reason);
+                (void)TFD::Location::RefreshCaptiveWorkResourceState(true, reason);
+                TFD::Captive::SyncCaptiveWorkResourceAliases(reason);
             }
         }
         else if (name == kCaptiveOutcomeReturnEvent) {
             reason = "mod_event_captive_return";
+
+            // Captive return can be selected from Work Pleasure AfterPleasure.
+            // In that route Papyrus bypasses the generic TFDAfterPleasureChoiceFinish
+            // event so the native PleasureRuntime must be closed here, otherwise
+            // the primary hotkey sees PleasureRuntime::IsActive() and reports
+            // "TFD: Busy" after the player has already returned to Captive.
+            TFD::PleasureRuntime::Break(reason, true, true, true);
+            (void)TFD::FlowController::QueueBridgeModEvent(
+                "TFDSystemEventClearAfterPleasure",
+                nullptr,
+                reason,
+                1.0f);
+
             ok = flow.RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                TFD::Captive::ClearReleasedWorkRuntime(reason);
+                TFD::Location::ClearCaptiveWorkResourceState(reason);
                 if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                     TFD::Captive::SyncPlayerAlias(player, reason);
+                }
+
+                const std::string returnReason{ reason };
+                const auto queueReturnTransition = [actorFormID, returnReason]() {
+                    auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
+                    auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
+
+                    if (!TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
+                        spdlog::warn(
+                            "[TFD][Flow] captive return transition rejected actor={:08X} reason=no_captive_marker source={}",
+                            actorFormID,
+                            returnReason);
+                        return;
+                    }
+
+                    const bool transitioned = TFD::Transition::CompleteCaptiveTransitionNow(returnReason.c_str(), runtimeHandlers, captiveHandlers);
+                    if (transitioned) {
+                        (void)TFD::FlowController::Controller::GetSingleton().RequestCaptive(
+                            actorFormID,
+                            TFD::FlowController::CaptiveMode::Kidnapped,
+                            returnReason);
+                        TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                    }
+
+                    spdlog::info(
+                        "[TFD][Flow] captive return transition actor={:08X} completed={} reason={}",
+                        actorFormID,
+                        transitioned ? 1 : 0,
+                        returnReason);
+                };
+
+                if (auto* task = SKSE::GetTaskInterface()) {
+                    task->AddTask(queueReturnTransition);
+                }
+                else {
+                    queueReturnTransition();
                 }
             }
         }
@@ -1613,6 +1732,8 @@ namespace TFD::FlowController
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Release, actorFormID, reason);
             TFD::Captive::SetRuntimeState(false, TFD::Captive::PhaseValue::None);
+            TFD::Captive::ClearReleasedWorkRuntime(reason);
+            TFD::Location::ClearCaptiveWorkResourceState(reason);
             TFD::HostilityController::ClearAggressionClamp();
             TFD::Actor::Ops::ClearAggressorFactionContext();
             if (ok) {
@@ -1627,6 +1748,8 @@ namespace TFD::FlowController
             ok = EnsureCaptiveRootForOutcome(flow, actorFormID, reason) &&
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Cancel, actorFormID, reason);
             TFD::Captive::SetRuntimeState(false, TFD::Captive::PhaseValue::None);
+            TFD::Captive::ClearReleasedWorkRuntime(reason);
+            TFD::Location::ClearCaptiveWorkResourceState(reason);
             TFD::HostilityController::ClearAggressionClamp();
             TFD::Actor::Ops::ClearAggressorFactionContext();
             if (ok) {
@@ -1642,6 +1765,8 @@ namespace TFD::FlowController
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::EscapeStarted, actorFormID, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Escape);
+                TFD::Captive::ClearReleasedWorkRuntime(reason);
+                TFD::Location::ClearCaptiveWorkResourceState(reason);
                 TFD::HostilityController::ClearAggressionClamp();
                 TFD::Actor::Ops::ClearAggressorFactionContext();
             }
@@ -1652,6 +1777,8 @@ namespace TFD::FlowController
                 flow.RequestResolveCaptiveOutcome(CaptiveOutcome::Pleasure, actorFormID, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Scene);
+                TFD::Captive::ClearReleasedWorkRuntime(reason);
+                TFD::Location::ClearCaptiveWorkResourceState(reason);
                 TFD::HostilityController::TickCaptiveSuppression();
             }
         }
@@ -1681,6 +1808,41 @@ namespace TFD::FlowController
 
         const std::string_view name{ eventName };
         const std::string_view arg = strArg ? std::string_view{ strArg } : std::string_view{};
+
+        if (name == kCaptiveWorkRefreshResourcesEvent) {
+            const std::string reason = arg.empty() ? std::string{ "mod_event_work_refresh" } : std::string{ arg };
+            const bool ok = TFD::Location::RefreshCaptiveWorkResourceState(false, reason.c_str());
+            if (ok) {
+                TFD::Captive::SyncCaptiveWorkResourceAliases(reason.c_str());
+            }
+            spdlog::info("[TFD][Flow] captive work resource refresh event ok={} reason={}", ok ? 1 : 0, reason);
+            return true;
+        }
+
+        if (name == kCaptiveWorkMiningCompletedEvent) {
+            const std::string reason = arg.empty() ? std::string{ "mod_event_work_mining_completed" } : std::string{ arg };
+            const bool marked = TFD::Location::MarkLastCaptiveWorkMiningRefDepleted(reason.c_str());
+            const bool refreshed = TFD::Location::RefreshCaptiveWorkResourceState(true, reason.c_str());
+            if (refreshed) {
+                TFD::Captive::SyncCaptiveWorkResourceAliases(reason.c_str());
+            }
+            spdlog::info(
+                "[TFD][Flow] captive work mining completed event marked={} refreshed={} reason={}",
+                marked ? 1 : 0,
+                refreshed ? 1 : 0,
+                reason);
+            return true;
+        }
+
+        if (name == kCaptiveWorkNoJobEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const double cooldownSec = numArg > 0.0f ? static_cast<double>(numArg) : 10.0;
+            TFD::Captive::HandleReleasedWorkNoJob(actor, cooldownSec, "mod_event_work_no_job");
+            spdlog::info("[TFD][Flow] captive work no-job event actor={:08X} cooldown={:.2f}",
+                actor ? actor->GetFormID() : 0u,
+                cooldownSec);
+            return true;
+        }
 
         if (name == "TFDPreCombatRootGreetRejected") {
             auto* actor = ResolveActorFromEventArg(arg);
@@ -1930,6 +2092,116 @@ namespace TFD::FlowController
                     sourceFlow,
                     actor ? actor->GetFormID() : 0u);
             }
+            return true;
+        }
+
+        if (name == kPleasureFailedEnterEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            if (actor) {
+                TFD::InteractionRouter::DialogueOpen::BeginPleasureFailed(actor);
+                spdlog::info(
+                    "[TFD][Flow] pleasure failed greet armed source={} actor={:08X} reason=no_speaker_climax",
+                    sourceFlow,
+                    actor->GetFormID());
+            }
+            else {
+                spdlog::warn("[TFD][Flow] pleasure failed enter rejected no actor source={} arg={}", sourceFlow, std::string(arg));
+            }
+            return true;
+        }
+
+        if (name == kPleasureFailedAggroEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            auto* player = RE::PlayerCharacter::GetSingleton();
+
+            if (actor) {
+                TFD::DefeatMonitor::SuppressDefeatedEnemyAutoDeathForActor(actor, 24.0, "pleasure_failed_fight_speaker");
+                ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_pre_break");
+            }
+
+            TFD::PleasureRuntime::Break("pleasure_failed_fight", true, true, true);
+            TFD::InteractionRouter::DialogueOpen::Cancel();
+
+            if (actor) {
+                ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_post_cancel");
+            }
+            (void)TFD::FlowController::QueueBridgeModEvent(
+                "TFDSystemEventClearAfterPleasure",
+                actor,
+                "pleasure_failed_fight",
+                1.0f);
+
+            bool truceReleased = false;
+            if (actor) {
+                truceReleased = TFD::HostilityController::ReleaseActiveTruceSessionForActor(
+                    actor,
+                    TFD::HostilityController::ReleaseReason::FightChoice,
+                    false);
+            }
+
+            bool captiveEscapeArmed = false;
+            if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                captiveEscapeArmed = flow.RequestResolveCaptiveOutcome(
+                    TFD::FlowController::CaptiveOutcome::EscapeStarted,
+                    actor->GetFormID(),
+                    "pleasure_failed_fight") || captiveEscapeArmed;
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Escape);
+                TFD::Captive::ClearReleasedWorkRuntime("pleasure_failed_fight");
+                TFD::Location::ClearCaptiveWorkResourceState("pleasure_failed_fight");
+                ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_after_escape_state");
+            }
+
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->runDetection = true;
+                process->ClearCachedFactionFightReactions();
+            }
+
+            bool nativeCombatRefresh = false;
+            if (actor && player) {
+                actor->AllowPCDialogue(true);
+                actor->SetBeenAttacked(true);
+                player->SetBeenAttacked(true);
+                (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+                (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+                if (!actor->IsWeaponDrawn()) {
+                    actor->DrawWeaponMagicHands(true);
+                }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                nativeCombatRefresh = TFD::HostilityController::ForceDetectionAndCombatRefresh(
+                    actor,
+                    player,
+                    TFD::HostilityController::ReleaseReason::FightChoice,
+                    true);
+                if (!nativeCombatRefresh) {
+                    TFD::HostilityController::QueueDetectionAndCombatRefresh(
+                        actor,
+                        player,
+                        TFD::HostilityController::ReleaseReason::FightChoice,
+                        true);
+                }
+                TFD::FlowController::Controller::GetSingleton().NotifyCombatStarted(actor->GetFormID(), "pleasure_failed_fight");
+                TFD::DefeatMonitor::SuppressDefeatedEnemyAutoDeathForActor(actor, 24.0, "pleasure_failed_fight_post_rehostile");
+                ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_post_rehostile");
+            }
+
+            const bool combatQueued = TFD::FlowController::QueueBridgeModEvent(
+                kPleasureFailedStartCombatEvent,
+                actor,
+                "pleasure_failed_fight",
+                static_cast<float>(sourceFlow));
+
+            spdlog::info(
+                "[TFD][Flow] pleasure failed fight actor={:08X} source={} truceReleased={} captiveEscapeArmed={} nativeCombatRefresh={} combatQueued={} reason=no_speaker_climax",
+                actor ? actor->GetFormID() : 0u,
+                sourceFlow,
+                truceReleased ? 1 : 0,
+                captiveEscapeArmed ? 1 : 0,
+                nativeCombatRefresh ? 1 : 0,
+                combatQueued ? 1 : 0);
             return true;
         }
 

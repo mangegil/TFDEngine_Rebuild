@@ -19,6 +19,7 @@
 #include "TFDLocation.h"
 #include "TFDPreCombatGreet.h"
 #include "TFDCaptiveGreet.h"
+#include "TFDCaptive.h"
 #include "TFDInCombat.h"
 #include "TFDInCombatGreet.h"
 #include "TFDBleedout.h"
@@ -109,7 +110,7 @@ static void ResetTransientStateForLoad()
 
 static constexpr std::uint32_t kSerializationID = 'TFDE';
 static constexpr std::uint32_t kProgressRecord = 'TDSP';
-static constexpr std::uint32_t kProgressVersion = 2;
+static constexpr std::uint32_t kProgressVersion = 3;
 static constexpr std::uint32_t kLocationCacheRecord = 'TDLC';
 static constexpr std::uint32_t kLocationCacheVersion = 1;
 
@@ -118,6 +119,14 @@ struct SavedProgressRecord
     std::uint32_t captiveState{ 0 };
     std::uint32_t captivePhase{ 0 };
     std::uint32_t bleedOutState{ 0 };
+
+    // v3: ReleasedWork / WorkForEnemy session restore.
+    // The older save record only knew that the player was in captive phase 3.
+    // It did not remember the boss/global work stage, so loading a Work save
+    // could wake up with Neutral/empty aliases or jump to the wrong objective.
+    std::uint32_t workBossFormID{ 0 };
+    std::uint32_t workJobType{ 0 };
+    std::uint32_t workAssignmentState{ 0 };
 };
 
 static std::atomic_bool gInitDone{ false };
@@ -183,6 +192,9 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
     rec.captiveState = TFD::DefeatMonitor::GetCaptiveStateForSave() ? 1u : 0u;
     rec.captivePhase = TFD::DefeatMonitor::GetCaptivePhaseForSave();
     rec.bleedOutState = TFD::DefeatMonitor::GetBleedOutStateForSave() ? 1u : 0u;
+    rec.workBossFormID = TFD::Captive::GetWorkBossFormIDForSave();
+    rec.workJobType = TFD::Captive::GetWorkJobTypeForSave();
+    rec.workAssignmentState = TFD::Captive::GetWorkAssignmentStateForSave();
 
     if (!intfc->OpenRecord(kProgressRecord, kProgressVersion)) {
         spdlog::error("[TFD] Serialization Save -> OpenRecord failed");
@@ -194,7 +206,13 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
         return;
     }
 
-    spdlog::info("[TFD] Serialization Save -> state={} phase={} bleed={}", rec.captiveState, rec.captivePhase, rec.bleedOutState);
+    spdlog::info("[TFD] Serialization Save -> state={} phase={} bleed={} workBoss={:08X} workJob={} workAssign={}",
+        rec.captiveState,
+        rec.captivePhase,
+        rec.bleedOutState,
+        rec.workBossFormID,
+        rec.workJobType,
+        rec.workAssignmentState);
 
     if (!intfc->OpenRecord(kLocationCacheRecord, kLocationCacheVersion)) {
         spdlog::error("[TFD] Serialization Save -> OpenRecord location cache failed");
@@ -252,7 +270,15 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
 
             TFD::DefeatMonitor::QueueLoadedProgressState(rec.captiveState >= 1u, rec.captivePhase);
             TFD::DefeatMonitor::QueueLoadedBleedOutState(rec.bleedOutState >= 1u);
-            spdlog::info("[TFD] Serialization Load -> state={} phase={} bleed={} version={}", rec.captiveState, rec.captivePhase, rec.bleedOutState, version);
+            TFD::Captive::QueueLoadedWorkSession(rec.workBossFormID, rec.workJobType, rec.workAssignmentState);
+            spdlog::info("[TFD] Serialization Load -> state={} phase={} bleed={} workBoss={:08X} workJob={} workAssign={} version={}",
+                rec.captiveState,
+                rec.captivePhase,
+                rec.bleedOutState,
+                rec.workBossFormID,
+                rec.workJobType,
+                rec.workAssignmentState,
+                version);
             sawProgress = true;
             continue;
         }
