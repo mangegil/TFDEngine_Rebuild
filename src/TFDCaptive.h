@@ -113,7 +113,7 @@ namespace TFD::Captive
 	void SealDoorIfPresent();
 
 	void ResolveQuestRegistry();
-	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref);
+	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref, const char* reason = nullptr);
 	void SyncPlayerAlias(RE::Actor* actor, const char* reason);
 	void SyncStorageDebugAliases(const char* reason);
 	void ClearStorageDebugAliases(const char* reason);
@@ -149,6 +149,10 @@ namespace TFD::Captive
 
 	bool IsCaptorCallCooldownActive(float* remainingSeconds = nullptr);
 	void ClearCaptorCallCooldown();
+
+	void RefreshCaptorApproachAI(RE::Actor* actor, const char* reason);
+	void LogCallingCaptorOwnershipSnapshot(RE::Actor* actor, const char* reason);
+
 	bool BeginCaptorCallHotkey(RE::Actor* player, RE::Actor** outCaptor = nullptr);
 
 	struct ApplyQueuedDefeatProgressHandlers

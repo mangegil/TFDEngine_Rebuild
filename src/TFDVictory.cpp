@@ -361,14 +361,15 @@ namespace TFD::Victory
             return kStateYes;
         }
 
-        if (context.hasEnemies) {
-            if (context.combatContext) {
-                g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
-            }
+        if (context.hasEnemies && context.combatContext) {
+            g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
             return kStateNo;
         }
 
-        const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateNo || previousState == kStateYes;
+        // Standing observed enemies without combat proof are precombat/threat data,
+        // not a committed combat-resolution context.  Do not advertise VictoryState=1
+        // just because an actor can see or warn the player.
+        const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateYes;
 
         if (HasDialogueCapableDefeatedEnemy(kDefeatedDialogueScanRadius)) {
             return kStateYes;

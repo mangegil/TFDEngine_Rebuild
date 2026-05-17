@@ -15,23 +15,37 @@
 
 #include <SKSE/SKSE.h>
 
+#include <RE/A/ActorValues.h>
 #include <RE/L/LockpickingMenu.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <string>
 #include <vector>
+#include <atomic>
+#include <cstring>
+#include <mutex>
 
 namespace TFD::Captive
 {
 	void EnsureCaptiveNavigationContext(RE::Actor* player, const char* reason);
 	void SyncCaptiveNavigationAliases(const char* reason);
+	RE::TESObjectREFR* ResolveBoundEscapeDoor();
 
 	namespace
 	{
 		RE::TESGlobal* g_captiveStateGlobal{ nullptr };
 		RE::TESGlobal* g_workJobTypeGlobal{ nullptr };
 		RE::TESGlobal* g_workAssignmentStateGlobal{ nullptr };
+
+		static constexpr const char* kCaptorApproachReadyEvent = "TFDCaptiveApproachReady";
+		std::atomic_bool g_captorApproachReadySinkInstalled{ false };
+		std::mutex g_captorHandshakeLock;
+		RE::FormID g_pendingCaptorCallActorFormID{ 0 };
+		std::uint32_t g_pendingCaptorCallSerial{ 0 };
+		std::chrono::steady_clock::time_point g_pendingCaptorCallStarted{};
 
 		static RE::TESGlobal* ResolveCaptiveStateGlobal()
 		{
@@ -219,12 +233,12 @@ namespace TFD::Captive
 				const bool hostile = info.hostileToPlayer || a->IsHostileToActor(player);
 				const bool combat = info.inCombat || a->IsInCombat();
 
-				// Calling Captor is a captive-camp request.  A caged player can have
-				// a valid captor directly in front of the cell while LOS is blocked by
-				// bars, doors, furniture, or collision.  Captive-location actors marked
-				// with TFDCaptiveFaction must remain valid even after a save/load where
-				// runtime suppression has not been rebuilt yet.
-				if (!hasCaptiveRole && !isSuppressed && !hasLOS && !hostile && !combat) {
+				// Calling Captor is a captive-camp request.  Do not require or
+				// prioritize LOS here.  Jail bars, furniture, and collision can block
+				// sight even when the selected actor is the correct captor.  Candidate
+				// validity is based on captive role/suppression or hostile combat
+				// context; LOS is diagnostic only.
+				if (!hasCaptiveRole && !isSuppressed && !hostile && !combat) {
 					continue;
 				}
 
@@ -234,9 +248,6 @@ namespace TFD::Captive
 				}
 				if (hasCaptiveRole) {
 					score -= 7000.0f;
-				}
-				if (hasLOS) {
-					score -= 3000.0f;
 				}
 				if (hostile) {
 					score -= 140.0f;
@@ -275,19 +286,102 @@ namespace TFD::Captive
 			return best;
 		}
 
+		static bool QueueDirectBridgeActorEvent(const char* eventName, RE::Actor* actor, const char* reason, float numArg = 0.0f)
+		{
+			if (!eventName || !eventName[0] || !actor) {
+				return false;
+			}
+
+			auto* task = SKSE::GetTaskInterface();
+			if (!task) {
+				return false;
+			}
+
+			const std::string name{ eventName };
+			const std::string sarg{ reason ? reason : "" };
+			const float narg = numArg;
+			const std::uint32_t actorHandle = actor->GetHandle().native_handle();
+			const RE::FormID actorFormID = actor->GetFormID();
+
+			task->AddTask([name, sarg, narg, actorHandle, actorFormID]() {
+				RE::TESForm* outSender = nullptr;
+
+				if (actorHandle != 0) {
+					auto actorSp = RE::Actor::LookupByHandle(actorHandle);
+					outSender = actorSp.get();
+				}
+				if (!outSender && actorFormID != 0) {
+					outSender = RE::TESForm::LookupByID(actorFormID);
+				}
+
+				auto* src = SKSE::GetModCallbackEventSource();
+				if (!src) {
+					spdlog::warn("[TFD][Captive] direct bridge dispatch skipped no callback source event={} actor={:08X}", name, actorFormID);
+					return;
+				}
+
+				SKSE::ModCallbackEvent e(name.c_str(), sarg.c_str(), narg, outSender);
+				src->SendEvent(&e);
+				spdlog::info("[TFD][Captive] direct bridge dispatch event={} actor={:08X} resolved={:08X} reason={}",
+					name,
+					actorFormID,
+					outSender ? outSender->GetFormID() : 0u,
+					sarg);
+				});
+
+			return true;
+		}
+
 		static void SendBridgeAssignActor(const char* eventName, RE::Actor* actor, const char* reason = "")
 		{
 			if (!eventName || !actor) {
 				return;
 			}
 
+			// Calling Captor now follows the PreCombat-style ownership rule:
+			// Papyrus owns alias binding and package warm-up.  Native only sends
+			// the assignment request.  Send both direct-task and queued variants
+			// because earlier fresh-game logs showed direct dispatch could be
+			// missed; TFDCaptiveBridge ignores duplicate active requests.
+			const bool directQueued = QueueDirectBridgeActorEvent(eventName, actor, reason ? reason : "", 0.0f);
+			if (directQueued) {
+				spdlog::info("[TFD][Captive] direct bridge assign queued event={} actor={:08X} reason={} policy=direct_task",
+					eventName,
+					actor->GetFormID(),
+					reason ? reason : "");
+			}
+
+			const bool queued = TFD::FlowController::QueueBridgeModEvent(
+				eventName,
+				actor,
+				reason ? reason : "",
+				0.0f);
+			if (queued) {
+				spdlog::info("[TFD][Captive] queued bridge assign event={} actor={:08X} reason={} policy=queue_fallback",
+					eventName,
+					actor->GetFormID(),
+					reason ? reason : "");
+			}
+
+			if (directQueued || queued) {
+				return;
+			}
+
 			auto* src = SKSE::GetModCallbackEventSource();
 			if (!src) {
+				spdlog::warn("[TFD][Captive] bridge assign failed no callback source event={} actor={:08X} reason={}",
+					eventName,
+					actor->GetFormID(),
+					reason ? reason : "");
 				return;
 			}
 
 			SKSE::ModCallbackEvent e(eventName, reason ? reason : "", 0.0f, actor);
 			src->SendEvent(&e);
+			spdlog::info("[TFD][Captive] direct bridge assign fallback event={} actor={:08X} reason={}",
+				eventName,
+				actor->GetFormID(),
+				reason ? reason : "");
 		}
 
 		static void SendBridgeFormEvent(const char* eventName, RE::TESForm* sender, const char* reason = "", float numArg = 0.0f)
@@ -305,65 +399,31 @@ namespace TFD::Captive
 			src->SendEvent(&e);
 		}
 
+
 		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason);
 		static void ApplyNativeCaptiveLocationRoleFactions(RE::Actor* player, const char* reason, bool force);
 
 		static void ApplyCallCaptorCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
 		{
-			if (!player || !primaryTarget) {
+			(void)player;
+			(void)radius;
+			if (!primaryTarget) {
 				return;
 			}
 
-			const float sweepRadius = (std::max)(radius, (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f));
-			TFD::HostilityController::StopCombatSweep(sweepRadius, true);
-			TFD::HostilityController::ScheduleStopCombatWaves(sweepRadius, true, 10, 120);
-			auto snapshot = TFD::Actor::BuildSnapshot(sweepRadius, false);
-
-			auto* pCell = player->GetParentCell();
-			for (const auto& info : snapshot.actors) {
-				auto* actor = info.get();
-				if (!actor || actor->IsDead() || actor->IsDisabled()) {
-					continue;
-				}
-				if (!actor->Is3DLoaded()) {
-					continue;
-				}
-				if (actor->GetFormID() == player->GetFormID()) {
-					continue;
-				}
-				if (pCell && actor->GetParentCell() != pCell) {
-					continue;
-				}
-				if (actor->GetFormID() != primaryTarget->GetFormID() && !info.hostileToPlayer && !info.inCombat) {
-					continue;
-				}
-
-				if (auto* process = RE::ProcessLists::GetSingleton()) {
-					const bool runDetection = process->runDetection;
-					process->runDetection = false;
-					process->ClearCachedFactionFightReactions();
-					process->StopCombatAndAlarmOnActor(actor, false);
-					process->runDetection = runDetection;
-				}
-				actor->StopCombat();
-				if (actor->IsWeaponDrawn()) {
-					actor->DrawWeaponMagicHands(false);
-				}
-				actor->EvaluatePackage(true, false);
+			// Calling Captor is not a Truce. The captive runtime has already
+			// pacified the active location when the player entered the CaptiveMarker.
+			// Do not run wide stop-combat waves here. Native only requests
+			// Papyrus assignment; Papyrus owns OwnerCaptor binding, package
+			// priming/maintenance, and sends TFDCaptiveApproachReady before
+			// native opens CaptiveGreet.
+			primaryTarget->AllowPCDialogue(true);
+			if (primaryTarget->IsInCombat()) {
+				primaryTarget->StopCombat();
+				primaryTarget->StopAlarmOnActor();
 			}
-
-			// Do not clear the whole captive bridge here.  ClearAll also wipes
-			// CaptiveMarker, EscapeDoor, and LootTarget aliases, which can break
-			// the active captive cycle and recover-item objective.  AssignActor
-			// is allowed to replace only OwnerCaptor.
-			//
-			// TFDCaptiveFaction is a dialogue-condition role for every eligible
-			// actor in the active captive location, not just OwnerCaptor.  CK
-			// dialogue can then distinguish captive-location actors from normal
-			// hostiles while native still owns forcegreet/session routing.
-			ApplyNativeCaptiveLocationRoleFactions(player, "call_captor_hotkey", true);
-			ApplyNativeCaptorRoleFaction(primaryTarget, "call_captor_hotkey_primary");
 			SendBridgeAssignActor("TFDCaptiveAssign", primaryTarget, "call_captor_hotkey");
+			spdlog::info("[TFD][Captive] call captor bridge assign sent actor={:08X} policy=papyrus_approach_owner", primaryTarget->GetFormID());
 		}
 
 		static constexpr int kCaptiveConfiscationInitialDelayMs = 300;
@@ -379,6 +439,144 @@ namespace TFD::Captive
 		static auto Now()
 		{
 			return std::chrono::steady_clock::now();
+		}
+
+		static bool HandleCaptorApproachReady(RE::Actor* actor, const char* reason, float token)
+		{
+			if (!actor) {
+				spdlog::warn("[TFD][Captive][Handshake] ready event ignored: missing actor reason={} token={:.0f}",
+					reason ? reason : "",
+					token);
+				return false;
+			}
+
+			RE::FormID expectedActorFormID = 0;
+			std::uint32_t serial = 0;
+			std::chrono::steady_clock::time_point started{};
+			{
+				std::scoped_lock lock(g_captorHandshakeLock);
+				expectedActorFormID = g_pendingCaptorCallActorFormID;
+				serial = g_pendingCaptorCallSerial;
+				started = g_pendingCaptorCallStarted;
+			}
+
+			const auto actorFormID = actor->GetFormID();
+			const double elapsedMs = started.time_since_epoch().count() != 0
+				? static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Now() - started).count())
+				: -1.0;
+			if (!expectedActorFormID || expectedActorFormID != actorFormID) {
+				spdlog::warn("[TFD][Captive][Handshake] ready event ignored actor={:08X} expected={:08X} serial={} reason={} token={:.0f}",
+					actorFormID,
+					expectedActorFormID,
+					serial,
+					reason ? reason : "",
+					token);
+				return false;
+			}
+
+			if (!IsStandardCaptiveActive()) {
+				spdlog::warn("[TFD][Captive][Handshake] ready event ignored actor={:08X} reason={} token={:.0f} cause=not_standard_captive",
+					actorFormID,
+					reason ? reason : "",
+					token);
+				return false;
+			}
+
+			LogCallingCaptorOwnershipSnapshot(actor, "handshake_ready_before_greet");
+			actor->AllowPCDialogue(true);
+			if (actor->IsInCombat()) {
+				actor->StopCombat();
+			}
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+
+			const bool began = TFD::CaptiveGreet::Begin(actor, "call_captor_package_ready");
+			LogCallingCaptorOwnershipSnapshot(actor, began ? "handshake_after_greet_begin" : "handshake_greet_begin_failed");
+
+			if (began) {
+				{
+					std::scoped_lock lock(g_captorHandshakeLock);
+					if (g_pendingCaptorCallActorFormID == actorFormID) {
+						g_pendingCaptorCallActorFormID = 0;
+					}
+				}
+				spdlog::info("[TFD][Captive][Handshake] ready accepted actor={:08X} serial={} reason={} token={:.0f} elapsedMs={:.0f}",
+					actorFormID,
+					serial,
+					reason ? reason : "",
+					token,
+					elapsedMs);
+			}
+			else {
+				spdlog::warn("[TFD][Captive][Handshake] ready rejected by CaptiveGreet actor={:08X} serial={} reason={} token={:.0f} elapsedMs={:.0f}",
+					actorFormID,
+					serial,
+					reason ? reason : "",
+					token,
+					elapsedMs);
+			}
+
+			return began;
+		}
+
+		class CaptorApproachReadySink final : public RE::BSTEventSink<SKSE::ModCallbackEvent>
+		{
+		public:
+			RE::BSEventNotifyControl ProcessEvent(const SKSE::ModCallbackEvent* ev, RE::BSTEventSource<SKSE::ModCallbackEvent>*) override
+			{
+				if (!ev) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				const auto* rawName = ev->eventName.c_str();
+				if (!rawName || std::strcmp(rawName, kCaptorApproachReadyEvent) != 0) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* actor = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
+				(void)HandleCaptorApproachReady(actor, ev->strArg.c_str(), ev->numArg);
+				return RE::BSEventNotifyControl::kContinue;
+			}
+		};
+
+		CaptorApproachReadySink g_captorApproachReadySink{};
+
+		static void EnsureCaptorApproachReadySinkRegistered()
+		{
+			if (g_captorApproachReadySinkInstalled.load(std::memory_order_acquire)) {
+				return;
+			}
+
+			auto* src = SKSE::GetModCallbackEventSource();
+			if (!src) {
+				spdlog::warn("[TFD][Captive][Handshake] ready sink registration skipped: no callback source");
+				return;
+			}
+
+			src->AddEventSink(&g_captorApproachReadySink);
+			g_captorApproachReadySinkInstalled.store(true, std::memory_order_release);
+			spdlog::info("[TFD][Captive][Handshake] ready sink registered event={}", kCaptorApproachReadyEvent);
+		}
+
+		static void ArmPendingCaptorCallHandshake(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			std::uint32_t serial = 0;
+			{
+				std::scoped_lock lock(g_captorHandshakeLock);
+				g_pendingCaptorCallActorFormID = actor->GetFormID();
+				g_pendingCaptorCallStarted = Now();
+				serial = ++g_pendingCaptorCallSerial;
+			}
+
+			spdlog::info("[TFD][Captive][Handshake] armed actor={:08X} serial={} reason={}",
+				actor->GetFormID(),
+				serial,
+				reason ? reason : "unknown");
 		}
 
 		static constexpr auto kCaptorCallCooldown = std::chrono::milliseconds(5000);
@@ -434,6 +632,7 @@ namespace TFD::Captive
 		RE::ObjectRefHandle g_boundEscapeDoor{};
 		RE::ObjectRefHandle g_lockpickDoorCandidate{};
 		bool g_lockpickDoorWasLocked = false;
+
 
 		bool g_escapeBleedoutActive = false;
 		bool g_recaptureCommitActive = false;
@@ -1271,30 +1470,177 @@ namespace TFD::Captive
 		}
 	}
 
-	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref)
+	void WriteQuestAlias(RE::BGSRefAlias* alias, RE::TESObjectREFR* ref, const char* reason)
 	{
 		ResolveQuestRegistry();
 		if (!g_registry.quest || !alias) {
 			return;
 		}
 
+		const bool isOwnerCaptorAlias = g_registry.bossCaptorAliases[0] && alias == g_registry.bossCaptorAliases[0];
+		auto* beforeRef = isOwnerCaptorAlias ? alias->GetReference() : nullptr;
+
 		RE::ObjectRefHandle handle{};
 		if (ref) {
 			handle = ref->CreateRefHandle();
 		}
 
-		RE::BSWriteLockGuard lock(g_registry.quest->aliasAccessLock);
-		auto it = g_registry.quest->refAliasMap.find(alias->aliasID);
-		if (ref) {
-			if (it != g_registry.quest->refAliasMap.end()) {
-				it->second = handle;
-			} else {
-				g_registry.quest->refAliasMap.insert({ alias->aliasID, handle });
+		{
+			RE::BSWriteLockGuard lock(g_registry.quest->aliasAccessLock);
+			auto it = g_registry.quest->refAliasMap.find(alias->aliasID);
+			if (ref) {
+				if (it != g_registry.quest->refAliasMap.end()) {
+					it->second = handle;
+				} else {
+					g_registry.quest->refAliasMap.insert({ alias->aliasID, handle });
+				}
+			} else if (it != g_registry.quest->refAliasMap.end()) {
+				g_registry.quest->refAliasMap.erase(it);
 			}
-		} else if (it != g_registry.quest->refAliasMap.end()) {
-			g_registry.quest->refAliasMap.erase(it);
+		}
+
+		if (isOwnerCaptorAlias) {
+			auto* afterRef = alias->GetReference();
+			spdlog::info("[TFD][Captive][OwnerCaptorTrace] source=native action={} reason={} before={:08X} after={:08X} requested={:08X}",
+				ref ? "force" : "clear",
+				reason ? reason : "write_quest_alias",
+				beforeRef ? beforeRef->GetFormID() : 0u,
+				afterRef ? afterRef->GetFormID() : 0u,
+				ref ? ref->GetFormID() : 0u);
 		}
 	}
+
+
+
+	static float DistanceSquaredRefs(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
+	{
+		if (!a || !b) {
+			return std::numeric_limits<float>::max();
+		}
+
+		const auto pa = a->GetPosition();
+		const auto pb = b->GetPosition();
+		const float dx = pa.x - pb.x;
+		const float dy = pa.y - pb.y;
+		const float dz = pa.z - pb.z;
+		return (dx * dx) + (dy * dy) + (dz * dz);
+	}
+
+
+	static int ReadDiagnosticGlobal(const char* editorID)
+	{
+		if (!editorID || !editorID[0]) {
+			return -9999;
+		}
+
+		auto* global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID);
+		if (!global) {
+			return -9999;
+		}
+		return static_cast<int>(std::lround(global->value));
+	}
+
+	static RE::TESObjectREFR* ReadAliasRefForDiagnostic(RE::BGSRefAlias* alias)
+	{
+		if (!alias) {
+			return nullptr;
+		}
+
+		return alias->GetReference();
+	}
+
+	static std::uint32_t RefIDForDiagnostic(RE::TESObjectREFR* ref)
+	{
+		return ref ? ref->GetFormID() : 0u;
+	}
+
+	void LogCallingCaptorOwnershipSnapshot(RE::Actor* actor, const char* reason)
+	{
+		ResolveQuestRegistry();
+
+		auto* player = Player();
+		auto* ownerRef = ReadAliasRefForDiagnostic(g_registry.bossCaptorAliases[0]);
+		auto* ownerActor = ownerRef ? ownerRef->As<RE::Actor>() : nullptr;
+		auto* targetRef = player;
+		auto* bossRef = ReadAliasRefForDiagnostic(g_registry.bossAlias);
+		auto* markerRef = ReadAliasRefForDiagnostic(g_registry.captiveMarkerAlias);
+
+		const float playerDist = (actor && player) ? std::sqrt(DistanceSquaredRefs(actor, player)) : -1.0f;
+		const float targetDist = (actor && targetRef) ? std::sqrt(DistanceSquaredRefs(actor, targetRef)) : -1.0f;
+
+		auto* actorCell = actor ? actor->GetParentCell() : nullptr;
+		auto* playerCell = player ? player->GetParentCell() : nullptr;
+		const bool sameCell = actorCell && playerCell && actorCell == playerCell;
+		const bool sameSpace = actor && player && IsActorSameSpace(actor, player);
+		const bool ownerMatches = actor && ownerActor && ownerActor == actor;
+		const bool targetIsPlayer = player && targetRef && targetRef == player;
+		const bool hasCaptiveRole = actor && ActorHasNativeCaptiveRole(actor);
+		const bool suppressed = actor && TFD::HostilityController::IsActorTemporarilySuppressed(actor);
+		const bool canOpenDialogue = actor && TFD::HostilityController::CanOpenDialogue(actor);
+		const bool hostile = actor && player && actor->IsHostileToActor(player);
+
+		spdlog::info(
+			"[TFD][Captive][CallDiag] reason={} actor={:08X} owner={:08X} ownerMatch={} boss={:08X} movementTarget=PlayerRef target={:08X} targetIsPlayer={} marker={:08X} globals[captive={} pre={} in={} defeat={} victory={} dialogue={}] actorState[dead={} disabled={} loaded3d={} ai={} combat={} hostile={} weapon={} suppressed={} captiveRole={} canOpenDialogue={}] dist[player={:.1f} target={:.1f}] cell[actor={:08X} player={:08X} sameCell={} sameSpace={}]",
+			reason ? reason : "unknown",
+			actor ? actor->GetFormID() : 0u,
+			RefIDForDiagnostic(ownerRef),
+			ownerMatches ? 1 : 0,
+			RefIDForDiagnostic(bossRef),
+			RefIDForDiagnostic(targetRef),
+			targetIsPlayer ? 1 : 0,
+			RefIDForDiagnostic(markerRef),
+			ReadDiagnosticGlobal("TFDCaptiveState"),
+			ReadDiagnosticGlobal("TFDPreCombatState"),
+			ReadDiagnosticGlobal("TFDInCombatState"),
+			ReadDiagnosticGlobal("TFDDefeatState"),
+			ReadDiagnosticGlobal("TFDVictoryState"),
+			ReadDiagnosticGlobal("TFDDialogueState"),
+			(actor && actor->IsDead()) ? 1 : 0,
+			(actor && actor->IsDisabled()) ? 1 : 0,
+			(actor && actor->Is3DLoaded()) ? 1 : 0,
+			(actor && actor->IsAIEnabled()) ? 1 : 0,
+			(actor && actor->IsInCombat()) ? 1 : 0,
+			hostile ? 1 : 0,
+			(actor && actor->IsWeaponDrawn()) ? 1 : 0,
+			suppressed ? 1 : 0,
+			hasCaptiveRole ? 1 : 0,
+			canOpenDialogue ? 1 : 0,
+			playerDist,
+			targetDist,
+			actorCell ? actorCell->GetFormID() : 0u,
+			playerCell ? playerCell->GetFormID() : 0u,
+			sameCell ? 1 : 0,
+			sameSpace ? 1 : 0);
+	}
+
+	void RefreshCaptorApproachAI(RE::Actor* actor, const char* reason)
+	{
+		if (!actor || actor->IsDead() || actor->IsDisabled()) {
+			return;
+		}
+
+		if (!actor->IsAIEnabled()) {
+			actor->EnableAI(true);
+		}
+
+		actor->AllowPCDialogue(true);
+		if (actor->IsInCombat()) {
+			actor->StopCombat();
+		}
+		if (actor->IsWeaponDrawn()) {
+			actor->DrawWeaponMagicHands(false);
+		}
+
+		LogCallingCaptorOwnershipSnapshot(actor, reason ? reason : "refresh_before_eval");
+		actor->EvaluatePackage(false, true);
+		LogCallingCaptorOwnershipSnapshot(actor, "refresh_after_eval_soft");
+		actor->EvaluatePackage(true, true);
+		LogCallingCaptorOwnershipSnapshot(actor, "refresh_after_eval_hard");
+		spdlog::info("[TFD][Captive] captor approach package refreshed actor={:08X} movementTarget=PlayerRef reason={}",
+			actor->GetFormID(),
+			reason ? reason : "unknown");
+	}
+
 
 	void SyncPlayerAlias(RE::Actor* actor, const char* reason)
 	{
@@ -1310,7 +1656,7 @@ namespace TFD::Captive
 			return;
 		}
 
-		WriteQuestAlias(g_registry.playerCaptiveAlias, actor);
+		WriteQuestAlias(g_registry.playerCaptiveAlias, actor, reason ? reason : "set_player_captive_alias");
 		spdlog::info("[TFD][Captive] PlayerCaptive alias {} actor={:08X} reason={}",
 			actor ? "assigned" : "cleared",
 			actor ? actor->GetFormID() : 0u,
@@ -1332,9 +1678,21 @@ namespace TFD::Captive
 		};
 
 		assignByFormID(g_registry.bossAlias, hasSnapshot ? snapshot.bossActorFormIDs[0] : 0u);
-		for (std::size_t i = 0; i < g_registry.bossCaptorAliases.size(); ++i) {
-			assignByFormID(g_registry.bossCaptorAliases[i], hasSnapshot ? snapshot.bossActorFormIDs[i] : 0u);
+		LogCallingCaptorOwnershipSnapshot(nullptr, "sync_storage_before_owner_clear");
+
+		// OwnerCaptor is not a passive storage/debug alias.  It drives the
+		// TFDCaptiveApproach package and must stay empty until the player
+		// explicitly uses Calling Captor.  Older code mirrored the location boss
+		// snapshot into bossCaptorAliases[0] (OwnerCaptor), which let Actor A own
+		// the approach package before the hotkey, then Actor B had to steal the
+		// same alias during Calling Captor.  Keep Boss for work/storage diagnostics
+		// and clear OwnerCaptor/BossCaptor slots here so fresh-game ownership starts
+		// from a clean alias.
+		for (auto* alias : g_registry.bossCaptorAliases) {
+			WriteQuestAlias(alias, nullptr, reason ? reason : "sync_storage_owner_clear");
 		}
+		LogCallingCaptorOwnershipSnapshot(nullptr, "sync_storage_after_owner_clear");
+
 		for (std::size_t i = 0; i < g_registry.bossContainerAliases.size(); ++i) {
 			assignByFormID(g_registry.bossContainerAliases[i], hasSnapshot ? snapshot.bossContainerFormIDs[i] : 0u);
 		}
@@ -1343,10 +1701,11 @@ namespace TFD::Captive
 		}
 		assignByFormID(g_registry.lootTargetAlias, hasSnapshot ? snapshot.finalTargetFormID : 0u);
 
-		spdlog::info("[TFD][Captive] debug aliases synced reason={} hasSnapshot={} boss1={:08X} bossContainer1={:08X} container1={:08X} lootTarget={:08X} targetKind={}",
+		spdlog::info("[TFD][Captive] debug aliases synced reason={} hasSnapshot={} boss1={:08X} ownerCaptorCleared={} bossContainer1={:08X} container1={:08X} lootTarget={:08X} targetKind={}",
 			reason ? reason : "unknown",
 			hasSnapshot ? 1 : 0,
 			hasSnapshot ? snapshot.bossActorFormIDs[0] : 0u,
+			g_registry.bossCaptorAliases[0] ? 1 : 0,
 			hasSnapshot ? snapshot.bossContainerFormIDs[0] : 0u,
 			hasSnapshot ? snapshot.containerFormIDs[0] : 0u,
 			hasSnapshot ? snapshot.finalTargetFormID : 0u,
@@ -1361,7 +1720,7 @@ namespace TFD::Captive
 		}
 
 		for (auto* alias : g_registry.bossCaptorAliases) {
-			WriteQuestAlias(alias, nullptr);
+			WriteQuestAlias(alias, nullptr, reason ? reason : "clear_storage_owner_clear");
 		}
 		for (auto* alias : g_registry.bossContainerAliases) {
 			WriteQuestAlias(alias, nullptr);
@@ -2689,20 +3048,30 @@ namespace TFD::Captive
 		}
 
 		EnsureCaptiveNavigationContext(player, "call_captor_hotkey");
+		ApplyNativeCaptiveLocationRoleFactions(player, "call_captor_hotkey_forced_sweep", true);
 
 		auto* captor = PickCaptorSameCellLoaded(player, 12288.0f);
 		if (!captor) {
 			return false;
 		}
 
+		EnsureCaptorApproachReadySinkRegistered();
+		ArmPendingCaptorCallHandshake(captor, "call_captor_hotkey");
+
+		// PreCombat-style handshake:
+		// Native only selects the actor and sends the Papyrus assignment request.
+		// Do NOT seed OwnerCaptor here. TFDCaptiveBridge must clear/rebind the
+		// alias, prime TFDCaptiveApproach, then send TFDCaptiveApproachReady.
+		captor->AllowPCDialogue(true);
+		LogCallingCaptorOwnershipSnapshot(captor, "call_captor_before_papyrus_owner_bind");
 		ApplyCallCaptorCalmBubble(player, captor, 12288.0f);
-		if (!TFD::CaptiveGreet::Begin(captor, "call_captor_hotkey")) {
-			spdlog::warn("[TFD][Captive] Call Captor greet failed actor={:08X}", captor->GetFormID());
-			return false;
-		}
+		LogCallingCaptorOwnershipSnapshot(captor, "call_captor_after_bridge_assign_pending_no_native_owner");
 
 		g_captorCallCooldownUntil = Now() + kCaptorCallCooldown;
-		spdlog::info("[TFD][Captive] Call Captor begin actor={:08X} cooldownMs={} reason=call_captor_hotkey", captor->GetFormID(), static_cast<int>(kCaptorCallCooldown.count()));
+		spdlog::info("[TFD][Captive][Handshake] Call Captor pending actor={:08X} cooldownMs={} reason=call_captor_hotkey policy=papyrus_package_ready_before_greet",
+			captor->GetFormID(),
+			static_cast<int>(kCaptorCallCooldown.count()));
+
 		if (outCaptor) {
 			*outCaptor = captor;
 		}

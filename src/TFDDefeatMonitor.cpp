@@ -1707,14 +1707,26 @@ namespace TFD::DefeatMonitor
 			return TFD::TeammateManager::CollectStandingFollowers(radius);
 		}
 
-		static bool IsVictoryCombatContextActive(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+		static bool IsObservedEnemyTarget(RE::Actor* target, const std::vector<RE::Actor*>& enemies)
+		{
+			if (!target) {
+				return false;
+			}
+
+			for (auto* enemy : enemies) {
+				if (enemy && enemy == target) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		static bool HasRealCombatProof(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
 		{
 			if (!player) {
 				return false;
 			}
-			if (!enemies.empty() || player->IsInCombat()) {
-				return true;
-			}
+
 			auto& flow = TFD::FlowController::Controller::GetSingleton();
 			if (flow.IsCombatOrBleedRootActive()) {
 				return true;
@@ -1722,7 +1734,34 @@ namespace TFD::DefeatMonitor
 			if (flow.IsCaptiveEscapeContextActive()) {
 				return true;
 			}
+
+			// Real combat proof must come from actual combat state or a live combat target.
+			// Observed enemies alone are only threat/precombat data and must not flip
+			// TFDVictoryState/TFDDefeatState to 1.
+			if (player->IsInCombat()) {
+				return true;
+			}
+
+			if (IsObservedEnemyTarget(ResolveCurrentCombatTarget(player), enemies)) {
+				return true;
+			}
+
+			for (auto* enemy : enemies) {
+				if (!enemy) {
+					continue;
+				}
+
+				if (IsActorActivelyTargetingPlayerSideForRouter(enemy, player)) {
+					return true;
+				}
+			}
+
 			return false;
+		}
+
+		static bool IsVictoryCombatContextActive(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+		{
+			return HasRealCombatProof(player, enemies);
 		}
 
 		static bool IsDefeatCombatContextActive(RE::Actor* player, const std::vector<RE::Actor*>& enemies)

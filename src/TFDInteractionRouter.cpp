@@ -1692,8 +1692,10 @@ namespace TFD::InteractionRouter
             constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
             constexpr auto kPreCombatApproachAssistDelay = std::chrono::milliseconds(10000);
             constexpr auto kBleedoutApproachAssistDelay = std::chrono::milliseconds(10000);
+            constexpr auto kCaptiveApproachAssistDelay = std::chrono::milliseconds(10000);
             constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
             constexpr float kPreCombatApproachAssistDistance = 240.0f;
+            constexpr float kCaptiveApproachAssistDistance = 240.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
             constexpr float kInCombatForceGreetMaxDistance = 160.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
@@ -1726,8 +1728,20 @@ namespace TFD::InteractionRouter
 
             PendingState g_pending{};
             RE::TESGlobal* g_dialogueStateGlobal = nullptr;
+            RE::TESGlobal* g_preCombatStateGlobal = nullptr;
+            RE::TESGlobal* g_inCombatStateGlobal = nullptr;
+            RE::TESGlobal* g_captiveStateGlobal = nullptr;
+            RE::TESGlobal* g_defeatStateGlobal = nullptr;
+            RE::TESGlobal* g_victoryStateGlobal = nullptr;
             bool g_loggedDialogueStateMissing = false;
+            bool g_loggedPreCombatStateMissing = false;
+            bool g_loggedInCombatStateMissing = false;
+            bool g_loggedCaptiveStateMissing = false;
+            bool g_loggedDefeatStateMissing = false;
+            bool g_loggedVictoryStateMissing = false;
             std::unordered_map<RE::FormID, Clock::time_point> g_temporaryDialogueCooldownUntil{};
+
+            void SetDialogueStateValue(int value);
 
             const char* ModeName(Mode mode)
             {
@@ -1751,6 +1765,95 @@ namespace TFD::InteractionRouter
                 default:
                     return "None";
                 }
+            }
+
+            RE::TESGlobal* ResolveApproachConditionGlobal(
+                RE::TESGlobal*& cache,
+                const char* editorID,
+                bool& missingLogged)
+            {
+                if (cache) {
+                    return cache;
+                }
+
+                cache = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID);
+                if (!cache && !missingLogged) {
+                    missingLogged = true;
+                    spdlog::warn("[TFD][DialogueOpen] approach condition global {} not found", editorID ? editorID : "<null>");
+                }
+                return cache;
+            }
+
+            void SetApproachConditionGlobal(
+                RE::TESGlobal*& cache,
+                const char* editorID,
+                bool& missingLogged,
+                int value)
+            {
+                auto* global = ResolveApproachConditionGlobal(cache, editorID, missingLogged);
+                if (!global) {
+                    return;
+                }
+
+                const float desired = static_cast<float>(value);
+                if (global->value != desired) {
+                    global->value = desired;
+                }
+            }
+
+            void SyncApproachConditionGlobals(Mode mode, const char* reason)
+            {
+                if (mode != Mode::PreCombatTruce &&
+                    mode != Mode::InCombatTruce &&
+                    mode != Mode::Bleedout &&
+                    mode != Mode::CaptiveMarker &&
+                    mode != Mode::PreCombatFollowup) {
+                    return;
+                }
+
+                int preCombat = 0;
+                int inCombat = 0;
+                int captive = 0;
+                int defeat = 0;
+                int victory = 0;
+
+                switch (mode) {
+                case Mode::PreCombatTruce:
+                case Mode::PreCombatFollowup:
+                    preCombat = 1;
+                    break;
+                case Mode::InCombatTruce:
+                    inCombat = 1;
+                    break;
+                case Mode::CaptiveMarker:
+                    captive = 1;
+                    break;
+                case Mode::Bleedout:
+                    defeat = 2;
+                    break;
+                default:
+                    break;
+                }
+
+                SetApproachConditionGlobal(g_preCombatStateGlobal, "TFDPreCombatState", g_loggedPreCombatStateMissing, preCombat);
+                SetApproachConditionGlobal(g_inCombatStateGlobal, "TFDInCombatState", g_loggedInCombatStateMissing, inCombat);
+                SetApproachConditionGlobal(g_captiveStateGlobal, "TFDCaptiveState", g_loggedCaptiveStateMissing, captive);
+                SetApproachConditionGlobal(g_defeatStateGlobal, "TFDDefeatState", g_loggedDefeatStateMissing, defeat);
+                SetApproachConditionGlobal(g_victoryStateGlobal, "TFDVictoryState", g_loggedVictoryStateMissing, victory);
+
+                // Approach packages and forced dialogue topics can evaluate before the UI menu opens.
+                // Keep TFDDialogueState valid during the pending native-open window.
+                SetDialogueStateValue(1);
+
+                spdlog::info(
+                    "[TFD][DialogueOpen] approach globals synced mode={} pre={} in={} captive={} defeat={} victory={} dialogue=1 reason={}",
+                    ModeName(mode),
+                    preCombat,
+                    inCombat,
+                    captive,
+                    defeat,
+                    victory,
+                    reason ? reason : "unknown");
             }
 
             RE::TESFaction* ResolveAfterPleasureDialogueFaction()
@@ -2115,6 +2218,27 @@ namespace TFD::InteractionRouter
                 return IsForceGreetRangeReady(player, speaker, kCaptiveForceGreetMaxDistanceSq);
             }
 
+
+            bool IsCaptiveApproachReady(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                // Calling Captor is player-target only in this baseline.
+                // No door, marker, or negotiation-boundary route is allowed here.
+                return IsCaptiveForceGreetRangeReady(player, speaker);
+            }
+
+            float CaptiveApproachDisplayDistance(RE::PlayerCharacter* player, RE::Actor* speaker)
+            {
+                if (!player || !speaker) {
+                    return -1.0f;
+                }
+                return std::sqrt(DistanceSquared(player, speaker));
+            }
+
+            float CaptiveApproachTargetDistance()
+            {
+                return kCaptiveForceGreetMaxDistance;
+            }
+
             constexpr const char* kPreCombatCrowdApproachAssistEvent = "TFDTruceApproachAssist";
 
             void SendPreCombatCrowdApproachAssistEvent(RE::Actor* speaker, unsigned movedCount, unsigned crowdMovedCount, unsigned participantCount, const char* reason)
@@ -2403,6 +2527,38 @@ namespace TFD::InteractionRouter
                 return movedCount > 0;
             }
 
+
+            bool AssistCaptiveApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
+            {
+                if (!player || !speaker || speaker == player) {
+                    return false;
+                }
+
+                if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+
+                TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, "dialogue_before_moveto_assist");
+                const bool moved = MoveActorNearPlayerForApproach(
+                    player,
+                    speaker,
+                    0.0f,
+                    kCaptiveApproachAssistDistance,
+                    "captor",
+                    reason,
+                    "CaptiveMarker",
+                    kCaptiveForceGreetMaxDistance);
+
+                TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, moved ? "dialogue_after_moveto_assist_moved" : "dialogue_after_moveto_assist_failed");
+                spdlog::warn(
+                    "[TFD][DialogueOpen][R127] approach assist moveto group mode=CaptiveMarker speaker={:08X} moved={} crowdMoved=0 participants=1 reason={}",
+                    speaker->GetFormID(),
+                    moved ? 1 : 0,
+                    reason ? reason : "unknown");
+
+                return moved;
+            }
+
             std::uint32_t PendingSpeakerFormID()
             {
                 auto sp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
@@ -2552,7 +2708,13 @@ namespace TFD::InteractionRouter
                 // ESP owns the approach AI package through the active Speaker alias.
                 // Native only nudges package evaluation; it must not inject or
                 // overwrite actor packages here.
+                if (g_pending.mode == Mode::CaptiveMarker) {
+                    TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, "dialogue_refresh_before_eval");
+                }
                 speaker->EvaluatePackage(false, true);
+                if (g_pending.mode == Mode::CaptiveMarker) {
+                    TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, "dialogue_refresh_after_eval");
+                }
             }
 
             void PrepareSpeakerForNativeDialogueOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
@@ -2658,14 +2820,22 @@ namespace TFD::InteractionRouter
                     g_pending.nextApproachAssist = now + kPreCombatApproachAssistDelay;
                 } else if (mode == Mode::Bleedout) {
                     g_pending.nextApproachAssist = now + kBleedoutApproachAssistDelay;
+                } else if (mode == Mode::CaptiveMarker) {
+                    g_pending.nextApproachAssist = now + kCaptiveApproachAssistDelay;
                 } else {
                     g_pending.nextApproachAssist = Clock::time_point{};
                 }
                 g_pending.approachAssistUsed = false;
 
                 if (IsApproachPackageMode(mode)) {
+                    SyncApproachConditionGlobals(mode, reason);
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                         RefreshApproachPackage(player, speaker);
+                        if (mode == Mode::CaptiveMarker) {
+                            spdlog::info(
+                                "[TFD][DialogueOpen] captive approach package refresh at begin speaker={:08X} policy=native_maintain_until_bridge",
+                                speaker ? speaker->GetFormID() : 0u);
+                        }
                     }
                 }
                 else if (mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) {
@@ -2807,7 +2977,13 @@ namespace TFD::InteractionRouter
                     g_pending.deadline = now + (g_pending.mode == Mode::Bleedout ?
                         kBleedoutTimeout :
                         (g_pending.mode == Mode::CaptiveMarker ? kCaptiveTimeout : kPreCombatTimeout));
-                    RefreshApproachPackage(player, speaker);
+                    if (g_pending.mode == Mode::CaptiveMarker) {
+                        spdlog::warn(
+                            "[TFD][DialogueOpen][R130] captive approach retry without native package refresh speaker={:08X}; Papyrus bridge owns approach",
+                            speaker->GetFormID());
+                    } else {
+                        RefreshApproachPackage(player, speaker);
+                    }
                     spdlog::warn(
                         "[TFD][DialogueOpen][R130] approach deadline converted to committed approach retry mode={} speaker={:08X} attempts={} requestIssued={}",
                         ModeName(g_pending.mode),
@@ -2848,17 +3024,23 @@ namespace TFD::InteractionRouter
                     rangeReady = IsBleedoutForceGreetRangeReady(player, speaker);
                     targetDist = kBleedoutForceGreetMaxDistance;
                 } else if (captiveMode) {
-                    rangeReady = IsCaptiveForceGreetRangeReady(player, speaker);
-                    targetDist = kCaptiveForceGreetMaxDistance;
+                    rangeReady = IsCaptiveApproachReady(player, speaker);
+                    targetDist = CaptiveApproachTargetDistance();
                 }
 
                 if (!rangeReady) {
-                    const float dist = std::sqrt(DistanceSquared(player, speaker));
+                    const float dist = captiveMode ? CaptiveApproachDisplayDistance(player, speaker) : std::sqrt(DistanceSquared(player, speaker));
                     g_pending.requestIssued = false;
                     g_pending.quietUntil = {};
                     g_pending.nextAttempt = now + kRetryDelay;
                     SyncDialogueStateLocked(dialogueOpen);
-                    RefreshApproachPackage(player, speaker);
+                    if (captiveMode) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen] captive request not confirmed; package refresh skipped because Papyrus bridge owns approach speaker={:08X}",
+                            speaker->GetFormID());
+                    } else {
+                        RefreshApproachPackage(player, speaker);
+                    }
                     spdlog::info(
                         "[TFD][DialogueOpen] request not confirmed; resume range gate mode={} speaker={:08X} dist={:.1f} max={:.1f} attempts={}",
                         ModeName(g_pending.mode),
@@ -2885,19 +3067,25 @@ namespace TFD::InteractionRouter
             const bool needsCaptiveRangeGate =
                 g_pending.mode == Mode::CaptiveMarker &&
                 !g_pending.requestIssued &&
-                !IsCaptiveForceGreetRangeReady(player, speaker);
+                !IsCaptiveApproachReady(player, speaker);
 
             if (needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) {
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
-                if ((needsPreCombatRangeGate || needsBleedoutRangeGate) &&
+                if ((needsPreCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) &&
                     !g_pending.approachAssistUsed &&
                     g_pending.nextApproachAssist.time_since_epoch().count() != 0 &&
                     now >= g_pending.nextApproachAssist) {
-                    g_pending.approachAssistUsed = needsBleedoutRangeGate ?
-                        AssistBleedoutApproach(player, speaker, "range_gate_stuck") :
-                        AssistPreCombatApproach(player, speaker, "range_gate_stuck");
+                    if (needsBleedoutRangeGate) {
+                        g_pending.approachAssistUsed = AssistBleedoutApproach(player, speaker, "range_gate_stuck");
+                    }
+                    else if (needsCaptiveRangeGate) {
+                        g_pending.approachAssistUsed = AssistCaptiveApproach(player, speaker, "range_gate_stuck");
+                    }
+                    else {
+                        g_pending.approachAssistUsed = AssistPreCombatApproach(player, speaker, "range_gate_stuck");
+                    }
                     g_pending.lastApproachRefresh = now;
                     g_pending.lastPackageRefresh = now;
                     g_pending.nextAttempt = now + kRetryDelay;
@@ -2907,29 +3095,31 @@ namespace TFD::InteractionRouter
                 if (g_pending.lastApproachRefresh.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastApproachRefresh) >= kApproachRefreshInterval) {
                     g_pending.lastApproachRefresh = now;
+                    const bool suppressPackageRefresh = false;
                     RefreshApproachPackage(player, speaker);
                     const float targetDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
                         (needsBleedoutRangeGate ?
                             kBleedoutForceGreetMaxDistance :
-                            (needsCaptiveRangeGate ? kCaptiveForceGreetMaxDistance : kPreCombatForceGreetMaxDistance));
+                            (needsCaptiveRangeGate ? CaptiveApproachTargetDistance() : kPreCombatForceGreetMaxDistance));
                     spdlog::info(
-                        "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f}",
+                        "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f} refreshSuppressed={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
-                        std::sqrt(DistanceSquared(player, speaker)),
-                        targetDist);
+                        needsCaptiveRangeGate ? CaptiveApproachDisplayDistance(player, speaker) : std::sqrt(DistanceSquared(player, speaker)),
+                        targetDist,
+                        suppressPackageRefresh ? 1 : 0);
                 }
 
                 if (g_pending.lastRangeGateLog.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastRangeGateLog) >= kPreCombatRangeGateLogInterval) {
                     g_pending.lastRangeGateLog = now;
-                    const float dist = std::sqrt(DistanceSquared(player, speaker));
+                    const float dist = needsCaptiveRangeGate ? CaptiveApproachDisplayDistance(player, speaker) : std::sqrt(DistanceSquared(player, speaker));
                     const float maxDist = needsInCombatRangeGate ?
                         kInCombatForceGreetMaxDistance :
                         (needsBleedoutRangeGate ?
                             kBleedoutForceGreetMaxDistance :
-                            (needsCaptiveRangeGate ? kCaptiveForceGreetMaxDistance : kPreCombatForceGreetMaxDistance));
+                            (needsCaptiveRangeGate ? CaptiveApproachTargetDistance() : kPreCombatForceGreetMaxDistance));
                     spdlog::info(
                         "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} max={:.1f}",
                         ModeName(g_pending.mode),

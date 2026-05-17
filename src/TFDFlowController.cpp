@@ -1800,6 +1800,54 @@ namespace TFD::FlowController
         return true;
     }
 
+    static void QueueInCombatCaptiveTransition(std::uint32_t actorFormID, const char* reason)
+    {
+        if (actorFormID == 0) {
+            spdlog::warn("[TFD][Flow][R93U] incombat captive transition skipped reason=no_actor source={}",
+                reason && reason[0] ? reason : "mod_event_incombat_captive");
+            return;
+        }
+
+        const std::string why = reason && reason[0] ? reason : "mod_event_incombat_captive";
+        auto runTransition = [actorFormID, why]() {
+            auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
+            auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
+
+            if (!TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
+                spdlog::warn(
+                    "[TFD][Flow][R93U] incombat captive transition rejected actor={:08X} reason=no_captive_marker source={}",
+                    actorFormID,
+                    why);
+                return;
+            }
+
+            const bool transitioned = TFD::Transition::CompleteCaptiveTransitionNow(why.c_str(), runtimeHandlers, captiveHandlers);
+            if (transitioned) {
+                (void)TFD::FlowController::Controller::GetSingleton().RequestCaptive(
+                    actorFormID,
+                    TFD::FlowController::CaptiveMode::Kidnapped,
+                    why);
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    TFD::Captive::SyncPlayerAlias(player, why.c_str());
+                }
+            }
+
+            spdlog::info(
+                "[TFD][Flow][R93U] incombat captive transition actor={:08X} completed={} reason={}",
+                actorFormID,
+                transitioned ? 1 : 0,
+                why);
+        };
+
+        if (auto* task = SKSE::GetTaskInterface()) {
+            task->AddTask(runTransition);
+        }
+        else {
+            runTransition();
+        }
+    }
+
     bool HandleOutcomeModEvent(const char* eventName, const char* strArg, float numArg, RE::TESForm* sender)
     {
         if (!eventName || !eventName[0]) {
@@ -2211,16 +2259,31 @@ namespace TFD::FlowController
             auto& flow = TFD::FlowController::Controller::GetSingleton();
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
                 const bool beginAfter = TFD::Bleedout::HandleAfterPleasureEnter(actor, "bleedout_after_pleasure_enter");
-                const bool nativeOpen = (beginAfter || TFD::Bleedout::OwnsCurrentFlow())
-                    ? TFD::BleedoutGreet::BeginAfterPleasure(actor, "bleedout_after_pleasure_enter")
-                    : false;
-                if (beginAfter || nativeOpen) {
+                bool nativeOpen = false;
+                if (beginAfter || TFD::Bleedout::OwnsCurrentFlow()) {
+                    nativeOpen = TFD::BleedoutGreet::BeginAfterPleasure(actor, "bleedout_after_pleasure_enter");
+                }
+
+                // Captive Pleasure can be reached from a Bleedout dialogue while the
+                // actual post-scene owner has already transitioned to Captive.  In
+                // that case the old Bleedout source value is stale; route the hard
+                // open through CaptiveGreet instead of dropping the AfterPleasure.
+                bool captiveFallbackOpen = false;
+                if (!nativeOpen) {
+                    const auto afterBleedAttempt = flow.GetSnapshot();
+                    if (afterBleedAttempt.root == RootFlow::Captive && afterBleedAttempt.sub == SubFlow::CaptiveAfterPleasure) {
+                        captiveFallbackOpen = TFD::CaptiveGreet::BeginAfterPleasure(actor, "bleedout_to_captive_after_pleasure_enter");
+                    }
+                }
+
+                if (beginAfter || nativeOpen || captiveFallbackOpen) {
                     spdlog::info(
-                        "[TFD][Flow][R127] bleedout after pleasure greet armed source={} actor={:08X} flowBegin={} nativeHardOpen={}",
+                        "[TFD][Flow][R127] bleedout after pleasure greet armed source={} actor={:08X} flowBegin={} nativeHardOpen={} captiveFallbackOpen={}",
                         sourceFlow,
                         actor->GetFormID(),
                         beginAfter ? 1 : 0,
-                        nativeOpen ? 1 : 0);
+                        nativeOpen ? 1 : 0,
+                        captiveFallbackOpen ? 1 : 0);
                 }
                 else {
                     spdlog::warn("[TFD][Flow][R127] bleedout after pleasure enter rejected source={} actor={:08X}", sourceFlow, actor ? actor->GetFormID() : 0u);
@@ -2674,18 +2737,24 @@ namespace TFD::FlowController
                 actorFormID = TFD::InCombat::GetPrimaryActorFormID();
             }
             auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
-            TFD::InCombat::OutcomeEventContext context{};
-            context.eventName = "mod_event_captive";
-            context.rawEventName = eventName;
-            context.actor = flowActor;
-            context.actorFormID = actorFormID;
-            context.inCombatState = TFD::InCombat::IsActive();
-            (void)TFD::InCombat::HandleOutcomeCaptiveEvent(context, inCombatOutcomeEventHandlers);
+            TFD::Bleedout::ArmSystemEventOutcomeWindow("mod_event_incombat_captive", 3.0);
+            TFD::InCombat::SetDialogueOutcome(TFD::InCombat::DialogueOutcome::Captive, "mod_event_incombat_captive");
+
             auto& flow = TFD::FlowController::Controller::GetSingleton();
             const bool flowDone = flow.RequestResolveInCombatOutcome(InCombatOutcome::Captive, actorFormID, "mod_event_incombat_captive");
-            const bool truceReleased = flowActor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(flowActor, TFD::HostilityController::ReleaseReason::Generic, false) : false;
+            const bool preserved = flowActor ? TFD::HostilityController::PreserveTruceSessionForFlowHandoff(flowActor, 90.0, "incombat_captive_handoff") : false;
+            const bool truceReleased = flowActor ? TFD::HostilityController::ReleaseActiveTruceSessionForActor(flowActor, TFD::HostilityController::ReleaseReason::FlowHandoff, false) : false;
+            if (flowDone) {
+                QueueInCombatCaptiveTransition(actorFormID, "mod_event_incombat_captive");
+            }
             TFD::InCombat::Complete("mod_event_incombat_captive");
-            spdlog::info("[TFD][Flow][R93T] incombat captive terminal actor={:08X} flowDone={} truceRelease={}", actorFormID, flowDone ? 1 : 0, truceReleased ? 1 : 0);
+            spdlog::info(
+                "[TFD][Flow][R93U] incombat captive terminal actor={:08X} flowDone={} preserved={} truceRelease={} transitionQueued={}",
+                actorFormID,
+                flowDone ? 1 : 0,
+                preserved ? 1 : 0,
+                truceReleased ? 1 : 0,
+                flowDone ? 1 : 0);
             return true;
         }
 

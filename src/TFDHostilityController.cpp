@@ -4351,6 +4351,41 @@ namespace TFD::HostilityController
         const char* why = reason && reason[0] ? reason : "hit_damage_interrupt";
         bool handledAny = false;
 
+        auto& flow = TFD::FlowController::Controller::GetSingleton();
+        const auto snapshot = flow.GetSnapshot();
+        const bool protectTerminalHandoff =
+            snapshot.root == TFD::FlowController::RootFlow::Bleedout ||
+            snapshot.root == TFD::FlowController::RootFlow::Captive ||
+            snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout;
+
+        if (protectTerminalHandoff) {
+            for (RE::FormID sessionId : sessionIds) {
+                auto sessionIt = g_sessions.find(sessionId);
+                if (sessionIt == g_sessions.end() || !IsActiveInCombatTruceSession(sessionIt->second)) {
+                    continue;
+                }
+
+                const auto primaryTargetId = sessionIt->second.primaryTargetId;
+                ReleaseSession(sessionId, ReleaseReason::FlowHandoff);
+                handledAny = true;
+
+                spdlog::warn(
+                    "TFDHostilityController: [R99D] ignore incombat hit interrupt during terminal handoff session={} primary={:08X} target={:08X} cause={:08X} root={} gate={} reason={}",
+                    sessionId,
+                    primaryTargetId,
+                    targetActor ? targetActor->GetFormID() : 0u,
+                    causeActor ? causeActor->GetFormID() : 0u,
+                    TFD::FlowController::Controller::ToString(snapshot.root),
+                    TFD::FlowController::Controller::ToString(snapshot.gate),
+                    why);
+            }
+
+            if (handledAny) {
+                TFD::InCombat::Complete("incombat_hit_damage_interrupt_flow_handoff");
+            }
+            return handledAny;
+        }
+
         // Close open forcegreet/dialogue immediately. Papyrus aliases are cleared by
         // TFDInCombatEmergencyCancel plus the normal unassign events from ReleaseSession.
         TFD::InteractionRouter::DialogueOpen::ForceCloseDialogueMenu(why);
@@ -4368,7 +4403,6 @@ namespace TFD::HostilityController
                 sessionPlayer = player;
             }
 
-            auto& flow = TFD::FlowController::Controller::GetSingleton();
             const bool flowDone = flow.RequestResolveInCombatOutcome(
                 TFD::FlowController::InCombatOutcome::Failed,
                 primaryTargetId,
