@@ -22,6 +22,7 @@
 #include <spdlog/spdlog.h>
 
 #include "EditorIdCache.h"
+#include "TFDCaptive.h"
 
 namespace TFD::Location
 {
@@ -1124,6 +1125,11 @@ namespace TFD::Location
 				auto* actor = actionRef ? actionRef->As<RE::Actor>() : nullptr;
 				if (!activatedRef || !actor) {
 					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				auto* player = RE::PlayerCharacter::GetSingleton();
+				if (player && actor == player) {
+					(void)TFD::Captive::NotifyRecoverGearContainerOpened(activatedRef, "tes_activate_event");
 				}
 
 				(void)MarkCaptiveWorkMineOccupiedByActivation(activatedRef, actor, "tes_activate_event");

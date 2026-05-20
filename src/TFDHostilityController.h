@@ -186,6 +186,19 @@ namespace TFD::HostilityController
     void TickCaptiveSuppression();
     void ResetCaptiveSuppression();
 
+    [[nodiscard]] bool HasVisibleCaptiveCombatWitness(
+        RE::Actor* player,
+        RE::Actor* preferredActor = nullptr,
+        const char* reason = nullptr);
+
+    std::size_t BreakCaptivePassiveForCombat(
+        RE::Actor* player,
+        RE::Actor* triggerActor,
+        ReleaseReason reason = ReleaseReason::PlayerAggression,
+        const char* debugReason = nullptr,
+        bool requireLineOfSightForCrowd = true,
+        bool forceTriggerActor = true);
+
     void ClearAllTemporaryHostility();
 
     struct BleedTruceRuntimeProviders

@@ -1642,6 +1642,19 @@ namespace TFD::FlowController
         return true;
     }
 
+    bool IsCaptiveEscapeGuardActive(TFD::FlowController::Controller& flow)
+    {
+        if (TFD::Captive::IsEscapeActive() || TFD::Captive::HasEscapeBreakRebleedPending() || TFD::Captive::IsEscapeBleedoutActive()) {
+            return true;
+        }
+
+        const auto snapshot = flow.GetSnapshot();
+        return snapshot.root == RootFlow::Captive &&
+            (snapshot.sub == SubFlow::EscapeAttempt ||
+                snapshot.sub == SubFlow::EscapeFailed ||
+                snapshot.sub == SubFlow::Recapture);
+    }
+
     bool HandleCaptiveOutcomeModEvent(std::string_view name, std::string_view arg, RE::TESForm* sender)
     {
         if (name.rfind("TFDCaptiveOutcome", 0) != 0) {
@@ -1681,6 +1694,18 @@ namespace TFD::FlowController
                 reason,
                 1.0f);
 
+            if (IsCaptiveEscapeGuardActive(flow)) {
+                TFD::Captive::ClearReleasedWorkRuntime("captive_return_ignored_escape_active");
+                TFD::Location::ClearCaptiveWorkResourceState("captive_return_ignored_escape_active");
+                spdlog::info(
+                    "[TFD][Flow] captive return ignored because escape is active actor={:08X} sender={:08X} reason={}",
+                    actorFormID,
+                    senderFormID,
+                    reason);
+                return true;
+            }
+
+            TFD::Captive::BeginReturnToCaptiveTransitionGuard(reason, 4.0);
             ok = flow.RequestCaptive(actorFormID, CaptiveMode::Kidnapped, reason);
             if (ok) {
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
@@ -1692,26 +1717,68 @@ namespace TFD::FlowController
 
                 const std::string returnReason{ reason };
                 const auto queueReturnTransition = [actorFormID, returnReason]() {
+                    auto finishReturnGuard = [&returnReason]() {
+                        TFD::Captive::EndReturnToCaptiveTransitionGuard(returnReason.c_str());
+                    };
+
+                    auto& queuedFlow = TFD::FlowController::Controller::GetSingleton();
+                    if (IsCaptiveEscapeGuardActive(queuedFlow)) {
+                        spdlog::info(
+                            "[TFD][Flow] captive return transition aborted actor={:08X} reason=escape_active source={}",
+                            actorFormID,
+                            returnReason);
+                        finishReturnGuard();
+                        return;
+                    }
+
                     auto runtimeHandlers = TFD::Transition::DefeatGlue::BuildTransitionRuntimeHandlers();
                     auto captiveHandlers = TFD::Transition::DefeatGlue::BuildTransitionCaptiveHandlers();
+
+                    if (IsCaptiveEscapeGuardActive(queuedFlow)) {
+                        spdlog::info(
+                            "[TFD][Flow] captive return transition aborted actor={:08X} reason=escape_active_after_handlers source={}",
+                            actorFormID,
+                            returnReason);
+                        finishReturnGuard();
+                        return;
+                    }
 
                     if (!TFD::Transition::ResolveCaptiveMarkerForOutcome(runtimeHandlers)) {
                         spdlog::warn(
                             "[TFD][Flow] captive return transition rejected actor={:08X} reason=no_captive_marker source={}",
                             actorFormID,
                             returnReason);
+                        finishReturnGuard();
+                        return;
+                    }
+
+                    if (IsCaptiveEscapeGuardActive(queuedFlow)) {
+                        spdlog::info(
+                            "[TFD][Flow] captive return transition aborted actor={:08X} reason=escape_active_before_transition source={}",
+                            actorFormID,
+                            returnReason);
+                        finishReturnGuard();
                         return;
                     }
 
                     const bool transitioned = TFD::Transition::CompleteCaptiveTransitionNow(returnReason.c_str(), runtimeHandlers, captiveHandlers);
                     if (transitioned) {
-                        (void)TFD::FlowController::Controller::GetSingleton().RequestCaptive(
-                            actorFormID,
-                            TFD::FlowController::CaptiveMode::Kidnapped,
-                            returnReason);
-                        TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                        if (IsCaptiveEscapeGuardActive(queuedFlow)) {
+                            spdlog::info(
+                                "[TFD][Flow] captive return post-transition captive restore skipped actor={:08X} reason=escape_active source={}",
+                                actorFormID,
+                                returnReason);
+                        }
+                        else {
+                            (void)TFD::FlowController::Controller::GetSingleton().RequestCaptive(
+                                actorFormID,
+                                TFD::FlowController::CaptiveMode::Kidnapped,
+                                returnReason);
+                            TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                        }
                     }
 
+                    finishReturnGuard();
                     spdlog::info(
                         "[TFD][Flow] captive return transition actor={:08X} completed={} reason={}",
                         actorFormID,
@@ -1725,6 +1792,9 @@ namespace TFD::FlowController
                 else {
                     queueReturnTransition();
                 }
+            }
+            else {
+                TFD::Captive::EndReturnToCaptiveTransitionGuard(reason);
             }
         }
         else if (name == kCaptiveOutcomeReleaseEvent) {
@@ -1767,8 +1837,16 @@ namespace TFD::FlowController
                 TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Escape);
                 TFD::Captive::ClearReleasedWorkRuntime(reason);
                 TFD::Location::ClearCaptiveWorkResourceState(reason);
-                TFD::HostilityController::ClearAggressionClamp();
-                TFD::Actor::Ops::ClearAggressorFactionContext();
+
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+                (void)TFD::HostilityController::BreakCaptivePassiveForCombat(
+                    player,
+                    actor,
+                    TFD::HostilityController::ReleaseReason::FightChoice,
+                    reason,
+                    true,
+                    true);
             }
         }
         else if (name == kCaptiveOutcomePleasureEvent) {
@@ -1995,6 +2073,36 @@ namespace TFD::FlowController
             }
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
                 const char* terminalReason = ResolveBleedoutAfterPleasureTerminalReason(name);
+
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                const auto snapshot = flow.GetSnapshot();
+                const bool captiveBleedoutWorkHandoff =
+                    name == kAfterPleasureChoiceWorkEvent &&
+                    (snapshot.root == RootFlow::Captive ||
+                        snapshot.contextRoot == RootFlow::Captive ||
+                        TFD::Captive::IsActive());
+
+                if (captiveBleedoutWorkHandoff) {
+                    const bool completeFlow = flow.RequestCompleteAfterPleasure("captive_bleedout_after_pleasure_work_handoff");
+                    (void)TFD::FlowController::QueueBridgeModEvent(
+                        "TFDSystemEventClearAfterPleasure",
+                        nullptr,
+                        "captive_bleedout_after_pleasure_work_handoff",
+                        1.0f);
+
+                    spdlog::info(
+                        "[TFD][Flow] captive bleedout after pleasure work handoff event={} source={} actor={:08X} complete={} root={} ctx={} sub={} reason={}",
+                        std::string(name),
+                        sourceFlow,
+                        actor->GetFormID(),
+                        completeFlow ? 1 : 0,
+                        Controller::ToString(snapshot.root),
+                        Controller::ToString(snapshot.contextRoot),
+                        Controller::ToString(snapshot.sub),
+                        terminalReason);
+                    return true;
+                }
+
                 const bool cycleQueued = TFD::PleasureRuntime::HasQueuedCycleForConsumedActor(
                     actor,
                     TFD::PleasureRuntime::SourceContext::Bleedout);
@@ -2925,14 +3033,24 @@ namespace TFD::FlowController
         }
 
         auto* actor = ResolveActorFromEventArg(strArg ? std::string_view(strArg) : std::string_view{});
+        const char* reason = name == kPassiveBreakCrimeEvent ? "player_crime" : "player_pickpocket";
         if (!actor) {
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (player && TFD::Captive::GetStateFlag() &&
+                TFD::HostilityController::HasVisibleCaptiveCombatWitness(player, nullptr, reason)) {
+                (void)TFD::Captive::TriggerPlayerAggressionEscape(nullptr, reason);
+                spdlog::info("[TFD][PassiveBreak] event={} handled by visible captive witness reason={} arg=invalid",
+                    std::string(name),
+                    reason);
+                return true;
+            }
+
             spdlog::warn("[TFD][PassiveBreak] event={} ignored reason=invalid_actor arg={}",
                 std::string(name),
                 strArg ? strArg : "");
             return true;
         }
 
-        const char* reason = name == kPassiveBreakCrimeEvent ? "player_crime" : "player_pickpocket";
         (void)HandlePassiveInvalidationAgainstActor(actor, reason, true);
         return true;
     }

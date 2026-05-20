@@ -4989,6 +4989,206 @@ namespace TFD::HostilityController
         g_rehostileRequests.clear();
     }
 
+    namespace
+    {
+        bool IsCaptiveCombatBreakCandidate(RE::Actor* actor, RE::Actor* player, const TFD::Actor::ActorInfo* info)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player) || actor == player) {
+                return false;
+            }
+            if (!actor->Is3DLoaded()) {
+                return false;
+            }
+            if (CaptiveSuppressionInternal::IsPlayerSideOrManagedAlly(actor)) {
+                return false;
+            }
+            if (info && info->playerSide) {
+                return false;
+            }
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
+                return false;
+            }
+
+            const bool hostile = (info && info->hostileToPlayer) || IsEnemyToPlayer(player, actor) || actor->IsHostileToActor(player);
+            const bool suppressed = CaptiveSuppressionInternal::IsSuppressed(actor) || IsSuppressed(actor);
+            const bool phaseMarked = HostilityOverrideFactionInternal::HasOverrideFaction(actor);
+            return hostile || suppressed || phaseMarked;
+        }
+
+        bool ActorHasPlayerLineOfSight(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+            return HasLineOfSightBetween(actor, player);
+        }
+
+        std::vector<RE::Actor*> CollectCaptiveCombatBreakActors(
+            RE::Actor* player,
+            RE::Actor* triggerActor,
+            bool requireLineOfSightForCrowd,
+            bool forceTriggerActor,
+            const char* reason)
+        {
+            std::vector<RE::Actor*> result;
+            if (!IsActorStillValid(player)) {
+                return result;
+            }
+
+            auto addCandidate = [&](RE::Actor* actor, const TFD::Actor::ActorInfo* info, bool fromTrigger) {
+                if (!IsCaptiveCombatBreakCandidate(actor, player, info)) {
+                    return;
+                }
+
+                bool accepted = true;
+                if (requireLineOfSightForCrowd) {
+                    accepted = ActorHasPlayerLineOfSight(actor, player);
+                    if (!accepted && fromTrigger && forceTriggerActor) {
+                        accepted = true;
+                    }
+                }
+
+                if (!accepted) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                if (actorId == 0) {
+                    return;
+                }
+                for (auto* existing : result) {
+                    if (existing && existing->GetFormID() == actorId) {
+                        return;
+                    }
+                }
+                result.push_back(actor);
+            };
+
+            if (triggerActor) {
+                addCandidate(triggerActor, nullptr, true);
+            }
+
+            const float radius = (std::max)(TFD::Settings::GetSweepRadius(), 12000.0f);
+            auto snapshot = TFD::Actor::BuildSnapshot(player, TFD::Actor::ScanOptions{ radius, true });
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                addCandidate(actor, &info, actor && triggerActor && actor->GetFormID() == triggerActor->GetFormID());
+            }
+
+            spdlog::info(
+                "[TFD][HostilityController][CaptiveBreak] collect reason={} trigger={:08X} requireLOS={} forceTrigger={} count={}",
+                reason ? reason : "unknown",
+                triggerActor ? triggerActor->GetFormID() : 0u,
+                requireLineOfSightForCrowd ? 1 : 0,
+                forceTriggerActor ? 1 : 0,
+                static_cast<unsigned int>(result.size()));
+
+            return result;
+        }
+    }
+
+    bool HasVisibleCaptiveCombatWitness(RE::Actor* player, RE::Actor* preferredActor, const char* reason)
+    {
+        if (!IsActorStillValid(player)) {
+            return false;
+        }
+
+        auto actors = CollectCaptiveCombatBreakActors(
+            player,
+            preferredActor,
+            true,
+            false,
+            reason ? reason : "visible_captive_combat_witness");
+        return !actors.empty();
+    }
+
+    std::size_t BreakCaptivePassiveForCombat(
+        RE::Actor* player,
+        RE::Actor* triggerActor,
+        ReleaseReason reason,
+        const char* debugReason,
+        bool requireLineOfSightForCrowd,
+        bool forceTriggerActor)
+    {
+        const char* why = debugReason ? debugReason : ToString(reason);
+        if (!IsActorStillValid(player)) {
+            spdlog::warn("[TFD][HostilityController][CaptiveBreak] rejected reason={} no_player", why);
+            return 0;
+        }
+
+        auto actors = CollectCaptiveCombatBreakActors(
+            player,
+            triggerActor,
+            requireLineOfSightForCrowd,
+            forceTriggerActor,
+            why);
+
+        // This is the hard invariant for Captive/Working/Escape combat breach:
+        // once combat is legitimately triggered, TFD must not leave any actor in
+        // captive pacify/aggression-zero state.  Actors without LOS are only thawed;
+        // actors that see the player are also explicitly re-hostiled below.
+        ResetCaptiveSuppression();
+        ClearAggressionClamp();
+        TFD::Actor::Ops::ClearAggressorFactionContext();
+        CancelPendingWaves();
+        PulseGlobalDetection(why);
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+        }
+
+        std::size_t rehostileCount = 0;
+        const double nowSec = SuppressionNowSec();
+        for (auto* actor : actors) {
+            if (!IsActorStillValid(actor) || actor == player) {
+                continue;
+            }
+
+            actor->AllowPCDialogue(true);
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            if (!actor->IsWeaponDrawn()) {
+                actor->DrawWeaponMagicHands(true);
+            }
+
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+
+            const bool satisfied = ForceRehostile(actor, player, reason, true);
+            if (!satisfied || !actor->IsInCombat()) {
+                QueueRehostileRetry(actor, player, 0, reason, nowSec, true);
+            }
+
+            const bool queued = TFD::FlowController::QueueBridgeModEvent(
+                kInCombatResumeCombatEvent,
+                actor,
+                why,
+                1.0f);
+
+            ++rehostileCount;
+            spdlog::info(
+                "[TFD][HostilityController][CaptiveBreak] rehostile actor={:08X} trigger={:08X} satisfied={} inCombat={} queued={} reason={}",
+                actor->GetFormID(),
+                triggerActor ? triggerActor->GetFormID() : 0u,
+                satisfied ? 1 : 0,
+                actor->IsInCombat() ? 1 : 0,
+                queued ? 1 : 0,
+                why);
+        }
+
+        spdlog::info(
+            "[TFD][HostilityController][CaptiveBreak] complete reason={} trigger={:08X} rehostile={} thawed=1",
+            why,
+            triggerActor ? triggerActor->GetFormID() : 0u,
+            static_cast<unsigned int>(rehostileCount));
+
+        return rehostileCount;
+    }
+
     bool ForceDetectionAndCombatRefresh(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
     {
         return ForceRehostile(actor, player, reason, drawWeapon);

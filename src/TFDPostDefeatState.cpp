@@ -261,11 +261,28 @@ namespace TFD::PostDefeatState
         bool IsBleedoutDecisionRootActive()
         {
             const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
-            return snapshot.root == TFD::FlowController::RootFlow::Bleedout &&
-                snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
-                snapshot.sub == TFD::FlowController::SubFlow::None &&
-                !snapshot.terminalResolved &&
-                snapshot.primaryActorFormID != 0;
+            if (snapshot.gate != TFD::FlowController::DecisionGate::PlayerBleedout ||
+                snapshot.terminalResolved ||
+                snapshot.primaryActorFormID == 0) {
+                return false;
+            }
+
+            if (snapshot.root == TFD::FlowController::RootFlow::Bleedout &&
+                snapshot.sub == TFD::FlowController::SubFlow::None) {
+                return true;
+            }
+
+            // Captive escape failure preserves the Captive root, but it is still a
+            // player-bleedout decision phase.  Keep TFDDefeatState at 2 so the
+            // shared Bleedout greet and its child choices stay condition-valid
+            // while the player is down during Escape/Recapture.
+            if (snapshot.root == TFD::FlowController::RootFlow::Captive &&
+                (snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+                    snapshot.sub == TFD::FlowController::SubFlow::Recapture)) {
+                return true;
+            }
+
+            return false;
         }
 
         void RefreshRecruitGlobalsWhenVictoryReady(int victoryState)

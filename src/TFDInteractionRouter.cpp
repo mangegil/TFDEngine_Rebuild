@@ -2173,7 +2173,7 @@ namespace TFD::InteractionRouter
                     speaker->Is3DLoaded();
             }
 
-            float DistanceSquared(RE::Actor* a, RE::Actor* b)
+            float DistanceSquaredRefs(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
             {
                 if (!a || !b) {
                     return std::numeric_limits<float>::max();
@@ -2185,6 +2185,11 @@ namespace TFD::InteractionRouter
                 const float dy = ap.y - bp.y;
                 const float dz = ap.z - bp.z;
                 return dx * dx + dy * dy + dz * dz;
+            }
+
+            float DistanceSquared(RE::Actor* a, RE::Actor* b)
+            {
+                return DistanceSquaredRefs(a, b);
             }
 
             bool IsForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker, float maxDistanceSq)
@@ -2219,11 +2224,25 @@ namespace TFD::InteractionRouter
             }
 
 
+            RE::TESObjectREFR* ResolveCaptiveApproachTarget(RE::PlayerCharacter* player)
+            {
+                auto* target = TFD::Captive::ResolveCaptorApproachTarget(player);
+                return target ? target : player;
+            }
+
+            const char* CaptiveApproachTargetName(RE::PlayerCharacter* player, RE::TESObjectREFR* target)
+            {
+                return TFD::Captive::GetCaptorApproachTargetName(target, player);
+            }
+
             bool IsCaptiveApproachReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
-                // Calling Captor is player-target only in this baseline.
-                // No door, marker, or negotiation-boundary route is allowed here.
-                return IsCaptiveForceGreetRangeReady(player, speaker);
+                if (!player || !speaker || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+
+                auto* target = ResolveCaptiveApproachTarget(player);
+                return target && DistanceSquaredRefs(speaker, target) <= kCaptiveForceGreetMaxDistanceSq;
             }
 
             float CaptiveApproachDisplayDistance(RE::PlayerCharacter* player, RE::Actor* speaker)
@@ -2231,7 +2250,8 @@ namespace TFD::InteractionRouter
                 if (!player || !speaker) {
                     return -1.0f;
                 }
-                return std::sqrt(DistanceSquared(player, speaker));
+                auto* target = ResolveCaptiveApproachTarget(player);
+                return target ? std::sqrt(DistanceSquaredRefs(speaker, target)) : -1.0f;
             }
 
             float CaptiveApproachTargetDistance()
@@ -2312,17 +2332,19 @@ namespace TFD::InteractionRouter
                 }
             }
 
-            bool MoveActorNearPlayerForApproach(
+            bool MoveActorNearRefForApproach(
                 RE::PlayerCharacter* player,
+                RE::TESObjectREFR* target,
                 RE::Actor* actor,
                 float yawOffset,
                 float distance,
                 const char* role,
                 const char* reason,
                 const char* modeName,
+                const char* targetName,
                 float targetDistanceForLog)
             {
-                if (!player || !actor || actor == player) {
+                if (!target || !actor || actor == player) {
                     return false;
                 }
 
@@ -2330,14 +2352,15 @@ namespace TFD::InteractionRouter
                     return false;
                 }
 
-                const float beforeDist = std::sqrt(DistanceSquared(player, actor));
-                const float yaw = player->GetAngleZ() + yawOffset;
-                RE::NiPoint3 pos = player->GetPosition();
+                const float beforeDist = std::sqrt(DistanceSquaredRefs(actor, target));
+                const float baseYaw = player ? player->GetAngleZ() : target->GetAngleZ();
+                const float yaw = baseYaw + yawOffset;
+                RE::NiPoint3 pos = target->GetPosition();
 
                 pos.x += std::sin(yaw) * distance;
                 pos.y += std::cos(yaw) * distance;
 
-                actor->MoveTo(player);
+                actor->MoveTo(target);
                 actor->SetPosition(pos, true);
 
                 if (!actor->IsAIEnabled()) {
@@ -2350,18 +2373,43 @@ namespace TFD::InteractionRouter
                 }
                 actor->EvaluatePackage(false, true);
 
-                const float afterDist = std::sqrt(DistanceSquared(player, actor));
+                const float afterDist = std::sqrt(DistanceSquaredRefs(actor, target));
                 spdlog::warn(
-                    "[TFD][DialogueOpen][R127] approach assist moveto member mode={} role={} actor={:08X} beforeDist={:.1f} afterDist={:.1f} targetDist={:.1f} reason={}",
+                    "[TFD][DialogueOpen][R127] approach assist moveto member mode={} role={} actor={:08X} targetMode={} target={:08X} beforeDist={:.1f} afterDist={:.1f} targetDist={:.1f} reason={}",
                     modeName ? modeName : "Unknown",
                     role ? role : "member",
                     actor->GetFormID(),
+                    targetName ? targetName : "Reference",
+                    target->GetFormID(),
                     beforeDist,
                     afterDist,
                     targetDistanceForLog,
                     reason ? reason : "unknown");
 
                 return true;
+            }
+
+            bool MoveActorNearPlayerForApproach(
+                RE::PlayerCharacter* player,
+                RE::Actor* actor,
+                float yawOffset,
+                float distance,
+                const char* role,
+                const char* reason,
+                const char* modeName,
+                float targetDistanceForLog)
+            {
+                return MoveActorNearRefForApproach(
+                    player,
+                    player,
+                    actor,
+                    yawOffset,
+                    distance,
+                    role,
+                    reason,
+                    modeName,
+                    "PlayerRef",
+                    targetDistanceForLog);
             }
 
             bool AssistPreCombatApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
@@ -2538,21 +2586,28 @@ namespace TFD::InteractionRouter
                     return false;
                 }
 
+                auto* target = ResolveCaptiveApproachTarget(player);
+                const char* targetName = CaptiveApproachTargetName(player, target);
+
                 TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, "dialogue_before_moveto_assist");
-                const bool moved = MoveActorNearPlayerForApproach(
+                const bool moved = MoveActorNearRefForApproach(
                     player,
+                    target,
                     speaker,
                     0.0f,
                     kCaptiveApproachAssistDistance,
                     "captor",
                     reason,
                     "CaptiveMarker",
+                    targetName,
                     kCaptiveForceGreetMaxDistance);
 
                 TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, moved ? "dialogue_after_moveto_assist_moved" : "dialogue_after_moveto_assist_failed");
                 spdlog::warn(
-                    "[TFD][DialogueOpen][R127] approach assist moveto group mode=CaptiveMarker speaker={:08X} moved={} crowdMoved=0 participants=1 reason={}",
+                    "[TFD][DialogueOpen][R127] approach assist moveto group mode=CaptiveMarker speaker={:08X} targetMode={} target={:08X} moved={} crowdMoved=0 participants=1 reason={}",
                     speaker->GetFormID(),
+                    targetName,
+                    target ? target->GetFormID() : 0u,
                     moved ? 1 : 0,
                     reason ? reason : "unknown");
 
@@ -3227,7 +3282,9 @@ namespace TFD::InteractionRouter
             }
             SyncDialogueStateLocked(IsDialogueOpen());
 
-            const float tryDist = std::sqrt(DistanceSquared(player, speaker));
+            const float tryDist = g_pending.mode == Mode::CaptiveMarker ?
+                CaptiveApproachDisplayDistance(player, speaker) :
+                std::sqrt(DistanceSquared(player, speaker));
             const float tryMaxDist = g_pending.mode == Mode::PreCombatTruce ?
                 kPreCombatForceGreetMaxDistance :
                 (g_pending.mode == Mode::InCombatTruce ?

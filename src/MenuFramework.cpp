@@ -115,6 +115,8 @@ namespace TFDMenu
 		constexpr double kVictoryManualActorCooldownSec = 1.50;
 		constexpr double kVictoryDialogueReadyHoldSec = 4.00;
 
+		static std::atomic_uint64_t gWorkDialogueOpenSerial{ 0 };
+
 		static std::vector<TFD::Tame::ActiveSnapshot> gCreatureTeammateMenuRows{};
 		static double gCreatureTeammateMenuRefreshRealSec = 0.0;
 		static double gCreatureTeammateMenuRefreshGameDays = 0.0;
@@ -188,6 +190,8 @@ namespace TFDMenu
 
 		static void ResolveGlobals();
 		static int GetGlobalValueInt(RE::TESGlobal* g);
+		static void SetGlobalInt(RE::TESGlobal* g, int value);
+		static void ClearInteractionStateValue();
 		static const char* DecodeWorkAssignmentState(int value);
 
 		static RE::TESTopicInfo* ResolveTeammateGreetTopicInfo()
@@ -436,27 +440,173 @@ namespace TFDMenu
 			}
 
 
-			static bool OpenCaptiveWorkDialogueFromActivation(RE::Actor* actor, const char* reason)
+			static void QueueCaptiveWorkDialogueOpen(RE::Actor* actor, RE::TESTopicInfo* topicInfo, bool openReport, const char* reason)
+			{
+				if (!actor || !topicInfo) {
+					spdlog::warn("[TFD][Menu][Work] delayed open skipped actor={:08X} topicInfo={:08X} reason={} action=skip_invalid",
+						actor ? actor->GetFormID() : 0u,
+						topicInfo ? topicInfo->GetFormID() : 0u,
+						reason ? reason : "work_activation_delayed_open");
+					return;
+				}
+
+				const std::uint32_t actorHandle = actor->GetHandle().native_handle();
+				const auto actorFormID = actor->GetFormID();
+				const auto topicFormID = topicInfo->GetFormID();
+				const auto serial = ++gWorkDialogueOpenSerial;
+				const std::string reasonText = reason ? reason : "work_activation_delayed_open";
+
+				spdlog::info("[TFD][Menu][Work] delayed native open queued serial={} actor={:08X} topicInfo={:08X} report={} reason={} action=queue_delayed_explicit_dialogue",
+					serial,
+					actorFormID,
+					topicFormID,
+					openReport ? 1 : 0,
+					reasonText);
+
+				std::thread([actorHandle, actorFormID, topicInfo, topicFormID, openReport, reasonText, serial]() {
+					std::this_thread::sleep_for(std::chrono::milliseconds(120));
+
+					auto* tasks = SKSE::GetTaskInterface();
+					if (!tasks) {
+						spdlog::warn("[TFD][Menu][Work] delayed native open failed serial={} actor={:08X} reason={} action=no_task_interface",
+							serial,
+							actorFormID,
+							reasonText);
+						return;
+					}
+
+					tasks->AddTask([actorHandle, actorFormID, topicInfo, topicFormID, openReport, reasonText, serial]() {
+						auto actorSp = RE::Actor::LookupByHandle(actorHandle);
+						auto* actor = actorSp.get();
+						if (!actor) {
+							spdlog::warn("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} reason={} action=actor_handle_invalid",
+								serial,
+								actorFormID,
+								reasonText);
+							return;
+						}
+
+						if (!TFD::Captive::IsReleasedWorkActive()) {
+							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} reason={} action=work_inactive",
+								serial,
+								actorFormID,
+								reasonText);
+							return;
+						}
+
+						const bool isCurrentBoss = TFD::Captive::IsCurrentWorkBoss(actor);
+						const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
+						if (!isCurrentBoss && !inWorkScope) {
+							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} currentBoss=0 inScope=0 reason={} action=actor_not_work_owned",
+								serial,
+								actorFormID,
+								reasonText);
+							return;
+						}
+
+						if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, isCurrentBoss ? "work_delayed_native_open_current_boss" : "work_delayed_native_open_dialogue_actor")) {
+							actor->SetDialogueWithPlayer(false, false, nullptr);
+							spdlog::info("[TFD][Menu][Work] delayed native open blocked serial={} actor={:08X} currentBoss={} inScope={} reason={} action=prepare_failed",
+								serial,
+								actorFormID,
+								isCurrentBoss ? 1 : 0,
+								inWorkScope ? 1 : 0,
+								reasonText);
+							return;
+						}
+
+						ResolveGlobals();
+						const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
+						if ((!openReport && assignmentState != 1) || (openReport && assignmentState != 3)) {
+							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} assignment={} ({}) report={} reason={} action=assignment_changed",
+								serial,
+								actorFormID,
+								assignmentState,
+								DecodeWorkAssignmentState(assignmentState),
+								openReport ? 1 : 0,
+								reasonText);
+							return;
+						}
+
+						if (!actor->IsAIEnabled()) {
+							actor->EnableAI(true);
+						}
+						actor->AllowPCDialogue(true);
+						actor->StopCombat();
+						if (auto* process = RE::ProcessLists::GetSingleton()) {
+							process->StopCombatAndAlarmOnActor(actor, false);
+						}
+						if (actor->IsWeaponDrawn()) {
+							actor->DrawWeaponMagicHands(false);
+						}
+						actor->EvaluatePackage(false, true);
+						actor->EvaluatePackage(true, true);
+
+						// Work dialogue must not inherit the old Calling Captor/CaptiveMarker
+						// interaction route.  The CK Working GREET requires neutral dialogue
+						// globals, then the explicit INFO opens the correct branch.
+						ClearInteractionStateValue();
+						SetGlobalInt(gDialogueState, 0);
+
+						actor->SetDialogueWithPlayer(false, false, nullptr);
+						const bool opened = actor->SetDialogueWithPlayer(true, true, topicInfo);
+						spdlog::info("[TFD][Menu][Work] delayed native open executed serial={} actor={:08X} opened={} assignment={} ({}) topicInfo={:08X} report={} reason={} interactionCleared=1 dialogueState=0 action=explicit_dialogue_after_activation",
+							serial,
+							actorFormID,
+							opened ? 1 : 0,
+							assignmentState,
+							DecodeWorkAssignmentState(assignmentState),
+							topicFormID,
+							openReport ? 1 : 0,
+							reasonText);
+					});
+				}).detach();
+			}
+
+			enum class WorkActivationResult
+			{
+				kNotHandled,
+				kAllowVanilla,
+				kStop
+			};
+
+			static WorkActivationResult PrepareCaptiveWorkDialogueFromActivation(RE::Actor* actor, const char* reason)
 			{
 				if (!actor || actor == RE::PlayerCharacter::GetSingleton()) {
-					return false;
+					return WorkActivationResult::kNotHandled;
 				}
 				if (!TFD::Captive::IsReleasedWorkActive()) {
-					return false;
+					return WorkActivationResult::kNotHandled;
 				}
 
 				const bool isCurrentBoss = TFD::Captive::IsCurrentWorkBoss(actor);
 				const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
 				if (!isCurrentBoss && !inWorkScope) {
-					return false;
+					return WorkActivationResult::kNotHandled;
 				}
 
-				if (!isCurrentBoss) {
-					actor->SetDialogueWithPlayer(false, false, nullptr);
-					spdlog::info("[TFD][Menu][Work] activate blocked non-boss captive actor={:08X} reason={} action=block_calling_captor_leak",
+				static RE::FormID s_lastWorkActivationActor = 0;
+				static Clock::time_point s_nextWorkActivationOpenAt{};
+				const auto now = Clock::now();
+				if (s_lastWorkActivationActor == actor->GetFormID() && now < s_nextWorkActivationOpenAt) {
+					spdlog::info("[TFD][Menu][Work] activate suppressed duplicate actor={:08X} reason={} action=block_duplicate_vanilla_open",
 						actor->GetFormID(),
 						reason ? reason : "work_activation");
-					return true;
+					return WorkActivationResult::kStop;
+				}
+
+				// Do not promote the clicked actor to WorkBoss here.  WorkBoss owns the
+				// objective marker, so promoting on every activation makes the marker jump
+				// between bandits.  Instead, keep WorkBoss stable and make the clicked
+				// in-scope actor dialogue-valid by applying TFDWorkingCaptiveFaction.
+				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, isCurrentBoss ? "work_activation_current_boss" : "work_activation_dialogue_actor")) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked work actor={:08X} currentBoss={} inScope={} reason={} action=block_calling_captor_leak",
+						actor->GetFormID(),
+						isCurrentBoss ? 1 : 0,
+						inWorkScope ? 1 : 0,
+						reason ? reason : "work_activation");
+					return WorkActivationResult::kStop;
 				}
 
 				ResolveGlobals();
@@ -469,7 +619,7 @@ namespace TFDMenu
 						assignmentState,
 						DecodeWorkAssignmentState(assignmentState),
 						reason ? reason : "work_activation");
-					return true;
+					return WorkActivationResult::kStop;
 				}
 
 				if (assignmentState == 4) {
@@ -479,7 +629,7 @@ namespace TFDMenu
 						assignmentState,
 						DecodeWorkAssignmentState(assignmentState),
 						reason ? reason : "work_activation");
-					return true;
+					return WorkActivationResult::kStop;
 				}
 
 				if (!actor->IsAIEnabled()) {
@@ -496,24 +646,30 @@ namespace TFDMenu
 				actor->EvaluatePackage(false, true);
 				actor->EvaluatePackage(true, true);
 
+				// C32: allowing vanilla activation after preparing the Work speaker can fall
+				// back into the old Captive/Calling Captor route or fail to open the Working
+				// branch at all.  Work activation is controlled again: block vanilla, clear
+				// the stale interaction route, then open the explicit Working/Report GREET
+				// on the SKSE task queue after this input event has returned.
+				s_lastWorkActivationActor = actor->GetFormID();
+				s_nextWorkActivationOpenAt = Clock::now() + std::chrono::milliseconds(900);
+
 				const bool openReport = assignmentState == 3;
 				auto* targetGreetInfo = openReport ? ResolveCaptiveReportGreetTopicInfo() : ResolveCaptiveWorkingGreetTopicInfo();
-				actor->SetDialogueWithPlayer(false, false, nullptr);
-				const bool opened = targetGreetInfo ? actor->SetDialogueWithPlayer(true, true, targetGreetInfo) : false;
-
-				spdlog::info("[TFD][Menu][Work] activate opened {} dialogue boss={:08X} opened={} reason={} assignment={} ({}) topicInfo={:08X} explicit={} action=block_vanilla",
+				ClearInteractionStateValue();
+				SetGlobalInt(gDialogueState, 0);
+				QueueCaptiveWorkDialogueOpen(actor, targetGreetInfo, openReport, reason ? reason : "work_activation_delayed_native_open");
+				spdlog::info("[TFD][Menu][Work] activate queued {} dialogue actor={:08X} currentBoss={} reason={} assignment={} ({}) topicInfo={:08X} explicit={} markerStable=1 interactionCleared=1 dialogueState=0 action=queue_delayed_native_open_block_vanilla",
 					openReport ? "report" : "working",
 					actor->GetFormID(),
-					opened ? 1 : 0,
+					isCurrentBoss ? 1 : 0,
 					reason ? reason : "work_activation",
 					assignmentState,
 					DecodeWorkAssignmentState(assignmentState),
 					targetGreetInfo ? targetGreetInfo->GetFormID() : 0u,
 					targetGreetInfo ? 1 : 0);
 
-				// Return true even if the explicit INFO failed to resolve, because falling
-				// through to vanilla topic selection reopens Calling Captor during Work.
-				return true;
+				return WorkActivationResult::kStop;
 			}
 
 			static bool OpenInCombatTruceDialogueFromActivation(RE::Actor* actor, const char* reason)
@@ -2472,6 +2628,11 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 								!ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
+							auto* initialCrosshairRef = GetCrosshairTargetRef();
+							if (player && initialCrosshairRef && !initialCrosshairRef->As<RE::Actor>()) {
+								(void)TFD::Captive::NotifyRecoverGearContainerOpened(initialCrosshairRef, "keyboard_activate_crosshair");
+							}
+
 							if (player && !TFD::Captive::IsStandardCaptiveActive()) {
 								auto openTeammateDialogue = [&](RE::Actor* teammateTalkTarget, const char* sourceReason) -> bool {
 									if (!teammateTalkTarget) {
@@ -2651,7 +2812,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 								// from containers/chests when a teammate stood beside the player.
 								// If the crosshair has a non-actor activation target, never run TFD's
 								// teammate/Victory scans; let vanilla activation handle that target.
-								auto* crosshairRef = GetCrosshairTargetRef();
+								auto* crosshairRef = initialCrosshairRef ? initialCrosshairRef : GetCrosshairTargetRef();
 								auto* crosshairActor = crosshairRef ? crosshairRef->As<RE::Actor>() : nullptr;
 
 								if (crosshairRef && !crosshairActor) {
@@ -2672,16 +2833,24 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 									else if (OpenAfterPleasureDialogueFromActivation(crosshairActor, "after_pleasure_crosshair_activate_dialogue")) {
 										return RE::BSEventNotifyControl::kStop;
 									}
-									else if (OpenCaptiveWorkDialogueFromActivation(crosshairActor, "work_crosshair_activate_dialogue")) {
-										return RE::BSEventNotifyControl::kStop;
-									}
-									else if (IsInCombatTruceActivationActor(crosshairActor)) {
-										if (OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue")) {
-											return RE::BSEventNotifyControl::kStop;
-										}
-										return RE::BSEventNotifyControl::kContinue;
-									}
 									else {
+										switch (PrepareCaptiveWorkDialogueFromActivation(crosshairActor, "work_crosshair_activate_dialogue")) {
+										case WorkActivationResult::kStop:
+											return RE::BSEventNotifyControl::kStop;
+										case WorkActivationResult::kAllowVanilla:
+											return RE::BSEventNotifyControl::kContinue;
+										case WorkActivationResult::kNotHandled:
+										default:
+											break;
+										}
+
+										if (IsInCombatTruceActivationActor(crosshairActor)) {
+											if (OpenInCombatTruceDialogueFromActivation(crosshairActor, "incombat_crosshair_activate_dialogue")) {
+												return RE::BSEventNotifyControl::kStop;
+											}
+											return RE::BSEventNotifyControl::kContinue;
+										}
+
 										spdlog::info("[TFD][Menu] activate crosshair actor not owned by TFD actor={:08X} action=allow_vanilla_activation",
 											crosshairActor->GetFormID());
 									}

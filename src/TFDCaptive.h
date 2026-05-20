@@ -28,6 +28,7 @@ namespace TFD::Captive
 		RE::BGSRefAlias* playerCaptiveAlias{ nullptr };
 		RE::BGSRefAlias* captiveMarkerAlias{ nullptr };
 		RE::BGSRefAlias* escapeDoorAlias{ nullptr };
+		RE::BGSRefAlias* approachPointAlias{ nullptr };
 		RE::BGSRefAlias* escapeRouteAlias{ nullptr };
 		RE::BGSRefAlias* bossAlias{ nullptr };
 		RE::BGSRefAlias* workMineAlias{ nullptr };
@@ -91,6 +92,8 @@ namespace TFD::Captive
 	bool IsReleasedWorkActive();
 	bool IsCurrentWorkBoss(RE::Actor* actor);
 	bool IsReleasedWorkActorInScope(RE::Actor* actor);
+	bool EnsureReleasedWorkDialogueActor(RE::Actor* actor, const char* reason);
+	bool PromoteReleasedWorkBoss(RE::Actor* actor, const char* reason);
 	RE::Actor* GetCurrentWorkBoss();
 	bool IsCaptivePassiveHoldActive();
 	bool IsEscapeBleedoutActive();
@@ -117,6 +120,9 @@ namespace TFD::Captive
 	void SyncPlayerAlias(RE::Actor* actor, const char* reason);
 	void SyncStorageDebugAliases(const char* reason);
 	void ClearStorageDebugAliases(const char* reason);
+	RE::TESObjectREFR* ResolveRecoverGearLootTarget();
+	bool IsRecoverGearLootTarget(RE::TESObjectREFR* ref);
+	bool NotifyRecoverGearContainerOpened(RE::TESObjectREFR* ref, const char* reason);
 	void BeginReleasedWorkRuntime(RE::Actor* actor, const char* reason);
 	void SyncCaptiveWorkResourceAliases(const char* reason);
 	void ClearCaptiveWorkResourceAliases(const char* reason, bool clearItemAlias = false);
@@ -133,9 +139,16 @@ namespace TFD::Captive
 	void CaptureCurrentLockpickMenuState();
 	void ResetLockpickWatch();
 	RE::TESObjectREFR* ResolveBoundEscapeDoor();
+	RE::TESObjectREFR* ResolveCaptorApproachTarget(RE::Actor* player);
+	const char* GetCaptorApproachTargetName(RE::TESObjectREFR* target, RE::Actor* player);
+	void SyncCaptorApproachPointAlias(RE::Actor* player, const char* reason);
+	void ClearCaptorApproachPointAlias(const char* reason);
 	void BindDoor(RE::TESObjectREFR* door);
 	void ClearEscapeContext();
 	void ArmEscapeContextFromCurrentState(RE::Actor* player);
+	void BeginReturnToCaptiveTransitionGuard(const char* reason, double seconds = 4.0);
+	void EndReturnToCaptiveTransitionGuard(const char* reason);
+	bool IsReturnToCaptiveTransitionGuardActive();
 	bool IsDoorNearMarker(RE::TESObjectREFR* door);
 	RE::TESObjectREFR* ResolveLockpickDoorCandidate(RE::TESObjectREFR* target);
 	bool UpdateLockpickEscapeWatch(const std::function<void(const char*, RE::TESObjectREFR*)>& onEscapeCommit);
