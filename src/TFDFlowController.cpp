@@ -79,6 +79,9 @@ namespace
     static bool g_hasObservedDiagnostic = false;
     static std::chrono::steady_clock::time_point g_lastObservedDiagnosticTick{};
     static std::chrono::steady_clock::time_point g_lastObservedDiagnosticLog{};
+    static bool g_hasStaleInCombatNeutralSince = false;
+    static std::chrono::steady_clock::time_point g_staleInCombatNeutralSince{};
+    static RE::FormID g_staleInCombatNeutralPrimary = 0;
     constexpr auto kObservedDiagnosticTickInterval = std::chrono::milliseconds(500);
     constexpr auto kObservedDiagnosticRepeatInterval = std::chrono::seconds(4);
 
@@ -636,6 +639,74 @@ static bool ShouldAutoEnterObservedVictory(const TFD::FlowController::ObservedMa
 
 static constexpr double kObservedVictoryDialogueReadyHoldSec = 8.0;
 
+static bool IsObservedPrimaryInvalidOrDead(const TFD::FlowController::ObservedMainStateSnapshot& observed)
+{
+    if (observed.flow.primaryActorFormID == 0) {
+        return true;
+    }
+
+    auto* actor = RE::TESForm::LookupByID<RE::Actor>(observed.flow.primaryActorFormID);
+    return !actor || actor->IsDead() || actor->IsDisabled();
+}
+
+static bool AutoCompleteStaleInCombatNeutralIfNeeded(
+    const TFD::FlowController::ObservedMainStateSnapshot& observed,
+    std::chrono::steady_clock::time_point now,
+    std::string_view tickReason)
+{
+    using TFD::FlowController::ObservedMainState;
+    using TFD::FlowController::RootFlow;
+    using TFD::FlowController::SubFlow;
+
+    const bool candidate =
+        observed.flow.root == RootFlow::InCombat &&
+        observed.flow.contextRoot == RootFlow::InCombat &&
+        observed.flow.sub == SubFlow::None &&
+        !observed.flow.terminalResolved &&
+        observed.observed == ObservedMainState::Neutral &&
+        observed.activeHostileCount == 0 &&
+        observed.mutualLosHostileCount == 0 &&
+        observed.defeatedLivingEnemyCount == 0 &&
+        !observed.captiveRuntimeActive &&
+        !observed.playerBleedRuntimeActive;
+
+    if (!candidate) {
+        g_hasStaleInCombatNeutralSince = false;
+        g_staleInCombatNeutralPrimary = 0;
+        return false;
+    }
+
+    const auto primary = observed.flow.primaryActorFormID;
+    if (!g_hasStaleInCombatNeutralSince || g_staleInCombatNeutralPrimary != primary) {
+        g_hasStaleInCombatNeutralSince = true;
+        g_staleInCombatNeutralSince = now;
+        g_staleInCombatNeutralPrimary = primary;
+        return false;
+    }
+
+    const bool primaryInvalid = IsObservedPrimaryInvalidOrDead(observed);
+    const auto hold = primaryInvalid ? std::chrono::seconds(1) : std::chrono::seconds(6);
+    if ((now - g_staleInCombatNeutralSince) < hold) {
+        return false;
+    }
+
+    spdlog::info(
+        "[TFD][Flow][W52] auto complete stale InCombat neutral primary={:08X} primaryInvalid={} reason={} tickReason={} globals(in={} defeat={} victory={})",
+        primary,
+        primaryInvalid ? 1 : 0,
+        primaryInvalid ? "primary_invalid_or_dead" : "no_active_hostiles",
+        tickReason.empty() ? std::string{ "-" } : std::string{ tickReason },
+        observed.inCombatGlobal,
+        observed.defeatGlobal,
+        observed.victoryGlobal);
+
+    TFD::FlowController::Controller::GetSingleton().ResetRuntime(
+        primaryInvalid ? "stale_incombat_primary_dead_neutral" : "stale_incombat_no_active_hostiles_neutral");
+    g_hasStaleInCombatNeutralSince = false;
+    g_staleInCombatNeutralPrimary = 0;
+    return true;
+}
+
 static void AutoEnterObservedVictoryIfNeeded(const TFD::FlowController::ObservedMainStateSnapshot& observed, std::string_view tickReason)
 {
     if (!ShouldAutoEnterObservedVictory(observed)) {
@@ -770,25 +841,62 @@ static void ClearPleasureFailedFightSpeakerSuppressors(RE::Actor* actor, const c
         return;
     }
 
-    // 02AA: Pleasure Failed -> Fight is a combat handoff, not a dialogue phase.
-    // TFDAfterPleasureFaction is required for the CK root greet condition, but if it
-    // survives into Fight it is treated by HostilityController as an active dialogue
-    // phase marker and suppresses UpdateCombat/StartCombat. Clear it before rehostile.
-    const bool afterRemoved = RemoveFactionByEditorID(actor, "TFDAfterPleasureFaction", reason);
+    // W52: Pleasure Failed -> Fight is an explicit combat handoff.  It must not
+    // keep any dialogue/pacify/phase faction from Truce, Bleedout, Captive,
+    // AfterPleasure, or temporary release grace.  Keeping even one of these can
+    // make the actor rehostile but unable to draw/attack, producing the fast
+    // draw/sheath loop reported in testing.
+    const char* passiveFactionEditorIDs[] = {
+        "TFDAfterPleasureFaction",
+        "TFDWorkingCaptiveFaction",
+        "TFDPacifyFaction",
+        "TFDPreCombatTruceFaction",
+        "TFDInCombatTruceFaction",
+        "TFDBleedOutFaction",
+        "TFDBleedoutFaction",
+        "TFDCaptiveFaction",
+        "TFDPleasureRejectFaction",
+        "TFDDesireFaction"
+    };
 
-    // WorkingCaptive should already be cleared by ClearReleasedWorkRuntime(), but clear
-    // it here too as a hard guard before combat handoff.
-    const bool workingRemoved = RemoveFactionByEditorID(actor, "TFDWorkingCaptiveFaction", reason);
+    std::vector<std::string> removedNames{};
+    removedNames.reserve(sizeof(passiveFactionEditorIDs) / sizeof(passiveFactionEditorIDs[0]));
+    for (const char* editorID : passiveFactionEditorIDs) {
+        if (RemoveFactionByEditorID(actor, editorID, reason)) {
+            removedNames.emplace_back(editorID ? editorID : "<null>");
+        }
+    }
 
-    if (afterRemoved || workingRemoved) {
-        actor->AllowPCDialogue(true);
-        actor->EvaluatePackage(false, true);
-        actor->EvaluatePackage(true, true);
+    TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnly(actor, reason ? reason : "pleasure_failed_fight_clear_grace");
+    TFD::Bleedout::ClearBleedoutDialogueFactionForActor(actor, reason ? reason : "pleasure_failed_fight_clear_bleedout_dialogue");
+
+    if (auto* process = RE::ProcessLists::GetSingleton()) {
+        process->ClearCachedFactionFightReactions();
+        process->runDetection = true;
+    }
+
+    actor->AllowPCDialogue(true);
+    actor->EvaluatePackage(false, true);
+    actor->EvaluatePackage(true, true);
+
+    if (!removedNames.empty()) {
+        std::ostringstream ss;
+        for (std::size_t i = 0; i < removedNames.size(); ++i) {
+            if (i > 0) {
+                ss << ',';
+            }
+            ss << removedNames[i];
+        }
         spdlog::info(
-            "[TFD][Flow] pleasure failed fight suppressors cleared actor={:08X} after={} working={} reason={}",
+            "[TFD][Flow][W52] pleasure failed fight passive suppressors cleared actor={:08X} removed={} reason={}",
             actor->GetFormID(),
-            afterRemoved ? 1 : 0,
-            workingRemoved ? 1 : 0,
+            ss.str(),
+            reason ? reason : "unknown");
+    }
+    else {
+        spdlog::info(
+            "[TFD][Flow][W52] pleasure failed fight passive suppressors checked actor={:08X} removed=none reason={}",
+            actor->GetFormID(),
             reason ? reason : "unknown");
     }
 }
@@ -1142,16 +1250,20 @@ namespace TFD::FlowController
         ResolveGlobal(g_captiveState, "TFDCaptiveState");
         ResolveGlobal(g_pleasureState, "TFDPleasureState");
         ResolveGlobal(g_defeatState, "TFDDefeatState");
+        ResolveGlobal(g_victoryState, "TFDVictoryState");
 
         const int preCombat = (_snapshot.root == RootFlow::PreCombat) ? 1 : 0;
 
-        // R132: a Bleedout crowd continuation after AfterPleasure is a
-        // source-owned Bleedout decision, even though the player may already
-        // be physically standing after the OStim handoff/recovery.  The Bleedout
-        // root and child topics depend on the defeat globals matching the
-        // Bleedout decision context.  Without this override the native opener
-        // can fire the root line, but the choice stack closes immediately
-        // because TFDDefeatState has drifted back to the standing value.
+        const auto runtimePhase = TFD::PleasureRuntime::GetPhase();
+        const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
+        const bool pleasureFailedDialogue = TFD::PleasureRuntime::IsPleasureFailedDialogueActive();
+
+        // R134: FlowController owns the dialogue-facing root mirrors whenever a
+        // flow transition is committed.  Do not preserve TFDDefeatState=2 just
+        // because a previous Bleedout dialogue wrote it.  That stale value wins
+        // over InCombat/Victory/PreCombat in HUD and CK conditions and can keep
+        // the system looking like it is still in Defeat after Pleasure/Captive/
+        // Release outcomes have already committed.
         const bool captiveEscapeBleedoutDecisionRoot =
             _snapshot.root == RootFlow::Captive &&
             _snapshot.gate == DecisionGate::PlayerBleedout &&
@@ -1161,20 +1273,46 @@ namespace TFD::FlowController
             ((_snapshot.root == RootFlow::Bleedout && _snapshot.sub == SubFlow::None) || captiveEscapeBleedoutDecisionRoot) &&
             _snapshot.gate == DecisionGate::PlayerBleedout &&
             !_snapshot.terminalResolved;
+        const bool bleedoutPleasureLock =
+            runtimeSource == TFD::PleasureRuntime::SourceContext::Bleedout &&
+            (runtimePhase == TFD::PleasureRuntime::Phase::PleasureStartPending ||
+                runtimePhase == TFD::PleasureRuntime::Phase::PleasureActive ||
+                runtimePhase == TFD::PleasureRuntime::Phase::PleasureEnding);
 
         const int observedDefeat = g_defeatState ? static_cast<int>(std::lround(g_defeatState->value)) : 0;
-        const int defeat = bleedoutDecisionRoot ? 2 : observedDefeat;
+        int defeat = observedDefeat;
+        if (bleedoutDecisionRoot || bleedoutPleasureLock) {
+            defeat = 2;
+        }
+        else if (defeat >= 2) {
+            defeat = 0;
+        }
 
-        const auto runtimePhase = TFD::PleasureRuntime::GetPhase();
-        const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
+        if (observedDefeat >= 2 && defeat == 0) {
+            spdlog::info(
+                "[TFD][Flow][R134] scrub stale Defeat global old={} root={} ctx={} gate={} sub={} terminal={} primary={:08X}",
+                observedDefeat,
+                ToString(_snapshot.root),
+                ToString(_snapshot.contextRoot),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.terminalResolved ? 1 : 0,
+                _snapshot.primaryActorFormID);
+        }
+
         const bool bleedoutAfterPleasure =
             runtimeSource == TFD::PleasureRuntime::SourceContext::Bleedout &&
             (runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest ||
                 runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue ||
-                runtimePhase == TFD::PleasureRuntime::Phase::Finalizing);
+                runtimePhase == TFD::PleasureRuntime::Phase::Finalizing ||
+                pleasureFailedDialogue);
 
-        int inCombat = (defeat == 2) ? 0 : (_combatActive ? 1 : 0);
-        if (_snapshot.sub == SubFlow::BleedoutAfterPleasure || bleedoutAfterPleasure) {
+        const bool captiveReleasedWork =
+            _snapshot.root == RootFlow::Captive &&
+            (_snapshot.sub == SubFlow::WorkForEnemy || TFD::Captive::IsReleasedWorkActive());
+
+        int inCombat = (defeat >= 2) ? 0 : (_combatActive ? 1 : 0);
+        if (_snapshot.sub == SubFlow::BleedoutAfterPleasure || bleedoutAfterPleasure || pleasureFailedDialogue || captiveReleasedWork) {
             inCombat = 0;
         }
 
@@ -1187,7 +1325,8 @@ namespace TFD::FlowController
 
             if (captiveEscapeSub && !_snapshot.terminalResolved) {
                 captive = 2;
-            } else {
+            }
+            else {
                 captive = static_cast<int>(TFD::Captive::GetPhaseRaw());
                 if (captive <= 0) {
                     captive = 1;
@@ -1197,7 +1336,13 @@ namespace TFD::FlowController
 
         int pleasure = 0;
         if (TFD::PleasureRuntime::IsActive()) {
-            switch (TFD::PleasureRuntime::GetPhase()) {
+            if (pleasureFailedDialogue) {
+                // R137: Pleasure Failed is its own dialogue condition state.
+                // Do not collapse it to generic AfterPleasure=2, otherwise CK
+                // child topics can fail while the native opener keeps reopening.
+                pleasure = 3;
+            }
+            else switch (TFD::PleasureRuntime::GetPhase()) {
             case TFD::PleasureRuntime::Phase::PleasureStartPending:
             case TFD::PleasureRuntime::Phase::PleasureActive:
             case TFD::PleasureRuntime::Phase::PleasureEnding:
@@ -1234,13 +1379,33 @@ namespace TFD::FlowController
             }
         }
 
+        const int observedVictory = g_victoryState ? static_cast<int>(std::lround(g_victoryState->value)) : 0;
+        int victory = observedVictory;
+        if (_snapshot.root == RootFlow::Victory) {
+            victory = 2;
+        }
+        else if (victory >= 2) {
+            victory = 0;
+        }
+
+        if (observedVictory >= 2 && victory == 0) {
+            spdlog::info(
+                "[TFD][Flow][R134] scrub stale Victory global old={} root={} ctx={} gate={} sub={} terminal={} primary={:08X}",
+                observedVictory,
+                ToString(_snapshot.root),
+                ToString(_snapshot.contextRoot),
+                ToString(_snapshot.gate),
+                ToString(_snapshot.sub),
+                _snapshot.terminalResolved ? 1 : 0,
+                _snapshot.primaryActorFormID);
+        }
+
         SetGlobalInt(g_preCombatState, preCombat);
         SetGlobalInt(g_inCombatState, inCombat);
         SetGlobalInt(g_captiveState, captive);
         SetGlobalInt(g_pleasureState, pleasure);
-        if (bleedoutDecisionRoot) {
-            SetGlobalInt(g_defeatState, defeat);
-        }
+        SetGlobalInt(g_defeatState, defeat);
+        SetGlobalInt(g_victoryState, victory);
     }
 
     Controller& Controller::GetSingleton()
@@ -1655,6 +1820,39 @@ namespace TFD::FlowController
                 snapshot.sub == SubFlow::Recapture);
     }
 
+    bool IsCaptiveOwnedPleasureFailure(
+        TFD::FlowController::Controller& flow,
+        const TFD::FlowController::Snapshot& snapshot,
+        int reportedSourceFlow)
+    {
+        if (reportedSourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
+            return true;
+        }
+
+        if (TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Captive) {
+            return true;
+        }
+
+        if (IsCaptiveEscapeGuardActive(flow)) {
+            return true;
+        }
+
+        if (snapshot.root != RootFlow::Captive && snapshot.contextRoot != RootFlow::Captive) {
+            return false;
+        }
+
+        switch (snapshot.sub) {
+        case SubFlow::CaptivePleasure:
+        case SubFlow::CaptiveAfterPleasure:
+        case SubFlow::EscapeAttempt:
+        case SubFlow::EscapeFailed:
+        case SubFlow::Recapture:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     bool HandleCaptiveOutcomeModEvent(std::string_view name, std::string_view arg, RE::TESForm* sender)
     {
         if (name.rfind("TFDCaptiveOutcome", 0) != 0) {
@@ -1719,7 +1917,7 @@ namespace TFD::FlowController
                 const auto queueReturnTransition = [actorFormID, returnReason]() {
                     auto finishReturnGuard = [&returnReason]() {
                         TFD::Captive::EndReturnToCaptiveTransitionGuard(returnReason.c_str());
-                    };
+                        };
 
                     auto& queuedFlow = TFD::FlowController::Controller::GetSingleton();
                     if (IsCaptiveEscapeGuardActive(queuedFlow)) {
@@ -1784,7 +1982,7 @@ namespace TFD::FlowController
                         actorFormID,
                         transitioned ? 1 : 0,
                         returnReason);
-                };
+                    };
 
                 if (auto* task = SKSE::GetTaskInterface()) {
                     task->AddTask(queueReturnTransition);
@@ -1916,7 +2114,7 @@ namespace TFD::FlowController
                 actorFormID,
                 transitioned ? 1 : 0,
                 why);
-        };
+            };
 
         if (auto* task = SKSE::GetTaskInterface()) {
             task->AddTask(runTransition);
@@ -2013,8 +2211,10 @@ namespace TFD::FlowController
         if (IsAfterPleasureTerminalChoiceEvent(name)) {
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto snapshot = flow.GetSnapshot();
+
             if (actor && IsInCombatSource(sourceFlow)) {
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
                 const auto releaseReason = ResolveInCombatTerminalReleaseReason(name);
                 const char* terminalReason = ResolveInCombatTerminalReason(name);
                 const bool cycleQueued = TFD::PleasureRuntime::HasQueuedCycleForConsumedActor(
@@ -2071,11 +2271,93 @@ namespace TFD::FlowController
                     TFD::HostilityController::ToString(releaseReason));
                 return true;
             }
+
+            const bool returnToCaptive =
+                name == kAfterPleasureChoiceFinishEvent ||
+                name == kAfterPleasureChoiceKidnapEvent;
+            const bool sourceIsCaptive =
+                sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive) ||
+                TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Captive ||
+                snapshot.root == RootFlow::Captive ||
+                snapshot.contextRoot == RootFlow::Captive ||
+                snapshot.sub == SubFlow::CaptivePleasure ||
+                snapshot.sub == SubFlow::CaptiveAfterPleasure ||
+                TFD::Captive::IsEscapeBleedoutActive();
+
+            // C33: Papyrus can report source=Bleedout for Captive escape-bleedout
+            // AfterPleasure. The native pleasure runtime and flow snapshot still own
+            // that chain as Captive, so resolve Captive return/recapture before the
+            // generic Bleedout terminal branch can neutralize it.
+            if (sourceIsCaptive && returnToCaptive) {
+                auto* captiveActor = actor ? actor : TFD::PleasureRuntime::GetPrimarySpeaker();
+                const char* terminalReason = name == kAfterPleasureChoiceKidnapEvent
+                    ? "captive_after_pleasure_return"
+                    : "captive_after_pleasure_finish";
+
+                // If Pleasure was chosen from Captive EscapeFailed bleedout,
+                // AfterPleasure terminal must finish the recapture commit, not
+                // merely restore CaptiveIdle. Otherwise the bleedout/escape FSM
+                // remains armed and the loot stash objective is not reopened for
+                // the recapture cycle.
+                if (TFD::Captive::IsEscapeBleedoutActive()) {
+                    const bool recaptured = TFD::Captive::CommitRecapture(captiveActor, terminalReason);
+                    (void)TFD::FlowController::QueueBridgeModEvent(
+                        "TFDSystemEventClearAfterPleasure",
+                        nullptr,
+                        "captive_after_pleasure_recapture",
+                        1.0f);
+                    spdlog::info(
+                        "[TFD][Flow][C33] captive escape-bleedout after pleasure terminal event={} reportedSource={} runtimeSource={} actor={:08X} recaptured={} root={} ctx={} sub={} reason={}",
+                        std::string(name),
+                        sourceFlow,
+                        TFD::PleasureRuntime::GetSourceContextName(),
+                        captiveActor ? captiveActor->GetFormID() : 0u,
+                        recaptured ? 1 : 0,
+                        Controller::ToString(snapshot.root),
+                        Controller::ToString(snapshot.contextRoot),
+                        Controller::ToString(snapshot.sub),
+                        terminalReason);
+                    return true;
+                }
+
+                // Captive Pleasure is a temporary Scene phase only.  Once the
+                // AfterPleasure terminal choice returns to captive, restore the
+                // runtime phase before refreshing Flow globals; otherwise
+                // TFDCaptiveState stays at 4 and Captive escape watchers never
+                // arm again.
+                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
+                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
+                    TFD::Captive::SyncPlayerAlias(player, terminalReason);
+                    TFD::Captive::ArmEscapeContextFromCurrentState(player);
+                    TFD::Captive::ResetLockpickWatch();
+                    TFD::Captive::SealDoorIfPresent();
+                }
+
+                const bool completeFlow = flow.RequestCompleteAfterPleasure(terminalReason);
+                TFD::HostilityController::TickCaptiveSuppression();
+                (void)TFD::FlowController::QueueBridgeModEvent(
+                    "TFDSystemEventClearAfterPleasure",
+                    nullptr,
+                    terminalReason,
+                    1.0f);
+
+                spdlog::info(
+                    "[TFD][Flow][C33] captive after pleasure terminal event={} reportedSource={} runtimeSource={} actor={:08X} flowComplete={} restoredPhase=Captive root={} ctx={} sub={} reason={}",
+                    std::string(name),
+                    sourceFlow,
+                    TFD::PleasureRuntime::GetSourceContextName(),
+                    captiveActor ? captiveActor->GetFormID() : 0u,
+                    completeFlow ? 1 : 0,
+                    Controller::ToString(snapshot.root),
+                    Controller::ToString(snapshot.contextRoot),
+                    Controller::ToString(snapshot.sub),
+                    terminalReason);
+                return true;
+            }
+
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
                 const char* terminalReason = ResolveBleedoutAfterPleasureTerminalReason(name);
 
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
-                const auto snapshot = flow.GetSnapshot();
                 const bool captiveBleedoutWorkHandoff =
                     name == kAfterPleasureChoiceWorkEvent &&
                     (snapshot.root == RootFlow::Captive ||
@@ -2150,73 +2432,6 @@ namespace TFD::FlowController
                     terminalReason);
                 return true;
             }
-
-            const bool sourceIsCaptive =
-                sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive) ||
-                TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Captive;
-            const bool returnToCaptive =
-                name == kAfterPleasureChoiceFinishEvent ||
-                name == kAfterPleasureChoiceKidnapEvent;
-
-            if (sourceIsCaptive && returnToCaptive) {
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
-                auto* captiveActor = actor ? actor : TFD::PleasureRuntime::GetPrimarySpeaker();
-                const char* terminalReason = name == kAfterPleasureChoiceKidnapEvent
-                    ? "captive_after_pleasure_return"
-                    : "captive_after_pleasure_finish";
-
-                // If Pleasure was chosen from Captive EscapeFailed bleedout,
-                // AfterPleasure terminal must finish the recapture commit, not
-                // merely restore CaptiveIdle. Otherwise the bleedout/escape FSM
-                // remains armed and the loot stash objective is not reopened for
-                // the recapture cycle.
-                if (TFD::Captive::IsEscapeBleedoutActive()) {
-                    const bool recaptured = TFD::Captive::CommitRecapture(captiveActor, terminalReason);
-                    (void)TFD::FlowController::QueueBridgeModEvent(
-                        "TFDSystemEventClearAfterPleasure",
-                        nullptr,
-                        "captive_after_pleasure_recapture",
-                        1.0f);
-                    spdlog::info(
-                        "[TFD][Flow] captive escape-bleedout after pleasure terminal event={} source={} actor={:08X} recaptured={} reason={}",
-                        std::string(name),
-                        sourceFlow,
-                        captiveActor ? captiveActor->GetFormID() : 0u,
-                        recaptured ? 1 : 0,
-                        terminalReason);
-                    return true;
-                }
-
-                // Captive Pleasure is a temporary Scene phase only.  Once the
-                // AfterPleasure terminal choice returns to captive, restore the
-                // runtime phase before refreshing Flow globals; otherwise
-                // TFDCaptiveState stays at 4 and Captive escape watchers never
-                // arm again.
-                TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
-                if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-                    TFD::Captive::SyncPlayerAlias(player, terminalReason);
-                    TFD::Captive::ArmEscapeContextFromCurrentState(player);
-                    TFD::Captive::ResetLockpickWatch();
-                    TFD::Captive::SealDoorIfPresent();
-                }
-
-                const bool completeFlow = flow.RequestCompleteAfterPleasure(terminalReason);
-                TFD::HostilityController::TickCaptiveSuppression();
-                (void)TFD::FlowController::QueueBridgeModEvent(
-                    "TFDSystemEventClearAfterPleasure",
-                    nullptr,
-                    terminalReason,
-                    1.0f);
-
-                spdlog::info(
-                    "[TFD][Flow] captive after pleasure terminal event={} source={} actor={:08X} flowComplete={} restoredPhase=Captive reason={}",
-                    std::string(name),
-                    sourceFlow,
-                    captiveActor ? captiveActor->GetFormID() : 0u,
-                    completeFlow ? 1 : 0,
-                    terminalReason);
-                return true;
-            }
         }
 
         if (HandleVictoryOutcomeModEvent(name, arg, sender)) {
@@ -2255,14 +2470,17 @@ namespace TFD::FlowController
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
             if (actor) {
+                auto& flow = TFD::FlowController::Controller::GetSingleton();
+                const bool beginAfter = flow.RequestBeginAfterPleasure(actor->GetFormID(), "pleasure_failed_enter");
                 TFD::InteractionRouter::DialogueOpen::BeginPleasureFailed(actor);
                 spdlog::info(
-                    "[TFD][Flow] pleasure failed greet armed source={} actor={:08X} reason=no_speaker_climax",
+                    "[TFD][Flow][R137] pleasure failed greet armed source={} actor={:08X} beginAfter={} reason=no_speaker_climax",
                     sourceFlow,
-                    actor->GetFormID());
+                    actor->GetFormID(),
+                    beginAfter ? 1 : 0);
             }
             else {
-                spdlog::warn("[TFD][Flow] pleasure failed enter rejected no actor source={} arg={}", sourceFlow, std::string(arg));
+                spdlog::warn("[TFD][Flow][R137] pleasure failed enter rejected no actor source={} arg={}", sourceFlow, std::string(arg));
             }
             return true;
         }
@@ -2271,6 +2489,12 @@ namespace TFD::FlowController
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
             auto* player = RE::PlayerCharacter::GetSingleton();
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto beforeFailure = flow.GetSnapshot();
+            const bool captiveFailureOwner = actor && IsCaptiveOwnedPleasureFailure(flow, beforeFailure, sourceFlow);
+            const int effectiveSourceFlow = captiveFailureOwner ?
+                static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive) :
+                sourceFlow;
 
             if (actor) {
                 TFD::DefeatMonitor::SuppressDefeatedEnemyAutoDeathForActor(actor, 24.0, "pleasure_failed_fight_speaker");
@@ -2289,6 +2513,21 @@ namespace TFD::FlowController
                 "pleasure_failed_fight",
                 1.0f);
 
+            bool truceHardCleared = false;
+            bool bleedoutCleared = false;
+            if (actor && captiveFailureOwner) {
+                truceHardCleared = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDTruceHardClearAll",
+                    actor,
+                    "pleasure_failed_fight",
+                    1.0f);
+                bleedoutCleared = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDBleedoutClearAll",
+                    actor,
+                    "pleasure_failed_fight",
+                    0.0f);
+            }
+
             bool truceReleased = false;
             if (actor) {
                 truceReleased = TFD::HostilityController::ReleaseActiveTruceSessionForActor(
@@ -2298,8 +2537,7 @@ namespace TFD::FlowController
             }
 
             bool captiveEscapeArmed = false;
-            if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Captive)) {
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
+            if (actor && captiveFailureOwner) {
                 captiveEscapeArmed = flow.RequestResolveCaptiveOutcome(
                     TFD::FlowController::CaptiveOutcome::EscapeStarted,
                     actor->GetFormID(),
@@ -2339,7 +2577,7 @@ namespace TFD::FlowController
                         TFD::HostilityController::ReleaseReason::FightChoice,
                         true);
                 }
-                TFD::FlowController::Controller::GetSingleton().NotifyCombatStarted(actor->GetFormID(), "pleasure_failed_fight");
+                flow.NotifyCombatStarted(actor->GetFormID(), "pleasure_failed_fight");
                 TFD::DefeatMonitor::SuppressDefeatedEnemyAutoDeathForActor(actor, 24.0, "pleasure_failed_fight_post_rehostile");
                 ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_post_rehostile");
             }
@@ -2348,16 +2586,23 @@ namespace TFD::FlowController
                 kPleasureFailedStartCombatEvent,
                 actor,
                 "pleasure_failed_fight",
-                static_cast<float>(sourceFlow));
+                static_cast<float>(effectiveSourceFlow));
 
             spdlog::info(
-                "[TFD][Flow] pleasure failed fight actor={:08X} source={} truceReleased={} captiveEscapeArmed={} nativeCombatRefresh={} combatQueued={} reason=no_speaker_climax",
+                "[TFD][Flow][C48] pleasure failed fight actor={:08X} reportedSource={} effectiveSource={} captiveOwner={} truceReleased={} truceHardCleared={} bleedoutCleared={} captiveEscapeArmed={} nativeCombatRefresh={} combatQueued={} root={} ctx={} sub={} reason=no_speaker_climax",
                 actor ? actor->GetFormID() : 0u,
                 sourceFlow,
+                effectiveSourceFlow,
+                captiveFailureOwner ? 1 : 0,
                 truceReleased ? 1 : 0,
+                truceHardCleared ? 1 : 0,
+                bleedoutCleared ? 1 : 0,
                 captiveEscapeArmed ? 1 : 0,
                 nativeCombatRefresh ? 1 : 0,
-                combatQueued ? 1 : 0);
+                combatQueued ? 1 : 0,
+                Controller::ToString(beforeFailure.root),
+                Controller::ToString(beforeFailure.contextRoot),
+                Controller::ToString(beforeFailure.sub));
             return true;
         }
 
@@ -2606,10 +2851,21 @@ namespace TFD::FlowController
             }
 
             const bool bleedActive = IsBleedStateActiveFromProviders();
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool captiveEscapeBleedout = bleedActive && IsCaptiveEscapeGuardActive(flow);
+            if (captiveEscapeBleedout) {
+                const bool recaptured = TFD::Captive::CommitRecapture(actor, "captive_escape_bleedout_do_nothing_recapture");
+                spdlog::info(
+                    "[TFD][Flow][C47] captive escape-bleedout do-nothing -> recapture actor={:08X} bleedActive={} recaptured={}",
+                    actorFormID,
+                    bleedActive ? 1 : 0,
+                    recaptured ? 1 : 0);
+                return true;
+            }
+
             bool flowResolved = false;
             bool leftForDeadStarted = false;
             if (bleedActive) {
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
                 flowResolved = flow.RequestResolveBleedoutOutcome(BleedoutOutcome::Cancel, actorFormID, "bleedout_do_nothing_left_for_dead");
                 TFD::FlowController::HandleObservedLeftForDead("bleedout_do_nothing_left_for_dead");
                 leftForDeadStarted = true;
@@ -2636,6 +2892,7 @@ namespace TFD::FlowController
             constexpr const char* graceReason = "bleedout_release";
             if (actor && g_outcomeRuntimeProviders.applyReleaseFollowGrace) {
                 g_outcomeRuntimeProviders.applyReleaseFollowGrace(actor, durationSec, graceReason);
+                TFD::Bleedout::ClearBleedoutDialogueFactionForActor(actor, "bleedout_release_preserve_grace_pacify_begin");
             }
             else if (!actor) {
                 spdlog::warn(
@@ -2645,22 +2902,70 @@ namespace TFD::FlowController
             }
 
             const bool bleedActive = IsBleedStateActiveFromProviders();
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto before = flow.GetSnapshot();
+            const bool bleedFlowContext =
+                before.root == RootFlow::Bleedout ||
+                before.contextRoot == RootFlow::Bleedout ||
+                before.sub == SubFlow::BleedoutPleasure ||
+                before.sub == SubFlow::BleedoutAfterPleasure;
             bool flowResolved = false;
+            bool flowCompleted = false;
+            bool forcedClear = false;
             bool terminalComplete = false;
-            if (bleedActive) {
-                auto& flow = TFD::FlowController::Controller::GetSingleton();
-                flowResolved = flow.RequestResolveBleedoutOutcome(BleedoutOutcome::Cancel, actorFormID, graceReason);
+
+            if (bleedActive || bleedFlowContext) {
+                if (bleedActive || before.root == RootFlow::Bleedout || before.sub == SubFlow::BleedoutPleasure) {
+                    flowResolved = flow.RequestResolveBleedoutOutcome(BleedoutOutcome::Cancel, actorFormID, graceReason);
+                }
+
+                // If the flow is already in BleedoutAfterPleasure terminal context,
+                // RequestResolveBleedoutOutcome can legitimately reject because the
+                // root is None.  The correct terminal action is still to complete the
+                // terminal context.
+                if (!flowResolved && bleedFlowContext) {
+                    flowResolved = true;
+                }
+
+                if (flowResolved) {
+                    flowCompleted = flow.RequestCompleteTerminalContext("bleedout_release_complete");
+                }
+
+                if (!flowCompleted) {
+                    const auto afterComplete = flow.GetSnapshot();
+                    const bool stillBleedContext =
+                        afterComplete.root == RootFlow::Bleedout ||
+                        afterComplete.contextRoot == RootFlow::Bleedout ||
+                        afterComplete.sub == SubFlow::BleedoutPleasure ||
+                        afterComplete.sub == SubFlow::BleedoutAfterPleasure;
+                    if (stillBleedContext) {
+                        flow.ResetRuntime("bleedout_release_force_clear");
+                        forcedClear = true;
+                        flowCompleted = true;
+                    }
+                }
+
                 terminalComplete = TFD::Bleedout::CompletePayRelease(
                     graceReason,
                     TFD::Bleedout::Builders::BuildPayReleaseCompletionHandlers());
+
+                if (actor) {
+                    TFD::Bleedout::ClearBleedoutDialogueFactionForActor(actor, "bleedout_release_preserve_grace_pacify_end");
+                    if (g_outcomeRuntimeProviders.applyReleaseFollowGrace) {
+                        g_outcomeRuntimeProviders.applyReleaseFollowGrace(actor, durationSec, "bleedout_release_post_cleanup_grace");
+                    }
+                }
             }
 
             spdlog::info(
-                "[TFD][Flow][R100C] bleedout release terminal actor={:08X} seconds={:.1f} bleedActive={} flowResolved={} terminalComplete={}",
+                "[TFD][Flow][W47] bleedout release terminal actor={:08X} seconds={:.1f} bleedActive={} bleedContext={} flowResolved={} flowCompleted={} forcedClear={} terminalComplete={}",
                 actorFormID,
                 durationSec,
                 bleedActive ? 1 : 0,
+                bleedFlowContext ? 1 : 0,
                 flowResolved ? 1 : 0,
+                flowCompleted ? 1 : 0,
+                forcedClear ? 1 : 0,
                 terminalComplete ? 1 : 0);
             return true;
         }
@@ -2990,12 +3295,25 @@ namespace TFD::FlowController
         if (name == kBleedoutOutcomeCaptiveEvent) {
             const auto actorFormID = ResolveBleedFlowActorFormIDFromProviders();
             auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool bleedActive = IsBleedStateActiveFromProviders();
+            const bool captiveEscapeBleedout = bleedActive && IsCaptiveEscapeGuardActive(flow);
+            if (captiveEscapeBleedout) {
+                const bool recaptured = TFD::Captive::CommitRecapture(flowActor, "captive_escape_bleedout_captive_choice_recapture");
+                spdlog::info(
+                    "[TFD][Flow][C47] captive escape-bleedout captive choice -> recapture actor={:08X} bleedActive={} recaptured={}",
+                    actorFormID,
+                    bleedActive ? 1 : 0,
+                    recaptured ? 1 : 0);
+                return true;
+            }
+
             TFD::Bleedout::OutcomeEventContext context{};
             context.eventName = "mod_event_captive";
             context.rawEventName = eventName;
             context.actor = flowActor;
             context.actorFormID = actorFormID;
-            context.inBleedState = IsBleedStateActiveFromProviders();
+            context.inBleedState = bleedActive;
             (void)TFD::Bleedout::HandleOutcomeCaptiveEvent(context, bleedOutcomeEventHandlers);
             return true;
         }
@@ -3385,6 +3703,10 @@ namespace TFD::FlowController
             _hasObservedSnapshot = true;
         }
 
+        if (AutoCompleteStaleInCombatNeutralIfNeeded(observed, now, reason)) {
+            return;
+        }
+
         AutoEnterObservedVictoryIfNeeded(observed, reason);
 
         if (!ShouldLogObservedMainStateDiagnostic(observed, now)) {
@@ -3648,7 +3970,20 @@ namespace TFD::FlowController
     bool Controller::ResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason)
     {
         std::scoped_lock lk(_lock);
-        if (_snapshot.root != RootFlow::PreCombat) {
+
+        // PreCombat terminal follow-up choices can arrive after the root has already
+        // moved into a terminal/after-pleasure context. In that valid state the
+        // snapshot root is None, while contextRoot/sub still preserve PreCombat
+        // ownership. Do not reject Captive/JoinEnemy/Fight-style terminal commits
+        // just because Pleasure/AfterPleasure has temporarily cleared root.
+        const bool validPreCombatRoot =
+            _snapshot.root == RootFlow::PreCombat ||
+            _snapshot.contextRoot == RootFlow::PreCombat ||
+            _snapshot.sub == SubFlow::PreCombatPayFollowup ||
+            _snapshot.sub == SubFlow::PreCombatPleasure ||
+            _snapshot.sub == SubFlow::PreCombatAfterPleasure;
+
+        if (!validPreCombatRoot) {
             return RejectLocked("ResolvePreCombatOutcome", reason);
         }
         if (!GuardPreCombatOwnerLocked(actorFormID, "ResolvePreCombatOutcome", reason)) {
@@ -3682,7 +4017,13 @@ namespace TFD::FlowController
         case PreCombatOutcome::RecruitEnemy:
         case PreCombatOutcome::Release:
         case PreCombatOutcome::Follow:
-            if (_snapshot.sub != SubFlow::PreCombatPayFollowup) {
+            // W45: Release can be a terminal AfterPleasure/Redo rejection outcome,
+            // not only a Pay follow-up.  W44 correctly sent a 10s release/grace
+            // event, but native rejected the flow because sub=PreCombatAfterPleasure,
+            // leaving ctx/sub alive and causing red flicker + fast draw/sheath loops.
+            if (_snapshot.sub != SubFlow::PreCombatPayFollowup &&
+                _snapshot.sub != SubFlow::PreCombatPleasure &&
+                _snapshot.sub != SubFlow::PreCombatAfterPleasure) {
                 return RejectLocked("ResolvePreCombatOutcome", reason);
             }
             handled = EnterTerminalContextLocked(RootFlow::PreCombat, SubFlow::None, actorFormID, reason);
@@ -3899,6 +4240,7 @@ namespace TFD::FlowController
             _snapshot.contextRoot = RootFlow::Captive;
             _snapshot.terminalResolved = false;
             _snapshot.gate = DecisionGate::None;
+            _combatActive = false;
             SetPrimaryActorLocked(actorFormID);
             break;
         case CaptiveOutcome::EscapeStarted:
@@ -4084,6 +4426,56 @@ namespace TFD::FlowController
     {
         std::scoped_lock lk(_lock);
         if (_snapshot.root == RootFlow::Victory) {
+            return;
+        }
+
+        const bool terminalPleasureContext = _snapshot.terminalResolved &&
+            (_snapshot.sub == SubFlow::PreCombatPleasure ||
+                _snapshot.sub == SubFlow::PreCombatAfterPleasure ||
+                _snapshot.sub == SubFlow::InCombatPleasure ||
+                _snapshot.sub == SubFlow::InCombatAfterPleasure ||
+                _snapshot.sub == SubFlow::BleedoutPleasure ||
+                _snapshot.sub == SubFlow::BleedoutAfterPleasure ||
+                _snapshot.sub == SubFlow::CaptivePleasure ||
+                _snapshot.sub == SubFlow::CaptiveAfterPleasure ||
+                _snapshot.sub == SubFlow::VictoryPleasure ||
+                _snapshot.sub == SubFlow::VictoryAfterPleasure);
+        if (terminalPleasureContext) {
+            const bool explicitPleasureFailedFight = reason == "pleasure_failed_fight";
+            if (explicitPleasureFailedFight) {
+                const auto oldContext = _snapshot.contextRoot;
+                const auto oldSub = _snapshot.sub;
+                const auto oldToken = _snapshot.token;
+
+                _combatActive = true;
+                (void)BeginRootLocked(RootFlow::InCombat, actorFormID, reason);
+                RefreshFlowGlobalsLocked();
+
+                spdlog::info(
+                    "[TFD][Flow][R138] combat start accepted from terminal pleasure failed fight actor={:08X} oldCtx={} oldSub={} oldToken={} newRoot={} newCtx={} newSub={} terminal={}",
+                    actorFormID,
+                    ToString(oldContext),
+                    ToString(oldSub),
+                    oldToken,
+                    ToString(_snapshot.root),
+                    ToString(_snapshot.contextRoot),
+                    ToString(_snapshot.sub),
+                    _snapshot.terminalResolved ? 1 : 0);
+                return;
+            }
+
+            // R137: terminal pleasure/pleasure-failed dialogue owns the actor.
+            // Combat notifications can still arrive from nearby enemies or stale
+            // alarm data; do not let them wipe the terminal context into InCombat.
+            _combatActive = false;
+            RefreshFlowGlobalsLocked();
+            spdlog::info(
+                "[TFD][Flow][R137] combat start ignored during terminal pleasure context actor={:08X} reason={} ctx={} sub={} pleasureFailed={} terminal=1",
+                actorFormID,
+                reason.empty() ? std::string{ "-" } : std::string{ reason },
+                ToString(_snapshot.contextRoot),
+                ToString(_snapshot.sub),
+                TFD::PleasureRuntime::IsPleasureFailedDialogueActive() ? 1 : 0);
             return;
         }
         if (_snapshot.root == RootFlow::Captive && (_snapshot.sub == SubFlow::EscapeAttempt || _snapshot.sub == SubFlow::EscapeFailed || _snapshot.sub == SubFlow::Recapture)) {

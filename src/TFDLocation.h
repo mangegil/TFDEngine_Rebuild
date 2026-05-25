@@ -61,8 +61,10 @@ namespace TFD::Location
 	void ClearCaptiveWorkMiningDepletedCache(const char* reason = nullptr);
 	RE::TESObjectREFR* GetLastCaptiveWorkMiningRef();
 	RE::TESObjectREFR* GetLastCaptiveWorkCraftingRef();
+	RE::TESObjectREFR* GetLastCaptiveWorkCraftingRefForState(int craftingState);
 	std::uint32_t GetLastCaptiveWorkMiningRefFormID();
 	std::uint32_t GetLastCaptiveWorkCraftingRefFormID();
+	std::uint32_t GetLastCaptiveWorkCraftingRefFormIDForState(int craftingState);
 
 	RE::TESObjectREFR* GetCachedCaptiveMarker();
 	std::uint32_t GetCachedCaptiveMarkerFormID();

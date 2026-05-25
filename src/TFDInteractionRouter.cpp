@@ -1733,12 +1733,14 @@ namespace TFD::InteractionRouter
             RE::TESGlobal* g_captiveStateGlobal = nullptr;
             RE::TESGlobal* g_defeatStateGlobal = nullptr;
             RE::TESGlobal* g_victoryStateGlobal = nullptr;
+            RE::TESGlobal* g_pleasureStateGlobal = nullptr;
             bool g_loggedDialogueStateMissing = false;
             bool g_loggedPreCombatStateMissing = false;
             bool g_loggedInCombatStateMissing = false;
             bool g_loggedCaptiveStateMissing = false;
             bool g_loggedDefeatStateMissing = false;
             bool g_loggedVictoryStateMissing = false;
+            bool g_loggedPleasureStateMissing = false;
             std::unordered_map<RE::FormID, Clock::time_point> g_temporaryDialogueCooldownUntil{};
 
             void SetDialogueStateValue(int value);
@@ -1807,7 +1809,9 @@ namespace TFD::InteractionRouter
                     mode != Mode::InCombatTruce &&
                     mode != Mode::Bleedout &&
                     mode != Mode::CaptiveMarker &&
-                    mode != Mode::PreCombatFollowup) {
+                    mode != Mode::PreCombatFollowup &&
+                    mode != Mode::AfterPleasure &&
+                    mode != Mode::PleasureFailed) {
                     return;
                 }
 
@@ -1816,6 +1820,7 @@ namespace TFD::InteractionRouter
                 int captive = 0;
                 int defeat = 0;
                 int victory = 0;
+                int pleasure = 0;
 
                 switch (mode) {
                 case Mode::PreCombatTruce:
@@ -1831,6 +1836,12 @@ namespace TFD::InteractionRouter
                 case Mode::Bleedout:
                     defeat = 2;
                     break;
+                case Mode::AfterPleasure:
+                    pleasure = 2;
+                    break;
+                case Mode::PleasureFailed:
+                    pleasure = 3;
+                    break;
                 default:
                     break;
                 }
@@ -1840,19 +1851,21 @@ namespace TFD::InteractionRouter
                 SetApproachConditionGlobal(g_captiveStateGlobal, "TFDCaptiveState", g_loggedCaptiveStateMissing, captive);
                 SetApproachConditionGlobal(g_defeatStateGlobal, "TFDDefeatState", g_loggedDefeatStateMissing, defeat);
                 SetApproachConditionGlobal(g_victoryStateGlobal, "TFDVictoryState", g_loggedVictoryStateMissing, victory);
+                SetApproachConditionGlobal(g_pleasureStateGlobal, "TFDPleasureState", g_loggedPleasureStateMissing, pleasure);
 
                 // Approach packages and forced dialogue topics can evaluate before the UI menu opens.
                 // Keep TFDDialogueState valid during the pending native-open window.
                 SetDialogueStateValue(1);
 
                 spdlog::info(
-                    "[TFD][DialogueOpen] approach globals synced mode={} pre={} in={} captive={} defeat={} victory={} dialogue=1 reason={}",
+                    "[TFD][DialogueOpen][R137] condition globals synced mode={} pre={} in={} captive={} defeat={} victory={} pleasure={} dialogue=1 reason={}",
                     ModeName(mode),
                     preCombat,
                     inCombat,
                     captive,
                     defeat,
                     victory,
+                    pleasure,
                     reason ? reason : "unknown");
             }
 
@@ -2894,6 +2907,7 @@ namespace TFD::InteractionRouter
                     }
                 }
                 else if (mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) {
+                    SyncApproachConditionGlobals(mode, reason);
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                         PrepareSpeakerForNativeDialogueOpen(player, speaker);
                     }

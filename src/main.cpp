@@ -34,6 +34,7 @@
 #include "TFDSettings.h"
 #include "TFDPayModel.h"
 #include "TFDRecruit.h"
+#include "TFDWorkNative.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -104,6 +105,7 @@ static void ResetTransientStateForLoad()
     TFD::DefeatMonitor::ResetGrace();
     TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
     TFD::PayModel::ClearCachedEncounterQuote("transient_reset_for_load");
+    TFD::WorkNative::ResetRuntimeRecipeCache();
 
     spdlog::info("[TFD] ResetTransientStateForLoad complete (runtime only, suppression cleared)");
 }
@@ -397,11 +399,13 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
     TFD::HostilityHooks::Install();
 
     if (auto* papyrus = SKSE::GetPapyrusInterface()) {
+        papyrus->Register(TFD::Actor::RegisterPapyrus);
         papyrus->Register(TFD::CombatBehavior::RegisterPapyrus);
+        papyrus->Register(TFD::WorkNative::RegisterPapyrus);
         spdlog::info("[TFD] Papyrus native registration queued");
     }
     else {
-        spdlog::warn("[TFD] PapyrusInterface missing; combat behavior native resolver unavailable");
+        spdlog::warn("[TFD] PapyrusInterface missing; Papyrus native resolvers unavailable");
     }
 
 #if TFDEnableSmf

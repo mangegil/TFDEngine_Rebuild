@@ -429,10 +429,18 @@ namespace TFDMenu
 					return false;
 				}
 
-				TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
+				const bool pleasureFailedDialogue = TFD::PleasureRuntime::IsPleasureFailedDialogueActive();
+				if (pleasureFailedDialogue) {
+					TFD::InteractionRouter::DialogueOpen::BeginPleasureFailed(actor);
+				}
+				else {
+					TFD::InteractionRouter::DialogueOpen::BeginAfterPleasure(actor);
+				}
+
 				spdlog::info(
-					"[TFD][Menu][R127] after pleasure activation native open actor={:08X} phase={} source={} reason={} action=native_activation_dialogue",
+					"[TFD][Menu][R136] after pleasure activation native open actor={:08X} mode={} phase={} source={} reason={} action=native_activation_dialogue",
 					actor->GetFormID(),
+					pleasureFailedDialogue ? "PleasureFailed" : "AfterPleasure",
 					TFD::PleasureRuntime::GetPhaseName(),
 					TFD::PleasureRuntime::GetSourceContextName(),
 					reason ? reason : "after_pleasure_activation_dialogue");
@@ -496,20 +504,21 @@ namespace TFDMenu
 
 						const bool isCurrentBoss = TFD::Captive::IsCurrentWorkBoss(actor);
 						const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
-						if (!isCurrentBoss && !inWorkScope) {
-							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} currentBoss=0 inScope=0 reason={} action=actor_not_work_owned",
+						if (!isCurrentBoss) {
+							actor->SetDialogueWithPlayer(false, false, nullptr);
+							spdlog::info("[TFD][Menu][Work][C46] delayed native open blocked non-boss serial={} actor={:08X} inScope={} reason={} action=block_non_boss_work_dialogue",
 								serial,
 								actorFormID,
+								inWorkScope ? 1 : 0,
 								reasonText);
 							return;
 						}
 
-						if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, isCurrentBoss ? "work_delayed_native_open_current_boss" : "work_delayed_native_open_dialogue_actor")) {
+						if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_delayed_native_open_current_boss")) {
 							actor->SetDialogueWithPlayer(false, false, nullptr);
-							spdlog::info("[TFD][Menu][Work] delayed native open blocked serial={} actor={:08X} currentBoss={} inScope={} reason={} action=prepare_failed",
+							spdlog::info("[TFD][Menu][Work] delayed native open blocked serial={} actor={:08X} currentBoss=1 inScope={} reason={} action=prepare_failed",
 								serial,
 								actorFormID,
-								isCurrentBoss ? 1 : 0,
 								inWorkScope ? 1 : 0,
 								reasonText);
 							return;
@@ -584,6 +593,14 @@ namespace TFDMenu
 				if (!isCurrentBoss && !inWorkScope) {
 					return WorkActivationResult::kNotHandled;
 				}
+				if (!isCurrentBoss) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work][C46] activate blocked non-boss actor={:08X} inScope={} reason={} action=block_non_boss_work_dialogue",
+						actor->GetFormID(),
+						inWorkScope ? 1 : 0,
+						reason ? reason : "work_activation");
+					return WorkActivationResult::kStop;
+				}
 
 				static RE::FormID s_lastWorkActivationActor = 0;
 				static Clock::time_point s_nextWorkActivationOpenAt{};
@@ -595,22 +612,30 @@ namespace TFDMenu
 					return WorkActivationResult::kStop;
 				}
 
-				// Do not promote the clicked actor to WorkBoss here.  WorkBoss owns the
-				// objective marker, so promoting on every activation makes the marker jump
-				// between bandits.  Instead, keep WorkBoss stable and make the clicked
-				// in-scope actor dialogue-valid by applying TFDWorkingCaptiveFaction.
-				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, isCurrentBoss ? "work_activation_current_boss" : "work_activation_dialogue_actor")) {
+				ResolveGlobals();
+				const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
+				if (assignmentState == 7) {
 					actor->SetDialogueWithPlayer(false, false, nullptr);
-					spdlog::info("[TFD][Menu][Work] activate blocked work actor={:08X} currentBoss={} inScope={} reason={} action=block_calling_captor_leak",
+					spdlog::info("[TFD][Menu][Work][C38] activate blocked work actor={:08X} currentBoss={} reason={} assignment={} ({}) action=block_cooldown_dialogue",
 						actor->GetFormID(),
 						isCurrentBoss ? 1 : 0,
+						reason ? reason : "work_activation",
+						assignmentState,
+						DecodeWorkAssignmentState(assignmentState));
+					return WorkActivationResult::kStop;
+				}
+
+				// WorkBoss owns the quest objective and marker.  Only the current Boss
+				// alias may open Working/Report dialogue; other captors remain captive
+				// ambience and must not be promoted into job givers by activation.
+				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_activation_current_boss")) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked work boss actor={:08X} inScope={} reason={} action=prepare_failed",
+						actor->GetFormID(),
 						inWorkScope ? 1 : 0,
 						reason ? reason : "work_activation");
 					return WorkActivationResult::kStop;
 				}
-
-				ResolveGlobals();
-				const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
 
 				if (assignmentState == 2) {
 					actor->SetDialogueWithPlayer(false, false, nullptr);
@@ -1044,6 +1069,10 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			case 3: return "Tanning Rack";
 			case 4: return "Grindstone";
 			case 5: return "Armor Workbench";
+			case 6: return "Chopping Block";
+			case 7: return "Cooking Pot";
+			case 8: return "Alchemy Lab";
+			case 9: return "Enchanting Table";
 			default: return "Custom";
 			}
 		}

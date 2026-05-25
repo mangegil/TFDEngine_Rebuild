@@ -636,6 +636,35 @@ namespace TFD::Bleedout
 			}
 		}
 
+
+		void ClearBleedoutDialogueFactionForActorInternal(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+			auto* bleedoutFaction = ResolveBleedoutDialogueFaction();
+			bool removedBleedout = false;
+			if (bleedoutFaction && actor->IsInFaction(bleedoutFaction)) {
+				actor->RemoveFromFaction(bleedoutFaction);
+				removedBleedout = true;
+			}
+			const auto actorId = actor->GetFormID();
+			g_bleedoutDialogueFactionActorIds.erase(
+				std::remove(g_bleedoutDialogueFactionActorIds.begin(), g_bleedoutDialogueFactionActorIds.end(), actorId),
+				g_bleedoutDialogueFactionActorIds.end());
+			if (removedBleedout) {
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->ClearCachedFactionFightReactions();
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+				spdlog::info(
+					"[TFD][Bleedout][W48] dialogue faction removed actor={:08X} preservePacify=1 reason={}",
+					actorId,
+					reason ? reason : "unknown");
+			}
+		}
+
 		void ClearBleedoutDialogueFactionsInternal(const char* reason)
 		{
 			if (g_bleedoutDialogueFactionActorIds.empty()) {
@@ -1739,6 +1768,11 @@ namespace TFD::Bleedout
 		ClearBleedoutDialogueFactionsInternal(reason ? reason : "external_clear");
 	}
 
+	void ClearBleedoutDialogueFactionForActor(RE::Actor* actor, const char* reason)
+	{
+		ClearBleedoutDialogueFactionForActorInternal(actor, reason ? reason : "external_clear_actor");
+	}
+
 	void AssignBridgeActor(RE::Actor* actor)
 	{
 		if (!actor) {
@@ -2759,7 +2793,12 @@ namespace TFD::Bleedout
 			handlers.clearPendingCinematicFadeIn();
 		}
 		if (handlers.clearBridgeAliases) {
-			spdlog::info("[TFD][Bleedout][R127] preserve bridge aliases during pleasure handoff reason={}", why);
+			// W53: Bleedout is only the source of the OStim scene now.  Do not keep
+			// TFDBleedoutQuest / bridge forcegreet ownership alive through Pleasure,
+			// because it blocks PleasureFailed terminal choices and can reopen/stick
+			// the Bleedout dialogue after the player has already stood up.
+			handlers.clearBridgeAliases(why);
+			spdlog::info("[TFD][Bleedout][W53] cleared bridge aliases during pleasure handoff reason={}", why);
 		}
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();

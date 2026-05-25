@@ -71,6 +71,7 @@ namespace TFD::PleasureRuntime
 	bool IsActive();
 	bool IsBlocking();
 	bool IsPassiveLockActive();
+	bool IsPleasureFailedDialogueActive();
 
 	Phase GetPhase();
 	const char* GetPhaseName();

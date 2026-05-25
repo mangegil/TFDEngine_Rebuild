@@ -47,6 +47,7 @@ add_library(TFDEngine SHARED
     src/TFDBleedout.cpp
     src/TFDBleedoutGreet.cpp
     src/TFDCombatBehavior.cpp
+    src/TFDWorkNative.cpp
     src/TFDHostilityHooks.cpp
     src/TFDHostilityController.cpp
     src/TFDInteractionRouter.cpp

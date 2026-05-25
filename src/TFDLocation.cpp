@@ -6,6 +6,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cctype>
 #include <chrono>
@@ -60,6 +61,17 @@ namespace TFD::Location
 
 		RE::TESGlobal* g_workMiningStateGlobal = nullptr;
 		RE::TESGlobal* g_workCraftingStateGlobal = nullptr;
+		RE::TESGlobal* g_workJobTypeGlobal = nullptr;
+		RE::TESGlobal* g_workAssignmentStateGlobal = nullptr;
+		RE::TESGlobal* g_workForgeStateGlobal = nullptr;
+		RE::TESGlobal* g_workSmelterStateGlobal = nullptr;
+		RE::TESGlobal* g_workTanningStateGlobal = nullptr;
+		RE::TESGlobal* g_workSharpeningStateGlobal = nullptr;
+		RE::TESGlobal* g_workWorkbenchStateGlobal = nullptr;
+		RE::TESGlobal* g_workChoppingStateGlobal = nullptr;
+		RE::TESGlobal* g_workCookingStateGlobal = nullptr;
+		RE::TESGlobal* g_workAlchemyStateGlobal = nullptr;
+		RE::TESGlobal* g_workEnchantingStateGlobal = nullptr;
 
 		static RE::TESObjectREFR* ResolveSpecialRef(RE::BGSLocation* loc, RE::BGSLocationRefType* type, bool preferInterior);
 		TFD::Location::CaptiveStorageDebugSnapshot g_lastCaptiveStorageDebugSnapshot{};
@@ -90,14 +102,17 @@ namespace TFD::Location
 		using Clock = std::chrono::steady_clock;
 
 		static constexpr float kCaptiveWorkResourceScanRadius = 12000.0f;
+		static constexpr float kCaptiveWorkFurnitureScanRadius = 12000.0f;
 		static constexpr float kCaptiveWorkMineOccupiedRadius = 512.0f;
 		static constexpr auto kCaptiveWorkResourceScanMinInterval = std::chrono::milliseconds(750);
 
 		RE::FormID g_lastWorkResourceCellId = 0;
 		int g_lastWorkMiningState = -1;
 		int g_lastWorkCraftingState = -1;
+		int g_activeWorkCraftingSubtypeRequest = 0;
 		RE::FormID g_lastWorkMiningRefId = 0;
 		RE::FormID g_lastWorkCraftingRefId = 0;
+		std::array<RE::FormID, 10> g_lastWorkCraftingRefIds{};
 		Clock::time_point g_lastWorkResourceScan{};
 		std::unordered_set<RE::FormID> g_depletedWorkMiningRefs{};
 
@@ -253,6 +268,55 @@ namespace TFD::Location
 			}
 		}
 
+		static int GetGlobalInt(RE::TESGlobal* global)
+		{
+			if (!global) {
+				return 0;
+			}
+			return static_cast<int>(global->value);
+		}
+
+		static bool IsCaptiveWorkCraftingSubtype(int state)
+		{
+			return state >= 1 && state <= 9;
+		}
+
+		static int GetActiveCaptiveWorkCraftingSubtypeRequest()
+		{
+			// WorkJobType: 2 = shared Crafting channel.
+			// WorkAssignmentState: 2 = Doing Work, 3 = Return Report.
+			// During an active job, periodic resource refresh must preserve the selected
+			// station subtype. Otherwise a generic tick with no requested state can
+			// replace Chopping/Tanning/Tempering/Cooking/Alchemy/Enchant aliases with
+			// the default Forge alias.
+			const int jobType = GetGlobalInt(g_workJobTypeGlobal);
+			const int assignment = GetGlobalInt(g_workAssignmentStateGlobal);
+			const int currentCraftingState = GetGlobalInt(g_workCraftingStateGlobal);
+
+			if (jobType != 2 || (assignment != 2 && assignment != 3)) {
+				if (g_activeWorkCraftingSubtypeRequest != 0) {
+					spdlog::info(
+						"[TFD][Location][W07] active crafting subtype latch cleared job={} assignment={} oldLatch={}",
+						jobType,
+						assignment,
+						g_activeWorkCraftingSubtypeRequest);
+				}
+				g_activeWorkCraftingSubtypeRequest = 0;
+				return 0;
+			}
+
+			if (IsCaptiveWorkCraftingSubtype(g_activeWorkCraftingSubtypeRequest)) {
+				return g_activeWorkCraftingSubtypeRequest;
+			}
+
+			if (IsCaptiveWorkCraftingSubtype(currentCraftingState)) {
+				g_activeWorkCraftingSubtypeRequest = currentCraftingState;
+				return currentCraftingState;
+			}
+
+			return 0;
+		}
+
 		static void ResolveMarkerGlobals()
 		{
 			ResolveGlobal(g_bossContainerMarkerStateGlobal, "TFDBossContainerMarkerState");
@@ -267,6 +331,35 @@ namespace TFD::Location
 		{
 			ResolveGlobal(g_workMiningStateGlobal, "TFDMiningState");
 			ResolveGlobal(g_workCraftingStateGlobal, "TFDCraftingState");
+			ResolveGlobal(g_workJobTypeGlobal, "TFDWorkJobType");
+			ResolveGlobal(g_workAssignmentStateGlobal, "TFDWorkAssignmentState");
+			ResolveGlobal(g_workForgeStateGlobal, "TFDForgeState");
+			ResolveGlobal(g_workSmelterStateGlobal, "TFDSmelterState");
+			ResolveGlobal(g_workTanningStateGlobal, "TFDTanningState");
+			ResolveGlobal(g_workSharpeningStateGlobal, "TFDSharpeningState");
+			ResolveGlobal(g_workWorkbenchStateGlobal, "TFDWorkbenchState");
+			ResolveGlobal(g_workChoppingStateGlobal, "TFDChoppingState");
+			ResolveGlobal(g_workCookingStateGlobal, "TFDCookingState");
+			ResolveGlobal(g_workAlchemyStateGlobal, "TFDAlchemyState");
+			ResolveGlobal(g_workEnchantingStateGlobal, "TFDEnchantingState");
+		}
+
+		static void SetCaptiveWorkFurnitureGlobals(const std::array<bool, 10>& available)
+		{
+			SetGlobalInt(g_workForgeStateGlobal, available[1] ? 1 : 0);
+			SetGlobalInt(g_workSmelterStateGlobal, available[2] ? 1 : 0);
+			SetGlobalInt(g_workTanningStateGlobal, available[3] ? 1 : 0);
+			SetGlobalInt(g_workSharpeningStateGlobal, available[4] ? 1 : 0);
+			SetGlobalInt(g_workWorkbenchStateGlobal, available[5] ? 1 : 0);
+			SetGlobalInt(g_workChoppingStateGlobal, available[6] ? 1 : 0);
+			SetGlobalInt(g_workCookingStateGlobal, available[7] ? 1 : 0);
+			SetGlobalInt(g_workAlchemyStateGlobal, available[8] ? 1 : 0);
+			SetGlobalInt(g_workEnchantingStateGlobal, available[9] ? 1 : 0);
+		}
+
+		static void ClearCaptiveWorkFurnitureGlobals()
+		{
+			SetCaptiveWorkFurnitureGlobals({});
 		}
 
 		static int CountNonZero3(const std::array<std::uint32_t, 3>& ids)
@@ -739,6 +832,19 @@ namespace TFD::Location
 			return false;
 		}
 
+		static bool IsUsableCampfireCookingStation(std::string_view edid)
+		{
+			// W19: Do not treat UC_* campfire activators as captive-work cooking stations.
+			// Runtime testing showed UC_Campfire01Burning can be selected as the marker
+			// target while normal cookpot COBJ recipes such as BYOH mudcrab food do not
+			// appear in the menu the player opens. Captive Work should only assign cooking
+			// when the nearby reference is an actual TESFurniture cooking station, such as
+			// CookingPot/CookingSpit/Cookpot. This prevents valid recipes from being paired
+			// with a nonstandard activator/campfire menu and creating stuck assignments.
+			(void)edid;
+			return false;
+		}
+
 		static int CaptiveWorkMiningStatePriority(int state)
 		{
 			switch (state) {
@@ -799,6 +905,10 @@ namespace TFD::Location
 			case 3: return 30; // Tanning rack: Leather -> strips
 			case 4: return 40; // Grindstone: low-tier weapon temper
 			case 5: return 50; // Armor workbench: low-tier armor temper
+			case 6: return 60; // Chopping block: Firewood
+			case 7: return 70; // Cooking pot: food work, backend pending
+			case 8: return 80; // Alchemy lab: potion work, backend pending
+			case 9: return 90; // Enchanting table: enchant work, backend pending
 			default: return 100000;
 			}
 		}
@@ -822,22 +932,100 @@ namespace TFD::Location
 				return 2;
 			}
 
-			if (ContainsNoCase(edid, "CraftingTanningRack") || ContainsNoCase(edid, "TanningRack")) {
+			if (ContainsNoCase(edid, "CraftingTanningRack") ||
+				ContainsNoCase(edid, "TanningRack") ||
+				ContainsNoCase(edid, "Tanning") ||
+				ContainsNoCase(edid, "LeatherRack")) {
 				return 3;
 			}
 
-			if (ContainsNoCase(edid, "SharpeningWheel") || ContainsNoCase(edid, "Grindstone")) {
+			if (ContainsNoCase(edid, "SharpeningWheel") ||
+				ContainsNoCase(edid, "Grindstone") ||
+				ContainsNoCase(edid, "GrindStone") ||
+				ContainsNoCase(edid, "WeaponRackSharpen")) {
 				return 4;
+			}
+
+			if (ContainsNoCase(edid, "ChoppingBlock") ||
+				ContainsNoCase(edid, "WoodChoppingBlock")) {
+				return 6;
+			}
+
+			if (IsUsableCampfireCookingStation(edid)) {
+				return 7;
+			}
+
+			if (ContainsNoCase(edid, "CookingPot") ||
+				ContainsNoCase(edid, "CookingSpit") ||
+				ContainsNoCase(edid, "Cookpot") ||
+				ContainsNoCase(edid, "CookPot") ||
+				ContainsNoCase(edid, "CookingStand") ||
+				ContainsNoCase(edid, "CookingFire") ||
+				ContainsNoCase(edid, "CookingPlace") ||
+				ContainsNoCase(edid, "CookingKettle") ||
+				ContainsNoCase(edid, "CraftingCook") ||
+				ContainsNoCase(edid, "CraftingCooking")) {
+				return 7;
+			}
+
+			// Check magic stations before the generic Workbench fallback. Otherwise
+			// AlchemyWorkbench / EnchantingWorkbench can be misclassified as armor
+			// workbenches and their dialogue globals never become available.
+			if (ContainsNoCase(edid, "AlchemyWorkbench") ||
+				ContainsNoCase(edid, "AlchemyTable") ||
+				ContainsNoCase(edid, "AlchemyLab") ||
+				ContainsNoCase(edid, "AlchemyStation") ||
+				ContainsNoCase(edid, "CraftingAlchemy")) {
+				return 8;
+			}
+
+			if (ContainsNoCase(edid, "EnchantingWorkbench") ||
+				ContainsNoCase(edid, "EnchantingTable") ||
+				ContainsNoCase(edid, "EnchantingStation") ||
+				ContainsNoCase(edid, "ArcaneEnchanter") ||
+				ContainsNoCase(edid, "CraftingEnchant")) {
+				return 9;
 			}
 
 			if (ContainsNoCase(edid, "ArmorTable") ||
 				ContainsNoCase(edid, "BlacksmithArmor") ||
 				ContainsNoCase(edid, "SmithingArmor") ||
-				ContainsNoCase(edid, "ArmorWorkbench")) {
+				ContainsNoCase(edid, "ArmorWorkbench") ||
+				ContainsNoCase(edid, "CraftingSmithingArmor") ||
+				ContainsNoCase(edid, "Workbench")) {
 				return 5;
 			}
 
 			return 0;
+		}
+
+		static int ParseRequestedCaptiveWorkCraftingState(std::string_view reason)
+		{
+			if (reason.empty()) {
+				return 0;
+			}
+
+			constexpr std::string_view key{ "work_request_crafting_state_" };
+			const auto pos = reason.find(key);
+			if (pos == std::string_view::npos) {
+				return 0;
+			}
+
+			std::size_t index = pos + key.size();
+			int value = 0;
+			while (index < reason.size()) {
+				const unsigned char ch = static_cast<unsigned char>(reason[index]);
+				if (!std::isdigit(ch)) {
+					break;
+				}
+				value = (value * 10) + static_cast<int>(reason[index] - '0');
+				++index;
+			}
+
+			if (value < 1 || value > 9) {
+				return 0;
+			}
+			return value;
 		}
 
 		static void PruneExpiredCaptiveWorkMineOccupancy(const char* reason)
@@ -999,7 +1187,7 @@ namespace TFD::Location
 				occupied = true;
 				outActorId = actor->GetFormID();
 				return RE::BSContainer::ForEachResult::kStop;
-			});
+				});
 
 			return occupied;
 		}
@@ -1013,11 +1201,15 @@ namespace TFD::Location
 			RE::FormID miningBaseId{ 0 };
 			RE::FormID craftingRefId{ 0 };
 			RE::FormID craftingBaseId{ 0 };
+			std::array<RE::FormID, 10> craftingRefIds{};
+			std::array<RE::FormID, 10> craftingBaseIds{};
 			std::string miningEditorId{};
 			std::string craftingEditorId{};
+			std::array<std::string, 10> craftingEditorIds{};
+			std::array<bool, 10> craftingAvailable{};
 		};
 
-		static bool ScanCaptiveWorkResources(CaptiveWorkResourceScanResult& out)
+		static bool ScanCaptiveWorkResources(CaptiveWorkResourceScanResult& out, int requestedCraftingState = 0)
 		{
 			out = {};
 			auto* player = Player();
@@ -1034,6 +1226,9 @@ namespace TFD::Location
 			std::uint32_t skippedDepletedMines = 0;
 			std::uint32_t skippedOccupiedMines = 0;
 			RE::FormID lastOccupiedMineActorId = 0;
+			std::uint32_t skippedNonFurnitureCrafting = 0;
+			std::uint32_t skippedFarCrafting = 0;
+			std::uint32_t acceptedUsableCampfireCooking = 0;
 
 			cell->ForEachReferenceInRange(origin, kCaptiveWorkResourceScanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
 				if (!candidate || candidate == player) {
@@ -1078,24 +1273,60 @@ namespace TFD::Location
 
 				const int craftingState = CaptiveWorkCraftingStateFromEditorID(edid);
 				if (craftingState > 0) {
-					const int priority = CaptiveWorkCraftingStatePriority(craftingState);
-					if (priority < bestCraftingPriority ||
-						(priority == bestCraftingPriority && candidate->GetFormID() < out.craftingRefId)) {
-						bestCraftingPriority = priority;
-						out.craftingState = craftingState;
-						out.craftingRefId = candidate->GetFormID();
-						out.craftingBaseId = base->GetFormID();
-						out.craftingEditorId = edid;
+					const bool isFurniture = base->As<RE::TESFurniture>() != nullptr;
+					const bool isUsableCampfireCooking = craftingState == 7 && IsUsableCampfireCookingStation(edid);
+					const bool acceptedCraftingTarget = isFurniture || isUsableCampfireCooking;
+					const auto candidatePos = candidate->GetPosition();
+					const double dx = static_cast<double>(candidatePos.x - origin.x);
+					const double dy = static_cast<double>(candidatePos.y - origin.y);
+					const double dz = static_cast<double>(candidatePos.z - origin.z);
+					const double distSq = (dx * dx) + (dy * dy) + (dz * dz);
+					const double furnitureRadiusSq = static_cast<double>(kCaptiveWorkFurnitureScanRadius) * static_cast<double>(kCaptiveWorkFurnitureScanRadius);
+					const bool localFurniture = distSq <= furnitureRadiusSq;
+
+					if (!acceptedCraftingTarget) {
+						++skippedNonFurnitureCrafting;
+					}
+					else if (!localFurniture) {
+						++skippedFarCrafting;
+					}
+					else {
+						if (isUsableCampfireCooking) {
+							++acceptedUsableCampfireCooking;
+						}
+						if (craftingState > 0 && craftingState < static_cast<int>(out.craftingAvailable.size())) {
+							out.craftingAvailable[craftingState] = true;
+							const auto craftingRefId = candidate->GetFormID();
+							if (craftingRefId != 0 &&
+								(out.craftingRefIds[craftingState] == 0 || craftingRefId < out.craftingRefIds[craftingState])) {
+								out.craftingRefIds[craftingState] = craftingRefId;
+								out.craftingBaseIds[craftingState] = base->GetFormID();
+								out.craftingEditorIds[craftingState] = edid;
+							}
+						}
+
+						if (requestedCraftingState <= 0 || craftingState == requestedCraftingState) {
+							const int priority = CaptiveWorkCraftingStatePriority(craftingState);
+							if (priority < bestCraftingPriority ||
+								(priority == bestCraftingPriority && (out.craftingRefId == 0 || candidate->GetFormID() < out.craftingRefId))) {
+								bestCraftingPriority = priority;
+								out.craftingState = craftingState;
+								out.craftingRefId = candidate->GetFormID();
+								out.craftingBaseId = base->GetFormID();
+								out.craftingEditorId = edid;
+							}
+						}
 					}
 				}
 
 				return RE::BSContainer::ForEachResult::kContinue;
-			});
+				});
 
 			spdlog::info(
-				"[TFD][Location] captive work resource scan cell={:08X} considered={} miningState={} miningRef={:08X} miningBase={:08X} miningEditor='{}' depletedSkipped={} occupiedSkipped={} occupiedActor={:08X} craftingState={} craftingRef={:08X} craftingBase={:08X} craftingEditor='{}'",
+				"[TFD][Location] captive work resource scan cell={:08X} considered={} requestedCraftingState={} miningState={} miningRef={:08X} miningBase={:08X} miningEditor='{}' depletedSkipped={} occupiedSkipped={} occupiedActor={:08X} craftingState={} craftingRef={:08X} craftingBase={:08X} craftingEditor='{}' furnitureRadius={} skippedCrafting[nonFurniture={} far={}] usableCampfireCooking={} furniture[forge={} smelter={} tanning={} sharpening={} workbench={} chopping={} cooking={} alchemy={} enchanting={}]",
 				out.cellId,
 				considered,
+				requestedCraftingState,
 				out.miningState,
 				out.miningRefId,
 				out.miningBaseId,
@@ -1106,7 +1337,20 @@ namespace TFD::Location
 				out.craftingState,
 				out.craftingRefId,
 				out.craftingBaseId,
-				out.craftingEditorId.c_str());
+				out.craftingEditorId.c_str(),
+				static_cast<int>(kCaptiveWorkFurnitureScanRadius),
+				skippedNonFurnitureCrafting,
+				skippedFarCrafting,
+				acceptedUsableCampfireCooking,
+				out.craftingAvailable[1] ? 1 : 0,
+				out.craftingAvailable[2] ? 1 : 0,
+				out.craftingAvailable[3] ? 1 : 0,
+				out.craftingAvailable[4] ? 1 : 0,
+				out.craftingAvailable[5] ? 1 : 0,
+				out.craftingAvailable[6] ? 1 : 0,
+				out.craftingAvailable[7] ? 1 : 0,
+				out.craftingAvailable[8] ? 1 : 0,
+				out.craftingAvailable[9] ? 1 : 0);
 
 			return true;
 		}
@@ -1895,11 +2139,14 @@ namespace TFD::Location
 		ResolveCaptiveWorkResourceGlobals();
 		SetGlobalInt(g_workMiningStateGlobal, 0);
 		SetGlobalInt(g_workCraftingStateGlobal, 0);
+		ClearCaptiveWorkFurnitureGlobals();
 		g_lastWorkResourceCellId = 0;
 		g_lastWorkMiningState = -1;
 		g_lastWorkCraftingState = -1;
+		g_activeWorkCraftingSubtypeRequest = 0;
 		g_lastWorkMiningRefId = 0;
 		g_lastWorkCraftingRefId = 0;
+		g_lastWorkCraftingRefIds = {};
 		g_lastWorkResourceScan = {};
 		spdlog::info("[TFD][Location] captive work resource state cleared reason={}", reason ? reason : "unknown");
 	}
@@ -1908,26 +2155,41 @@ namespace TFD::Location
 	{
 		ResolveCaptiveWorkResourceGlobals();
 
+		const std::string_view reasonView = reason ? std::string_view{ reason } : std::string_view{};
+		int requestedCraftingState = ParseRequestedCaptiveWorkCraftingState(reasonView);
+		if (requestedCraftingState > 0) {
+			g_activeWorkCraftingSubtypeRequest = requestedCraftingState;
+			spdlog::info(
+				"[TFD][Location][W07] active crafting subtype latch set requested={} reason={}",
+				requestedCraftingState,
+				reason ? reason : "unknown");
+		}
+		else {
+			requestedCraftingState = GetActiveCaptiveWorkCraftingSubtypeRequest();
+		}
+
 		CaptiveWorkResourceScanResult result{};
 		auto* player = Player();
 		auto* cell = player ? player->GetParentCell() : nullptr;
 		const RE::FormID cellId = cell ? cell->GetFormID() : 0;
 		const auto now = Clock::now();
 
-		if (!force && cellId != 0 && g_lastWorkResourceCellId == cellId &&
+		if (!force && requestedCraftingState <= 0 && cellId != 0 && g_lastWorkResourceCellId == cellId &&
 			g_lastWorkResourceScan.time_since_epoch().count() != 0 &&
 			now - g_lastWorkResourceScan < kCaptiveWorkResourceScanMinInterval) {
 			return true;
 		}
 
-		if (!ScanCaptiveWorkResources(result)) {
+		if (!ScanCaptiveWorkResources(result, requestedCraftingState)) {
 			SetGlobalInt(g_workMiningStateGlobal, 0);
 			SetGlobalInt(g_workCraftingStateGlobal, 0);
+			ClearCaptiveWorkFurnitureGlobals();
 			g_lastWorkResourceCellId = 0;
 			g_lastWorkMiningState = 0;
 			g_lastWorkCraftingState = 0;
 			g_lastWorkMiningRefId = 0;
 			g_lastWorkCraftingRefId = 0;
+			g_lastWorkCraftingRefIds = {};
 			g_lastWorkResourceScan = now;
 			spdlog::warn("[TFD][Location] captive work resource refresh failed reason={}", reason ? reason : "unknown");
 			return false;
@@ -1935,19 +2197,33 @@ namespace TFD::Location
 
 		SetGlobalInt(g_workMiningStateGlobal, result.miningState);
 		SetGlobalInt(g_workCraftingStateGlobal, result.craftingState);
+		SetCaptiveWorkFurnitureGlobals(result.craftingAvailable);
 		g_lastWorkResourceCellId = result.cellId;
 		g_lastWorkMiningState = result.miningState;
 		g_lastWorkCraftingState = result.craftingState;
 		g_lastWorkMiningRefId = result.miningRefId;
 		g_lastWorkCraftingRefId = result.craftingRefId;
+		g_lastWorkCraftingRefIds = result.craftingRefIds;
 		g_lastWorkResourceScan = now;
 
 		spdlog::info(
-			"[TFD][Location] captive work globals refreshed reason={} cell={:08X} TFDMiningState={} TFDCraftingState={}",
+			"[TFD][Location] captive work globals refreshed reason={} requestedCraftingState={} activeCraftingRequest={} cell={:08X} TFDMiningState={} TFDCraftingState={} furnitureRadius={} furniture[forge={} smelter={} tanning={} sharpening={} workbench={} chopping={} cooking={} alchemy={} enchanting={}]",
 			reason ? reason : "unknown",
+			requestedCraftingState,
+			g_activeWorkCraftingSubtypeRequest,
 			result.cellId,
 			result.miningState,
-			result.craftingState);
+			result.craftingState,
+			static_cast<int>(kCaptiveWorkFurnitureScanRadius),
+			result.craftingAvailable[1] ? 1 : 0,
+			result.craftingAvailable[2] ? 1 : 0,
+			result.craftingAvailable[3] ? 1 : 0,
+			result.craftingAvailable[4] ? 1 : 0,
+			result.craftingAvailable[5] ? 1 : 0,
+			result.craftingAvailable[6] ? 1 : 0,
+			result.craftingAvailable[7] ? 1 : 0,
+			result.craftingAvailable[8] ? 1 : 0,
+			result.craftingAvailable[9] ? 1 : 0);
 
 		return true;
 	}
@@ -1960,6 +2236,14 @@ namespace TFD::Location
 	std::uint32_t GetLastCaptiveWorkCraftingRefFormID()
 	{
 		return g_lastWorkCraftingRefId;
+	}
+
+	std::uint32_t GetLastCaptiveWorkCraftingRefFormIDForState(int craftingState)
+	{
+		if (craftingState <= 0 || craftingState >= static_cast<int>(g_lastWorkCraftingRefIds.size())) {
+			return 0;
+		}
+		return g_lastWorkCraftingRefIds[static_cast<std::size_t>(craftingState)];
 	}
 
 	bool MarkLastCaptiveWorkMiningRefDepleted(const char* reason)
@@ -2000,6 +2284,15 @@ namespace TFD::Location
 			return nullptr;
 		}
 		return RE::TESForm::LookupByID<RE::TESObjectREFR>(g_lastWorkCraftingRefId);
+	}
+
+	RE::TESObjectREFR* GetLastCaptiveWorkCraftingRefForState(int craftingState)
+	{
+		const auto formID = GetLastCaptiveWorkCraftingRefFormIDForState(craftingState);
+		if (formID == 0) {
+			return nullptr;
+		}
+		return RE::TESForm::LookupByID<RE::TESObjectREFR>(formID);
 	}
 
 	bool UpdateAmbientKidnapAvailability(bool force)

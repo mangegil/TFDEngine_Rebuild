@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include <RE/Skyrim.h>
 
@@ -7,9 +7,27 @@
 #include <string>
 #include <vector>
 
+namespace RE
+{
+    namespace BSScript
+    {
+        class IVirtualMachine;
+    }
+}
+
 namespace TFD::Actor
 {
     bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs);
+    bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm);
+
+    namespace PleasureAwareness
+    {
+        std::int32_t ScanNearbyPleasureActors(float radius, std::int32_t maxCount, bool npcOnly, bool requireLineOfSight);
+        std::int32_t GetCount();
+        RE::Actor* GetActor(std::int32_t index);
+        float GetDistance(std::int32_t index);
+        bool HasLineOfSight(std::int32_t index);
+    }
 
     struct ScanOptions
     {

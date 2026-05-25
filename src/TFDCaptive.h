@@ -33,6 +33,7 @@ namespace TFD::Captive
 		RE::BGSRefAlias* bossAlias{ nullptr };
 		RE::BGSRefAlias* workMineAlias{ nullptr };
 		RE::BGSRefAlias* workCraftingStationAlias{ nullptr };
+		std::array<RE::BGSRefAlias*, 10> workCraftingStationAliases{};
 		RE::BGSRefAlias* workItemAlias{ nullptr };
 		std::array<RE::BGSRefAlias*, 3> bossCaptorAliases{};
 		std::array<RE::BGSRefAlias*, 3> bossContainerAliases{};

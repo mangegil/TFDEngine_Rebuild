@@ -1,4 +1,4 @@
-﻿#include "TFDActor.h"
+#include "TFDActor.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
 #include "TFDTame.h"
@@ -21,6 +21,7 @@
 #include <RE/T/TESDataHandler.h>
 #include <RE/T/TESFile.h>
 #include <RE/T/TESForm.h>
+#include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
 namespace TFD::Actor
@@ -28,6 +29,332 @@ namespace TFD::Actor
     bool SharesAllowedFactionExact(RE::Actor* lhs, RE::Actor* rhs)
     {
         return Ops::SharesAllowedFactionExact(lhs, rhs);
+    }
+}
+
+
+namespace TFD::Actor::PleasureAwareness
+{
+    namespace
+    {
+        struct AwarenessEntry
+        {
+            RE::ActorHandle actor{};
+            float distance{ 0.0f };
+            bool lineOfSightToPlayer{ false };
+        };
+
+        std::mutex g_awarenessLock;
+        std::vector<AwarenessEntry> g_awarenessActors;
+
+        static constexpr std::int32_t kDefaultMaxActors = 16;
+        static constexpr std::int32_t kHardMaxActors = 64;
+
+        RE::BGSKeyword* GetActorTypeNpcKeywordForAwareness()
+        {
+            static RE::BGSKeyword* cached = nullptr;
+            static bool tried = false;
+            if (tried) {
+                return cached;
+            }
+            tried = true;
+            cached = RE::TESForm::LookupByID<RE::BGSKeyword>(0x00013794);  // ActorTypeNPC
+            return cached;
+        }
+
+        bool IsNpcLikeForAwareness(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            auto* kwNpc = GetActorTypeNpcKeywordForAwareness();
+            if (!kwNpc) {
+                return true;
+            }
+
+            if (auto* race = actor->GetRace(); race && race->HasKeyword(kwNpc)) {
+                return true;
+            }
+            if (auto* base = actor->GetActorBase(); base && base->HasKeyword(kwNpc)) {
+                return true;
+            }
+            if (actor->HasKeyword(kwNpc)) {
+                return true;
+            }
+
+            return false;
+        }
+
+        float DistanceBetweenRefs(RE::TESObjectREFR* a, RE::TESObjectREFR* b)
+        {
+            if (!a || !b) {
+                return 0.0f;
+            }
+
+            const auto pa = a->GetPosition();
+            const auto pb = b->GetPosition();
+            const float dx = pa.x - pb.x;
+            const float dy = pa.y - pb.y;
+            const float dz = pa.z - pb.z;
+            return std::sqrt((dx * dx) + (dy * dy) + (dz * dz));
+        }
+
+        bool IsSameLoadedArea(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+
+            auto* playerCell = player->GetParentCell();
+            auto* actorCell = actor->GetParentCell();
+            if (playerCell && actorCell != playerCell) {
+                return false;
+            }
+
+            auto* playerWorld = player->GetWorldspace();
+            if (playerWorld && actor->GetWorldspace() != playerWorld) {
+                return false;
+            }
+
+            return true;
+        }
+
+        bool HasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+            bool hasLOSData = false;
+            return actor->HasLineOfSight(player, hasLOSData);
+        }
+
+        std::vector<RE::ActorHandle> CollectLoadedActorHandlesForAwareness()
+        {
+            std::vector<RE::ActorHandle> out;
+            out.reserve(256);
+
+            auto* lists = RE::ProcessLists::GetSingleton();
+            if (!lists) {
+                return out;
+            }
+
+            auto addArr = [&](auto& arr) {
+                for (auto& h : arr) {
+                    if (h) {
+                        out.push_back(h);
+                    }
+                }
+                };
+
+            addArr(lists->highActorHandles);
+            addArr(lists->middleHighActorHandles);
+            addArr(lists->middleLowActorHandles);
+            addArr(lists->lowActorHandles);
+
+            return out;
+        }
+    }
+
+    std::int32_t ScanNearbyPleasureActors(float radius, std::int32_t maxCount, bool npcOnly, bool requireLineOfSight)
+    {
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            std::scoped_lock lk(g_awarenessLock);
+            g_awarenessActors.clear();
+            return 0;
+        }
+
+        if (radius < 0.0f) {
+            radius = 0.0f;
+        }
+        if (maxCount <= 0) {
+            maxCount = kDefaultMaxActors;
+        }
+        maxCount = (std::min)(maxCount, kHardMaxActors);
+
+        const auto handles = CollectLoadedActorHandlesForAwareness();
+        std::unordered_set<RE::FormID> seen;
+        seen.reserve(handles.size() * 2);
+
+        std::vector<AwarenessEntry> temp;
+        temp.reserve(static_cast<std::size_t>(maxCount));
+
+        std::uint32_t skippedDead = 0;
+        std::uint32_t skippedNo3D = 0;
+        std::uint32_t skippedArea = 0;
+        std::uint32_t skippedDistance = 0;
+        std::uint32_t skippedNpc = 0;
+        std::uint32_t skippedLos = 0;
+
+        for (auto const& h : handles) {
+            auto sp = h.get();
+            auto* actor = sp.get();
+            if (!actor || actor == player) {
+                continue;
+            }
+
+            const auto formID = actor->GetFormID();
+            if (formID == 0 || !seen.insert(formID).second) {
+                continue;
+            }
+
+            if (actor->IsDead() || actor->IsDisabled()) {
+                ++skippedDead;
+                continue;
+            }
+            if (!actor->Is3DLoaded()) {
+                ++skippedNo3D;
+                continue;
+            }
+            if (!IsSameLoadedArea(actor, player)) {
+                ++skippedArea;
+                continue;
+            }
+            if (npcOnly && !IsNpcLikeForAwareness(actor)) {
+                ++skippedNpc;
+                continue;
+            }
+
+            const float distance = DistanceBetweenRefs(actor, player);
+            if (radius > 0.0f && distance > radius) {
+                ++skippedDistance;
+                continue;
+            }
+
+            const bool hasLOS = HasLineOfSightToPlayer(actor, player);
+            if (requireLineOfSight && !hasLOS) {
+                ++skippedLos;
+                continue;
+            }
+
+            AwarenessEntry entry{};
+            entry.actor = actor->GetHandle();
+            entry.distance = distance;
+            entry.lineOfSightToPlayer = hasLOS;
+            temp.push_back(entry);
+        }
+
+        std::sort(temp.begin(), temp.end(), [](const AwarenessEntry& lhs, const AwarenessEntry& rhs) {
+            if (lhs.lineOfSightToPlayer != rhs.lineOfSightToPlayer) {
+                return lhs.lineOfSightToPlayer && !rhs.lineOfSightToPlayer;
+            }
+            return lhs.distance < rhs.distance;
+            });
+
+        if (temp.size() > static_cast<std::size_t>(maxCount)) {
+            temp.resize(static_cast<std::size_t>(maxCount));
+        }
+
+        const auto kept = temp.size();
+        std::uint32_t losCount = 0;
+        for (auto const& entry : temp) {
+            if (entry.lineOfSightToPlayer) {
+                ++losCount;
+            }
+        }
+
+        {
+            std::scoped_lock lk(g_awarenessLock);
+            g_awarenessActors = std::move(temp);
+        }
+
+        spdlog::info("[TFD][Actor][DS04] pleasure awareness scan radius={} max={} npcOnly={} requireLOS={} kept={} los={} skipped[dead={} no3d={} area={} npc={} distance={} los={}]",
+            radius,
+            maxCount,
+            npcOnly ? 1 : 0,
+            requireLineOfSight ? 1 : 0,
+            kept,
+            losCount,
+            skippedDead,
+            skippedNo3D,
+            skippedArea,
+            skippedNpc,
+            skippedDistance,
+            skippedLos);
+
+        return static_cast<std::int32_t>(kept);
+    }
+
+    std::int32_t GetCount()
+    {
+        std::scoped_lock lk(g_awarenessLock);
+        return static_cast<std::int32_t>(g_awarenessActors.size());
+    }
+
+    RE::Actor* GetActor(std::int32_t index)
+    {
+        std::scoped_lock lk(g_awarenessLock);
+        if (index < 0 || static_cast<std::size_t>(index) >= g_awarenessActors.size()) {
+            return nullptr;
+        }
+        auto sp = g_awarenessActors[static_cast<std::size_t>(index)].actor.get();
+        return sp.get();
+    }
+
+    float GetDistance(std::int32_t index)
+    {
+        std::scoped_lock lk(g_awarenessLock);
+        if (index < 0 || static_cast<std::size_t>(index) >= g_awarenessActors.size()) {
+            return 0.0f;
+        }
+        return g_awarenessActors[static_cast<std::size_t>(index)].distance;
+    }
+
+    bool HasLineOfSight(std::int32_t index)
+    {
+        std::scoped_lock lk(g_awarenessLock);
+        if (index < 0 || static_cast<std::size_t>(index) >= g_awarenessActors.size()) {
+            return false;
+        }
+        return g_awarenessActors[static_cast<std::size_t>(index)].lineOfSightToPlayer;
+    }
+}
+
+namespace TFD::Actor
+{
+    namespace
+    {
+        std::int32_t PapyrusScanNearbyPleasureActors(RE::StaticFunctionTag*, float radius, std::int32_t maxCount, bool npcOnly, bool requireLineOfSight)
+        {
+            return PleasureAwareness::ScanNearbyPleasureActors(radius, maxCount, npcOnly, requireLineOfSight);
+        }
+
+        std::int32_t PapyrusGetPleasureScanCount(RE::StaticFunctionTag*)
+        {
+            return PleasureAwareness::GetCount();
+        }
+
+        RE::Actor* PapyrusGetPleasureScanActor(RE::StaticFunctionTag*, std::int32_t index)
+        {
+            return PleasureAwareness::GetActor(index);
+        }
+
+        float PapyrusGetPleasureScanDistance(RE::StaticFunctionTag*, std::int32_t index)
+        {
+            return PleasureAwareness::GetDistance(index);
+        }
+
+        bool PapyrusGetPleasureScanHasLineOfSight(RE::StaticFunctionTag*, std::int32_t index)
+        {
+            return PleasureAwareness::HasLineOfSight(index);
+        }
+    }
+
+    bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm)
+    {
+        if (!a_vm) {
+            return false;
+        }
+
+        a_vm->RegisterFunction("ScanNearbyPleasureActors", "TFDActorNative", PapyrusScanNearbyPleasureActors);
+        a_vm->RegisterFunction("GetPleasureScanCount", "TFDActorNative", PapyrusGetPleasureScanCount);
+        a_vm->RegisterFunction("GetPleasureScanActor", "TFDActorNative", PapyrusGetPleasureScanActor);
+        a_vm->RegisterFunction("GetPleasureScanDistance", "TFDActorNative", PapyrusGetPleasureScanDistance);
+        a_vm->RegisterFunction("GetPleasureScanHasLineOfSight", "TFDActorNative", PapyrusGetPleasureScanHasLineOfSight);
+
+        spdlog::info("[TFD][Actor][DS04] Papyrus natives registered for pleasure awareness scan");
+        return true;
     }
 }
 
@@ -1592,6 +1919,12 @@ namespace TFD::Actor::Ops
 			RE::ActorHandle actor{};
 			std::chrono::steady_clock::time_point expiresAt{};
 			std::string source{};
+			bool hadHelperFaction{ false };
+			bool addedHelperFaction{ false };
+			bool hadDialogueHelperFaction{ false };
+			bool addedDialogueHelperFaction{ false };
+			bool hasOriginalAggression{ false };
+			float originalAggression{ 0.0f };
 		};
 
 		bool g_initialized = false;
@@ -2297,6 +2630,84 @@ namespace TFD::Actor::Ops
 			return true;
 		}
 
+
+		static void StabilizeReleaseFollowGraceActor(RE::Actor* actor, ReleaseFollowGraceEntry& entry, const char* reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			ResolveReleaseFollowHelperFaction();
+			bool changedFaction = false;
+			bool changedAggression = false;
+
+			if (g_releaseFollowHelperFaction) {
+				if (!entry.hadHelperFaction && !entry.addedHelperFaction) {
+					entry.hadHelperFaction = actor->IsInFaction(g_releaseFollowHelperFaction);
+				}
+				if (!actor->IsInFaction(g_releaseFollowHelperFaction)) {
+					actor->AddToFaction(g_releaseFollowHelperFaction, 0);
+					if (!entry.hadHelperFaction) {
+						entry.addedHelperFaction = true;
+					}
+					changedFaction = true;
+				}
+			}
+
+			if (g_dialogueHelperFaction) {
+				if (!entry.hadDialogueHelperFaction && !entry.addedDialogueHelperFaction) {
+					entry.hadDialogueHelperFaction = actor->IsInFaction(g_dialogueHelperFaction);
+				}
+				if (!actor->IsInFaction(g_dialogueHelperFaction)) {
+					actor->AddToFaction(g_dialogueHelperFaction, 0);
+					if (!entry.hadDialogueHelperFaction) {
+						entry.addedDialogueHelperFaction = true;
+					}
+					changedFaction = true;
+				}
+			}
+
+			auto* avo = actor->AsActorValueOwner();
+			if (avo) {
+				const float currentAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+				if (!entry.hasOriginalAggression && currentAggression > 0.0f) {
+					entry.originalAggression = currentAggression;
+					entry.hasOriginalAggression = true;
+				}
+				if (currentAggression > 0.0f) {
+					avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+					changedAggression = true;
+				}
+			}
+
+			if (auto* player = Player()) {
+				(void)SuppressReleaseFollowTargetingToPlayer(actor, player, reason ? reason : "release_grace_stabilize");
+			}
+
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+
+			if (changedFaction || changedAggression) {
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->ClearCachedFactionFightReactions();
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+				actor->UpdateCombat();
+				if (auto* player = Player()) {
+					player->UpdateCombat();
+				}
+				spdlog::info(
+					"[TFD][FactionManager][W48] grace stabilized actor={:08X} helperAdded={} pacifyAdded={} aggressionHeld={} reason={}",
+					actor->GetFormID(),
+					entry.addedHelperFaction ? 1 : 0,
+					entry.addedDialogueHelperFaction ? 1 : 0,
+					entry.hasOriginalAggression ? 1 : 0,
+					reason ? reason : "unknown");
+			}
+		}
+
 		static void RemoveReleaseFollowGraceFromActor(RE::Actor* actor, const char* reason)
 		{
 			if (!actor) {
@@ -2304,24 +2715,55 @@ namespace TFD::Actor::Ops
 			}
 			ResolveReleaseFollowHelperFaction();
 
+			ReleaseFollowGraceEntry entry{};
+			bool hadEntry = false;
+			if (auto it = g_releaseFollowGraceEntries.find(actor->GetFormID()); it != g_releaseFollowGraceEntries.end()) {
+				entry = it->second;
+				hadEntry = true;
+			}
+
 			const bool keepPacifyForPermanentTeammate = ActorHasPermanentTeammateFaction(actor);
+			const bool keepPacifyForActiveDialogue = ActorHasActiveDialoguePhaseFaction(actor);
 
 			if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
-				actor->RemoveFromFaction(g_releaseFollowHelperFaction);
+				if (!hadEntry || entry.addedHelperFaction || !entry.hadHelperFaction) {
+					actor->RemoveFromFaction(g_releaseFollowHelperFaction);
+				}
 			}
 			if (g_dialogueHelperFaction && actor->IsInFaction(g_dialogueHelperFaction)) {
-				if (keepPacifyForPermanentTeammate) {
+				if (keepPacifyForPermanentTeammate || keepPacifyForActiveDialogue) {
 					spdlog::info(
-						"[TFD][FactionManager] grace keep pacify actor={:08X} reason={} guard=permanent_teammate",
+						"[TFD][FactionManager] grace keep pacify actor={:08X} reason={} guard={}",
 						actor->GetFormID(),
-						reason ? reason : "unknown");
+						reason ? reason : "unknown",
+						keepPacifyForPermanentTeammate ? "permanent_teammate" : "active_dialogue_phase");
 				}
-				else if (!ActorHasActiveDialoguePhaseFaction(actor)) {
+				else if (!hadEntry || entry.addedDialogueHelperFaction || !entry.hadDialogueHelperFaction) {
 					actor->RemoveFromFaction(g_dialogueHelperFaction);
 				}
 			}
+
+			if (hadEntry && entry.hasOriginalAggression) {
+				if (auto* avo = actor->AsActorValueOwner()) {
+					avo->SetActorValue(RE::ActorValue::kAggression, entry.originalAggression);
+				}
+			}
+
 			g_releaseFollowGraceEntries.erase(actor->GetFormID());
-			spdlog::info("[TFD][FactionManager] grace removed actor={:08X} reason={}", actor->GetFormID(), reason ? reason : "unknown");
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->ClearCachedFactionFightReactions();
+			}
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+			actor->UpdateCombat();
+			if (auto* player = Player()) {
+				player->UpdateCombat();
+			}
+			spdlog::info(
+				"[TFD][FactionManager] grace removed actor={:08X} reason={} restoredAggression={}",
+				actor->GetFormID(),
+				reason ? reason : "unknown",
+				(hadEntry && entry.hasOriginalAggression) ? 1 : 0);
 		}
 
 		static void ApplyReleaseFollowGraceToActor(RE::Actor* actor, double durationSeconds, const char* reason)
@@ -2336,26 +2778,21 @@ namespace TFD::Actor::Ops
 			if (durationSeconds <= 0.0) {
 				durationSeconds = 20.0;
 			}
-			if (g_releaseFollowHelperFaction && !actor->IsInFaction(g_releaseFollowHelperFaction)) {
-				actor->AddToFaction(g_releaseFollowHelperFaction, 0);
-			}
-			if (g_dialogueHelperFaction && !actor->IsInFaction(g_dialogueHelperFaction)) {
-				actor->AddToFaction(g_dialogueHelperFaction, 0);
-			}
-			ReleaseFollowGraceEntry entry{};
+
+			auto& entry = g_releaseFollowGraceEntries[actor->GetFormID()];
 			entry.actor = actor->GetHandle();
 			entry.expiresAt = Now() + std::chrono::milliseconds(static_cast<int>((std::max)(0.0, durationSeconds) * 1000.0));
 			entry.source = reason ? reason : "unknown";
-			g_releaseFollowGraceEntries[actor->GetFormID()] = std::move(entry);
-			if (auto* player = Player()) {
-				(void)SuppressReleaseFollowTargetingToPlayer(actor, player, reason ? reason : "grace_apply");
-			}
-			spdlog::info("[TFD][FactionManager] grace applied actor={:08X} helperFaction={:08X} dialogueFaction={:08X} duration={:.2f} reason={}",
+
+			StabilizeReleaseFollowGraceActor(actor, entry, reason ? reason : "grace_apply");
+
+			spdlog::info("[TFD][FactionManager] grace applied actor={:08X} helperFaction={:08X} dialogueFaction={:08X} duration={:.2f} reason={} aggressionHeld={}",
 				actor->GetFormID(),
 				g_releaseFollowHelperFaction ? g_releaseFollowHelperFaction->GetFormID() : 0u,
 				g_dialogueHelperFaction ? g_dialogueHelperFaction->GetFormID() : 0u,
 				durationSeconds,
-				reason ? reason : "unknown");
+				reason ? reason : "unknown",
+				entry.hasOriginalAggression ? 1 : 0);
 		}
 	}
 
@@ -2541,7 +2978,6 @@ namespace TFD::Actor::Ops
 		if (g_releaseFollowGraceEntries.empty()) {
 			return;
 		}
-		auto* player = Player();
 		std::vector<RE::Actor*> actorsToClear{};
 		std::vector<RE::FormID> staleIds{};
 		const auto now = Now();
@@ -2551,9 +2987,7 @@ namespace TFD::Actor::Ops
 			const bool expired = now >= entry.expiresAt;
 			const bool invalid = !actor || actor->IsDead() || actor->IsDisabled();
 			if (!expired && !invalid) {
-				if (player) {
-					(void)SuppressReleaseFollowTargetingToPlayer(actor, player, entry.source.c_str());
-				}
+				StabilizeReleaseFollowGraceActor(actor, entry, entry.source.c_str());
 				continue;
 			}
 			if (actor) {

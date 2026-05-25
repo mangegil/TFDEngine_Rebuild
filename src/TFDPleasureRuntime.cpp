@@ -43,6 +43,7 @@ namespace TFD::PleasureRuntime
 			bool passiveLockActive{ false };
 			bool holdActive{ false };
 			bool afterPleasureCommitted{ false };
+			bool pleasureFailedDialogueActive{ false };
 			bool redoPending{ false };
 			AfterChoice pendingChoice{ AfterChoice::None };
 
@@ -66,6 +67,9 @@ namespace TFD::PleasureRuntime
 			double abortedFlowCompleteDueSec{ 0.0 };
 			std::uint32_t abortedFlowActorFormID{ 0 };
 			bool abortedFlowCompleteQueued{ false };
+
+			double scenePassiveHoldNextPulseSec{ 0.0 };
+			unsigned scenePassiveHoldPulseCount{ 0 };
 
 			std::vector<std::uint32_t> deferredInCombatRecruitActorIds{};
 		};
@@ -109,6 +113,8 @@ namespace TFD::PleasureRuntime
 		constexpr double kSuppressSceneStartDialogueCooldownSec = 0.75;
 		constexpr double kMinimumSceneActiveSec = 1.50;
 		constexpr double kAbortedFlowCompleteDelaySec = 0.05;
+		constexpr double kScenePassiveHoldPendingPulseSec = 0.45;
+		constexpr double kScenePassiveHoldActivePulseSec = 3.50;
 
 		const char* ToString(Phase value)
 		{
@@ -202,6 +208,21 @@ namespace TFD::PleasureRuntime
 				return AfterChoice::Captive;
 			}
 			return AfterChoice::None;
+		}
+
+		bool IsValidSceneStartSource(SourceContext source)
+		{
+			switch (source) {
+			case SourceContext::PreCombat:
+			case SourceContext::InCombat:
+			case SourceContext::Bleedout:
+			case SourceContext::Captive:
+			case SourceContext::Victory:
+			case SourceContext::Teammate:
+				return true;
+			default:
+				return false;
+			}
 		}
 
 		RE::Actor* LookupActor(std::uint32_t formID)
@@ -408,13 +429,13 @@ namespace TFD::PleasureRuntime
 		{
 			return IsDeferredPleasureChainSourceLocked() &&
 				(g_state.active ||
-				g_state.blocking ||
-				g_state.passiveLockActive ||
-				g_state.holdActive ||
-				g_state.queuedPreCombatSpeakerFormID != 0 ||
-				g_state.queuedTerminalNeutralFinalize ||
-				g_state.abortedFlowCompleteQueued ||
-				!g_state.deferredInCombatRecruitActorIds.empty());
+					g_state.blocking ||
+					g_state.passiveLockActive ||
+					g_state.holdActive ||
+					g_state.queuedPreCombatSpeakerFormID != 0 ||
+					g_state.queuedTerminalNeutralFinalize ||
+					g_state.abortedFlowCompleteQueued ||
+					!g_state.deferredInCombatRecruitActorIds.empty());
 		}
 
 		void DeferInCombatRecruitAliasLocked(RE::Actor* actor, std::string_view reason)
@@ -490,9 +511,12 @@ namespace TFD::PleasureRuntime
 			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
 			g_state.bridgeState = 0;
 			g_state.afterPleasureCommitted = false;
+			g_state.pleasureFailedDialogueActive = false;
 			g_state.afterPleasureDialogueExpireSec = 0.0;
 			g_state.pleasureStartPendingAtSec = 0.0;
 			g_state.pleasureActiveStartedAtSec = 0.0;
+			g_state.scenePassiveHoldNextPulseSec = 0.0;
+			g_state.scenePassiveHoldPulseCount = 0;
 		}
 
 		void ClearHoldStateLocked()
@@ -503,6 +527,8 @@ namespace TFD::PleasureRuntime
 			g_state.holdActive = false;
 			g_state.passiveLockActive = false;
 			g_state.blocking = false;
+			g_state.scenePassiveHoldNextPulseSec = 0.0;
+			g_state.scenePassiveHoldPulseCount = 0;
 		}
 
 		void ResetStateLocked(std::string_view reason)
@@ -542,9 +568,13 @@ namespace TFD::PleasureRuntime
 			if (next == Phase::PleasureStartPending) {
 				g_state.pleasureStartPendingAtSec = NowSec();
 				g_state.pleasureActiveStartedAtSec = 0.0;
+				g_state.scenePassiveHoldNextPulseSec = 0.0;
+				g_state.scenePassiveHoldPulseCount = 0;
 			}
 			else if (next == Phase::PleasureActive) {
 				g_state.pleasureActiveStartedAtSec = NowSec();
+				g_state.scenePassiveHoldNextPulseSec = 0.0;
+				g_state.scenePassiveHoldPulseCount = 0;
 			}
 
 			if (next == Phase::Idle || next == Phase::Closed) {
@@ -574,6 +604,7 @@ namespace TFD::PleasureRuntime
 			g_state.redoPending = false;
 			g_state.pendingChoice = AfterChoice::None;
 			g_state.afterPleasureCommitted = false;
+			g_state.pleasureFailedDialogueActive = false;
 			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
 			g_state.bridgeState = 0;
 			g_state.pleasureStartPendingAtSec = 0.0;
@@ -595,6 +626,46 @@ namespace TFD::PleasureRuntime
 				g_state.sessionCycleId,
 				ToString(source),
 				g_state.pleasureSpeakerFormID,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		void PrepareRedoSpeakerSwitchLocked(RE::Actor* redoActor, std::uint32_t requestedActorID, std::string_view reason)
+		{
+			const auto oldPleasureID = g_state.pleasureSpeakerFormID;
+			const auto oldAfterID = g_state.afterPleasureSpeakerFormID;
+			const auto newActorID = redoActor ? redoActor->GetFormID() : requestedActorID;
+
+			std::vector<std::uint32_t> staleActorIDs{};
+			if (oldAfterID != 0 && oldAfterID != newActorID) {
+				staleActorIDs.push_back(oldAfterID);
+			}
+			if (oldPleasureID != 0 && oldPleasureID != newActorID &&
+				std::find(staleActorIDs.begin(), staleActorIDs.end(), oldPleasureID) == staleActorIDs.end()) {
+				staleActorIDs.push_back(oldPleasureID);
+			}
+
+			std::uint32_t released = 0;
+			for (auto actorID : staleActorIDs) {
+				auto* staleActor = LookupActor(actorID);
+				if (!staleActor || staleActor->IsDead() || staleActor->IsDisabled()) {
+					continue;
+				}
+				ReleaseAfterPleasurePackageActor(staleActor, reason.empty() ? "after_pleasure_redo_actor_switch" : reason);
+				++released;
+			}
+
+			if (newActorID != 0) {
+				g_state.pleasureSpeakerFormID = newActorID;
+			}
+			g_state.afterPleasureSpeakerFormID = 0;
+			g_state.ostimThreadId = static_cast<std::uint32_t>(-1);
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][C51] redo speaker switch prepared oldPleasure={:08X} oldAfter={:08X} new={:08X} released={} reason={}",
+				oldPleasureID,
+				oldAfterID,
+				newActorID,
+				released,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
@@ -621,6 +692,8 @@ namespace TFD::PleasureRuntime
 				eventName == kOStimSceneEndedEvent ||
 				eventName == kAfterPleasureEnterEvent ||
 				eventName == kAfterPleasureLoopEnterEvent ||
+				eventName == kPleasureFailedEnterEvent ||
+				eventName == kPleasureClearEvent ||
 				IsAfterPleasureChoiceEvent(eventName);
 		}
 
@@ -863,6 +936,87 @@ namespace TFD::PleasureRuntime
 				ToString(g_state.phase),
 				g_state.sessionCycleId,
 				reasonText);
+		}
+
+		bool IsScenePassiveHoldSourceLocked()
+		{
+			// W37: repeated passive hold pulses are only for real combat-to-scene
+			// handoffs. PreCombat and Captive are already passive dialogue contexts;
+			// keeping them in this loop created avoidable delay and native busy windows.
+			return g_state.source == SourceContext::InCombat ||
+				g_state.source == SourceContext::Bleedout;
+		}
+
+		bool ShouldMaintainScenePassiveHoldLocked()
+		{
+			if (!g_state.passiveLockActive || !g_state.holdActive) {
+				return false;
+			}
+
+			if (!IsScenePassiveHoldSourceLocked()) {
+				return false;
+			}
+
+			// W33: The aggressive passive hold is only needed while OStim is still
+			// starting. Once OStim reports the scene active, repeated StopCombat /
+			// EvaluatePackage waves can fight OStim's own scene/UI state and add
+			// avoidable pressure during alignment/animation UI updates.
+			return g_state.phase == Phase::PleasureStartPending;
+		}
+
+		void MaintainScenePassiveHoldLocked(double now)
+		{
+			if (!ShouldMaintainScenePassiveHoldLocked()) {
+				return;
+			}
+
+			if (g_state.scenePassiveHoldNextPulseSec > 0.0 && now < g_state.scenePassiveHoldNextPulseSec) {
+				return;
+			}
+
+			auto* actor = LookupActor(g_state.pleasureSpeakerFormID);
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				g_state.scenePassiveHoldNextPulseSec = now + kScenePassiveHoldPendingPulseSec;
+				return;
+			}
+
+			TFD::HostilityController::ApplyAggressionClamp(actor);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				const bool oldRunDetection = process->runDetection;
+				process->runDetection = false;
+				process->ClearCachedFactionFightReactions();
+				process->StopCombatAndAlarmOnActor(actor, false);
+				process->runDetection = oldRunDetection;
+			}
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			if (actor->IsWeaponDrawn()) {
+				actor->DrawWeaponMagicHands(false);
+			}
+			actor->EvaluatePackage(false, true);
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			if (player) {
+				player->StopCombat();
+			}
+
+			const float waveRadius = g_state.source == SourceContext::Captive ? 2400.0f : 1800.0f;
+			TFD::HostilityController::ScheduleStopCombatWaves(waveRadius, g_state.source == SourceContext::Captive, 3, 75);
+
+			++g_state.scenePassiveHoldPulseCount;
+			const double nextDelay = g_state.phase == Phase::PleasureStartPending ? kScenePassiveHoldPendingPulseSec : kScenePassiveHoldActivePulseSec;
+			g_state.scenePassiveHoldNextPulseSec = now + nextDelay;
+
+			if (g_state.scenePassiveHoldPulseCount == 1 || (g_state.scenePassiveHoldPulseCount % 4) == 0) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][W33] scene pending passive hold pulse actor={:08X} source={} phase={} cycle={} count={} next={:.2f}s",
+					actor->GetFormID(),
+					ToString(g_state.source),
+					ToString(g_state.phase),
+					g_state.sessionCycleId,
+					g_state.scenePassiveHoldPulseCount,
+					nextDelay);
+			}
 		}
 
 		void HandleAfterPleasureLoopNoiseLocked(const EventInfo& info, std::string_view reason)
@@ -1598,20 +1752,73 @@ namespace TFD::PleasureRuntime
 
 		void HandleRecognizedEventLocked(std::string_view eventName, const EventInfo& info)
 		{
+			if (eventName == kPleasureClearEvent) {
+				const auto oldPhase = g_state.phase;
+				const auto oldSource = g_state.source;
+				const auto oldCycle = g_state.sessionCycleId;
+				auto* clearActor = ResolveEventOrTrackedActorLocked(info);
+
+				ClearQueuedPreCombatCycleLocked(eventName);
+				ClearQueuedTerminalNeutralFinalizeLocked(eventName);
+				g_state.redoPending = false;
+				g_state.pendingChoice = AfterChoice::None;
+				g_state.abortedFlowCompleteQueued = false;
+				g_state.abortedFlowActorFormID = 0;
+				g_state.abortedFlowCompleteDueSec = 0.0;
+				g_state.afterPleasureCommitted = false;
+				g_state.active = false;
+				g_state.blocking = false;
+				g_state.phase = Phase::Closed;
+				g_state.source = SourceContext::None;
+				g_state.flowOwnerToken = 0;
+				ClearBridgeStateLocked();
+				ClearHoldStateLocked();
+				ClearSpeakerStateLocked();
+
+				spdlog::info(
+					"[TFD][PleasureRuntime][W32] clear event accepted event={} actor={:08X} oldPhase={} oldSource={} oldCycle={} reason=papyrus_or_system_clear",
+					std::string{ eventName },
+					clearActor ? clearActor->GetFormID() : info.actorFormID,
+					ToString(oldPhase),
+					ToString(oldSource),
+					oldCycle);
+				return;
+			}
+
 			if (eventName == kPleasureStartPendingEvent || eventName == kOStimSceneStartPendingEvent) {
 				if (g_state.phase == Phase::Idle || g_state.phase == Phase::Closed) {
-					const auto fallbackSource = g_state.source == SourceContext::None ? SourceContext::PreCombat : g_state.source;
-					auto eventSource = SourceFromFlowValue(info.sourceFlow, fallbackSource);
-					if (eventSource == SourceContext::None) {
-						eventSource = SourceContext::PreCombat;
+					const auto eventSource = SourceFromFlowValue(info.sourceFlow, SourceContext::None);
+					auto* eventActor = info.actor ? info.actor : LookupActor(info.actorFormID);
+
+					if (!IsValidSceneStartSource(eventSource)) {
+						LogEventIgnoredLocked(eventName, "orphan_start_pending_source_none", info);
+						return;
 					}
-					BeginNewCycleLocked(info.actor, eventSource, eventName);
+
+					if (!eventActor || eventActor->IsDisabled() || eventActor->IsDead()) {
+						LogEventIgnoredLocked(eventName, "orphan_start_pending_no_actor", info);
+						return;
+					}
+
+					BeginNewCycleLocked(eventActor, eventSource, eventName);
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.blocking = true;
-					g_state.passiveLockActive = true;
 					g_state.holdActive = true;
-					PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_passive_lock");
-					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_start_pending_suppress_dialogue");
+					if (eventSource == SourceContext::InCombat || eventSource == SourceContext::Bleedout) {
+						g_state.passiveLockActive = true;
+						PrepareActorForScenePassiveLocked(eventActor, "scene_start_pending_passive_lock");
+						SuppressActorDialogueForSceneLocked(eventActor, "scene_start_pending_suppress_dialogue");
+					}
+					else {
+						g_state.passiveLockActive = false;
+						g_state.scenePassiveHoldNextPulseSec = 0.0;
+						g_state.scenePassiveHoldPulseCount = 0;
+						spdlog::info(
+							"[TFD][PleasureRuntime][W37] safe scene start pending actor={:08X} source={} cycle={} reason=no_hard_passive_hold",
+							eventActor->GetFormID(),
+							ToString(eventSource),
+							g_state.sessionCycleId);
+					}
 					LogEventAcceptedLocked(eventName, info, "new_cycle");
 					return;
 				}
@@ -1627,9 +1834,18 @@ namespace TFD::PleasureRuntime
 				if (g_state.phase == Phase::PleasureStartPending) {
 					AdvancePhaseLocked(Phase::PleasureActive, eventName);
 					g_state.holdActive = true;
-					g_state.passiveLockActive = true;
-					PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_passive_lock");
-					SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
+					if (g_state.source == SourceContext::InCombat || g_state.source == SourceContext::Bleedout) {
+						g_state.passiveLockActive = true;
+						PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_passive_lock");
+						SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
+					}
+					else {
+						g_state.passiveLockActive = false;
+						spdlog::info(
+							"[TFD][PleasureRuntime][W37] safe scene active source={} cycle={} reason=no_hard_passive_hold",
+							ToString(g_state.source),
+							g_state.sessionCycleId);
+					}
 					LogEventAcceptedLocked(eventName, info, "scene_active");
 					return;
 				}
@@ -1695,18 +1911,34 @@ namespace TFD::PleasureRuntime
 					g_state.phase == Phase::AfterPleasureAwaitQuest ||
 					g_state.phase == Phase::AfterPleasureDialogue) {
 					auto* failedActor = ResolveEventOrTrackedActorLocked(info);
-					const auto failedActorFormID = failedActor ? failedActor->GetFormID() : (info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID);
+					if (!failedActor || failedActor->IsDead() || failedActor->IsDisabled()) {
+						spdlog::warn(
+							"[TFD][PleasureRuntime][W51] pleasure failed dialogue ignored invalid actor actor={:08X} tracked={:08X} phase={} source={}",
+							info.actorFormID,
+							g_state.pleasureSpeakerFormID,
+							ToString(g_state.phase),
+							ToString(g_state.source));
+						AdvancePhaseLocked(Phase::Finalizing, "pleasure_failed_invalid_actor");
+						AdvancePhaseLocked(Phase::Closed, "pleasure_failed_invalid_actor");
+						ClearBridgeStateLocked();
+						ClearHoldStateLocked();
+						g_state.redoPending = false;
+						g_state.pendingChoice = AfterChoice::None;
+						LogEventIgnoredLocked(eventName, "invalid_actor", info);
+						return;
+					}
+
+					const auto failedActorFormID = failedActor->GetFormID();
 					g_state.afterPleasureSpeakerFormID = failedActorFormID;
 					g_state.afterPleasureCommitted = true;
+					g_state.pleasureFailedDialogueActive = true;
 					g_state.pendingChoice = AfterChoice::None;
 					g_state.redoPending = false;
 					g_state.blocking = true;
 					g_state.holdActive = true;
 					g_state.passiveLockActive = true;
 					g_state.afterPleasureDialogueExpireSec = 0.0;
-					if (auto* actor = failedActor ? failedActor : LookupActor(failedActorFormID)) {
-						PrepareAfterPleasurePackageActor(actor, "pleasure_failed_dialogue");
-					}
+					PrepareAfterPleasurePackageActor(failedActor, "pleasure_failed_dialogue");
 					AdvancePhaseLocked(Phase::AfterPleasureDialogue, eventName);
 					LogEventAcceptedLocked(eventName, info, "pleasure_failed_dialogue_open");
 					return;
@@ -1719,6 +1951,7 @@ namespace TFD::PleasureRuntime
 				if (g_state.phase == Phase::AfterPleasureAwaitQuest) {
 					AdvancePhaseLocked(Phase::AfterPleasureDialogue, eventName);
 					g_state.afterPleasureCommitted = true;
+					g_state.pleasureFailedDialogueActive = false;
 					g_state.pendingChoice = AfterChoice::None;
 					g_state.blocking = true;
 					g_state.afterPleasureDialogueExpireSec = 0.0;
@@ -1766,11 +1999,19 @@ namespace TFD::PleasureRuntime
 				}
 
 				const auto choice = MapAfterPleasureChoice(eventName);
+				const bool fromPleasureFailedDialogue = g_state.pleasureFailedDialogueActive;
+				if (fromPleasureFailedDialogue && choice != AfterChoice::Redo) {
+					LogEventIgnoredLocked(eventName, "pleasure_failed_blocks_normal_after_choice", info);
+					return;
+				}
+
+				g_state.pleasureFailedDialogueActive = false;
 				g_state.afterPleasureDialogueExpireSec = 0.0;
 				g_state.pendingChoice = choice;
 
 				if (choice == AfterChoice::Redo) {
 					auto* redoActor = ResolveEventOrTrackedActorLocked(info);
+					PrepareRedoSpeakerSwitchLocked(redoActor, info.actorFormID, "after_pleasure_redo_actor_switch");
 					const bool combatFlagged = IsSceneCombatUnsafe(redoActor);
 					if (combatFlagged) {
 						// CB09A: Redo is requested from an already-owned AfterPleasure dialogue.
@@ -1819,7 +2060,8 @@ namespace TFD::PleasureRuntime
 						// otherwise that actor is still treated as temporarily suppressed
 						// after lockpick escape while the rest of the camp goes hostile.
 						ReleaseAfterPleasurePackageActor(terminalActor, eventName);
-					} else {
+					}
+					else {
 						SuppressActorDialogueForSceneLocked(
 							terminalActor,
 							"after_pleasure_terminal_suppress_teammate_dialogue");
@@ -1874,6 +2116,7 @@ namespace TFD::PleasureRuntime
 			}
 
 			const double now = NowSec();
+			MaintainScenePassiveHoldLocked(now);
 			afterDialogueTimeout = TakeDueAfterPleasureDialogueTimeoutLocked(now);
 			if (!afterDialogueTimeout.valid) {
 				abortedComplete = TakeDueAbortedFlowCompleteLocked(now);
@@ -2063,11 +2306,7 @@ namespace TFD::PleasureRuntime
 		}
 
 		BeginNewCycleLocked(speaker, source, reason);
-		if ((source == SourceContext::PreCombat || source == SourceContext::Captive) && speaker) {
-			if (source == SourceContext::Captive) {
-				TFD::HostilityController::TickCaptiveSuppression();
-			}
-
+		if ((source == SourceContext::InCombat || source == SourceContext::Bleedout) && speaker) {
 			TFD::HostilityController::ApplyAggressionClamp(speaker);
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				const bool oldRunDetection = process->runDetection;
@@ -2082,18 +2321,32 @@ namespace TFD::PleasureRuntime
 			}
 			speaker->EvaluatePackage(true, false);
 
-			const float waveRadius = source == SourceContext::Captive ? 2400.0f : 1600.0f;
-			TFD::HostilityController::ScheduleStopCombatWaves(waveRadius, source == SourceContext::Captive, 4, 85);
+			const float waveRadius = source == SourceContext::Bleedout ? 2400.0f : 1800.0f;
+			TFD::HostilityController::ScheduleStopCombatWaves(waveRadius, false, 3, 75);
 			spdlog::info(
-				"[TFD][PleasureRuntime] {} hard passive lock actor={:08X} reason={}",
-				source == SourceContext::Captive ? "captive" : "precombat",
+				"[TFD][PleasureRuntime][W37] combat hard passive lock actor={:08X} source={} reason={}",
 				speaker->GetFormID(),
+				ToString(source),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+		else if ((source == SourceContext::PreCombat || source == SourceContext::Captive) && speaker) {
+			if (source == SourceContext::Captive) {
+				TFD::HostilityController::TickCaptiveSuppression();
+			}
+			if (speaker->IsWeaponDrawn()) {
+				speaker->DrawWeaponMagicHands(false);
+			}
+			speaker->EvaluatePackage(false, true);
+			spdlog::info(
+				"[TFD][PleasureRuntime][W37] safe source no hard passive lock actor={:08X} source={} reason={}",
+				speaker->GetFormID(),
+				ToString(source),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 		AdvancePhaseLocked(Phase::PleasureStartPending, reason);
 		g_state.blocking = true;
-		g_state.passiveLockActive = true;
 		g_state.holdActive = true;
+		g_state.passiveLockActive = source == SourceContext::InCombat || source == SourceContext::Bleedout;
 		return true;
 	}
 
@@ -2205,6 +2458,7 @@ namespace TFD::PleasureRuntime
 
 		g_state.redoPending = false;
 		g_state.pendingChoice = AfterChoice::None;
+		g_state.pleasureFailedDialogueActive = false;
 		ClearQueuedTerminalNeutralFinalizeLocked(reason.empty() ? "break" : reason);
 		g_state.active = false;
 		g_state.blocking = false;
@@ -2235,6 +2489,12 @@ namespace TFD::PleasureRuntime
 	{
 		std::scoped_lock lk(g_lock);
 		return g_state.passiveLockActive;
+	}
+
+	bool IsPleasureFailedDialogueActive()
+	{
+		std::scoped_lock lk(g_lock);
+		return g_state.pleasureFailedDialogueActive;
 	}
 
 	Phase GetPhase()
