@@ -99,7 +99,7 @@ static void ResetTransientStateForLoad()
     TFD::Bleedout::ResetForLoad();
     TFD::FlowController::ResetRuntimeLifecycle();
     TFD::BleedoutGreet::Reset();
-    TFD::HostilityController::Reset();
+    TFD::HostilityController::ResetForLoad();
     TFD::CombatBehavior::ResetForLoad();
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();

@@ -230,26 +230,13 @@ namespace TFD::PostDefeatState
 
         bool IsBleedoutPleasureLockActive()
         {
-            if (TFD::PleasureRuntime::GetSourceContext() != TFD::PleasureRuntime::SourceContext::Bleedout) {
-                return false;
-            }
-
-            // R121: only the actual OStim scene handoff should preserve the old
-            // Defeat global.  Once the scene has ended and the flow is waiting
-            // for AfterPleasure dialogue, the Bleedout decision is already
-            // terminally resolved.  Keeping TFDDefeatState at 2 during
-            // AfterPleasure makes the shared AfterPleasure dialogue behave like
-            // it is still inside the defeat/bleedout dialogue phase, which can
-            // pass the root greet and then immediately close before player
-            // choices settle.
-            switch (TFD::PleasureRuntime::GetPhase()) {
-            case TFD::PleasureRuntime::Phase::PleasureStartPending:
-            case TFD::PleasureRuntime::Phase::PleasureActive:
-            case TFD::PleasureRuntime::Phase::PleasureEnding:
-                return true;
-            default:
-                return false;
-            }
+            // R248A: Bleedout -> Pleasure is a terminal handoff.  The old
+            // Bleedout decision must not keep projecting TFDDefeatState=2 after
+            // the player has committed the Pleasure outcome.  The source is kept
+            // only as PleasureRuntime metadata; PostDefeat/HUD/CK conditions must
+            // see the flow as neutral/pleasure-owned, not as an active Bleedout
+            // forcegreet context.
+            return false;
         }
 
         bool IsDialogueMenuOpen()

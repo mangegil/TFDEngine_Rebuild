@@ -38,6 +38,23 @@ namespace TFD::InCombat
 
 		HitSink g_hitSink{};
 
+		RE::Actor* ResolveActorByFormID(std::uint32_t actorFormID)
+		{
+			if (actorFormID == 0) {
+				return nullptr;
+			}
+			return RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+		}
+
+		bool IsTemporaryFollowOrPlayerSideActor(RE::Actor* actor)
+		{
+			return actor &&
+				(TFD::Actor::Ops::HasTemporaryFollowLock(actor) ||
+					actor->IsPlayerTeammate() ||
+					TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+					TFD::TeammateManager::IsPlayerSideTeammateActor(actor));
+		}
+
 		void SetStateLocked(State state, std::uint32_t actorFormID)
 		{
 			g_state.store(state, std::memory_order_release);
@@ -101,23 +118,15 @@ namespace TFD::InCombat
 				if (changed) {
 					++changedCount;
 					const bool hostileAfterCleanup = actor->IsHostileToActor(player) || info.hostileToPlayer;
-					actor->SetBeenAttacked(true);
-					player->SetBeenAttacked(true);
-					(void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
-					(void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
-					actor->EvaluatePackage(false, true);
-					actor->EvaluatePackage(true, true);
 
-					if (hostileAfterCleanup) {
-						(void)TFD::FlowController::QueueBridgeModEvent(
-							"TFDInCombatResumeCombat",
-							actor,
-							"load_cleanup_detection_wake",
-							1.0f);
-					}
-
+					// P12LOAD: load cleanup must be a passive stale-state scrub.  It must not
+					// mark actors/player as attacked, pulse critical detection, evaluate combat
+					// packages, or dispatch TFDInCombatResumeCombat.  Those calls caused a clean
+					// reload to actively wake the same hostile encounter that the user was trying
+					// to reset.  Vanilla may still decide hostility after the load settles, but
+					// TFD should not force it from the stale-faction cleanup path.
 					spdlog::info(
-						"[TFD][InCombat][R93Y] load cleanup stale truce/pacify/expired factions actor={:08X} dist={:.1f} hostileAfterCleanup={}",
+						"[TFD][InCombat][P12LOAD] load cleanup stale truce/pacify/expired factions actor={:08X} dist={:.1f} hostileAfterCleanup={} wake=0 resume=0",
 						actor->GetFormID(),
 						info.dist,
 						hostileAfterCleanup ? 1 : 0);
@@ -172,6 +181,27 @@ namespace TFD::InCombat
 		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		std::scoped_lock lk(g_lock);
 
+		auto* observedActor = ResolveActorByFormID(actorFormID);
+		const bool observedTemporaryFollow = observedActor && TFD::Actor::Ops::HasTemporaryFollowLock(observedActor);
+		const bool observedPlayerSide = observedActor &&
+			(observedActor->IsPlayerTeammate() ||
+				TFD::TeammateManager::IsActiveFollowerActor(observedActor) ||
+				TFD::TeammateManager::IsPlayerSideTeammateActor(observedActor));
+		if (observedTemporaryFollow || observedPlayerSide) {
+			if (g_primaryActorFormID.load(std::memory_order_acquire) == actorFormID) {
+				SetStateLocked(State::Idle, 0);
+				g_dialogueOutcome = DialogueOutcome::None;
+			}
+			spdlog::info(
+				"[TFD][InCombat][R144] observe ignored actor={:08X} active={} reason={} temporaryFollow={} playerSide={}",
+				actorFormID,
+				active ? 1 : 0,
+				reason ? reason : "incombat_observe",
+				observedTemporaryFollow ? 1 : 0,
+				observedPlayerSide ? 1 : 0);
+			return;
+		}
+
 		if (active) {
 			flow.NotifyCombatStarted(actorFormID, reason ? reason : "incombat_observe_start");
 			if (g_state.load(std::memory_order_acquire) == State::Idle) {
@@ -189,6 +219,27 @@ namespace TFD::InCombat
 	{
 		auto& flow = TFD::FlowController::Controller::GetSingleton();
 		std::scoped_lock lk(g_lock);
+
+		auto* truceActor = ResolveActorByFormID(actorFormID);
+		const bool truceTemporaryFollow = truceActor && TFD::Actor::Ops::HasTemporaryFollowLock(truceActor);
+		const bool trucePlayerSide = truceActor &&
+			(truceActor->IsPlayerTeammate() ||
+				TFD::TeammateManager::IsActiveFollowerActor(truceActor) ||
+				TFD::TeammateManager::IsPlayerSideTeammateActor(truceActor));
+		if (truceTemporaryFollow || trucePlayerSide) {
+			if (g_primaryActorFormID.load(std::memory_order_acquire) == actorFormID) {
+				SetStateLocked(State::Idle, 0);
+				g_dialogueOutcome = DialogueOutcome::None;
+			}
+			spdlog::info(
+				"[TFD][InCombat][R144] BeginTruce blocked actor={:08X} dialogueRequested={} reason={} temporaryFollow={} playerSide={}",
+				actorFormID,
+				dialogueRequested ? 1 : 0,
+				reason ? reason : "incombat_truce_begin",
+				truceTemporaryFollow ? 1 : 0,
+				trucePlayerSide ? 1 : 0);
+			return false;
+		}
 
 		const auto why = reason ? reason : "incombat_truce_begin";
 		const bool began = flow.BeginInCombat(actorFormID, why);
@@ -309,12 +360,19 @@ namespace TFD::InCombat
 		if (!context.inCombatState) {
 			return true;
 		}
-		if (handlers.armOutcomeWindow) {
-			handlers.armOutcomeWindow("mod_event_pay", 3.0);
+
+		// P5PAY: InCombat Pay is a linked-topic branch selector, not PayRelease.
+		// Keep dialogue outcome clear so dialogue close does not resolve Release
+		// before the player chooses the real Pay follow-up topic.
+		if (handlers.clearDialogueOutcome) {
+			handlers.clearDialogueOutcome("mod_event_pay_branch");
 		}
-		if (handlers.setDialogueOutcome) {
-			handlers.setDialogueOutcome(DialogueOutcome::PayRelease, "mod_event_pay");
+		auto* payActor = context.actor ? context.actor : ResolveActorByFormID(context.actorFormID);
+		if (payActor) {
+			TFD::HostilityController::ArmPayDialoguePassiveGuard(payActor, 30.0, "incombat_pay_linked_topic");
 		}
+		spdlog::info("[TFD][InCombat][P5PAY] pay branch accepted actor={:08X} keepDialogue=1 terminal=0 payRelease=0",
+			context.actorFormID);
 		return true;
 	}
 

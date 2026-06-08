@@ -15,6 +15,7 @@
 #include <limits>
 #include <atomic>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 #include <utility>
@@ -30,6 +31,7 @@
 #include "TFDBleedoutGreet.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDPayModel.h"
 #include "TFDRecruit.h"
 #include "TFDCaptive.h"
 #include "RE/B/BGSKeyword.h"
@@ -143,10 +145,7 @@ namespace TFD::Bleedout
 		}
 
 		constexpr const char* kPrimeSpeakerEvent = "TFDBleedoutPrimeSpeaker";
-		constexpr const char* kTruceCrowdAssignEvent = "TFDTruceAssign";
-		constexpr const char* kTrucePromoteSpeakerEvent = "TFDTrucePromoteSpeaker";
-		constexpr const char* kTruceClearAllEvent = "TFDTruceClearAll";
-		constexpr double kBleedoutReleaseGraceSeconds = 10.0;
+		constexpr double kBleedoutReleaseGraceSeconds = 30.0;  // R216A: terminal Pay/Release needs a real released-safe window, not a 4-10s threshold race.
 
 		void CancelPendingBleedoutDialogueOpen(const char* reason)
 		{
@@ -161,6 +160,22 @@ namespace TFD::Bleedout
 
 			TFD::InteractionRouter::DialogueOpen::Cancel();
 			spdlog::info("[TFD][Bleedout][R112] canceled stale Bleedout DialogueOpen reason={}", reason ? reason : "unknown");
+		}
+
+		void ScrubTerminalReleaseGlobals(const char* reason)
+		{
+			const char* why = reason && reason[0] ? reason : "bleedout_terminal_release";
+			auto setNeutralGlobal = [](const char* editorID) {
+				if (auto* global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID)) {
+					global->value = 0.0f;
+				}
+			};
+			setNeutralGlobal("TFDPreCombatState");
+			setNeutralGlobal("TFDInCombatState");
+			setNeutralGlobal("TFDDefeatState");
+			setNeutralGlobal("TFDVictoryState");
+			setNeutralGlobal("TFDDialogueState");
+			spdlog::info("[TFD][Bleedout][R216A] terminal release globals scrubbed reason={}", why);
 		}
 
 		bool ReasonIs(const char* reason, const char* expected)
@@ -534,6 +549,10 @@ namespace TFD::Bleedout
 		{
 			if (!actor) {
 				return false;
+			}
+
+			if (TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor)) {
+				return true;
 			}
 
 			constexpr const char* kPreserveEditorIds[] = {
@@ -1352,9 +1371,9 @@ namespace TFD::Bleedout
 
 		actor->StopAlarmOnActor();
 		actor->StopCombat();
-		if (actor->IsWeaponDrawn()) {
-			actor->DrawWeaponMagicHands(false);
-		}
+		// R250A: do not force weapon stance here.  If pacify / combat alarm
+		// cleanup is correct, Skyrim will sheathe naturally.  Forcing weapon state
+		// can break the animation graph (idle posture with weapon still in hand).
 		actor->EvaluatePackage(false, true);
 		actor->EvaluatePackage(true, true);
 
@@ -1650,39 +1669,40 @@ namespace TFD::Bleedout
 		// openers.
 		CancelPendingBleedoutDialogueOpen(why);
 
-		if (!preserveSession && handlers.releaseNoSpeakerTameSession) {
+		// R248A: the Pleasure runtime owns the source metadata after commit.
+		// Do not preserve the Bleedout forcegreet/dialogue owner just because a
+		// truce/suppress session existed.  Preserving it allowed initial handoff
+		// retry and flow-greet-confirm callbacks to reopen/confirm Bleedout after
+		// the player had already committed Pleasure, keeping HUD/conditions in
+		// Defeat and leaking passive suppression into the OStim handoff.
+		if (handlers.releaseNoSpeakerTameSession) {
 			handlers.releaseNoSpeakerTameSession(why);
 		}
-		if (!preserveSession && handlers.clearBridgeAliases) {
+		if (handlers.clearBridgeAliases) {
 			handlers.clearBridgeAliases(why);
-		}
-		if (preserveSession) {
-			spdlog::info("[TFD][Bleedout][R127] preserve source bridge during pleasure commit speaker={:08X} captor={:08X} reason={}",
-				speakerId,
-				captorId,
-				why);
 		}
 		if (handlers.setBleedActive) {
 			handlers.setBleedActive(false, why);
 		}
-		if (!preserveSession && handlers.resetGreetRuntime) {
-			handlers.resetGreetRuntime("bleed_reset");
+		if (handlers.resetGreetRuntime) {
+			handlers.resetGreetRuntime("bleed_pleasure_commit");
 		}
-		if (!preserveSession && handlers.resetDialogueRuntimeState) {
+		if (handlers.resetDialogueRuntimeState) {
 			handlers.resetDialogueRuntimeState();
 		}
-		if (!preserveSession && handlers.resetBattleObserveState) {
+		if (handlers.resetBattleObserveState) {
 			handlers.resetBattleObserveState();
 		}
-		if (!preserveSession && handlers.clearEscapeBreakState) {
+		if (handlers.clearEscapeBreakState) {
 			handlers.clearEscapeBreakState();
 		}
-		if (!preserveSession && handlers.clearLastEnemyTargetingPlayer) {
+		if (handlers.clearLastEnemyTargetingPlayer) {
 			handlers.clearLastEnemyTargetingPlayer();
 		}
-		if (preserveSession) {
-			spdlog::info("[TFD][Bleedout][R127] preserve source runtime during pleasure commit reason={}", why);
-		}
+		spdlog::info("[TFD][Bleedout][R248A] bleedout dialogue owner cleared during pleasure commit speaker={:08X} captor={:08X} preservedSourceMetadata=1 reason={}",
+			speakerId,
+			captorId,
+			why);
 		if (handlers.clearOutcomeWindow) {
 			handlers.clearOutcomeWindow(why);
 		}
@@ -1742,21 +1762,23 @@ namespace TFD::Bleedout
 	void ClearBridgeAliases(RE::TESForm* sender, const char* reason)
 	{
 		const char* why = reason ? reason : "unknown";
-		if (!IsBleedoutSetupClearReason(reason)) {
+		const bool setupClear = IsBleedoutSetupClearReason(reason);
+		if (!setupClear) {
 			ClearBleedoutDialogueFactionsInternal(why);
 		}
 		else {
 			spdlog::info("[TFD][Bleedout][R114] dialogue faction clear skipped during setup/handoff reason={}", why);
 		}
+
 		const bool bleedQueued = SendBridgeModEvent("TFDBleedoutClearAll", sender, why);
-		const bool skipTruceClear = IsBleedoutSetupClearReason(reason);
-		const bool truceQueued = skipTruceClear ? false : SendBridgeModEvent(kTruceClearAllEvent, sender, why);
-		spdlog::info("[TFD][BleedBridge][R101] ClearAll reason={} bleedQueued={} truceQueued={} skipTruceClear={}",
+		const bool truceQueued = setupClear ? false : SendBridgeModEvent("TFDTruceClearAll", sender, why);
+		spdlog::info("[TFD][BleedBridge][P14OWN] ClearAll reason={} bleedQueued={} truceQueued={} owner=bleedout setupClear={}",
 			why,
 			bleedQueued ? 1 : 0,
 			truceQueued ? 1 : 0,
-			skipTruceClear ? 1 : 0);
+			setupClear ? 1 : 0);
 	}
+
 
 	void ApplyBleedoutDialogueFactions(RE::Actor* actor, const char* role, const char* reason)
 	{
@@ -1791,11 +1813,9 @@ namespace TFD::Bleedout
 		}
 
 		ApplyBleedoutDialogueFactionsInternal(actor, "speaker", reason ? reason : "bleedout_prime_speaker");
-		const bool promoteQueued = SendBridgeModEvent(kTrucePromoteSpeakerEvent, actor, "bleedout_speaker");
 		const bool queued = SendBridgeModEvent(kPrimeSpeakerEvent, actor);
-		spdlog::info("[TFD][BleedBridge][R100H] Prime speaker actor={:08X} promoteQueued={} queued={} reason={}",
+		spdlog::info("[TFD][BleedBridge][P14OWN] Prime speaker actor={:08X} trucePromote=0 queued={} reason={}",
 			actor->GetFormID(),
-			promoteQueued ? 1 : 0,
 			queued ? 1 : 0,
 			reason ? reason : "unknown");
 	}
@@ -1807,12 +1827,13 @@ namespace TFD::Bleedout
 		}
 
 		ApplyBleedoutDialogueFactionsInternal(actor, "crowd", reason ? reason : "bleedout_prime_crowd");
-		const bool queued = SendBridgeModEvent(kTruceCrowdAssignEvent, actor, "bleedout_crowd");
-		spdlog::info("[TFD][BleedBridge][R100H] Prime crowd direct-to-truce actor={:08X} queued={} reason={}",
+		const bool truceQueued = SendBridgeModEvent("TFDTruceAssign", actor, "bleedout_crowd");
+		spdlog::info("[TFD][BleedBridge][P14OWN] Prime crowd actor={:08X} truceAssign={} reason={}",
 			actor->GetFormID(),
-			queued ? 1 : 0,
+			truceQueued ? 1 : 0,
 			reason ? reason : "unknown");
 	}
+
 
 	bool ActorHasAllowListFaction(RE::Actor* actor)
 	{
@@ -1994,19 +2015,56 @@ namespace TFD::Bleedout
 			(now - g_captorBindLast) < window;
 	}
 
+	bool ShouldUseBleedoutScopedSupportClear(const char* reason)
+	{
+		if (!reason || !*reason) {
+			return false;
+		}
+
+		std::string_view why{ reason };
+		if (why.find("bleed") != std::string_view::npos) {
+			return true;
+		}
+		if (why.find("post_dialogue_system_event") != std::string_view::npos) {
+			return true;
+		}
+		if (why.find("dialogue_closed_pay_release") != std::string_view::npos) {
+			return true;
+		}
+		if (why.find("pay_release") != std::string_view::npos) {
+			return true;
+		}
+		if (why == "reset_bleed_runtime") {
+			return true;
+		}
+		return false;
+	}
+
 	void ClearSupportBridgeAliases(const char* reason, const SupportBridgeHandlers& handlers)
 	{
-		const bool preCombatQueued = handlers.queuePreCombatClearAll ? handlers.queuePreCombatClearAll() : false;
-		const bool truceQueued = handlers.queueTruceClearAll ? handlers.queueTruceClearAll() : false;
-		const bool inCombatQueued = handlers.queueInCombatClearAll ? handlers.queueInCombatClearAll() : false;
-		if (handlers.cancelAllPreCombat) {
-			handlers.cancelAllPreCombat();
+		const bool bleedoutScoped = ShouldUseBleedoutScopedSupportClear(reason);
+		bool preCombatQueued = false;
+		bool truceQueued = false;
+		bool inCombatQueued = false;
+		bool preCombatCancelled = false;
+
+		if (!bleedoutScoped) {
+			preCombatQueued = handlers.queuePreCombatClearAll ? handlers.queuePreCombatClearAll() : false;
+			truceQueued = handlers.queueTruceClearAll ? handlers.queueTruceClearAll() : false;
+			inCombatQueued = handlers.queueInCombatClearAll ? handlers.queueInCombatClearAll() : false;
+			if (handlers.cancelAllPreCombat) {
+				handlers.cancelAllPreCombat();
+				preCombatCancelled = true;
+			}
 		}
-		spdlog::info("[TFD][BleedBridge] ClearSupport reason={} preCombatQueued={} truceQueued={} inCombatQueued={}",
+
+		spdlog::info("[TFD][BleedBridge][P18OWN] ClearSupport reason={} bleedoutScoped={} preCombatQueued={} truceQueued={} inCombatQueued={} preCombatCancel={}",
 			reason ? reason : "unknown",
+			bleedoutScoped ? 1 : 0,
 			preCombatQueued ? 1 : 0,
 			truceQueued ? 1 : 0,
-			inCombatQueued ? 1 : 0);
+			inCombatQueued ? 1 : 0,
+			preCombatCancelled ? 1 : 0);
 	}
 
 	bool StartTruceSessionForSpeaker(RE::Actor* player, RE::Actor* speaker, const char* reason, RuntimeHostStateRefs state, const RuntimeHostHandlers& handlers)
@@ -2047,26 +2105,32 @@ namespace TFD::Bleedout
 		}
 		speaker->AllowPCDialogue(true);
 		speaker->SetDialogueWithPlayer(false, false, nullptr);
+		ApplyBleedoutDialogueFactionsInternal(speaker, "speaker", reason ? reason : "bleed_truce_session_speaker");
 		HardStopActorCombatAndAlarm(speaker, reason ? reason : "bleed_truce_session_speaker");
-		// CB07: Bleedout has its own bridge aliases and locked crowd list. Start the
-		// native truce suppression session without dialogue cell-bubble ownership so the
-		// HostilityController cannot re-collect distant ambient actors as dialogue/crowd
-		// participants after Bleedout has already rejected them.
-		auto sessionId = TFD::HostilityController::BeginTruceInCombatSession(player, speaker, 0.0, false, false, true);
-		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
-		if (!sessionId.has_value() && preserveDialogueSession) {
-			spdlog::info("[TFD][Defeat][CB07] bleed speaker restart retry ignoreSpent actor={:08X} reason={}",
-				speaker->GetFormID(),
-				reason ? reason : "unknown");
-			sessionId = TFD::HostilityController::BeginTruceInCombatSession(player, speaker, 0.0, false, true, true);
-		}
+		// P14OWN: Bleedout owns passive suppression directly. Do not borrow
+		// TruceInCombat here; that leaks truce_spent, ignoreSpent retry,
+		// TFDInCombatClear/Assign, and generic InCombat release semantics into
+		// Bleedout.
+		auto sessionId = TFD::HostilityController::BeginBleedoutSuppressSession(
+			player,
+			speaker,
+			0.0,
+			0.0,
+			false,
+			0.0f,
+			reason ? reason : "bleed_speaker_suppress");
 		if (!sessionId.has_value()) {
-			spdlog::warn("[TFD][Defeat] bleed speaker restart rejected actor={:08X} reason={}",
+			spdlog::warn("[TFD][Bleedout][P14OWN] speaker suppress rejected actor={:08X} reason={}",
 				speaker->GetFormID(),
 				reason ? reason : "unknown");
 			return false;
 		}
 		g_truceSessionId = *sessionId;
+		spdlog::info(
+			"[TFD][Bleedout][P14OWN] bleedout suppress armed actor={:08X} session={} reason={}",
+			speaker->GetFormID(),
+			g_truceSessionId,
+			reason ? reason : "unknown");
 		ApplyDialogueOverdrive(player, speaker, reason ? reason : "bleed_retry", false, state, handlers);
 		speaker->EvaluatePackage(false, true);
 		speaker->EvaluatePackage(true, true);
@@ -2105,7 +2169,13 @@ namespace TFD::Bleedout
 		std::optional<RE::FormID> burstId;
 		const bool preserveDialogueSession = state.inBleedState && state.inBleedState->load(std::memory_order_relaxed);
 		if (!preserveDialogueSession) {
-			burstId = TFD::HostilityController::BeginCellTruceBurst(player, speaker, 0.0, 2.5, 12000.0f);
+			burstId = TFD::HostilityController::BeginBleedoutSuppressBurst(
+				player,
+				speaker,
+				0.0,
+				2.5,
+				12000.0f,
+				reason ? reason : "bleed_dialogue_overdrive");
 		}
 		else {
 			spdlog::info("[TFD][Defeat] bleed dialogue overdrive preserve dialogue session speaker={:08X} reason={}",
@@ -2138,9 +2208,13 @@ namespace TFD::Bleedout
 	{
 		ClearBleedoutDialogueFactionsInternal(TFD::HostilityController::ToString(reason));
 		if (g_truceSessionId != 0) {
-			TFD::HostilityController::ReleaseSession(g_truceSessionId, reason);
-			spdlog::info("[TFD][Defeat] bleed truce session released id={} reason={}",
+			const bool released = TFD::HostilityController::ReleaseBleedoutSuppressSession(
 				g_truceSessionId,
+				reason,
+				"bleedout_release_suppress_session");
+			spdlog::info("[TFD][Bleedout][P14OWN] bleed suppress session released id={} released={} reason={}",
+				g_truceSessionId,
+				released ? 1 : 0,
 				TFD::HostilityController::ToString(reason));
 			g_truceSessionId = 0;
 		}
@@ -2154,10 +2228,14 @@ namespace TFD::Bleedout
 	void ReleaseNoSpeakerTameSession(const char* reason)
 	{
 		if (g_noSpeakerTameSessionId != 0) {
-			TFD::HostilityController::ReleaseSession(g_noSpeakerTameSessionId, TFD::Tame::ReleaseReason::Generic);
-			spdlog::info("[TFD][Defeat] bleed no-speaker tame session released id={} primary={:08X} reason={}",
+			const bool released = TFD::HostilityController::ReleaseBleedoutSuppressSession(
+				g_noSpeakerTameSessionId,
+				TFD::HostilityController::ReleaseReason::Generic,
+				reason ? reason : "bleed_no_speaker_suppress_release");
+			spdlog::info("[TFD][Bleedout][P14OWN] bleed no-speaker suppress released id={} primary={:08X} released={} reason={}",
 				g_noSpeakerTameSessionId,
 				g_noSpeakerTamePrimaryId,
+				released ? 1 : 0,
 				reason ? reason : "unknown");
 			g_noSpeakerTameSessionId = 0;
 		}
@@ -2188,24 +2266,30 @@ namespace TFD::Bleedout
 			return false;
 		}
 		if (g_noSpeakerTamePrimaryId == primary->GetFormID() &&
-			TFD::HostilityController::IsSuppressed(primary) &&
-			TFD::HostilityController::GetMode(primary) == TFD::HostilityController::Mode::Tame) {
+			TFD::HostilityController::IsBleedoutSuppressed(primary)) {
 			return true;
 		}
 		if (g_noSpeakerTameSessionId != 0) {
 			ReleaseNoSpeakerTameSession("restart");
 		}
 		player->DrawWeaponMagicHands(false);
-		auto sessionId = TFD::Tame::BeginSession(player, primary, 0.0, false);
+		auto sessionId = TFD::HostilityController::BeginBleedoutSuppressSession(
+			player,
+			primary,
+			0.0,
+			0.0,
+			false,
+			0.0f,
+			reason ? reason : "bleed_no_speaker_suppress");
 		if (!sessionId.has_value()) {
-			spdlog::info("[TFD][Defeat] bleed no-speaker tame session rejected primary={:08X} reason={}",
+			spdlog::info("[TFD][Bleedout][P14OWN] bleed no-speaker suppress rejected primary={:08X} reason={}",
 				primary->GetFormID(),
 				reason ? reason : "unknown");
 			return false;
 		}
 		g_noSpeakerTameSessionId = *sessionId;
 		g_noSpeakerTamePrimaryId = primary->GetFormID();
-		spdlog::info("[TFD][Defeat] bleed no-speaker tame session id={} primary={:08X} crowdSize={} reason={}",
+		spdlog::info("[TFD][Bleedout][P14OWN] bleed no-speaker suppress session id={} primary={:08X} crowdSize={} reason={}",
 			g_noSpeakerTameSessionId,
 			g_noSpeakerTamePrimaryId,
 			actors.size(),
@@ -2658,6 +2742,8 @@ namespace TFD::Bleedout
 		const char* why = reason ? reason : "captive_pleasure_handoff";
 		RE::Actor* preservedSpeaker = handlers.resolveRuntimeSpeaker ? handlers.resolveRuntimeSpeaker() : nullptr;
 		const auto preservedSpeakerID = preservedSpeaker ? preservedSpeaker->GetFormID() : 0u;
+		const bool preserveReleasedWork = TFD::Captive::IsReleasedWorkActive();
+
 		if (handlers.clearOutcomeWindow) {
 			handlers.clearOutcomeWindow(why);
 		}
@@ -2670,6 +2756,47 @@ namespace TFD::Bleedout
 		if (handlers.clearBridgeAliases) {
 			handlers.clearBridgeAliases(why);
 		}
+
+		if (preserveReleasedWork) {
+			// R234A: Captive Work escape-break -> Bleedout Pleasure must not be
+			// downgraded into normal Kidnapped/Captive.  Keep ReleasedWork (state 3),
+			// keep work aliases/resource context, and do not clear the bleed runtime in
+			// a way that releases suppression/restores aggression before OStim owns the
+			// speaker.
+			if (handlers.setGraceActive) {
+				handlers.setGraceActive(false);
+			}
+			if (handlers.clearLastAggressor) {
+				handlers.clearLastAggressor();
+			}
+			if (handlers.setPrevDialogueOpen) {
+				handlers.setPrevDialogueOpen(false);
+			}
+			if (handlers.setPrevLockpickOpen) {
+				handlers.setPrevLockpickOpen(false);
+			}
+			if (handlers.syncPlayerCaptiveAlias) {
+				handlers.syncPlayerCaptiveAlias(why);
+			}
+			if (handlers.setPlayerBleedImmune) {
+				handlers.setPlayerBleedImmune(false);
+			}
+			if (handlers.recoverPlayerForTransition) {
+				handlers.recoverPlayerForTransition();
+			}
+			if (handlers.applyCalmBubble) {
+				handlers.applyCalmBubble(ResolveCalmRadius(handlers));
+			}
+			if (handlers.updatePreCombatState) {
+				handlers.updatePreCombatState();
+			}
+			if (handlers.beginPleasure) {
+				handlers.beginPleasure(preservedSpeaker, true, why);
+			}
+			spdlog::info("[TFD][Bleedout][R234A] captive work pleasure handoff preserved work context reason={} speaker={:08X}", why, preservedSpeakerID);
+			return true;
+		}
+
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();
 		}
@@ -2703,8 +2830,12 @@ namespace TFD::Bleedout
 		if (handlers.recoverPlayerForTransition) {
 			handlers.recoverPlayerForTransition();
 		}
+		// R250A: Bleedout-source Pleasure must not keep the transition calm window
+		// alive after the Pleasure commit.  That window repeatedly StopCombat /
+		// EvaluatePackage-s nearby actors and can pull a drawn speaker out of stance
+		// before PleasureFailed -> Fight.
 		if (handlers.applyCalmBubble) {
-			handlers.applyCalmBubble(ResolveCalmRadius(handlers));
+			spdlog::info("[TFD][Bleedout][R250A] calm bubble skipped during bleedout pleasure handoff reason={}", why);
 		}
 		if (handlers.updatePreCombatState) {
 			handlers.updatePreCombatState();
@@ -2719,12 +2850,44 @@ namespace TFD::Bleedout
 	bool CompletePayRelease(const char* reason, const CompletionHandlers& handlers)
 	{
 		const char* why = reason ? reason : "bleed_pay_release";
+		RE::Actor* paySpeaker = handlers.resolveRuntimeSpeaker ? handlers.resolveRuntimeSpeaker() : nullptr;
+		const auto speakerId = paySpeaker ? paySpeaker->GetFormID() : 0u;
+
 		if (handlers.clearOutcomeWindow) {
 			handlers.clearOutcomeWindow(why);
 		}
 		if (handlers.tryBeginTerminalCommit && !handlers.tryBeginTerminalCommit(TerminalCommit::PayRelease, why)) {
+			spdlog::info(
+				"[TFD][Bleedout][P15BOWN] terminal PayRelease rejected before ownership change actor={:08X} reason={}",
+				speakerId,
+				why);
 			return false;
 		}
+
+		// P15BOWN: Bleedout Pay is a terminal PayRelease topic.  The Pay guard is
+		// only a bridge while old dialogue/runtime ownership is cleared.  It must
+		// not be the final owner and it must not expire into restore aggression.
+		if (paySpeaker) {
+			TFD::HostilityController::ArmPayDialoguePassiveGuard(
+				paySpeaker,
+				static_cast<double>(kBleedoutReleaseGraceSeconds) + 4.0,
+				"bleedout_pay_terminal_cleanup_bridge_guard");
+		}
+
+		if (g_truceSessionId != 0) {
+			const bool released = TFD::HostilityController::ReleaseBleedoutSuppressSession(
+				g_truceSessionId,
+				TFD::HostilityController::ReleaseReason::FlowHandoff,
+				"bleedout_pay_terminal_dialogue_suppress_end");
+			spdlog::info(
+				"[TFD][Bleedout][P15BOWN] dialogue suppress ended before PayRelease final owner session={} released={} actor={:08X} reason={}",
+				g_truceSessionId,
+				released ? 1 : 0,
+				speakerId,
+				why);
+			g_truceSessionId = 0;
+		}
+
 		if (handlers.clearPendingCinematicFadeIn) {
 			handlers.clearPendingCinematicFadeIn();
 		}
@@ -2733,6 +2896,11 @@ namespace TFD::Bleedout
 		}
 		if (handlers.clearFactionState) {
 			handlers.clearFactionState();
+		}
+		if (paySpeaker) {
+			TFD::HostilityController::MarkPayDialoguePassiveGuardRemovePacifyOnRelease(
+				paySpeaker,
+				"bleedout_pay_terminal_bridge_owns_pacify_until_final_owner");
 		}
 		if (handlers.clearEscapeContext) {
 			handlers.clearEscapeContext();
@@ -2749,6 +2917,18 @@ namespace TFD::Bleedout
 		if (handlers.resetBleedRuntimeState) {
 			handlers.resetBleedRuntimeState(false);
 		}
+
+		std::optional<RE::FormID> finalSessionId;
+		if (paySpeaker) {
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			finalSessionId = TFD::HostilityController::BeginBleedoutPayReleaseSuppressSession(
+				player,
+				paySpeaker,
+				0.0,
+				static_cast<double>(kBleedoutReleaseGraceSeconds),
+				"bleedout_pay_terminal_final_owner");
+		}
+
 		if (handlers.setPrevDialogueOpen) {
 			handlers.setPrevDialogueOpen(false);
 		}
@@ -2776,7 +2956,21 @@ namespace TFD::Bleedout
 		if (handlers.updatePreCombatState) {
 			handlers.updatePreCombatState();
 		}
-		spdlog::info("[TFD][Bleedout] pay release complete reason={}", why);
+		ScrubTerminalReleaseGlobals(why);
+
+		const bool payGuardActiveAfter = paySpeaker && TFD::HostilityController::IsPayDialoguePassiveGuardActive(paySpeaker);
+		const bool finalOwned = paySpeaker && TFD::HostilityController::IsBleedoutPayReleaseSuppressed(paySpeaker);
+		// P16OWN: Bleedout Pay is terminal. Gold must be cleared by the
+		// Bleedout PayRelease owner, not preserved by cross-flow clear guards.
+		TFD::PayModel::ClearSharedGold("bleedout_pay_release_complete");
+		spdlog::info(
+			"[TFD][Bleedout][R216A] terminal PayRelease safe recovery complete actor={:08X} finalSession={} payGuardActiveAfter={} finalOwned={} duration={:.1f} reason={} payGoldCleared=1",
+			speakerId,
+			finalSessionId.value_or(0),
+			payGuardActiveAfter ? 1 : 0,
+			finalOwned ? 1 : 0,
+			static_cast<double>(kBleedoutReleaseGraceSeconds),
+			why);
 		return true;
 	}
 
@@ -3003,6 +3197,34 @@ namespace TFD::Bleedout
 			}
 			ForceStopBleedRuntimeForCaptiveRecapture("late_bleed_timeout_after_recapture");
 			spdlog::info("[TFD][Bleedout] bleed timeout suppressed by captive recapture guard reason={}", why);
+			return true;
+		}
+		const auto dialogueMode = TFD::InteractionRouter::DialogueOpen::GetMode();
+		const bool nativeBleedDialoguePending =
+			TFD::InteractionRouter::DialogueOpen::IsActive() &&
+			(dialogueMode == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout ||
+				dialogueMode == TFD::InteractionRouter::DialogueOpen::Mode::AfterPleasure ||
+				dialogueMode == TFD::InteractionRouter::DialogueOpen::Mode::PleasureFailed);
+		auto* ui = RE::UI::GetSingleton();
+		const bool dialogueMenuOpen = ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+		const bool bleedoutDialogueOwned =
+			nativeBleedDialoguePending ||
+			(OwnsCurrentFlow() && dialogueMenuOpen) ||
+			TFD::BleedoutGreet::IsActive() ||
+			TFD::BleedoutGreet::HasFlowGreetConfirmed() ||
+			TFD::BleedoutGreet::HasSeenDialogue() ||
+			TFD::BleedoutGreet::HasStickyReopenPending();
+		if (!context.hasTerminalCommit && bleedoutDialogueOwned) {
+			g_bleedStart = Clock::now();
+			g_bleedLastSeconds = -1;
+			spdlog::info(
+				"[TFD][Bleedout][P7BLEED] bleed timeout suppressed by dialogue ownership reason={} nativePending={} menuOpen={} greetActive={} seen={} ack={}",
+				why,
+				nativeBleedDialoguePending ? 1 : 0,
+				dialogueMenuOpen ? 1 : 0,
+				TFD::BleedoutGreet::IsActive() ? 1 : 0,
+				TFD::BleedoutGreet::HasSeenDialogue() ? 1 : 0,
+				TFD::BleedoutGreet::HasFlowGreetConfirmed() ? 1 : 0);
 			return true;
 		}
 		if (context.hasTerminalCommit) {
@@ -3330,10 +3552,14 @@ namespace TFD::Bleedout
 		ClearBridgeAliases(nullptr, why);
 
 		if (g_truceSessionId != 0) {
-			TFD::HostilityController::ReleaseSession(g_truceSessionId, TFD::HostilityController::ReleaseReason::FlowHandoff);
-			spdlog::info(
-				"[TFD][Bleedout][R133] truce session released at chain neutral id={} reason={}",
+			const bool released = TFD::HostilityController::ReleaseBleedoutSuppressSession(
 				g_truceSessionId,
+				TFD::HostilityController::ReleaseReason::FlowHandoff,
+				why);
+			spdlog::info(
+				"[TFD][Bleedout][P14OWN] bleed suppress released at chain neutral id={} released={} reason={}",
+				g_truceSessionId,
+				released ? 1 : 0,
 				why);
 			g_truceSessionId = 0;
 		}
@@ -3435,9 +3661,7 @@ namespace TFD::Bleedout
 		if (actor->IsInCombat()) {
 			actor->StopCombat();
 		}
-		if (actor->IsWeaponDrawn()) {
-			actor->DrawWeaponMagicHands(false);
-		}
+		// R250A: no forced weapon stance reset for Bleedout-source pleasure cycles.
 
 		AssignBridgeActor(actor);
 		PrimeBridgeActor(actor, "pleasure_cycle_bleedout_dialogue_begin");
@@ -5542,14 +5766,16 @@ namespace TFD::Bleedout::DefeatGlue
 		};
 
 		stopPleasureParticipant(p, reason ? reason : "bleed_pleasure_prepare_player");
-		if (auto* speaker = ResolveBleedRuntimeSpeaker()) {
-			stopPleasureParticipant(speaker, reason ? reason : "bleed_pleasure_prepare_speaker");
-		}
-		for (const auto crowdID : GetBleedCrowdAssignedIDs()) {
-			if (auto* crowdActor = RE::TESForm::LookupByID<RE::Actor>(crowdID)) {
-				stopPleasureParticipant(crowdActor, reason ? reason : "bleed_pleasure_prepare_crowd");
-			}
-		}
+
+		// R250A: once the player has committed Bleedout -> Pleasure, Bleedout is
+		// only source metadata.  Do not hard-stop the speaker/crowd here; doing so
+		// can drop a drawn actor out of combat stance before PleasureFailed / Fight.
+		const unsigned int skippedActorStops =
+			(ResolveBleedRuntimeSpeaker() ? 1u : 0u) +
+			static_cast<unsigned int>(GetBleedCrowdAssignedIDs().size());
+		spdlog::info("[TFD][Bleedout][R250A] pleasure prepare actor hard stop skipped count={} reason={}",
+			skippedActorStops,
+			reason ? reason : "unknown");
 		spdlog::info("[TFD][Bleedout][CB07] pleasure prepare participant hard stop count={} broadSweep=0 reason={}",
 			static_cast<unsigned int>(stoppedForPleasure.size()),
 			reason ? reason : "unknown");
@@ -5561,9 +5787,28 @@ namespace TFD::Bleedout::DefeatGlue
 
 	void PreparePlayerForCaptivePleasureScene(const char* reason)
 	{
-		PreparePlayerForBleedoutPleasureScene(reason ? reason : "captive_pleasure_prepare");
-		TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Captive);
-		TFD::Captive::SyncPlayerAlias(g_provider.getPlayer ? g_provider.getPlayer() : nullptr, reason ? reason : "captive_pleasure_prepare");
+		const char* why = reason ? reason : "captive_pleasure_prepare";
+		const bool preserveReleasedWork = TFD::Captive::IsReleasedWorkActive();
+
+		PreparePlayerForBleedoutPleasureScene(why);
+
+		if (!preserveReleasedWork) {
+			// R234B: Captive/Bleedout -> Pleasure is already a terminal scene handoff.
+			// Do not reopen the standard Captive phase here; standard Captive runs
+			// marker-radius escape checks and can restore aggression before OStim owns
+			// the pair scene. Scene keeps Captive identity without escape ticking.
+			TFD::Captive::SetRuntimeState(true, TFD::Captive::PhaseValue::Scene);
+		}
+		else {
+			// R234B: preserve ReleasedWork so CompleteCaptivePleasureHandoff can keep
+			// the work/escape-break context instead of clearing work aliases and letting
+			// marker_radius convert the handoff into EscapeStarted.
+			spdlog::info(
+				"[TFD][Bleedout][R234B] captive pleasure prepare preserved ReleasedWork phase reason={}",
+				why);
+		}
+
+		TFD::Captive::SyncPlayerAlias(g_provider.getPlayer ? g_provider.getPlayer() : nullptr, why);
 	}
 
 	RuntimeHostHandlers BuildLocalRuntimeHostHandlers()

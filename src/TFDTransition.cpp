@@ -929,6 +929,53 @@ namespace TFD::Transition
 		TFD::DefeatBridge::ClearPlayerSavior(nullptr, "clear_no_marker_fallback");
 	}
 
+	void AbortCalmWindowForCombat(RE::Actor* actor, const char* reason)
+	{
+		const char* why = reason ? reason : "combat_owner_abort_calm_window";
+		const bool hadLeftForDead = g_leftForDeadActive ||
+			g_leftForDeadUntil.time_since_epoch().count() != 0 ||
+			g_leftForDeadNextPulse.time_since_epoch().count() != 0;
+		const bool hadFallback = g_fallback.branch != FallbackBranch::None ||
+			g_fallback.follower ||
+			g_fallback.destination ||
+			g_fallback.hasFallbackPos ||
+			g_fallback.potionFormId != 0;
+		const bool hadFollowerHold = g_allyHoldActive || static_cast<bool>(g_allyHoldFollower);
+		const std::size_t lockedCrowdBefore = g_lockedFallbackCrowdIds.size();
+
+		g_leftForDeadActive = false;
+		g_leftForDeadUntil = {};
+		g_leftForDeadNextPulse = {};
+		g_leftForDeadPleasureDeferLast = {};
+		g_leftForDeadNeedsAggroKick = false;
+		g_fallback = {};
+		g_allyHoldFollower.reset();
+		g_allyHoldActive = false;
+		g_lockedFallbackCrowdIds.clear();
+
+		TFD::HostilityController::ClearAggressionClamp();
+
+		if (auto* process = RE::ProcessLists::GetSingleton()) {
+			process->runDetection = true;
+			process->ClearCachedFactionFightReactions();
+		}
+
+		if (actor && !actor->IsDead() && !actor->IsDisabled()) {
+			actor->AllowPCDialogue(true);
+		}
+
+		if (hadLeftForDead || hadFallback || hadFollowerHold || lockedCrowdBefore > 0 || actor) {
+			spdlog::info(
+				"[TFD][Transition][R220A] calm window aborted for combat actor={:08X} leftForDead={} fallback={} followerHold={} lockedCrowd={} reason={}",
+				actor ? actor->GetFormID() : 0u,
+				hadLeftForDead ? 1 : 0,
+				hadFallback ? 1 : 0,
+				hadFollowerHold ? 1 : 0,
+				static_cast<unsigned int>(lockedCrowdBefore),
+				why);
+		}
+	}
+
 	void BeginLeftForDeadCooldown(int seconds)
 	{
 		if (seconds <= 0) {
@@ -950,6 +997,16 @@ namespace TFD::Transition
 		if (!g_leftForDeadActive) {
 			return false;
 		}
+
+		const auto flow = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+
+		if (flow.root == TFD::FlowController::RootFlow::InCombat ||
+			flow.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak) {
+			auto* combatActor = flow.primaryActorFormID ? RE::TESForm::LookupByID<RE::Actor>(flow.primaryActorFormID) : nullptr;
+			AbortCalmWindowForCombat(combatActor, "left_for_dead_cooldown_incombat_guard");
+			return false;
+		}
+
 		const auto now = Clock::now();
 		if (now >= g_leftForDeadUntil) {
 			if (TFD::PleasureRuntime::IsPassiveLockActive()) {
@@ -1009,6 +1066,44 @@ namespace TFD::Transition
 		if (!player) {
 			return;
 		}
+
+		const auto flow = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+		if (TFD::PleasureRuntime::IsActive() &&
+			TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Bleedout) {
+			const auto phase = TFD::PleasureRuntime::GetPhase();
+			if (phase == TFD::PleasureRuntime::Phase::PleasureStartPending ||
+				phase == TFD::PleasureRuntime::Phase::PleasureActive ||
+				phase == TFD::PleasureRuntime::Phase::PleasureFailedDialogue) {
+				spdlog::info(
+					"[TFD][Transition][R250A] calm window skipped during bleedout-source pleasure source={} phase={} root={} sub={} primary={:08X}",
+					TFD::PleasureRuntime::GetSourceContextName(),
+					TFD::PleasureRuntime::GetPhaseName(),
+					TFD::FlowController::Controller::ToString(flow.root),
+					TFD::FlowController::Controller::ToString(flow.sub),
+					flow.primaryActorFormID);
+				return;
+			}
+		}
+		if (flow.sub == TFD::FlowController::SubFlow::PleasureFailedDialogue) {
+			spdlog::info(
+				"[TFD][Transition][R247A1] calm window skipped during pleasure failed dialogue root={} sub={} primary={:08X}",
+				TFD::FlowController::Controller::ToString(flow.root),
+				TFD::FlowController::Controller::ToString(flow.sub),
+				flow.primaryActorFormID);
+			return;
+		}
+		if (flow.root == TFD::FlowController::RootFlow::InCombat ||
+			flow.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak) {
+			auto* combatActor = flow.primaryActorFormID ? RE::TESForm::LookupByID<RE::Actor>(flow.primaryActorFormID) : nullptr;
+			AbortCalmWindowForCombat(combatActor, "maintain_calm_window_incombat_guard");
+			spdlog::info(
+				"[TFD][Transition][R220A] calm window skipped during combat root={} sub={} primary={:08X}",
+				TFD::FlowController::Controller::ToString(flow.root),
+				TFD::FlowController::Controller::ToString(flow.sub),
+				flow.primaryActorFormID);
+			return;
+		}
+
 		const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
 		if (handlers.tryAbortPleasureDueToHostileIntrusion && handlers.tryAbortPleasureDueToHostileIntrusion(radius)) {
 			return;

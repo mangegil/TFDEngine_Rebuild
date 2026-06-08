@@ -778,7 +778,7 @@ namespace
             return;
         }
         if (actor->IsWeaponDrawn()) {
-            actor->DrawWeaponMagicHands(false);
+            // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
         }
         actor->EvaluatePackage(false, true);
         actor->EvaluatePackage(true, true);
@@ -824,17 +824,14 @@ namespace
             return false;
         }
 
-        // CB06B: keep the load cleanup away from native detection/combat mutation.
-        // The earlier R96E path used RequestDetectionLevel/UpdateCombat/ForceDetection
-        // directly and can leave AI passive or risk detection-worker races.  Queue the
-        // existing Papyrus resume bridge instead; it performs StartCombat(player) after
-        // the loaded world and aliases have settled.
-        TFD::HostilityController::Runtime::SendModEvent("TFDInCombatResumeCombat", actor);
-        TFD::HostilityController::Runtime::SendModEvent("TFDPostLoadHostileWake", actor);
-
+        // P12LOAD: restoring a runtime snapshot on load must not resume combat.
+        // Earlier builds queued TFDInCombatResumeCombat / TFDPostLoadHostileWake here,
+        // which made a clean loaded save immediately re-enter InCombat if the restored
+        // actor was naturally hostile. Keep package/cache refresh only; vanilla may
+        // decide combat later, but TFD must not force StartCombat from load cleanup.
         auto* afterTarget = ResolveCurrentCombatTarget(actor);
         spdlog::info(
-            "[TFD][Recruit][CB08] post-load hostile wake actor={:08X} reason={} rawHostile={} knownHostile={} targetBefore={:08X} targetAfter={:08X} inCombat={} resumeBridge=1 wakeBridge=1 name='{}'",
+            "[TFD][Recruit][P12LOAD] post-load hostile wake suppressed actor={:08X} reason={} rawHostile={} knownHostile={} targetBefore={:08X} targetAfter={:08X} inCombat={} resumeBridge=0 wakeBridge=0 name='{}'",
             actor->GetFormID(),
             reason ? reason : "unknown",
             rawHostile ? 1 : 0,
@@ -844,7 +841,7 @@ namespace
             actor->IsInCombat() ? 1 : 0,
             actor->GetName() ? actor->GetName() : "");
 
-        return true;
+        return false;
     }
 
     RuntimeSnapshotApplyResult ApplyRuntimeSnapshot(
@@ -1529,7 +1526,7 @@ namespace TFD::Recruit
                     actor->GetName() ? actor->GetName() : "");
             }
 
-            const auto applied = ApplyRuntimeSnapshot(actor, snapshot, reason, true, !isPlayer);
+            const auto applied = ApplyRuntimeSnapshot(actor, snapshot, reason, true, false);
             if (!applied.actorResolved) {
                 ++missingActors;
                 continue;

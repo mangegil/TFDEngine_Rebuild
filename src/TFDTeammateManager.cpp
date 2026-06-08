@@ -578,6 +578,13 @@ namespace
                 return false;
             }
 
+            // R150: Temporary Follow uses TFDTeammateFaction only to satisfy
+            // TFDTemporaryFollowerQuest alias package conditions. It must not
+            // be promoted into the persistent teammate alias/contract system.
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
+                return false;
+            }
+
             if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
                 return true;
             }
@@ -698,6 +705,13 @@ namespace
             // otherwise the alias package stack is built before TFDTeammateFaction
             // exists and the final follow package can fail to take over.
             if (TFD::Recruit::IsRecruitCommitPending(actor)) {
+                return false;
+            }
+
+            // R150: Temporary Follow is owned by TFDTemporaryFollowerQuest, not
+            // TFDPlayerTeammateQuest. Do not auto-register it as a natural
+            // follower while its temporary ownership lock is active.
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
                 return false;
             }
 
@@ -1366,7 +1380,7 @@ namespace
                 process->StopCombatAndAlarmOnActor(actor, false);
             }
             if (actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(false);
+                // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
             }
             if (actor->Is3DLoaded()) {
                 actor->EvaluatePackage();
@@ -1562,7 +1576,7 @@ namespace
                     process->StopCombatAndAlarmOnActor(actor, false);
                 }
                 if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
+                    // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
                 }
                 // CommonLibSSE-NG SE 1.5.97 does not expose Actor::SetPlayerTeammate().
                 // Papyrus clears the engine teammate flag through Actor.SetPlayerTeammate(False, False).
@@ -1908,7 +1922,7 @@ namespace
                     actor->EnableAI(true);
                 }
                 if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
+                    // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
                 }
 
                 spdlog::info("[TFD][TeammateManager] expired teammate prearmed actor={:08X} faction=1 slot={} reason={}",
@@ -1983,6 +1997,12 @@ namespace
                 if (actor && TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
                     spdlog::info(
                         "[TFD][TeammateManager][R93V] skip release-follow grace actor={:08X} reason=collect_nearby",
+                        actor->GetFormID());
+                    continue;
+                }
+                if (actor && TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
+                    spdlog::info(
+                        "[TFD][TeammateManager][R150] skip temporary-follow actor={:08X} reason=collect_nearby",
                         actor->GetFormID());
                     continue;
                 }
@@ -2255,6 +2275,13 @@ namespace
                 return false;
             }
 
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
+                ClearStrayExpiredHelperFactionUnsafe(actor, "alias_clear_temporary_follow");
+                ForgetConvertedTeammate(actor, "alias_clear_temporary_follow");
+                LogInvalidAliasDiagnostic(alias, actor, "clear_temporary_follow", reason, 0);
+                return false;
+            }
+
             const bool hasCurrentTfdMarker = HasAnyTFDTeammateFactionNow(actor);
             const bool hasNaturalFollowerState = actor->IsPlayerTeammate() || HasFollowerAnchorFaction(actor);
             if (!hasCurrentTfdMarker && !hasNaturalFollowerState && HasPlayerHostility(actor)) {
@@ -2409,7 +2436,7 @@ namespace
                         process->StopCombatAndAlarmOnActor(actor, false);
                     }
                     if (actor->IsWeaponDrawn()) {
-                        actor->DrawWeaponMagicHands(false);
+                        // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
                     }
                     if (combatDiagActor || combatDiagTarget) {
                         auto* targetAfterClear = ResolveCombatTarget(actor);
@@ -2534,6 +2561,14 @@ namespace
                 spdlog::warn(
                     "[TFD][TeammateManager] register now failed actor={:08X} reason={} detail=invalid_input",
                     actor ? actor->GetFormID() : 0u,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R150] register now rejected actor={:08X} reason={} detail=temporary_follow_owned",
+                    actor->GetFormID(),
                     reason ? reason : "unknown");
                 return false;
             }
@@ -2801,7 +2836,7 @@ namespace
                 actor->EnableAI(true);
             }
             if (actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(false);
+                // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
             }
             if (auto* process = RE::ProcessLists::GetSingleton()) {
                 process->StopCombatAndAlarmOnActor(actor, false);
@@ -3608,7 +3643,7 @@ namespace TFD::TeammateManager
                 process->StopCombatAndAlarmOnActor(actor, false);
             }
             if (actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(false);
+                // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
             }
 
             const bool isLockedAlly = BridgeInternal::g_runtimeProviders.hasAllyBleedLock ? BridgeInternal::g_runtimeProviders.hasAllyBleedLock(actor) : false;
@@ -3752,7 +3787,7 @@ namespace TFD::TeammateManager
         if (actor->IsInCombat()) {
             actor->StopCombat();
         }
-        actor->DrawWeaponMagicHands(false);
+        // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
         if (actor->Is3DLoaded()) {
             actor->EvaluatePackage();
         }

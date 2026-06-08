@@ -19,6 +19,8 @@
 #include "TFDPayModel.h"
 #include "TFDBleedout.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDActor.h"
+#include "TFDTeammateManager.h"
 
 namespace TFD::InCombatGreet
 {
@@ -154,7 +156,7 @@ namespace TFD::InCombatGreet
 			g_runtime.pleasureCycleActive = false;
 		}
 
-		void ReleaseTrackedSession(TFD::HostilityController::ReleaseReason releaseReason)
+		void ReleaseTrackedSession(TFD::HostilityController::ReleaseReason releaseReason, bool sendBridgeClear = true)
 		{
 			RE::FormID sessionId = 0;
 			bool assignSent = false;
@@ -169,13 +171,20 @@ namespace TFD::InCombatGreet
 
 			const auto speakerFormID = g_speakerFormID.load(std::memory_order_acquire);
 			auto* speaker = speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(speakerFormID) : nullptr;
-			if (assignSent) {
+			if (assignSent && sendBridgeClear) {
 				if (speaker) {
 					SendBridgeEvent("TFDInCombatClear", speaker);
 				} else {
 					SendBridgeEvent("TFDInCombatClearAll", nullptr);
 				}
 			}
+			else if (assignSent && !sendBridgeClear) {
+				spdlog::info(
+					"[TFD][InCombatGreet][P28OWN] suppress stale bridge clear session={} speaker={:08X} reason=begin_replace",
+					sessionId,
+					speakerFormID);
+			}
+
 			if (sessionId != 0) {
 				TFD::HostilityController::ReleaseSession(sessionId, releaseReason);
 			}
@@ -255,6 +264,22 @@ namespace TFD::InCombatGreet
 
 	bool BeginForActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
 	{
+		if (speaker &&
+			(TFD::Actor::Ops::HasTemporaryFollowLock(speaker) ||
+				speaker->IsPlayerTeammate() ||
+				TFD::TeammateManager::IsActiveFollowerActor(speaker) ||
+				TFD::TeammateManager::IsPlayerSideTeammateActor(speaker))) {
+			if (outAction) {
+				*outAction = TFD::InteractionRouter::Action::None;
+			}
+			spdlog::info(
+				"[TFD][InCombatGreet][R144] BeginForActor blocked actor={:08X} reason=temporary_follow_or_player_side temporaryFollow={} teammate={}",
+				speaker->GetFormID(),
+				TFD::Actor::Ops::HasTemporaryFollowLock(speaker) ? 1 : 0,
+				speaker->IsPlayerTeammate() ? 1 : 0);
+			return false;
+		}
+
 		if (IsPleasureRuntimeDialogueSuppressed(speaker, "BeginForActor", "incombat_begin_for_actor")) {
 			if (outAction) {
 				*outAction = TFD::InteractionRouter::Action::None;
@@ -524,12 +549,17 @@ namespace TFD::InCombatGreet
 	void CancelAll(const char* reason)
 	{
 		const auto formID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
-		ReleaseTrackedSession(ResolveReleaseReason(reason));
+		const bool beginReplace = reason && std::string_view(reason) == "begin_replace";
+		ReleaseTrackedSession(ResolveReleaseReason(reason), !beginReplace);
 		ResetRuntime("cancel");
 		TFD::InteractionRouter::DialogueOpen::Cancel();
 		g_state.store(State::Idle, std::memory_order_release);
 
-		spdlog::info("[TFD][InCombatGreet] CancelAll speaker={:08X} reason={}", formID, reason ? reason : "-");
+		spdlog::info(
+			"[TFD][InCombatGreet] CancelAll speaker={:08X} reason={} bridgeClearSuppressed={}",
+			formID,
+			reason ? reason : "-",
+			beginReplace ? 1 : 0);
 	}
 
 	void NotifyDialogueOpened()

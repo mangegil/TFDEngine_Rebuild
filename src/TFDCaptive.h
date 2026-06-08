@@ -93,6 +93,7 @@ namespace TFD::Captive
 	bool IsReleasedWorkActive();
 	bool IsCurrentWorkBoss(RE::Actor* actor);
 	bool IsReleasedWorkActorInScope(RE::Actor* actor);
+	void ClearReleasedWorkDialogueActorForCombatBreak(RE::Actor* actor, const char* reason);
 	bool EnsureReleasedWorkDialogueActor(RE::Actor* actor, const char* reason);
 	bool PromoteReleasedWorkBoss(RE::Actor* actor, const char* reason);
 	RE::Actor* GetCurrentWorkBoss();

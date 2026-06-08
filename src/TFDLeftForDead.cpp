@@ -43,7 +43,7 @@ namespace TFD::LeftForDead
 			if (actor->IsInCombat()) {
 				actor->StopCombat();
 			}
-			actor->DrawWeaponMagicHands(false);
+			// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 		}
 
 		static void MoveFollowerNearPlayer(const TFD::Transition::RuntimeHandlers& runtimeHandlers,

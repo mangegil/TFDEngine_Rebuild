@@ -63,6 +63,7 @@ struct DialogueClosedHandlers
 
 	void NotifyDialogueOpened();
 	void NotifyFlowGreetConfirmed(RE::Actor* speaker = nullptr, const char* reason = nullptr);
+	void ClearFlowGreetConfirmed(const char* reason = nullptr);
 	void MarkAfterPleasureArmed(const char* reason = nullptr);
 	bool HasSeenDialogue();
 	bool HasFlowGreetConfirmed();

@@ -243,11 +243,17 @@ namespace TFD::Actor
         bool HasReleaseFollowGrace(RE::Actor* actor);
         void ApplyReleaseFollowGraceToActorOnly(RE::Actor* actor, double durationSeconds, const char* reason = nullptr);
         void RemoveReleaseFollowGraceFromActorOnly(RE::Actor* actor, const char* reason = nullptr);
+        void RemoveReleaseFollowGraceFromActorOnlyForFightChoice(RE::Actor* actor, const char* reason = nullptr);
         void ApplyReleaseFollowGraceToSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason = nullptr);
         void RemoveReleaseFollowGraceFromSpeakerAndCrowd(RE::Actor* speaker, const char* reason = nullptr);
         void CancelReleaseFollowGraceFromPlayerAggression(RE::Actor* actor, const char* reason = nullptr);
         void MaintainReleaseFollowGrace();
         void ClearAllReleaseFollowGrace(const char* reason = nullptr);
+
+        bool HasTemporaryFollowLock(RE::Actor* actor);
+        void ApplyTemporaryFollowLockToActorOnly(RE::Actor* actor, double durationSeconds, const char* reason = nullptr);
+        void RemoveTemporaryFollowLockFromActorOnly(RE::Actor* actor, const char* reason = nullptr);
+        void ClearAllTemporaryFollowLocks(const char* reason = nullptr);
 
         struct DefeatedEnemyQueryHooks
         {

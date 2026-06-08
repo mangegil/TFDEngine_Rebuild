@@ -6,6 +6,7 @@
 #include "TFDTame.h"
 #include "TFDSettings.h"
 #include "TFDLocation.h"
+#include "TFDWorkNative.h"
 
 #include "TFDFlowController.h"
 #include "TFDInteractionRouter.h"
@@ -423,7 +424,7 @@ namespace TFD::Captive
 		}
 
 
-		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason);
+		static bool ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason);
 		static void ApplyNativeCaptiveLocationRoleFactions(RE::Actor* player, const char* reason, bool force);
 
 		static void ApplyCallCaptorCalmBubble(RE::Actor* player, RE::Actor* primaryTarget, float radius)
@@ -511,7 +512,7 @@ namespace TFD::Captive
 				actor->StopCombat();
 			}
 			if (actor->IsWeaponDrawn()) {
-				actor->DrawWeaponMagicHands(false);
+				// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 			}
 
 			const bool began = TFD::CaptiveGreet::Begin(actor, "call_captor_package_ready");
@@ -689,13 +690,57 @@ namespace TFD::Captive
 		RE::FormID g_currentWorkBossFormID = 0;
 		std::chrono::steady_clock::time_point g_workBossResumeAt{};
 		std::chrono::steady_clock::time_point g_nextCaptiveRoleFactionSweep{};
+		std::chrono::steady_clock::time_point g_nextCaptiveRoleFactionNoopLog{};
 		std::chrono::steady_clock::time_point g_releasedWorkWeaponDrawnNextLog{};
+		std::chrono::steady_clock::time_point g_nextReleasedWorkAliasSelfHeal{};
 		static constexpr auto kCaptiveRoleFactionSweepInterval = std::chrono::milliseconds(1500);
+		static constexpr auto kCaptiveRoleFactionNoopLogInterval = std::chrono::milliseconds(10000);
+		static constexpr auto kReleasedWorkAliasSelfHealInterval = std::chrono::milliseconds(5000);
 		static constexpr auto kRecaptureDuplicateGuard = std::chrono::milliseconds(8000);
+
+		struct WorkResourceAliasSnapshot
+		{
+			bool valid = false;
+			RE::FormID mineRefId = 0;
+			RE::FormID craftingRefId = 0;
+			std::array<RE::FormID, 10> stationRefIds{};
+		};
+
+		WorkResourceAliasSnapshot g_lastWorkResourceAliasSnapshot{};
 
 		static std::uint32_t ActorFormID(RE::Actor* actor)
 		{
 			return actor ? actor->GetFormID() : 0u;
+		}
+
+		static bool ReasonEquals(const char* reason, const char* expected)
+		{
+			return reason && expected && std::strcmp(reason, expected) == 0;
+		}
+
+		static bool WorkResourceAliasSnapshotMatches(
+			RE::FormID mineRefId,
+			RE::FormID craftingRefId,
+			const std::array<RE::FormID, 10>& stationRefIds)
+		{
+			if (!g_lastWorkResourceAliasSnapshot.valid) {
+				return false;
+			}
+
+			return g_lastWorkResourceAliasSnapshot.mineRefId == mineRefId &&
+				g_lastWorkResourceAliasSnapshot.craftingRefId == craftingRefId &&
+				g_lastWorkResourceAliasSnapshot.stationRefIds == stationRefIds;
+		}
+
+		static void RememberWorkResourceAliasSnapshot(
+			RE::FormID mineRefId,
+			RE::FormID craftingRefId,
+			const std::array<RE::FormID, 10>& stationRefIds)
+		{
+			g_lastWorkResourceAliasSnapshot.valid = true;
+			g_lastWorkResourceAliasSnapshot.mineRefId = mineRefId;
+			g_lastWorkResourceAliasSnapshot.craftingRefId = craftingRefId;
+			g_lastWorkResourceAliasSnapshot.stationRefIds = stationRefIds;
 		}
 
 		static RE::TESFaction* ResolveNativeCaptiveFaction()
@@ -994,9 +1039,11 @@ namespace TFD::Captive
 		static void ApplyWorkingFactionToCurrentBoss(RE::Actor* boss, const char* reason)
 		{
 			ClearNativeWorkingCaptiveFaction(reason ? reason : "working_refresh");
+			TFD::WorkNative::ClearWorkDemandFactions(reason ? reason : "working_refresh_clear_demand");
 			WriteCurrentWorkBossAlias(boss, reason ? reason : "working_refresh");
 			if (boss) {
 				ApplyNativeWorkingCaptiveFaction(boss, reason);
+				TFD::WorkNative::RefreshWorkDemandFactionsForBoss(boss, reason ? reason : "working_refresh_apply_demand");
 			}
 			spdlog::info("[TFD][Captive] working faction current boss refresh actor={:08X} reason={}",
 				boss ? boss->GetFormID() : 0u,
@@ -1037,30 +1084,31 @@ namespace TFD::Captive
 			if (!boss) {
 				boss = SelectWorkBossActor(nullptr, 0, true);
 			}
-			ApplyWorkingFactionToCurrentBoss(boss, reason ? reason : "work_no_job_cooldown_resume");
-			ForceWorkGlobals(0, 1, "work_no_job_cooldown_resume");
 			(void)TFD::Location::RefreshCaptiveWorkResourceState(true, reason ? reason : "work_no_job_cooldown_resume");
 			SyncCaptiveWorkResourceAliases(reason ? reason : "work_no_job_cooldown_resume");
+			ApplyWorkingFactionToCurrentBoss(boss, reason ? reason : "work_no_job_cooldown_resume");
+			ForceWorkGlobals(0, 1, "work_no_job_cooldown_resume");
 		}
 
-		static void ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason)
+		static bool ApplyNativeCaptorRoleFaction(RE::Actor* actor, const char* reason)
 		{
 			if (!actor) {
-				return;
+				return false;
 			}
 
 			auto* faction = ResolveNativeCaptiveFaction();
 			if (!faction) {
-				return;
+				return false;
 			}
 
 			const RE::FormID formID = actor->GetFormID();
 			const bool hadFaction = actor->IsInFaction(faction);
+			const bool trackedBefore = IsNativeCaptiveFactionTracked(formID);
 			if (!hadFaction) {
 				actor->AddToFaction(faction, 0);
 			}
 
-			if (!IsNativeCaptiveFactionTracked(formID)) {
+			if (!trackedBefore) {
 				NativeCaptiveRoleEntry entry{};
 				entry.actor = actor->GetHandle();
 				entry.formID = formID;
@@ -1068,12 +1116,134 @@ namespace TFD::Captive
 				g_nativeCaptiveRoleActors.push_back(entry);
 			}
 
-			spdlog::info("[TFD][Captive] native captive role faction applied actor={:08X} added={} hadFaction={} tracked={} reason={}",
+			const bool changed = !hadFaction || !trackedBefore;
+			const bool quietNoop = !changed;
+			if (!quietNoop) {
+				spdlog::info("[TFD][Captive] native captive role faction applied actor={:08X} added={} hadFaction={} tracked={} reason={}",
+					actor->GetFormID(),
+					(!hadFaction) ? 1 : 0,
+					hadFaction ? 1 : 0,
+					static_cast<unsigned>(g_nativeCaptiveRoleActors.size()),
+					reason ? reason : "unknown");
+			}
+
+			return changed;
+		}
+
+		static bool RemoveNativeCaptorRoleFactionForActor(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			auto* faction = ResolveNativeCaptiveFaction();
+			if (!faction) {
+				return false;
+			}
+
+			const RE::FormID formID = actor->GetFormID();
+			bool removedFaction = false;
+			bool removedTracked = false;
+			bool preservedExternal = false;
+
+			g_nativeCaptiveRoleActors.erase(
+				std::remove_if(
+					g_nativeCaptiveRoleActors.begin(),
+					g_nativeCaptiveRoleActors.end(),
+					[&](const NativeCaptiveRoleEntry& entry) {
+						if (entry.formID != formID) {
+							return false;
+						}
+						removedTracked = true;
+						if (entry.addedByTFD && actor->IsInFaction(faction)) {
+							actor->RemoveFromFaction(faction);
+							removedFaction = true;
+						}
+						else if (actor->IsInFaction(faction)) {
+							preservedExternal = true;
+						}
+						return true;
+					}),
+				g_nativeCaptiveRoleActors.end());
+
+			if (removedTracked || removedFaction || preservedExternal) {
+				spdlog::info("[TFD][Captive][R221A] native captive role faction skipped/removed for combat break actor={:08X} removedFaction={} removedTracked={} preservedExternal={} reason={}",
+					formID,
+					removedFaction ? 1 : 0,
+					removedTracked ? 1 : 0,
+					preservedExternal ? 1 : 0,
+					reason ? reason : "unknown");
+			}
+
+			return removedFaction || removedTracked;
+		}
+
+		static bool ShouldSkipNativeCaptiveRoleApplyForCombatBreak(RE::Actor* actor, RE::Actor* player, const char* reason)
+		{
+			if (!actor || !player || !reason || std::strcmp(reason, "captive_runtime_tick") != 0) {
+				return false;
+			}
+
+			// R230A: R221A/R229A still treated PhaseValue::Escape, generic
+			// hostility, and weapon-drawn state as enough reason to skip captive
+			// role/pacify re-application.  That was correct for the actual
+			// InCombatEscapeBreak speaker, but wrong for Bleedout/AfterPleasure
+			// crowd: those actors can remain hostile/drawn for a few ticks while
+			// the dialogue owner needs them fully pacified.  Only a real combat
+			// owner may block this sweep.  BleedoutEscapeBreak must not block it.
+			auto& flow = TFD::FlowController::Controller::GetSingleton();
+			const auto snapshot = flow.GetSnapshot();
+			const bool phaseEscape = g_phase == PhaseValue::Escape;
+			const bool inCombatEscapeBreak = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
+				snapshot.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak;
+			const bool bleedoutEscapeBreak = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
+				snapshot.sub == TFD::FlowController::SubFlow::BleedoutEscapeBreak;
+
+			if (bleedoutEscapeBreak) {
+				return false;
+			}
+
+			if (!phaseEscape && !inCombatEscapeBreak) {
+				return false;
+			}
+
+			auto target = actor->GetActorRuntimeData().currentCombatTarget.get();
+			const bool targetingPlayer = target && target->GetFormID() == player->GetFormID();
+			const bool hostile = actor->IsHostileToActor(player);
+			const bool inCombat = actor->IsInCombat();
+			const bool weaponDrawn = actor->IsWeaponDrawn();
+			const bool primaryInCombatEscapeBreak = inCombatEscapeBreak && snapshot.primaryActorFormID == actor->GetFormID();
+			const bool activeCombatOwner = targetingPlayer || inCombat || primaryInCombatEscapeBreak;
+
+			if (!activeCombatOwner) {
+				if (hostile || inCombat || weaponDrawn) {
+					spdlog::info("[TFD][Captive][R230A] native captive role apply allowed for non-combat crowd actor={:08X} phaseEscape={} inCombatEscapeBreak={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} reason={}",
+						actor->GetFormID(),
+						phaseEscape ? 1 : 0,
+						inCombatEscapeBreak ? 1 : 0,
+						hostile ? 1 : 0,
+						targetingPlayer ? 1 : 0,
+						inCombat ? 1 : 0,
+						weaponDrawn ? 1 : 0,
+						primaryInCombatEscapeBreak ? 1 : 0,
+						reason ? reason : "unknown");
+				}
+				return false;
+			}
+
+			(void)RemoveNativeCaptorRoleFactionForActor(actor, "captive_runtime_tick_escape_break_combat_owner");
+			spdlog::info("[TFD][Captive][R230A] native captive role apply skipped for active combat owner actor={:08X} phaseEscape={} inCombatEscapeBreak={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} reason={}",
 				actor->GetFormID(),
-				(!hadFaction) ? 1 : 0,
-				hadFaction ? 1 : 0,
-				static_cast<unsigned>(g_nativeCaptiveRoleActors.size()),
+				phaseEscape ? 1 : 0,
+				inCombatEscapeBreak ? 1 : 0,
+				hostile ? 1 : 0,
+				targetingPlayer ? 1 : 0,
+				inCombat ? 1 : 0,
+				weaponDrawn ? 1 : 0,
+				primaryInCombatEscapeBreak ? 1 : 0,
 				reason ? reason : "unknown");
+
+			return true;
 		}
 
 		static bool IsActorInNativeCaptiveLocationScope(RE::Actor* actor, RE::Actor* player)
@@ -1112,6 +1282,7 @@ namespace TFD::Captive
 			std::uint32_t applied = 0;
 			std::uint32_t considered = 0;
 			std::uint32_t inScope = 0;
+			std::uint32_t combatBreakSkipped = 0;
 
 			for (const auto& info : snapshot.actors) {
 				auto* actor = info.get();
@@ -1126,17 +1297,32 @@ namespace TFD::Captive
 					continue;
 				}
 				++inScope;
-				ApplyNativeCaptorRoleFaction(actor, reason ? reason : "native_captive_location");
-				++applied;
+				if (ShouldSkipNativeCaptiveRoleApplyForCombatBreak(actor, player, reason)) {
+					++combatBreakSkipped;
+					continue;
+				}
+				if (ApplyNativeCaptorRoleFaction(actor, reason ? reason : "native_captive_location")) {
+					++applied;
+				}
 			}
 
-			spdlog::info("[TFD][Captive] native captive location faction sweep applied={} inScope={} considered={} tracked={} loc={:08X} reason={}",
+			const bool quietNoopSweep = applied == 0 && !force;
+			if (quietNoopSweep) {
+				if (g_nextCaptiveRoleFactionNoopLog != std::chrono::steady_clock::time_point{} && now < g_nextCaptiveRoleFactionNoopLog) {
+					return;
+				}
+				g_nextCaptiveRoleFactionNoopLog = now + kCaptiveRoleFactionNoopLogInterval;
+			}
+
+			spdlog::info("[TFD][Captive][R164] native captive location faction sweep applied={} inScope={} considered={} skippedCombatBreak={} tracked={} loc={:08X} reason={}{}",
 				applied,
 				inScope,
 				considered,
+				combatBreakSkipped,
 				static_cast<unsigned>(g_nativeCaptiveRoleActors.size()),
 				g_locationFormID,
-				reason ? reason : "unknown");
+				reason ? reason : "unknown",
+				quietNoopSweep ? " throttle=noop" : "");
 		}
 	}
 
@@ -1281,6 +1467,57 @@ namespace TFD::Captive
 		return IsActorInNativeCaptiveLocationScope(actor, player);
 	}
 
+	static bool ShouldBlockReleasedWorkDialogueForEscapeBreak(RE::Actor* actor, const char* reason)
+	{
+		if (!actor) {
+			return false;
+		}
+
+		auto* player = Player();
+		auto& flow = TFD::FlowController::Controller::GetSingleton();
+		const auto snapshot = flow.GetSnapshot();
+		const bool inCombatEscapeBreak = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
+			snapshot.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak;
+		if (!inCombatEscapeBreak || !player) {
+			return false;
+		}
+
+		auto target = actor->GetActorRuntimeData().currentCombatTarget.get();
+		const bool targetingPlayer = target && target->GetFormID() == player->GetFormID();
+		const bool hostile = actor->IsHostileToActor(player);
+		const bool inCombat = actor->IsInCombat();
+		const bool weaponDrawn = actor->IsWeaponDrawn();
+		const bool primaryInCombatEscapeBreak = snapshot.primaryActorFormID == actor->GetFormID();
+		const bool shouldBlock = targetingPlayer || inCombat || primaryInCombatEscapeBreak;
+
+		if (shouldBlock) {
+			spdlog::info("[TFD][Captive][R230A] work dialogue actor prepare blocked for active escape-break combat actor={:08X} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} reason={}",
+				actor->GetFormID(),
+				hostile ? 1 : 0,
+				targetingPlayer ? 1 : 0,
+				inCombat ? 1 : 0,
+				weaponDrawn ? 1 : 0,
+				primaryInCombatEscapeBreak ? 1 : 0,
+				reason ? reason : "released_work_dialogue_actor");
+		}
+
+		return shouldBlock;
+	}
+
+	void ClearReleasedWorkDialogueActorForCombatBreak(RE::Actor* actor, const char* reason)
+	{
+		if (!actor) {
+			return;
+		}
+
+		const char* useReason = reason ? reason : "released_work_combat_break";
+		RemoveNativeWorkingCaptiveFaction(actor, useReason);
+		actor->SetDialogueWithPlayer(false, false, nullptr);
+		spdlog::info("[TFD][Captive][R222A] work dialogue actor cleared for escape-break combat actor={:08X} reason={} action=no_stop_combat",
+			actor->GetFormID(),
+			useReason);
+	}
+
 	bool EnsureReleasedWorkDialogueActor(RE::Actor* actor, const char* reason)
 	{
 		const char* useReason = reason ? reason : "released_work_dialogue_actor";
@@ -1298,6 +1535,11 @@ namespace TFD::Captive
 			spdlog::info("[TFD][Captive] work dialogue actor prepare rejected out_of_scope actor={:08X} reason={}",
 				actor->GetFormID(),
 				useReason);
+			return false;
+		}
+
+		if (ShouldBlockReleasedWorkDialogueForEscapeBreak(actor, useReason)) {
+			ClearReleasedWorkDialogueActorForCombatBreak(actor, useReason);
 			return false;
 		}
 
@@ -1324,7 +1566,7 @@ namespace TFD::Captive
 			process->StopCombatAndAlarmOnActor(actor, false);
 		}
 		if (actor->IsWeaponDrawn()) {
-			actor->DrawWeaponMagicHands(false);
+			// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 		}
 		actor->EvaluatePackage(false, true);
 		actor->EvaluatePackage(true, true);
@@ -1369,7 +1611,7 @@ namespace TFD::Captive
 			process->StopCombatAndAlarmOnActor(actor, false);
 		}
 		if (actor->IsWeaponDrawn()) {
-			actor->DrawWeaponMagicHands(false);
+			// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 		}
 		actor->EvaluatePackage(false, true);
 		actor->EvaluatePackage(true, true);
@@ -1920,7 +2162,7 @@ namespace TFD::Captive
 			actor->StopCombat();
 		}
 		if (actor->IsWeaponDrawn()) {
-			actor->DrawWeaponMagicHands(false);
+			// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 		}
 
 		auto* player = Player();
@@ -2039,27 +2281,47 @@ namespace TFD::Captive
 
 		auto* mineRef = TFD::Location::GetLastCaptiveWorkMiningRef();
 		auto* craftRef = TFD::Location::GetLastCaptiveWorkCraftingRef();
-		WriteQuestAlias(g_registry.workMineAlias, mineRef, reason ? reason : "sync_work_mine_alias");
-		WriteQuestAlias(g_registry.workCraftingStationAlias, craftRef, reason ? reason : "sync_work_crafting_alias");
+		const RE::FormID mineRefId = mineRef ? mineRef->GetFormID() : 0u;
+		const RE::FormID craftingRefId = craftRef ? craftRef->GetFormID() : 0u;
 
-		std::array<std::uint32_t, 10> stationRefIds{};
+		std::array<RE::TESObjectREFR*, 10> stationRefs{};
+		std::array<RE::FormID, 10> stationRefIds{};
 		std::uint32_t stationAliasCount = 0;
 		for (std::size_t station = 1; station < g_registry.workCraftingStationAliases.size(); ++station) {
-			auto* stationAlias = g_registry.workCraftingStationAliases[station];
-			if (stationAlias) {
+			if (g_registry.workCraftingStationAliases[station]) {
 				++stationAliasCount;
 			}
-			auto* stationRef = TFD::Location::GetLastCaptiveWorkCraftingRefForState(static_cast<int>(station));
-			stationRefIds[station] = stationRef ? stationRef->GetFormID() : 0u;
-			WriteQuestAlias(stationAlias, stationRef, reason ? reason : "sync_work_station_alias");
+			stationRefs[station] = TFD::Location::GetLastCaptiveWorkCraftingRefForState(static_cast<int>(station));
+			stationRefIds[station] = stationRefs[station] ? stationRefs[station]->GetFormID() : 0u;
 		}
 
-		spdlog::info("[TFD][Captive][W17] work resource aliases synced reason={} mineAlias={} mineRef={:08X} craftingAlias={} craftingRef={:08X} stationAliases={} stationRefs[forge={:08X} smelter={:08X} tanning={:08X} sharpening={:08X} workbench={:08X} chopping={:08X} cooking={:08X} alchemy={:08X} enchanting={:08X}]",
+		const bool releasedWorkTick = ReasonEquals(reason, "released_work_tick");
+		const bool workUpdateTick = ReasonEquals(reason, "work_update");
+		const bool unchanged = WorkResourceAliasSnapshotMatches(mineRefId, craftingRefId, stationRefIds);
+		const auto now = Now();
+		if ((releasedWorkTick || workUpdateTick) && unchanged &&
+			g_nextReleasedWorkAliasSelfHeal != std::chrono::steady_clock::time_point{} &&
+			now < g_nextReleasedWorkAliasSelfHeal) {
+			return;
+		}
+
+		g_nextReleasedWorkAliasSelfHeal = now + kReleasedWorkAliasSelfHealInterval;
+
+		WriteQuestAlias(g_registry.workMineAlias, mineRef, reason ? reason : "sync_work_mine_alias");
+		WriteQuestAlias(g_registry.workCraftingStationAlias, craftRef, reason ? reason : "sync_work_crafting_alias");
+		for (std::size_t station = 1; station < g_registry.workCraftingStationAliases.size(); ++station) {
+			WriteQuestAlias(g_registry.workCraftingStationAliases[station], stationRefs[station], reason ? reason : "sync_work_station_alias");
+		}
+
+		RememberWorkResourceAliasSnapshot(mineRefId, craftingRefId, stationRefIds);
+
+		spdlog::info("[TFD][Captive][R158] work resource aliases synced reason={} unchanged={} mineAlias={} mineRef={:08X} craftingAlias={} craftingRef={:08X} stationAliases={} stationRefs[forge={:08X} smelter={:08X} tanning={:08X} sharpening={:08X} workbench={:08X} chopping={:08X} cooking={:08X} alchemy={:08X} enchanting={:08X}]",
 			reason ? reason : "unknown",
+			unchanged ? 1 : 0,
 			g_registry.workMineAlias ? 1 : 0,
-			mineRef ? mineRef->GetFormID() : 0u,
+			mineRefId,
 			g_registry.workCraftingStationAlias ? 1 : 0,
-			craftRef ? craftRef->GetFormID() : 0u,
+			craftingRefId,
 			stationAliasCount,
 			stationRefIds[1],
 			stationRefIds[2],
@@ -2071,6 +2333,7 @@ namespace TFD::Captive
 			stationRefIds[8],
 			stationRefIds[9]);
 	}
+
 
 	void ClearCaptiveWorkResourceAliases(const char* reason, bool clearItemAlias)
 	{
@@ -2091,6 +2354,9 @@ namespace TFD::Captive
 		if (clearItemAlias) {
 			WriteQuestAlias(g_registry.workItemAlias, nullptr, reason ? reason : "clear_work_item_alias");
 		}
+
+		g_lastWorkResourceAliasSnapshot = {};
+		g_nextReleasedWorkAliasSelfHeal = {};
 
 		spdlog::info("[TFD][Captive] work resource aliases cleared reason={} mineAlias={} craftingAlias={} stationAliases={} itemAliasCleared={}",
 			reason ? reason : "unknown",
@@ -2172,9 +2438,13 @@ namespace TFD::Captive
 				useReason);
 		}
 
-		ApplyWorkingFactionToBossActors(actor, useReason);
+		// R187: Work Boss dialogue must be ready before the player activates the Boss.
+		// Refresh resource globals/aliases first, then publish exact-offer demand
+		// factions for the final Boss.  The GREET/TIF is now light-only and no longer
+		// repairs late setup after dialogue open.
 		(void)TFD::Location::RefreshCaptiveWorkResourceState(true, useReason);
 		SyncCaptiveWorkResourceAliases(useReason);
+		ApplyWorkingFactionToBossActors(actor, useReason);
 	}
 
 	void HandleReleasedWorkNoJob(RE::Actor* actor, double cooldownSeconds, const char* reason)
@@ -2190,12 +2460,18 @@ namespace TFD::Captive
 
 		(void)TFD::Location::ResolveNearestCaptiveStorageTarget(actor);
 		const auto excluded = actor ? actor->GetFormID() : g_currentWorkBossFormID;
-		auto* nextBoss = SelectWorkBossActor(nullptr, excluded, false);
+
+		// R189: No Job redirect must be exact-offer-aware.  Do not blindly cycle to
+		// the next LocRefType Boss, because that can ping-pong between two empty
+		// bosses while a third Boss still has Crafting/Cooking/Pleasure/Improve.
+		// WorkNative owns the prepared offer list; if it cannot find a Boss with a
+		// valid offer, this is final No Job for the current Work pass.
+		auto* nextBoss = TFD::WorkNative::SelectNextBossWithExactWorkOffer(actor, excluded, reason ? reason : "work_no_job_exact_redirect");
 		if (nextBoss) {
 			g_workBossResumeAt = {};
-			ApplyWorkingFactionToCurrentBoss(nextBoss, reason ? reason : "work_no_job_next_boss");
-			ForceWorkGlobals(0, 1, "work_no_job_redirect_next_boss");
-			spdlog::info("[TFD][Captive][C38] work no-job redirected from={:08X} to={:08X} assignment=TalkBoss reason={}",
+			ApplyWorkingFactionToCurrentBoss(nextBoss, reason ? reason : "work_no_job_next_exact_boss");
+			ForceWorkGlobals(0, 1, "work_no_job_redirect_next_exact_boss");
+			spdlog::info("[TFD][Captive][R189] work no-job redirected exact-offer from={:08X} to={:08X} assignment=TalkBoss reason={}",
 				excluded,
 				nextBoss->GetFormID(),
 				reason ? reason : "unknown");
@@ -2220,6 +2496,7 @@ namespace TFD::Captive
 	void ClearReleasedWorkRuntime(const char* reason)
 	{
 		ClearNativeWorkingCaptiveFaction(reason ? reason : "clear_released_work_runtime");
+		TFD::WorkNative::ClearWorkDemandFactions(reason ? reason : "clear_released_work_runtime");
 		WriteCurrentWorkBossAlias(nullptr, reason ? reason : "clear_released_work_runtime");
 		ClearCaptiveWorkResourceAliases(reason ? reason : "clear_released_work_runtime", true);
 		g_workBossResumeAt = {};
@@ -3493,6 +3770,24 @@ namespace TFD::Captive
 		return true;
 	}
 
+	static bool IsCaptivePleasureSceneHandoffActive()
+	{
+		if (!TFD::PleasureRuntime::IsActive()) {
+			return false;
+		}
+
+		if (TFD::PleasureRuntime::GetSourceContext() != TFD::PleasureRuntime::SourceContext::Captive) {
+			return false;
+		}
+
+		const auto phase = TFD::PleasureRuntime::GetPhase();
+		return phase == TFD::PleasureRuntime::Phase::PleasureStartPending ||
+			phase == TFD::PleasureRuntime::Phase::PleasureActive ||
+			phase == TFD::PleasureRuntime::Phase::PleasureEnding ||
+			phase == TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest ||
+			phase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue;
+	}
+
 	static bool TryTriggerReleasedWorkWeaponDrawnEscape(RE::Actor* player, const RuntimeTickHandlers& handlers)
 	{
 		if (!IsReleasedWorkActive() || !player || !player->IsWeaponDrawn()) {
@@ -3500,6 +3795,17 @@ namespace TFD::Captive
 			return false;
 		}
 		if (g_escapeBleedoutActive || g_recaptureCommitActive) {
+			return false;
+		}
+		if (IsCaptivePleasureSceneHandoffActive()) {
+			const auto now = Now();
+			if (g_releasedWorkWeaponDrawnNextLog == std::chrono::steady_clock::time_point{} || now >= g_releasedWorkWeaponDrawnNextLog) {
+				g_releasedWorkWeaponDrawnNextLog = now + std::chrono::milliseconds(1500);
+				spdlog::info(
+					"[TFD][Captive][R234B] released work weapon draw ignored reason=captive_pleasure_handoff phase={} source={}",
+					TFD::PleasureRuntime::GetPhaseName(),
+					TFD::PleasureRuntime::GetSourceContextName());
+			}
 			return false;
 		}
 
@@ -3561,7 +3867,9 @@ namespace TFD::Captive
 		ProcessPendingConfiscation();
 		(void)NormalizeInvalidCaptivePair();
 
-		if (TryTriggerReleasedWorkWeaponDrawnEscape(player, handlers)) {
+		const bool escapeBreakOverlay = TFD::FlowController::Controller::GetSingleton().IsCaptiveCombatEscapeBreakContextActive();
+
+		if (!escapeBreakOverlay && TryTriggerReleasedWorkWeaponDrawnEscape(player, handlers)) {
 			return false;
 		}
 
@@ -3569,11 +3877,25 @@ namespace TFD::Captive
 			if (IsStandardCaptiveActive()) {
 				EnsureCaptiveNavigationContext(player, "standard_captive_tick");
 			}
-			TFD::HostilityController::TickCaptiveSuppression();
-			ProcessReleasedWorkBossResume("released_work_tick");
-			if (g_phase == PhaseValue::ReleasedWork) {
-				(void)TFD::Location::RefreshCaptiveWorkResourceState(false, "released_work_tick");
-				SyncCaptiveWorkResourceAliases("released_work_tick");
+			if (!escapeBreakOverlay) {
+				TFD::HostilityController::TickCaptiveSuppression();
+				ProcessReleasedWorkBossResume("released_work_tick");
+				if (g_phase == PhaseValue::ReleasedWork) {
+					(void)TFD::Location::RefreshCaptiveWorkResourceState(false, "released_work_tick");
+					SyncCaptiveWorkResourceAliases("released_work_tick");
+				}
+			}
+			else {
+				// R206A: Captive/Work PleasureFailed > Fight temporarily keeps
+				// Captive as context while InCombat owns behavior. Do not run the
+				// ReleasedWork passive package maintainer here; it can sheathe the
+				// speaker right after the Fight commit. Keep resource aliases valid
+				// for the post-bleedout Work menu, but let combat AI own stance.
+				TFD::HostilityController::ResetCaptiveSuppression();
+				if (g_phase == PhaseValue::ReleasedWork) {
+					(void)TFD::Location::RefreshCaptiveWorkResourceState(false, "released_work_escape_break_tick");
+					SyncCaptiveWorkResourceAliases("released_work_escape_break_tick");
+				}
 			}
 		}
 		else {
@@ -3604,6 +3926,7 @@ namespace TFD::Captive
 		}
 
 		if (IsStandardCaptiveActive()) {
+			const bool captivePleasureSceneHandoff = IsCaptivePleasureSceneHandoffActive();
 			const bool dialogOpen = handlers.isDialogueOpen ? handlers.isDialogueOpen() : false;
 			const bool prevDialogueOpen = handlers.getPrevDialogueOpen ? handlers.getPrevDialogueOpen() : false;
 			if (dialogOpen) {
@@ -3618,8 +3941,14 @@ namespace TFD::Captive
 			if (handlers.setPrevDialogueOpen) {
 				handlers.setPrevDialogueOpen(dialogOpen);
 			}
-			if (!captiveBleedOverlay) {
+			if (!captiveBleedOverlay && !captivePleasureSceneHandoff) {
 				(void)TickCaptiveEscapePhase(player, handlers.escape);
+			}
+			else if (captivePleasureSceneHandoff) {
+				spdlog::info(
+					"[TFD][Captive][R234B] standard captive escape tick suppressed reason=captive_pleasure_handoff phase={} source={}",
+					TFD::PleasureRuntime::GetPhaseName(),
+					TFD::PleasureRuntime::GetSourceContextName());
 			}
 		}
 		else if (IsEscapeActive()) {
@@ -3637,6 +3966,23 @@ namespace TFD::Captive
 		}
 
 		if (IsActive() && !captiveBleedOverlay && !HasEscapeBreakRebleedPending()) {
+			if (escapeBreakOverlay) {
+				// R227A: InCombatEscapeBreak keeps Captive as context, but combat/defeat
+				// must own behavior.  Do not consume the DefeatMonitor tick here,
+				// otherwise player HP threshold is never scanned and the player can die
+				// during escape without a Bleedout forcegreet.
+				static auto s_nextEscapeBreakThresholdPassLog = std::chrono::steady_clock::time_point{};
+				const auto now = Now();
+				if (s_nextEscapeBreakThresholdPassLog == std::chrono::steady_clock::time_point{} || now >= s_nextEscapeBreakThresholdPassLog) {
+					s_nextEscapeBreakThresholdPassLog = now + std::chrono::milliseconds(1250);
+					spdlog::info("[TFD][Captive][R227A] captive escape-break allowed defeat threshold tick phase={} bleedOverlay={} rebleedPending={} player={:08X}",
+						static_cast<int>(g_phase),
+						captiveBleedOverlay ? 1 : 0,
+						HasEscapeBreakRebleedPending() ? 1 : 0,
+						player ? player->GetFormID() : 0u);
+				}
+				return true;
+			}
 			return false;
 		}
 
@@ -3710,6 +4056,22 @@ namespace TFD::Captive
 		const std::uint32_t actorFormID = ResolveRecaptureActorFormID(preferredCaptor);
 		g_lastRecaptureActorID = actorFormID;
 
+		(void)TFD::FlowController::QueueBridgeModEvent(
+			"TFDSystemEventForceClearRoute",
+			preferredCaptor,
+			"recapture_commit_alias_clear",
+			1.0f);
+		(void)TFD::FlowController::QueueBridgeModEvent(
+			"TFDBleedoutUnassign",
+			preferredCaptor,
+			"recapture_commit_alias_clear",
+			0.0f);
+		(void)TFD::FlowController::QueueBridgeModEvent(
+			"TFDTruceHardClearAll",
+			preferredCaptor,
+			"recapture_commit_alias_clear",
+			1.0f);
+
 		ClearEscapeBreakRebleed();
 		g_escapeBleedoutActive = false;
 		ResetLockpickWatch();
@@ -3750,6 +4112,11 @@ namespace TFD::Captive
 			}
 			SealDoorIfPresent();
 			(void)TFD::FlowController::QueueBridgeModEvent(
+				"TFDSystemEventForceClearRoute",
+				preferredCaptor,
+				why,
+				1.0f);
+			(void)TFD::FlowController::QueueBridgeModEvent(
 				"TFDSystemEventClearAfterPleasure",
 				nullptr,
 				why,
@@ -3771,7 +4138,7 @@ namespace TFD::Captive
 				1.0f);
 			TFD::DefeatMonitor::ForceRecoverPlayerAfterCaptiveRecapture(why);
 			g_lastRecaptureCompleted = Now();
-			spdlog::info("[TFD][Captive] CommitRecapture complete actor={:08X} reason={} clearBleedAliases=1 clearCrowdAliases=1 hardCrowdClear=1 recoverPlayer=1", actorFormID, why);
+			spdlog::info("[TFD][Captive][R202B] CommitRecapture complete actor={:08X} reason={} clearSystemRoute=1 clearBleedAliases=1 clearCrowdAliases=1 hardCrowdClear=1 recoverPlayer=1", actorFormID, why);
 		}
 		else {
 			spdlog::warn("[TFD][Captive] CommitRecapture incomplete actor={:08X} reason={}", actorFormID, why);

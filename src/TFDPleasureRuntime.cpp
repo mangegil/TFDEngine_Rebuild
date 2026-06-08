@@ -131,6 +131,8 @@ namespace TFD::PleasureRuntime
 				return "AfterPleasureAwaitQuest";
 			case Phase::AfterPleasureDialogue:
 				return "AfterPleasureDialogue";
+			case Phase::PleasureFailedDialogue:
+				return "PleasureFailedDialogue";
 			case Phase::RedoPending:
 				return "RedoPending";
 			case Phase::Finalizing:
@@ -244,6 +246,20 @@ namespace TFD::PleasureRuntime
 			return faction;
 		}
 
+		RE::TESFaction* ResolvePleasureFailedFaction()
+		{
+			static RE::TESFaction* faction = nullptr;
+			static bool tried = false;
+			if (!tried) {
+				tried = true;
+				faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPleasureFailedFaction");
+				if (!faction) {
+					spdlog::warn("[TFD][PleasureRuntime][R203A] TFDPleasureFailedFaction unresolved");
+				}
+			}
+			return faction;
+		}
+
 		void RemoveAfterPleasureFaction(RE::Actor* actor, std::string_view reason)
 		{
 			auto* faction = ResolveAfterPleasureFaction();
@@ -254,6 +270,21 @@ namespace TFD::PleasureRuntime
 				actor->RemoveFromFaction(faction);
 				spdlog::info(
 					"[TFD][PleasureRuntime][R109] after pleasure faction removed actor={:08X} reason={}",
+					actor->GetFormID(),
+					reason.empty() ? std::string{ "-" } : std::string{ reason });
+			}
+		}
+
+		void RemovePleasureFailedFaction(RE::Actor* actor, std::string_view reason)
+		{
+			auto* faction = ResolvePleasureFailedFaction();
+			if (!actor || !faction) {
+				return;
+			}
+			if (actor->IsInFaction(faction)) {
+				actor->RemoveFromFaction(faction);
+				spdlog::info(
+					"[TFD][PleasureRuntime][R203A] pleasure failed faction removed actor={:08X} reason={}",
 					actor->GetFormID(),
 					reason.empty() ? std::string{ "-" } : std::string{ reason });
 			}
@@ -278,9 +309,10 @@ namespace TFD::PleasureRuntime
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				process->StopCombatAndAlarmOnActor(actor, false);
 			}
-			if (actor->IsWeaponDrawn()) {
-				actor->DrawWeaponMagicHands(false);
-			}
+			// R240A: Do not force weapon sheathe here. Once combat/alarm/pacify
+			// state is correct, Skyrim will settle the weapon naturally. Forced
+			// sheathe can break the animation graph: idle posture with weapon still
+			// in hand, then hostile actors cannot attack after Fight.
 			actor->EvaluatePackage(false, true);
 			actor->EvaluatePackage(true, true);
 
@@ -291,6 +323,60 @@ namespace TFD::PleasureRuntime
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 
+		void PreparePleasureFailedPackageActor(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+
+			// R203A: Pleasure Failed is not generic AfterPleasure.  Give it its
+			// own CK faction/package route and explicitly strip the old passive
+			// AfterPleasure marker so the speaker does not inherit the sheathe/idle
+			// package before the user chooses Fight.
+			RemoveAfterPleasureFaction(actor, reason.empty() ? "pleasure_failed_prepare_strip_after" : reason);
+
+			auto* faction = ResolvePleasureFailedFaction();
+			if (faction && !actor->IsInFaction(faction)) {
+				actor->AddToFaction(faction, 0);
+			}
+
+			if (!actor->IsAIEnabled()) {
+				actor->EnableAI(true);
+			}
+			actor->AllowPCDialogue(true);
+
+			// R253A: PleasureFailed is opened by native hard-topic forcegreet, not by
+			// an AI package.  BO11/R252A proved the drawn-state predicate was too late:
+			// after OStim ends, the actor can already report weaponDrawn=false even
+			// though the animation/package graph is still in the fragile handoff that
+			// later becomes idle-with-weapon-in-hand.  Do not StopCombatAlarm or
+			// EvaluatePackage for any PleasureFailed speaker.  Keep the dialogue marker
+			// and let the hard topic open directly; Fight owns the later combat handoff.
+			const bool wasInCombat = actor->IsInCombat();
+			const bool wasWeaponDrawn = actor->IsWeaponDrawn();
+			const bool preserveDrawnPosture = true;
+			const bool stoppedCombat = false;
+			const bool stoppedAlarm = false;
+			const bool evaluatedPackage = false;
+
+			// No forced sheathe/draw, no StopCombatAlarm, and no package settle during
+			// PleasureFailed.  The dialogue opener forces the topic directly and Fight
+			// removes TFDPleasureFailedFaction before combat refresh.
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R253A] pleasure failed package actor prepared actor={:08X} factionApplied={} wasInCombat={} wasWeaponDrawn={} preserveDrawnPosture={} stoppedCombat={} stoppedAlarm={} packageEval={} weaponDrawnNow={} forcedSheathe=0 reason={}",
+				actor->GetFormID(),
+				faction ? 1 : 0,
+				wasInCombat ? 1 : 0,
+				wasWeaponDrawn ? 1 : 0,
+				preserveDrawnPosture ? 1 : 0,
+				stoppedCombat ? 1 : 0,
+				stoppedAlarm ? 1 : 0,
+				evaluatedPackage ? 1 : 0,
+				actor->IsWeaponDrawn() ? 1 : 0,
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
 		void ReleaseAfterPleasurePackageActor(RE::Actor* actor, std::string_view reason)
 		{
 			if (!actor || actor->IsDead() || actor->IsDisabled()) {
@@ -298,6 +384,7 @@ namespace TFD::PleasureRuntime
 			}
 
 			RemoveAfterPleasureFaction(actor, reason.empty() ? "after_pleasure_terminal_cleanup" : reason);
+			RemovePleasureFailedFaction(actor, reason.empty() ? "after_pleasure_terminal_cleanup" : reason);
 			if (!actor->IsAIEnabled()) {
 				actor->EnableAI(true);
 			}
@@ -501,6 +588,7 @@ namespace TFD::PleasureRuntime
 		{
 			if (auto* actor = LookupActor(g_state.afterPleasureSpeakerFormID ? g_state.afterPleasureSpeakerFormID : g_state.pleasureSpeakerFormID)) {
 				RemoveAfterPleasureFaction(actor, "clear_speaker_state");
+				RemovePleasureFailedFaction(actor, "clear_speaker_state");
 			}
 			g_state.pleasureSpeakerFormID = 0;
 			g_state.afterPleasureSpeakerFormID = 0;
@@ -597,6 +685,7 @@ namespace TFD::PleasureRuntime
 		{
 			if (auto* oldActor = LookupActor(g_state.afterPleasureSpeakerFormID ? g_state.afterPleasureSpeakerFormID : g_state.pleasureSpeakerFormID)) {
 				RemoveAfterPleasureFaction(oldActor, "begin_new_cycle");
+				RemovePleasureFailedFaction(oldActor, "begin_new_cycle");
 			}
 			++g_state.sessionCycleId;
 			g_state.source = source;
@@ -723,6 +812,7 @@ namespace TFD::PleasureRuntime
 			case Phase::PleasureEnding:
 			case Phase::AfterPleasureAwaitQuest:
 			case Phase::AfterPleasureDialogue:
+			case Phase::PleasureFailedDialogue:
 			case Phase::RedoPending:
 			case Phase::Finalizing:
 				return true;
@@ -747,6 +837,7 @@ namespace TFD::PleasureRuntime
 			case Phase::PleasureEnding:
 			case Phase::AfterPleasureAwaitQuest:
 			case Phase::AfterPleasureDialogue:
+			case Phase::PleasureFailedDialogue:
 			case Phase::RedoPending:
 				return true;
 			default:
@@ -923,9 +1014,7 @@ namespace TFD::PleasureRuntime
 			}
 			actor->StopCombat();
 			actor->StopAlarmOnActor();
-			if (actor->IsWeaponDrawn()) {
-				actor->DrawWeaponMagicHands(false);
-			}
+			// R240A: no forced sheathe during scene passive lock.
 			actor->EvaluatePackage(true, false);
 			TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 5, 90);
 
@@ -940,11 +1029,14 @@ namespace TFD::PleasureRuntime
 
 		bool IsScenePassiveHoldSourceLocked()
 		{
-			// W37: repeated passive hold pulses are only for real combat-to-scene
-			// handoffs. PreCombat and Captive are already passive dialogue contexts;
-			// keeping them in this loop created avoidable delay and native busy windows.
-			return g_state.source == SourceContext::InCombat ||
-				g_state.source == SourceContext::Bleedout;
+			// R249A: Bleedout-source Pleasure has already committed its Bleedout
+			// dialogue owner before entering PleasureRuntime.  Keeping it in the
+			// hard passive hold loop can drop the actor out of combat stance while
+			// leaving the weapon in hand, then PleasureFailed -> Fight inherits a
+			// broken animation graph.  Only true InCombat handoffs still need this
+			// repeated native StopCombat/EvaluatePackage pressure while OStim is
+			// starting.
+			return g_state.source == SourceContext::InCombat;
 		}
 
 		bool ShouldMaintainScenePassiveHoldLocked()
@@ -990,9 +1082,10 @@ namespace TFD::PleasureRuntime
 			}
 			actor->StopCombat();
 			actor->StopAlarmOnActor();
-			if (actor->IsWeaponDrawn()) {
-				actor->DrawWeaponMagicHands(false);
-			}
+			// R240A: Do not force weapon sheathe here. Once combat/alarm/pacify
+			// state is correct, Skyrim will settle the weapon naturally. Forced
+			// sheathe can break the animation graph: idle posture with weapon still
+			// in hand, then hostile actors cannot attack after Fight.
 			actor->EvaluatePackage(false, true);
 
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1804,7 +1897,7 @@ namespace TFD::PleasureRuntime
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.blocking = true;
 					g_state.holdActive = true;
-					if (eventSource == SourceContext::InCombat || eventSource == SourceContext::Bleedout) {
+					if (eventSource == SourceContext::InCombat) {
 						g_state.passiveLockActive = true;
 						PrepareActorForScenePassiveLocked(eventActor, "scene_start_pending_passive_lock");
 						SuppressActorDialogueForSceneLocked(eventActor, "scene_start_pending_suppress_dialogue");
@@ -1813,8 +1906,11 @@ namespace TFD::PleasureRuntime
 						g_state.passiveLockActive = false;
 						g_state.scenePassiveHoldNextPulseSec = 0.0;
 						g_state.scenePassiveHoldPulseCount = 0;
+						if (eventSource == SourceContext::Bleedout) {
+							SuppressActorDialogueForSceneLocked(eventActor, "r249a_bleedout_scene_start_dialogue_cooldown_only");
+						}
 						spdlog::info(
-							"[TFD][PleasureRuntime][W37] safe scene start pending actor={:08X} source={} cycle={} reason=no_hard_passive_hold",
+							"[TFD][PleasureRuntime][R249A] safe scene start pending actor={:08X} source={} cycle={} reason=no_hard_passive_hold",
 							eventActor->GetFormID(),
 							ToString(eventSource),
 							g_state.sessionCycleId);
@@ -1834,15 +1930,20 @@ namespace TFD::PleasureRuntime
 				if (g_state.phase == Phase::PleasureStartPending) {
 					AdvancePhaseLocked(Phase::PleasureActive, eventName);
 					g_state.holdActive = true;
-					if (g_state.source == SourceContext::InCombat || g_state.source == SourceContext::Bleedout) {
+					if (g_state.source == SourceContext::InCombat) {
 						g_state.passiveLockActive = true;
 						PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_passive_lock");
 						SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
 					}
 					else {
 						g_state.passiveLockActive = false;
+						g_state.scenePassiveHoldNextPulseSec = 0.0;
+						g_state.scenePassiveHoldPulseCount = 0;
+						if (g_state.source == SourceContext::Bleedout) {
+							SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "r249a_bleedout_scene_started_dialogue_cooldown_only");
+						}
 						spdlog::info(
-							"[TFD][PleasureRuntime][W37] safe scene active source={} cycle={} reason=no_hard_passive_hold",
+							"[TFD][PleasureRuntime][R249A] safe scene active source={} cycle={} reason=no_hard_passive_hold",
 							ToString(g_state.source),
 							g_state.sessionCycleId);
 					}
@@ -1909,7 +2010,8 @@ namespace TFD::PleasureRuntime
 					g_state.phase == Phase::PleasureActive ||
 					g_state.phase == Phase::PleasureEnding ||
 					g_state.phase == Phase::AfterPleasureAwaitQuest ||
-					g_state.phase == Phase::AfterPleasureDialogue) {
+					g_state.phase == Phase::AfterPleasureDialogue ||
+					g_state.phase == Phase::PleasureFailedDialogue) {
 					auto* failedActor = ResolveEventOrTrackedActorLocked(info);
 					if (!failedActor || failedActor->IsDead() || failedActor->IsDisabled()) {
 						spdlog::warn(
@@ -1936,11 +2038,14 @@ namespace TFD::PleasureRuntime
 					g_state.redoPending = false;
 					g_state.blocking = true;
 					g_state.holdActive = true;
-					g_state.passiveLockActive = true;
+					// R203A: hold the runtime route, but do not arm the AfterPleasure
+					// passive lock for Pleasure Failed.  The new Aggressor alias/package
+					// owns the forcegreet posture until a terminal choice is selected.
+					g_state.passiveLockActive = false;
 					g_state.afterPleasureDialogueExpireSec = 0.0;
-					PrepareAfterPleasurePackageActor(failedActor, "pleasure_failed_dialogue");
-					AdvancePhaseLocked(Phase::AfterPleasureDialogue, eventName);
-					LogEventAcceptedLocked(eventName, info, "pleasure_failed_dialogue_open");
+					PreparePleasureFailedPackageActor(failedActor, "pleasure_failed_dialogue");
+					AdvancePhaseLocked(Phase::PleasureFailedDialogue, eventName);
+					LogEventAcceptedLocked(eventName, info, "r223a_pleasure_failed_independent_dialogue_open");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);
@@ -1968,7 +2073,7 @@ namespace TFD::PleasureRuntime
 			}
 
 			if (eventName == kPleasureFailedEvent || eventName == kPleasureAbortedEvent) {
-				if (g_state.phase == Phase::PleasureStartPending || g_state.phase == Phase::PleasureActive || g_state.phase == Phase::PleasureEnding || g_state.phase == Phase::RedoPending || g_state.phase == Phase::AfterPleasureDialogue) {
+				if (g_state.phase == Phase::PleasureStartPending || g_state.phase == Phase::PleasureActive || g_state.phase == Phase::PleasureEnding || g_state.phase == Phase::RedoPending || g_state.phase == Phase::AfterPleasureDialogue || g_state.phase == Phase::PleasureFailedDialogue) {
 					auto* eventActor = ResolveEventOrTrackedActorLocked(info);
 					AdvancePhaseLocked(Phase::Finalizing, eventName);
 					AdvancePhaseLocked(Phase::Closed, eventName);
@@ -1993,13 +2098,13 @@ namespace TFD::PleasureRuntime
 					g_state.afterPleasureCommitted = true;
 					g_state.afterPleasureDialogueExpireSec = 0.0;
 				}
-				if (g_state.phase != Phase::AfterPleasureDialogue) {
+				const auto choice = MapAfterPleasureChoice(eventName);
+				const bool fromPleasureFailedDialogue =
+					g_state.pleasureFailedDialogueActive || g_state.phase == Phase::PleasureFailedDialogue;
+				if (g_state.phase != Phase::AfterPleasureDialogue && g_state.phase != Phase::PleasureFailedDialogue) {
 					LogEventIgnoredLocked(eventName, "wrong_phase", info);
 					return;
 				}
-
-				const auto choice = MapAfterPleasureChoice(eventName);
-				const bool fromPleasureFailedDialogue = g_state.pleasureFailedDialogueActive;
 				if (fromPleasureFailedDialogue && choice != AfterChoice::Redo) {
 					LogEventIgnoredLocked(eventName, "pleasure_failed_blocks_normal_after_choice", info);
 					return;
@@ -2306,7 +2411,7 @@ namespace TFD::PleasureRuntime
 		}
 
 		BeginNewCycleLocked(speaker, source, reason);
-		if ((source == SourceContext::InCombat || source == SourceContext::Bleedout) && speaker) {
+		if (source == SourceContext::InCombat && speaker) {
 			TFD::HostilityController::ApplyAggressionClamp(speaker);
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				const bool oldRunDetection = process->runDetection;
@@ -2316,26 +2421,28 @@ namespace TFD::PleasureRuntime
 				process->runDetection = oldRunDetection;
 			}
 			speaker->StopCombat();
-			if (speaker->IsWeaponDrawn()) {
-				speaker->DrawWeaponMagicHands(false);
-			}
+			// R240A: no forced sheathe at pleasure handoff; pacify/combat state owns this.
 			speaker->EvaluatePackage(true, false);
 
-			const float waveRadius = source == SourceContext::Bleedout ? 2400.0f : 1800.0f;
-			TFD::HostilityController::ScheduleStopCombatWaves(waveRadius, false, 3, 75);
+			TFD::HostilityController::ScheduleStopCombatWaves(1800.0f, false, 3, 75);
 			spdlog::info(
 				"[TFD][PleasureRuntime][W37] combat hard passive lock actor={:08X} source={} reason={}",
 				speaker->GetFormID(),
 				ToString(source),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
+		else if (source == SourceContext::Bleedout && speaker) {
+			SuppressActorDialogueForSceneLocked(speaker, "r250a_bleedout_begin_pleasure_dialogue_cooldown_only");
+			spdlog::info(
+				"[TFD][PleasureRuntime][R250A] bleedout source BeginPleasure without hard passive lock actor={:08X} reason={}",
+				speaker->GetFormID(),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
 		else if ((source == SourceContext::PreCombat || source == SourceContext::Captive) && speaker) {
 			if (source == SourceContext::Captive) {
 				TFD::HostilityController::TickCaptiveSuppression();
 			}
-			if (speaker->IsWeaponDrawn()) {
-				speaker->DrawWeaponMagicHands(false);
-			}
+			// R240A: no forced sheathe for already-safe sources.
 			speaker->EvaluatePackage(false, true);
 			spdlog::info(
 				"[TFD][PleasureRuntime][W37] safe source no hard passive lock actor={:08X} source={} reason={}",
@@ -2346,7 +2453,7 @@ namespace TFD::PleasureRuntime
 		AdvancePhaseLocked(Phase::PleasureStartPending, reason);
 		g_state.blocking = true;
 		g_state.holdActive = true;
-		g_state.passiveLockActive = source == SourceContext::InCombat || source == SourceContext::Bleedout;
+		g_state.passiveLockActive = source == SourceContext::InCombat;
 		return true;
 	}
 

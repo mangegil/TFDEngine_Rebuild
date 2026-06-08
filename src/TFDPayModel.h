@@ -106,6 +106,7 @@ namespace TFD::PayModel
 
     void ClearCachedEncounterQuote(const char* reason = "clear");
     bool PublishSharedGold(RE::Actor* speaker, PayContext context, const char* reason = "publish");
+    bool ClearSharedGoldForContext(PayContext context, const char* reason = "clear_context");
     void ClearSharedGold(const char* reason = "clear");
 
     [[nodiscard]] int GetContextPercent(PayContext context);

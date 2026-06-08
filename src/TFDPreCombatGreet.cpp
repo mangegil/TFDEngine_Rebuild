@@ -50,7 +50,7 @@ namespace TFD::PreCombatGreet
         constexpr double kStickyTerminalSuppressSec = 0.75;
         constexpr double kDialogueCloseResolveDelaySec = 1.20;
         constexpr double kNegotiationRefreshSec = 0.15;
-        constexpr double kPreCombatOutcomeGraceSec = 3.50;
+        constexpr double kPreCombatOutcomeGraceSec = 5.50; // R219A: allow delayed Papyrus line fragments to beat close-abort.
         constexpr double kTerminalPendingOutcomeGraceSec = 6.00;
         constexpr double kPreCombatOutcomeRetryDelaySec = 0.20;
         constexpr unsigned kDialogueOpenRetryLogEvery = 10;
@@ -64,6 +64,7 @@ namespace TFD::PreCombatGreet
         constexpr double kStaleRecruitCombatStateSuppressSec = 8.00;
         constexpr double kRecruitCommitPendingGuardSec = 5.00;
         constexpr double kPleasureHandoffHoldSec = 18.00;
+        constexpr double kPreCombatPayFollowupOutcomeHoldSec = 18.00;
 
         constexpr const char* kPreCombatOutcomePayEvent = "TFDPreCombatOutcomePay";
         constexpr const char* kPreCombatOutcomeFightEvent = "TFDPreCombatOutcomeFight";
@@ -74,6 +75,7 @@ namespace TFD::PreCombatGreet
         constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
         constexpr const char* kPreCombatOutcomeFollowEndEvent = "TFDPreCombatOutcomeFollowEnd";
         constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
+        constexpr const char* kPreCombatOutcomeFailedEvent = "TFDPreCombatOutcomeFailed";
         constexpr const char* kPreCombatTerminalPendingEvent = "TFDPreCombatTerminalPending";
         constexpr const char* kPreCombatRecruitPendingEvent = "TFDPreCombatRecruitPending";
         constexpr const char* kPreCombatDialogueConfirmedEvent = "TFDPreCombatDialogueConfirmed";
@@ -153,6 +155,7 @@ namespace TFD::PreCombatGreet
         {
             return eventName == std::string_view("TFDPreCombatOutcomeRelease") ||
                 eventName == std::string_view("TFDPreCombatOutcomeFollow") ||
+                eventName == std::string_view("TFDTemporaryFollowPrelock") ||
                 eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd") ||
                 eventName == std::string_view("TFDPreCombatOutcomeFollowEnd");
         }
@@ -662,6 +665,15 @@ namespace TFD::PreCombatGreet
             }
 
             const double now = NowSec();
+            if (TFD::HostilityController::IsPayDialoguePassiveGuardActive(recentActor)) {
+                TFD::HostilityController::ArmPayDialoguePassiveGuard(recentActor, 10.0, "precombat_recent_player_combat_pay_guard_extend");
+                spdlog::info(
+                    "[TFD][PreCombatGreet][P6PAY] player combat recent clear suppressed actor={:08X} reason=pay_dialogue_passive_guard source={}",
+                    recentActor->GetFormID(),
+                    source ? source : "unknown");
+                return true;
+            }
+
             if (!IsTrackedStaleRecruitHostilityLocked(recentActor, now)) {
                 return false;
             }
@@ -1219,6 +1231,57 @@ namespace TFD::PreCombatGreet
                 return false;
             }
 
+            // R143: Pay followup is not a terminal release. The player has paid and
+            // is currently choosing the followup outcome (release/follow/recruit/etc.).
+            // If we release the truce session just because that followup menu closes,
+            // the actor immediately reacquires combat and the generic router can open
+            // InCombat Truce on top of the unfinished PreCombat Pay branch. Keep the
+            // PreCombat owner and suppression alive until a real followup outcome
+            // arrives or the explicit hold window expires.
+            if (pending.payFollowupPending) {
+                if (pending.postCloseOutcomeGraceUntilSec <= 0.0) {
+                    pending.postCloseOutcomeGraceUntilSec = nowSec + kPreCombatPayFollowupOutcomeHoldSec;
+                    pending.expiresSec = std::max(pending.expiresSec, pending.postCloseOutcomeGraceUntilSec);
+                    pending.nextPostCloseOutcomeLogSec = nowSec;
+                }
+
+                const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+                const auto actorFormID = actor->GetFormID();
+                const bool sameActor = snapshot.primaryActorFormID == 0 || snapshot.primaryActorFormID == actorFormID;
+                const bool flowStillPreCombat = snapshot.root == TFD::FlowController::RootFlow::PreCombat;
+                const bool flowPayFollowup = snapshot.sub == TFD::FlowController::SubFlow::PreCombatPayFollowup;
+                const bool extortionActive = TFD::Extortion::IsActive(actor) || TFD::Extortion::HasActive();
+                const bool holdWindowActive = nowSec < pending.postCloseOutcomeGraceUntilSec;
+
+                if (sameActor && holdWindowActive && (flowStillPreCombat || flowPayFollowup || extortionActive)) {
+                    EnforceNegotiationState(actor, pending, nowSec);
+                    if (nowSec >= pending.nextPostCloseOutcomeLogSec) {
+                        pending.nextPostCloseOutcomeLogSec = nowSec + 0.50;
+                        spdlog::info(
+                            "[TFD][PreCombatGreet][R143] hold pay followup actor={:08X} root={} sub={} extortion={} graceUntil={:.2f} now={:.2f}",
+                            actorFormID,
+                            TFD::FlowController::Controller::ToString(snapshot.root),
+                            TFD::FlowController::Controller::ToString(snapshot.sub),
+                            extortionActive ? 1 : 0,
+                            pending.postCloseOutcomeGraceUntilSec,
+                            nowSec);
+                    }
+                    pending.dialogueClosePending = true;
+                    pending.dialogueCloseResolveAtSec = std::min(pending.postCloseOutcomeGraceUntilSec, nowSec + kPreCombatOutcomeRetryDelaySec);
+                    return true;
+                }
+
+                spdlog::warn(
+                    "[TFD][PreCombatGreet][R143] pay followup hold expired actor={:08X} root={} sub={} extortion={} graceUntil={:.2f} now={:.2f}",
+                    actorFormID,
+                    TFD::FlowController::Controller::ToString(snapshot.root),
+                    TFD::FlowController::Controller::ToString(snapshot.sub),
+                    extortionActive ? 1 : 0,
+                    pending.postCloseOutcomeGraceUntilSec,
+                    nowSec);
+                return false;
+            }
+
             // Other real terminal outcomes may clean up normally. TerminalPending is only a
             // Papyrus-side "the player picked a terminal answer" signal; the real
             // native outcome still has to arrive after the TIF chain finishes.
@@ -1257,7 +1320,7 @@ namespace TFD::PreCombatGreet
             if (nowSec >= pending.nextPostCloseOutcomeLogSec) {
                 pending.nextPostCloseOutcomeLogSec = nowSec + 0.50;
                 spdlog::info(
-                    "[TFD][PreCombatGreet] hold close for outcome actor={:08X} action={} root={} sub={} extortion={} payFollowup={} terminalPending={} graceUntil={:.2f} now={:.2f}",
+                    "[TFD][PreCombatGreet][R219A] hold close for outcome actor={:08X} action={} root={} sub={} extortion={} payFollowup={} terminalPending={} graceUntil={:.2f} now={:.2f}",
                     actorFormID,
                     TFD::InteractionRouter::ToString(pending.action),
                     TFD::FlowController::Controller::ToString(snapshot.root),
@@ -1284,6 +1347,14 @@ namespace TFD::PreCombatGreet
             pending.dialogueCloseResolveAtSec = nowSec + kDialogueCloseResolveDelaySec;
             pending.nextNegotiationRefreshSec = nowSec;
             if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat &&
+                pending.payFollowupPending &&
+                pending.postCloseOutcomeGraceUntilSec <= 0.0) {
+                pending.postCloseOutcomeGraceUntilSec = nowSec + kPreCombatPayFollowupOutcomeHoldSec;
+                pending.expiresSec = std::max(pending.expiresSec, pending.postCloseOutcomeGraceUntilSec);
+                pending.nextPostCloseOutcomeLogSec = nowSec;
+            }
+
+            if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat &&
                 !pending.terminalChoiceCommitted &&
                 !pending.payFollowupPending &&
                 !pending.terminalPendingBarrier &&
@@ -1294,7 +1365,7 @@ namespace TFD::PreCombatGreet
             }
 
             spdlog::info(
-                "[TFD][PreCombatGreet] dialogue close armed actor={:08X} action={} resolveIn={:.2f}s reason={} graceUntil={:.2f}",
+                "[TFD][PreCombatGreet][R219A] dialogue close armed actor={:08X} action={} resolveIn={:.2f}s reason={} graceUntil={:.2f}",
                 actor ? actor->GetFormID() : 0u,
                 TFD::InteractionRouter::ToString(pending.action),
                 kDialogueCloseResolveDelaySec,
@@ -1849,16 +1920,19 @@ namespace TFD::PreCombatGreet
             pending.nextStickyRetrySec = now;
             pending.stickySuppressTerminalUntilSec = now + kStickyTerminalSuppressSec;
             pending.nextPreserveHandoffLogSec = 0.0;
-            pending.postCloseOutcomeGraceUntilSec = 0.0;
-            pending.nextPostCloseOutcomeLogSec = 0.0;
+            pending.postCloseOutcomeGraceUntilSec = now + kPreCombatPayFollowupOutcomeHoldSec;
+            pending.nextPostCloseOutcomeLogSec = now;
+            pending.expiresSec = std::max(pending.expiresSec, pending.postCloseOutcomeGraceUntilSec);
             ResetDialogueOpenRetryLocked(pending);
             ClearDialogueClosePendingLocked(pending);
             CacheRecentActor(actor, 0.0, reason ? reason : "precombat_pay_followup");
             spdlog::info(
-                "[TFD][PreCombatGreet] pay followup armed actor={:08X} action={} reason={}",
+                "[TFD][PreCombatGreet][R143] pay followup armed actor={:08X} action={} reason={} holdUntil={:.2f} expiresIn={:.2f}",
                 actor->GetFormID(),
                 TFD::InteractionRouter::ToString(pending.action),
-                reason ? reason : "unknown");
+                reason ? reason : "unknown",
+                pending.postCloseOutcomeGraceUntilSec,
+                pending.expiresSec - now);
         }
 
         bool HasProtectedPleasurePendingLocked()
@@ -1945,21 +2019,51 @@ namespace TFD::PreCombatGreet
 
         }
 
-        void ClearAllPendingLocked()
+        void ClearAllPendingLocked(const char* reason = "precombat_clear_all_pending", bool forceOwnerClear = false)
         {
-            ClearAllBridgeAliases();
-            TFD::Extortion::CancelAll("precombat_clear_all_pending");
-            TFD::PayModel::ClearSharedGold("precombat_clear_all_pending");
-
+            const char* clearReason = reason && reason[0] ? reason : "precombat_clear_all_pending";
             bool hadPreCombatPending = false;
+
+            for (auto& [handle, pending] : gPending) {
+                (void)handle;
+                if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
+                    hadPreCombatPending = true;
+                    break;
+                }
+            }
+
+            const bool flowOwnsPreCombat =
+                TFD::FlowController::GetDialogueContextKind() == TFD::FlowController::DialogueContextKind::PreCombat;
+            const bool canClearPreCombatOwnedState = forceOwnerClear || hadPreCombatPending || flowOwnsPreCombat;
+
+            // R147: Ownership boundary.  This function is also called by bleedout,
+            // recovery, loading, and blocked-flow watchdogs.  When PreCombat has no
+            // active owner, do not clear shared PayModel gold, Extortion barriers,
+            // or bridge aliases.  Those may currently belong to Bleedout/InCombat/
+            // Captive routes.
+            if (!canClearPreCombatOwnedState && gPending.empty()) {
+                return;
+            }
+
+            if (canClearPreCombatOwnedState) {
+                ClearAllBridgeAliases();
+                TFD::Extortion::CancelAll(clearReason);
+                (void)TFD::PayModel::ClearSharedGoldForContext(
+                    TFD::PayModel::PayContext::PreCombat,
+                    clearReason);
+            }
+            else {
+                spdlog::info(
+                    "[TFD][PreCombatGreet][R147OWN] owner boundary skipped global cleanup reason={} pendingCount={} flowCtx={} flowHold={} policy=precombat_not_owner",
+                    clearReason,
+                    static_cast<unsigned>(gPending.size()),
+                    TFD::FlowController::GetDialogueContextName(),
+                    TFD::FlowController::GetPassiveHoldName());
+            }
 
             for (auto& [handle, pending] : gPending) {
                 auto sp = RE::Actor::LookupByHandle(handle);
                 auto* actor = sp.get();
-
-                if (pending.action == TFD::InteractionRouter::Action::TrucePreCombat) {
-                    hadPreCombatPending = true;
-                }
 
                 if (pending.truceSessionId != 0) {
                     TFD::HostilityController::ReleaseSession(pending.truceSessionId, TFD::Tame::ReleaseReason::Generic);
@@ -1978,7 +2082,7 @@ namespace TFD::PreCombatGreet
             gPending.clear();
             gStaleRecruitHostilityUntil.clear();
 
-            if (hadPreCombatPending) {
+            if (canClearPreCombatOwnedState) {
                 TFD::InteractionRouter::ClearInteractionStateValue();
             }
         }
@@ -2090,6 +2194,10 @@ namespace TFD::PreCombatGreet
 
                     if (pendingActor) {
                         ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
+                        TFD::HostilityController::ExtendPayDialoguePassiveGuardCombatBlock(
+                            pendingActor,
+                            kRecruitCommitPendingGuardSec + 1.0,
+                            "precombat_recruit_pending_hook_block");
                         TFD::Recruit::MarkRecruitCommitPendingGroup(
                             CollectPreCombatRecruitCommitActors(pendingActor),
                             kRecruitCommitPendingGuardSec,
@@ -2187,7 +2295,8 @@ namespace TFD::PreCombatGreet
                     name == kPreCombatOutcomeRecruitEvent ||
                     name == kPreCombatOutcomeReleaseEvent ||
                     name == kPreCombatOutcomeFollowEvent ||
-                    name == kPreCombatOutcomePleasureEvent) {
+                    name == kPreCombatOutcomePleasureEvent ||
+                    name == kPreCombatOutcomeFailedEvent) {
                     std::scoped_lock lk(gLock);
                     RE::Actor* pendingActor = actor ? actor : ResolveSinglePendingActorLocked();
                     if (!pendingActor) {
@@ -2237,26 +2346,23 @@ namespace TFD::PreCombatGreet
                     TFD::Extortion::HandlePreCombatOutcomeEvent(rawName, pendingActor ? pendingActor : actor);
                     bool shouldClearInteractionState = false;
                     if (name == kPreCombatOutcomePayEvent) {
-                        bool startedExtortion = false;
-                        if (matchedPending) {
-                            MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
-                        }
-                        const bool resolved = ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay");
+                        // P5PAY: CK Pay is a linked-topic branch, not a terminal outcome.
+                        // Keep the dialogue alive; only arm a passive guard so the old
+                        // truce/session cleanup cannot blink aggression before Release/
+                        // Follow/Recruit/JoinEnemy is chosen.
+                        const bool resolved = ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pay, actorFormID, "mod_event_precombat_pay_branch");
                         if (resolved) {
                             if (matchedPending && pendingActor) {
                                 ArmPreCombatPayFollowupLocked(pendingActor, *matchedPending, rawName);
                             }
                             if (pendingActor) {
-                                startedExtortion = TFD::Extortion::BeginPreCombat(pendingActor, "mod_event_precombat_pay");
-                                if (startedExtortion) {
-                                    CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay");
-                                }
+                                TFD::HostilityController::ArmPayDialoguePassiveGuard(pendingActor, kPreCombatPayFollowupOutcomeHoldSec, "precombat_pay_linked_topic");
+                                CacheRecentActor(pendingActor, 0.0, "mod_event_precombat_pay_branch");
                             }
-                            spdlog::info("[TFD][PreCombatGreet] precombat pay accepted actor={:08X} -> extortion {}", actorFormID, startedExtortion ? "handoff" : "already_active");
-                            shouldClearInteractionState = true;
+                            spdlog::info("[TFD][PreCombatGreet][P5PAY] precombat pay branch accepted actor={:08X} keepDialogue=1 terminal=0 extortion=0", actorFormID);
                         }
                         else {
-                            spdlog::warn("[TFD][PreCombatGreet] pay outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                            spdlog::warn("[TFD][PreCombatGreet][P5PAY] pay branch rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
                     else if (name == kPreCombatOutcomeFightEvent) {
@@ -2287,6 +2393,9 @@ namespace TFD::PreCombatGreet
                             MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
                         }
                         if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::JoinEnemy, actorFormID, "mod_event_precombat_join_enemy")) {
+                            if (pendingActor) {
+                                TFD::HostilityController::ConsumePayDialoguePassiveGuardAsPersistent(pendingActor, "precombat_join_enemy_persistent_owner");
+                            }
                             shouldClearInteractionState = true;
                         }
                         else {
@@ -2312,8 +2421,15 @@ namespace TFD::PreCombatGreet
                             if (pendingActor) {
                                 CacheRecentActor(pendingActor, 0.0, rawName);
                                 const double followDurationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 60.0;
-                                TFD::Actor::Ops::ApplyReleaseFollowGraceToSpeakerAndCrowd(pendingActor, followDurationSec, "precombat_follow");
-                                spdlog::info("[TFD][PreCombatGreet] follow choice committed action=TrucePreCombat actor={:08X} reason={} duration={:.2f}",
+                                // R140: Do not apply native release-follow grace inside the
+                                // TFDPreCombatOutcomeFollow ModEvent callback. Papyrus has already
+                                // converted the actor into a temporary follower before sending this
+                                // event, and the old native grace path immediately performed faction,
+                                // aggression, StopCombat, EvaluatePackage, and UpdateCombat work on
+                                // the same actor while the quest/alias route was finalizing. That
+                                // stack was a hard-crash site on SE 1.5.97. The temporary follower
+                                // quest owns the short follow state; native only commits the flow.
+                                spdlog::info("[TFD][PreCombatGreet][R140] follow choice committed without native release-follow grace action=TrucePreCombat actor={:08X} reason={} duration={:.2f}",
                                     actorFormID,
                                     rawName ? rawName : "TFDPreCombatOutcomeFollow",
                                     followDurationSec);
@@ -2332,6 +2448,17 @@ namespace TFD::PreCombatGreet
                             spdlog::warn("[TFD][PreCombatGreet] pleasure outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
+                    else if (name == kPreCombatOutcomeFailedEvent) {
+                        if (matchedPending) {
+                            MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+                        }
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Failed, actorFormID, "mod_event_precombat_failed")) {
+                            shouldClearInteractionState = true;
+                        }
+                        else {
+                            spdlog::warn("[TFD][PreCombatGreet] failed outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
+                    }
                     else {
                         if (pendingActor) {
                             ArmRecruitDialogueCooldownForGroup(pendingActor, rawName);
@@ -2348,6 +2475,7 @@ namespace TFD::PreCombatGreet
                         const bool resolvedRecruit = ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::RecruitEnemy, actorFormID, "mod_event_precombat_recruit");
                         if (resolvedRecruit) {
                             if (pendingActor) {
+                                TFD::HostilityController::ConsumePayDialoguePassiveGuardAsPersistent(pendingActor, "precombat_recruit_persistent_owner");
                                 CommitPreCombatRecruitGroup(pendingActor, "mod_event_precombat_recruit_commit");
                                 ArmPostRecruitSettleForGroup(pendingActor, "mod_event_precombat_recruit_settle_after_commit");
                             }
@@ -2387,7 +2515,7 @@ namespace TFD::PreCombatGreet
 
             if (gSuspended.load(std::memory_order_acquire)) {
                 std::scoped_lock lk(gLock);
-                ClearAllPendingLocked();
+                ClearAllPendingLocked("suspended_tick");
                 return;
             }
 
@@ -2403,13 +2531,13 @@ namespace TFD::PreCombatGreet
 
             if (TFD::Transition::IsRecoveryActive()) {
                 std::scoped_lock lk(gLock);
-                ClearAllPendingLocked();
+                ClearAllPendingLocked("recovery_active");
                 return;
             }
 
             if (IsPlayerDown()) {
                 std::scoped_lock lk(gLock);
-                ClearAllPendingLocked();
+                ClearAllPendingLocked("player_down");
                 return;
             }
 
@@ -2435,7 +2563,7 @@ namespace TFD::PreCombatGreet
                             TFD::FlowController::GetDialogueContextName(),
                             TFD::FlowController::GetPassiveHoldName());
                     }
-                    ClearAllPendingLocked();
+                    ClearAllPendingLocked("precombat_blocked");
                     return;
                 }
 
@@ -2683,7 +2811,7 @@ namespace TFD::PreCombatGreet
 
         {
             std::scoped_lock lk(gLock);
-            ClearAllPendingLocked();
+            ClearAllPendingLocked("shutdown", true);
             gCooldownUntil.clear();
             ClearRecentActor("shutdown");
             ClearPostHandoffBlockLocked("shutdown");
@@ -3016,32 +3144,113 @@ namespace TFD::PreCombatGreet
         if (!IsGraceEventName(eventName)) {
             return false;
         }
+        if (eventName == std::string_view("TFDTemporaryFollowPrelock")) {
+            const double followLockSec = context.durationSec > 0.0 ? context.durationSec + 30.0 : 90.0;
+            TFD::Actor::Ops::ApplyTemporaryFollowLockToActorOnly(actor, followLockSec, "temporary_follow_prelock");
+            spdlog::info(
+                "[TFD][PreCombatGreet][R151] temporary follow prelock actor={:08X} requestedDuration={:.1f} routingLock={:.1f}",
+                actor->GetFormID(),
+                context.durationSec > 0.0 ? context.durationSec : 0.0,
+                followLockSec);
+            return true;
+        }
+
         if (eventName == std::string_view("TFDPreCombatOutcomeReleaseEnd")) {
-            if (handlers.removeGrace) {
+            // P12C: neutral safe-pass expiry is not a native combat-restore point.
+            // Do not call generic ReleaseFollowGrace cleanup when Papyrus sends
+            // restore=0; that cleanup can touch package/combat state inside the
+            // mod-event callback and has crashed during precombat_release_end.
+            const bool restoreRequested = context.numericArg > 0.5;
+            bool graceRemoved = false;
+            if (restoreRequested && handlers.removeGrace) {
                 handlers.removeGrace(actor, "precombat_release_end");
+                graceRemoved = true;
+            } else if (!restoreRequested) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet][P12C] neutral precombat release end skipped native grace cleanup actor={:08X} rawArg={:.2f}",
+                    actor->GetFormID(),
+                    context.numericArg);
             }
 
+            TFD::Actor::Ops::RemoveTemporaryFollowLockFromActorOnly(actor, "precombat_release_or_follow_end");
+            TFD::HostilityController::ReleasePayDialoguePassiveGuard(actor, restoreRequested, "precombat_release_end");
+
             spdlog::info(
-                "[TFD][PreCombatGreet] grace handled actor={:08X} reason=precombat_release_end",
-                actor->GetFormID());
+                "[TFD][PreCombatGreet][P12C] grace handled actor={:08X} reason=precombat_release_end restore={} graceRemoved={} payGuardRelease=1",
+                actor->GetFormID(),
+                restoreRequested ? 1 : 0,
+                graceRemoved ? 1 : 0);
             return true;
         }
 
         if (eventName == std::string_view("TFDPreCombatOutcomeFollowEnd")) {
-            if (handlers.removeGrace) {
+            // P12C: FollowEnd also carries a restore flag from Papyrus.  Respect it
+            // instead of always restoring aggression from the native Pay guard.
+            const bool restoreRequested = context.numericArg > 0.5;
+            bool graceRemoved = false;
+            if (restoreRequested && handlers.removeGrace) {
                 handlers.removeGrace(actor, "precombat_follow_end");
+                graceRemoved = true;
+            } else if (!restoreRequested) {
+                spdlog::info(
+                    "[TFD][PreCombatGreet][P12C] neutral precombat follow end skipped native grace cleanup actor={:08X} rawArg={:.2f}",
+                    actor->GetFormID(),
+                    context.numericArg);
             }
 
+            TFD::Actor::Ops::RemoveTemporaryFollowLockFromActorOnly(actor, "precombat_follow_end");
+            TFD::HostilityController::ReleasePayDialoguePassiveGuard(actor, restoreRequested, "precombat_follow_end");
+
             spdlog::info(
-                "[TFD][PreCombatGreet] grace handled actor={:08X} reason=precombat_follow_end",
-                actor->GetFormID());
+                "[TFD][PreCombatGreet][P12C] grace handled actor={:08X} reason=precombat_follow_end restore={} graceRemoved={} payGuardRelease=1",
+                actor->GetFormID(),
+                restoreRequested ? 1 : 0,
+                graceRemoved ? 1 : 0);
             return true;
         }
 
-        const char* graceReason =
-            eventName == std::string_view("TFDPreCombatOutcomeFollow") ?
-            "precombat_follow" :
-            "precombat_release";
+        if (eventName == std::string_view("TFDPreCombatOutcomeRelease")) {
+            // P5PAY: PreCombat Pay > Release is owned by the Papyrus SafePass route.
+            // Do not apply generic ReleaseFollowGrace here; only extend the lightweight
+            // Pay guard if Pay already armed it, so the session handoff stays passive.
+            if (TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor)) {
+                const double guardSeconds = (context.durationSec > 0.0 ? context.durationSec : 20.0) + 5.0;
+                TFD::HostilityController::ArmPayDialoguePassiveGuard(actor, guardSeconds, "precombat_release_safe_pass_extend");
+            }
+            spdlog::info(
+                "[TFD][PreCombatGreet][P5PAY] release grace bypassed actor={:08X} reason=precombat_release papyrusSafePassOwns=1 requestedDuration={:.1f} payGuardActive={}",
+                actor->GetFormID(),
+                context.durationSec > 0.0 ? context.durationSec : 0.0,
+                TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor) ? 1 : 0);
+            return true;
+        }
+
+        if (eventName == std::string_view("TFDPreCombatOutcomeFollow")) {
+            if (TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor)) {
+                const double guardSeconds = (context.durationSec > 0.0 ? context.durationSec : 60.0) + 30.0;
+                TFD::HostilityController::ArmPayDialoguePassiveGuard(actor, guardSeconds, "precombat_follow_temporary_extend");
+            }
+            // R141: Temporary follow is owned by TFDTemporaryFollowerQuest.
+            // Do not apply generic ReleaseFollowGrace here. That helper adds the
+            // expired-teammate/pacify layer and keeps re-stabilizing combat AI while
+            // the alias package is trying to make the actor follow the player. It also
+            // differs from the InCombat Pay > Follow path, which already avoids this
+            // generic grace layer.
+            // R142: still give native a lightweight routing lock so the same actor
+            // cannot be picked again by PreCombat/InCombat truce detection while
+            // Papyrus owns the temporary follower alias. This lock does not touch
+            // factions, aggression, StopCombat, EvaluatePackage, or UpdateCombat.
+            const double followLockSec = context.durationSec > 0.0 ? context.durationSec + 30.0 : 90.0;
+            TFD::Actor::Ops::ApplyTemporaryFollowLockToActorOnly(actor, followLockSec, "precombat_temporary_follow");
+            spdlog::info(
+                "[TFD][PreCombatGreet][R142] follow grace bypassed actor={:08X} reason=precombat_follow temporaryFollowerOwns=1 requestedDuration={:.1f} routingLock={:.1f}",
+                actor->GetFormID(),
+                context.durationSec > 0.0 ? context.durationSec : 0.0,
+                followLockSec);
+            return true;
+        }
+
+        const char* graceReason = "precombat_release";
 
         const double durationSec = context.durationSec > 0.0 ? context.durationSec : 20.0;
         if (handlers.applyGrace) {
@@ -3062,6 +3271,7 @@ namespace TFD::PreCombatGreet
         context.eventName = eventName;
         context.actor = ResolveActorFromEventArgRaw(eventArg);
         context.durationSec = durationSec > 0.0 ? durationSec : 20.0;
+        context.numericArg = durationSec;
         return HandleGraceModEvent(context, handlers);
     }
 
@@ -3082,8 +3292,18 @@ namespace TFD::PreCombatGreet
 
         const char* eventName = ev->eventName.c_str();
         const char* eventArg = ev->strArg.c_str();
-        const double durationSec = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 20.0;
-        return HandleModEventRaw(eventName, eventArg, durationSec, handlers);
+        const double rawNumericArg = static_cast<double>(ev->numArg);
+        GraceEventContext context{};
+        context.eventName = eventName;
+        context.actor = ResolveActorFromEventArgRaw(eventArg);
+        context.durationSec = rawNumericArg > 0.0 ? rawNumericArg : 20.0;
+        context.numericArg = rawNumericArg;
+
+        const std::string_view name = eventName ? std::string_view(eventName) : std::string_view{};
+        if (!IsGraceEventName(name)) {
+            return false;
+        }
+        return HandleGraceModEvent(context, handlers);
     }
 
     RE::Actor* ResolveRecentAggressor(float radius, double maxAgeSec)
@@ -3240,9 +3460,7 @@ namespace TFD::PreCombatGreet
     void CancelAll()
     {
         std::scoped_lock lk(gLock);
-        ClearAllPendingLocked();
-        TFD::Extortion::CancelAll("precombat_cancel_all");
-        TFD::PayModel::ClearSharedGold("precombat_cancel_all");
+        ClearAllPendingLocked("precombat_cancel_all");
         gCooldownUntil.clear();
         ClearRecentActor("cancel_all");
 

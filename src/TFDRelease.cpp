@@ -90,17 +90,19 @@ namespace TFD::Release
                 defaultGrace = 10.0;
                 return true;
             }
-            if (name == std::string_view("TFDBleedoutOutcomeRelease")) {
-                source = Source::Bleedout;
-                reason = "bleedout_release_to_vanilla";
-                defaultGrace = 10.0;
-                return true;
+            if (name == std::string_view("TFDBleedoutOutcomeRelease") ||
+                name == std::string_view("TFDBleedoutOutcomePay")) {
+                // P16OWN: Bleedout Pay/Release is terminal-owned by TFDBleedout
+                // (BleedoutPayReleaseSuppress).  Do not let the legacy generic
+                // Release manager apply ReleaseFollowGrace or global ClearAll.
+                return false;
             }
             if (name == std::string_view("TFDPleasureOutcomeRelease")) {
-                source = Source::AfterPleasure;
-                reason = "pleasure_release_to_vanilla";
-                defaultGrace = 10.0;
-                return true;
+                // P16OWN: Pleasure release is source-specific and is handled by
+                // FlowController after generic Release declines it.  The old generic
+                // Release manager clears every dialogue bridge and is too broad for
+                // source-owned Pleasure/AfterPleasure cleanup.
+                return false;
             }
             return false;
         }
@@ -172,16 +174,53 @@ namespace TFD::Release
 
             TFD::HostilityController::ClearAllTemporaryHostility();
             TFD::FlowController::Controller::GetSingleton().ResetRuntime("release_to_vanilla");
-            (void)TFD::FlowController::QueueBridgeModEvent("TFDPreCombatClearAll");
-            (void)TFD::FlowController::QueueBridgeModEvent("TFDTruceClearAll");
-            (void)TFD::FlowController::QueueBridgeModEvent("TFDInCombatClearAll");
-            (void)TFD::FlowController::QueueBridgeModEvent("TFDBleedoutClearAll");
+
+            bool preCombatQueued = false;
+            bool truceQueued = false;
+            bool inCombatQueued = false;
+            bool bleedoutQueued = false;
+            switch (state.source) {
+            case Source::PreCombat:
+                preCombatQueued = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDPreCombatClearAll",
+                    actor,
+                    "release_to_vanilla_precombat",
+                    0.0f);
+                break;
+            case Source::InCombat:
+                inCombatQueued = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDInCombatClearAll",
+                    actor,
+                    "release_to_vanilla_incombat",
+                    0.0f);
+                truceQueued = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDTruceClearAll",
+                    actor,
+                    "release_to_vanilla_incombat",
+                    0.0f);
+                break;
+            case Source::Bleedout:
+                bleedoutQueued = TFD::FlowController::QueueBridgeModEvent(
+                    "TFDBleedoutClearAll",
+                    actor,
+                    "release_to_vanilla_bleedout_legacy",
+                    0.0f);
+                break;
+            case Source::AfterPleasure:
+            case Source::None:
+            default:
+                break;
+            }
 
             spdlog::info(
-                "[TFD][Release] finalize actor={:08X} source={} reason={}",
+                "[TFD][Release][P16OWN] finalize actor={:08X} source={} reason={} clear(pre={},truce={},incombat={},bleedout={})",
                 state.actorFormID,
                 ToString(state.source),
-                state.reason);
+                state.reason,
+                preCombatQueued ? 1 : 0,
+                truceQueued ? 1 : 0,
+                inCombatQueued ? 1 : 0,
+                bleedoutQueued ? 1 : 0);
         }
     }
 
@@ -267,6 +306,26 @@ namespace TFD::Release
         const std::string_view name = rawName ? std::string_view(rawName) : std::string_view{};
         if (name.empty()) {
             return false;
+        }
+
+        // P2PAY: Pay > Release is owned by the Papyrus SafePass/Pay child route
+        // for PreCombat and InCombat. Do not also arm the generic ReleaseFollowGrace
+        // lifecycle here, because that creates a second pacify/aggression owner.
+        if (name == std::string_view("TFDPreCombatOutcomeRelease") ||
+            name == std::string_view("TFDInCombatOutcomeRelease")) {
+            auto* actor = ResolveActorFromEventArg(ev->strArg.c_str(), ev->sender);
+            if (actor && TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor)) {
+                const double guardSeconds = (ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 10.0) + 5.0;
+                TFD::HostilityController::ArmPayDialoguePassiveGuard(
+                    actor,
+                    guardSeconds,
+                    name == std::string_view("TFDPreCombatOutcomeRelease") ? "precombat_release_safe_pass_extend" : "incombat_release_safe_pass_extend");
+            }
+            spdlog::info(
+                "[TFD][Release][P5PAY] ignored pay-owned release event={} reason=papyrus_safepass_owner payGuardActive={}",
+                std::string(name),
+                actor && TFD::HostilityController::IsPayDialoguePassiveGuardActive(actor) ? 1 : 0);
+            return true;
         }
 
         Source source = Source::None;

@@ -19,6 +19,10 @@ namespace TFD::PreCombatGreet
 		const char* eventName{ nullptr };
 		RE::Actor* actor{ nullptr };
 		double durationSec{ 20.0 };
+		// P12C: keep the raw numeric mod-event argument.  Release/Follow end
+		// events use it as a restore flag; durationSec normalizes 0.0 to a
+		// default duration and therefore cannot be used for that decision.
+		double numericArg{ 0.0 };
 	};
 
 	struct GraceEventHandlers

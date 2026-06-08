@@ -202,6 +202,18 @@ namespace TFD::BleedoutGreet
 			reason ? reason : "unknown");
 	}
 
+
+	void ClearFlowGreetConfirmed(const char* reason)
+	{
+		std::scoped_lock lk(g_runtime.lock);
+		g_runtime.flowGreetConfirmed = false;
+		g_runtime.flowGreetSpeakerFormID = 0;
+		g_runtime.initialHandoffArmed = true;
+		g_runtime.initialHandoffRetryCount = 0;
+		g_runtime.initialHandoffNextRetry = Clock::now();
+		spdlog::info("[TFD][BleedoutGreet][R166] flow greet ack cleared reason={}", reason ? reason : "unknown");
+	}
+
 	void MarkAfterPleasureArmed(const char* reason)
 	{
 		std::scoped_lock lk(g_runtime.lock);

@@ -72,6 +72,7 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kBleedoutOutcomeCaptiveEvent = "TFDBleedoutOutcomeCaptive";
 		constexpr const char* kBleedoutOutcomeReleaseEvent = "TFDBleedoutOutcomeRelease";
 		constexpr const char* kBleedoutOutcomeResetEvent = "TFDBleedoutOutcomeReset";
+		constexpr const char* kBleedoutOutcomeDoNothingEvent = "TFDBleedoutOutcomeDoNothing";
 		constexpr const char* kInCombatOutcomeReleaseEvent = "TFDInCombatOutcomeRelease";
 		constexpr const char* kInCombatOutcomeFollowEvent = "TFDInCombatOutcomeFollow";
 		constexpr const char* kInCombatOutcomePayEvent = "TFDInCombatOutcomePay";
@@ -128,6 +129,11 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_bleedStickyReopenGraceUntil{};
 		std::uint32_t g_bleedStickyReopenGraceSpeakerID = 0;
 		float g_bleedStickyReopenGraceDistance = 99999.0f;
+
+		bool g_postTerminalBleedoutLockoutActive = false;
+		std::chrono::steady_clock::time_point g_postTerminalBleedoutLockoutUntil{};
+		std::chrono::steady_clock::time_point g_postTerminalBleedoutLockoutLastLog{};
+		std::string g_postTerminalBleedoutLockoutReason{};
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -304,6 +310,89 @@ namespace TFD::DefeatMonitor
 			}
 			g_graceUntil = Now() + std::chrono::seconds(seconds);
 			g_grace.store(true, std::memory_order_release);
+		}
+
+		static bool IsBleedoutTerminalOutcomeEvent(const char* rawName)
+		{
+			if (!rawName || !rawName[0]) {
+				return false;
+			}
+			return std::strcmp(rawName, kBleedoutOutcomePayEvent) == 0 ||
+				std::strcmp(rawName, kBleedoutOutcomePleasureEvent) == 0 ||
+				std::strcmp(rawName, kBleedoutOutcomeCaptiveEvent) == 0 ||
+				std::strcmp(rawName, kBleedoutOutcomeReleaseEvent) == 0 ||
+				std::strcmp(rawName, kBleedoutOutcomeResetEvent) == 0 ||
+				std::strcmp(rawName, kBleedoutOutcomeDoNothingEvent) == 0;
+		}
+
+		static double ResolvePostTerminalBleedoutLockoutSeconds(const char* rawName, float numArg)
+		{
+			if (!rawName) {
+				return 6.0;
+			}
+
+			if (_stricmp(rawName, "TFDBleedoutOutcomePay") == 0) {
+				const double requested = numArg > 0.0f ? static_cast<double>(numArg) : 30.0;
+				return std::clamp(requested, 20.0, 40.0);
+			}
+
+			if (_stricmp(rawName, "TFDBleedoutOutcomeRelease") == 0) {
+				const double requested = numArg > 0.0f ? static_cast<double>(numArg) : 30.0;
+				return std::clamp(requested, 20.0, 40.0);
+			}
+
+			if (_stricmp(rawName, "TFDBleedoutOutcomeDoNothing") == 0) {
+				return 12.0;
+			}
+
+			if (_stricmp(rawName, "TFDBleedoutOutcomeCaptive") == 0 ||
+				_stricmp(rawName, "TFDBleedoutOutcomePleasure") == 0) {
+				return 6.0;
+			}
+
+			return 6.0;
+		}
+
+		static void ArmPostTerminalBleedoutLockout(const char* eventName, double seconds, const char* reason)
+		{
+			const double duration = std::clamp(seconds, 1.0, 45.0);
+			g_postTerminalBleedoutLockoutActive = true;
+			g_postTerminalBleedoutLockoutUntil = Now() + std::chrono::milliseconds(static_cast<int>(duration * 1000.0));
+			g_postTerminalBleedoutLockoutLastLog = {};
+			g_postTerminalBleedoutLockoutReason = reason && reason[0] ? reason : (eventName && eventName[0] ? eventName : "terminal_outcome");
+			spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout armed event={} seconds={:.1f} reason={}",
+				eventName && eventName[0] ? eventName : "<none>",
+				duration,
+				g_postTerminalBleedoutLockoutReason);
+		}
+
+		static bool IsPostTerminalBleedoutLockoutActive(const char* checkReason, float hpPct, float thresholdPct)
+		{
+			if (!g_postTerminalBleedoutLockoutActive) {
+				return false;
+			}
+			const auto now = Now();
+			if (now >= g_postTerminalBleedoutLockoutUntil) {
+				g_postTerminalBleedoutLockoutActive = false;
+				g_postTerminalBleedoutLockoutUntil = {};
+				g_postTerminalBleedoutLockoutLastLog = {};
+				spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout expired reason={}",
+					g_postTerminalBleedoutLockoutReason.empty() ? "unknown" : g_postTerminalBleedoutLockoutReason.c_str());
+				g_postTerminalBleedoutLockoutReason.clear();
+				return false;
+			}
+			if (g_postTerminalBleedoutLockoutLastLog.time_since_epoch().count() == 0 ||
+				(now - g_postTerminalBleedoutLockoutLastLog) >= std::chrono::milliseconds(900)) {
+				g_postTerminalBleedoutLockoutLastLog = now;
+				const auto remainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(g_postTerminalBleedoutLockoutUntil - now).count();
+				spdlog::info("[TFD][Defeat][R216A] player threshold suppressed during post-terminal lockout check={} hpPct={:.1f} threshold={:.1f} remainingMs={} reason={}",
+					checkReason && checkReason[0] ? checkReason : "threshold",
+					hpPct,
+					thresholdPct,
+					static_cast<long long>(remainingMs),
+					g_postTerminalBleedoutLockoutReason.empty() ? "unknown" : g_postTerminalBleedoutLockoutReason.c_str());
+			}
+			return true;
 		}
 
 		static std::uint32_t CurrentBleedSpeakerID()
@@ -982,8 +1071,11 @@ namespace TFD::DefeatMonitor
 		static bool IsReasonableBleedoutSpeaker(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance = nullptr);
 		static void SetGraceSeconds(int seconds);
 		static bool IsGraceActive();
+		static bool IsBleedoutTerminalOutcomeEvent(const char* rawName);
+		static double ResolvePostTerminalBleedoutLockoutSeconds(const char* rawName, float numArg);
+		static void ArmPostTerminalBleedoutLockout(const char* eventName, double seconds, const char* reason);
+		static bool IsPostTerminalBleedoutLockoutActive(const char* checkReason, float hpPct, float thresholdPct);
 		static void ClearBleedStickyReopenGrace(const char* reason);
-		static void ArmBleedStickyReopenGrace(std::uint32_t speakerID, float distance, std::chrono::steady_clock::time_point now, const char* reason);
 		static bool TickBleedStickyReopenGrace(RE::Actor* player, std::chrono::steady_clock::time_point now);
 		static void UpdatePreCombatState();
 		static bool IsActorCloseAndFront(RE::Actor* actor, RE::Actor* player, float maxDist);
@@ -1255,6 +1347,33 @@ namespace TFD::DefeatMonitor
 			return IsReasonableBleedoutSpeaker(aggressor, player, 12000.0f, &outDistance);
 		}
 
+
+		static bool CanForceReopenClosedBleedoutGreet(RE::Actor* player, RE::Actor* speaker, const TFD::BleedoutGreet::StickyReopenProbe& probe, float& outDistance)
+		{
+			(void)probe;
+			outDistance = -1.0f;
+			if (!player || !speaker || speaker == player || speaker->IsDead(false) || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
+				return false;
+			}
+			if (!IsCaptiveSupportedAggressor(speaker) || !IsBleedSpaceCompatible(speaker, player)) {
+				return false;
+			}
+
+			const auto pp = player->GetPosition();
+			const auto sp = speaker->GetPosition();
+			const float dx = sp.x - pp.x;
+			const float dy = sp.y - pp.y;
+			const float dz = sp.z - pp.z;
+			outDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+			// R209A: after Bleedout forcegreet opens, the valid speaker is intentionally
+			// pacified by BleedoutSuppress. Do not require hostile/in-combat here; that is
+			// exactly why captive bleedout close-no-commit could become stuck with
+			// "reopen unavailable" even though the same actor was loaded and nearby.
+			constexpr float kClosedBleedoutReopenMaxDistance = 2048.0f;
+			return outDistance <= kClosedBleedoutReopenMaxDistance;
+		}
+
 		static void PreparePlayerForBleedoutPleasureScene(const char* reason)
 		{
 			TFD::Bleedout::DefeatGlue::PreparePlayerForBleedoutPleasureScene(reason);
@@ -1298,7 +1417,7 @@ namespace TFD::DefeatMonitor
 				}
 				actor->StopCombat();
 				if (actor->IsWeaponDrawn()) {
-					actor->DrawWeaponMagicHands(false);
+					// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 				}
 				actor->EvaluatePackage(true, false);
 			}
@@ -2206,7 +2325,7 @@ namespace TFD::DefeatMonitor
 						process->StopCombatAndAlarmOnActor(actor, false);
 					}
 					if (actor->IsWeaponDrawn()) {
-						actor->DrawWeaponMagicHands(false);
+						// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 					}
 				}
 				actor->NotifyAnimationGraph("BleedoutStart");
@@ -2301,12 +2420,49 @@ namespace TFD::DefeatMonitor
 			const bool playerSideThreat = HasImmediatePlayerSideBleedThreat(player, snapshot, radius);
 
 			const float playerThreshold = ResolveBleedLockThresholdPct(player);
-			if (ShouldEnterBleedLock(player, playerThreshold, playerSideThreat)) {
+			const float playerHpPct = GetActorHealthPct(player);
+			const bool terminalLockout = playerHpPct <= std::clamp(playerThreshold, 2.0f, 95.0f) &&
+				IsPostTerminalBleedoutLockoutActive("threshold_scan_player", playerHpPct, std::clamp(playerThreshold, 2.0f, 95.0f));
+			if (!terminalLockout && ShouldEnterBleedLock(player, playerThreshold, playerSideThreat)) {
 				EnterBleedLock(player, BleedLockKind::Player, playerThreshold, "threshold_scan_player");
+
+				// R259A: threshold_scan_player is already the first hard defeat point.
+				// Do not leave the player in hard-invuln while combat continues until
+				// the later player_threshold branch eventually fires.  Start the same
+				// Bleedout decision route immediately, using the normal threshold
+				// classifier, so enemies are detached and forcegreet can own the state
+				// on the first down tick.
+				if (!g_inBleedState.load(std::memory_order_acquire) &&
+					!TFD::FlowController::Controller::GetSingleton().IsBleedDecisionActive()) {
+					auto thresholdScan = ScanPlayerThresholdOutcome(player);
+					const bool immediateThreat = player->IsInCombat() ||
+						thresholdScan.initialAggressor != nullptr ||
+						thresholdScan.hostileCoalitionStanding;
+					if (immediateThreat) {
+						ClearEnemyTargetsToPlayerForDefeat(player, thresholdScan.scanRadius, "threshold_scan_player_immediate");
+						auto thresholdClassification = ClassifyPlayerThresholdOutcome(thresholdScan);
+						const bool dispatched = DispatchPlayerThresholdOutcome(player, thresholdScan, thresholdClassification);
+						spdlog::info(
+							"[TFD][Defeat][R259A] threshold scan immediate bleedout dispatch dispatched={} hpPct={:.1f} threshold={:.1f} threat=1 rootBleedActive={}",
+							dispatched ? 1 : 0,
+							playerHpPct,
+							std::clamp(playerThreshold, 2.0f, 95.0f),
+							g_inBleedState.load(std::memory_order_acquire) ? 1 : 0);
+						if (dispatched) {
+							return;
+						}
+					}
+					else {
+						spdlog::info(
+							"[TFD][Defeat][R259A] threshold scan immediate bleedout skipped reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}",
+							playerHpPct,
+							std::clamp(playerThreshold, 2.0f, 95.0f));
+					}
+				}
 			}
-			else if (GetActorHealthPct(player) <= std::clamp(playerThreshold, 2.0f, 95.0f) && !playerSideThreat) {
+			else if (!terminalLockout && playerHpPct <= std::clamp(playerThreshold, 2.0f, 95.0f) && !playerSideThreat) {
 				spdlog::info("[TFD][Defeat] skip bleed lock player reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}",
-					GetActorHealthPct(player),
+					playerHpPct,
 					std::clamp(playerThreshold, 2.0f, 95.0f));
 			}
 
@@ -2410,7 +2566,7 @@ namespace TFD::DefeatMonitor
 						process->StopCombatAndAlarmOnActor(actor, false);
 					}
 					if (actor->IsWeaponDrawn()) {
-						actor->DrawWeaponMagicHands(false);
+						// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 					}
 					if (!recoveryDialogueHold) {
 						actor->EvaluatePackage(false, true);
@@ -2435,7 +2591,7 @@ namespace TFD::DefeatMonitor
 						process->StopCombatAndAlarmOnActor(actor, false);
 					}
 					if (actor->IsWeaponDrawn()) {
-						actor->DrawWeaponMagicHands(false);
+						// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 					}
 					if (entry.defeatedManaged && entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
 						if (!entry.defeatedAutoDeathIssued) {
@@ -2546,27 +2702,25 @@ namespace TFD::DefeatMonitor
 			g_bleedStickyReopenGraceDistance = 99999.0f;
 		}
 
-		static void ArmBleedStickyReopenGrace(std::uint32_t speakerID, float distance, std::chrono::steady_clock::time_point now, const char* reason)
+		static void ArmBleedStickyReopenGrace(std::uint32_t speakerID, float distance, std::chrono::milliseconds duration, const char* reason)
 		{
 			if (speakerID == 0) {
-				ClearBleedStickyReopenGrace("arm_no_speaker");
 				return;
 			}
-			const bool captiveEscapeBleedout = TFD::Captive::IsEscapeBleedoutActive() ||
-				TFD::Captive::HasEscapeBreakRebleedPending() ||
-				TFD::Captive::IsRecaptureCommitActive();
-			const auto delayMs = captiveEscapeBleedout ? 2200 : 650;
-
+			if (duration < std::chrono::milliseconds(250)) {
+				duration = std::chrono::milliseconds(250);
+			}
+			if (duration > std::chrono::milliseconds(3000)) {
+				duration = std::chrono::milliseconds(3000);
+			}
 			g_bleedStickyReopenGraceActive = true;
-			g_bleedStickyReopenGraceUntil = now + std::chrono::milliseconds(delayMs);
+			g_bleedStickyReopenGraceUntil = Now() + duration;
 			g_bleedStickyReopenGraceSpeakerID = speakerID;
 			g_bleedStickyReopenGraceDistance = distance;
-			TFD::BleedoutGreet::MarkStickyReopenPending(false, "dialogue_closed_sticky_reopen_grace");
-			spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed speaker={:08X} dist={:.1f} delayMs={} captiveEscapeBleedout={} reason={}",
+			spdlog::info("[TFD][Defeat][R218A] bleed close commit-grace armed speaker={:08X} delayMs={} dist={:.1f} reason={}",
 				speakerID,
+				static_cast<int>(duration.count()),
 				distance,
-				delayMs,
-				captiveEscapeBleedout ? 1 : 0,
 				reason ? reason : "unknown");
 		}
 
@@ -2602,14 +2756,22 @@ namespace TFD::DefeatMonitor
 
 			auto* reopenSpeaker = RE::TESForm::LookupByID<RE::Actor>(speakerID);
 			float reopenDist = 99999.0f;
-			if (!(reopenSpeaker && CanUseAggressorForBleedoutGreet(player, reopenSpeaker, reopenDist))) {
-				spdlog::info("[TFD][Defeat][R113] bleed sticky reopen delayed skip speaker={:08X} valid=0", speakerID);
+			TFD::BleedoutGreet::StickyReopenProbe probe{};
+			probe.speakerFormID = speakerID;
+			probe.loaded = reopenSpeaker && reopenSpeaker->Is3DLoaded();
+			probe.dead = !reopenSpeaker || reopenSpeaker->IsDead(false);
+			probe.distance = g_bleedStickyReopenGraceDistance;
+			if (!(reopenSpeaker && CanForceReopenClosedBleedoutGreet(player, reopenSpeaker, probe, reopenDist))) {
+				TFD::BleedoutGreet::MarkStickyReopenPending(false, "dialogue_closed_sticky_reopen_grace_invalid");
+				spdlog::info("[TFD][Defeat][R218A] bleed sticky reopen grace elapsed but speaker invalid speaker={:08X}", speakerID);
 				return false;
 			}
 
 			ResetBleedSpeakerKickState();
 			g_bleedLastSeconds = -1;
 			TFD::Bleedout::ClearSystemEventOutcomeWindow("dialogue_closed_sticky_reopen_grace_elapsed");
+			TFD::BleedoutGreet::ClearFlowGreetConfirmed("dialogue_closed_sticky_reopen_grace_elapsed");
+			TFD::BleedoutGreet::MarkStickyReopenPending(false, "dialogue_closed_sticky_reopen_grace_elapsed");
 			ApplyBleedDialogueOverdrive(player, reopenSpeaker, "dialogue_closed_sticky_reopen_grace_elapsed", true);
 			g_bleedPaused = true;
 			g_bleedPauseStarted = now;
@@ -2733,12 +2895,19 @@ namespace TFD::DefeatMonitor
 			if (HandlePendingEscapeBreakBleed()) {
 				return;
 			}
-			TickBleedLocks();
-			UpdatePreCombatState();
+
+			// R215A: Pay/Release and Left-For-Dead terminal outcomes arm the
+			// post-defeat recovery cooldown before the next threshold scan.  The
+			// old order scanned TickBleedLocks() first, so a still-low player HP
+			// could immediately create a new Bleedout window before recovery had
+			// a chance to own the state.
 			if (TFD::Transition::IsLeftForDeadCooldownActive(BuildTransitionRuntimeHandlers())) {
 				TFD::Transition::TickLeftForDeadCooldown(BuildTransitionRuntimeHandlers());
 				return;
 			}
+
+			TickBleedLocks();
+			UpdatePreCombatState();
 			if (IsGraceActive()) return;
 			if (!captiveBleedOverlay && !g_inBleedState.load(std::memory_order_acquire) && TFD::InCombat::IsActive()) {
 				const auto nowInCombat = Now();
@@ -2991,11 +3160,93 @@ namespace TFD::DefeatMonitor
 [&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
 	g_prevDialogueOpen = false;
 	g_bleedLastSeconds = -1;
-	const auto nowReopenGrace = Now();
+	const auto nowSettle = Now();
 	g_bleedPaused = true;
-	g_bleedPauseStarted = nowReopenGrace;
-	ArmBleedStickyReopenGrace(probe.speakerFormID, probe.distance, nowReopenGrace, "dialogue_closed_sticky_reopen");
-	spdlog::info("[TFD][Defeat][R113] bleedout dialogue closed without committed outcome -> sticky reopen delayed speaker={:08X} dist={:.1f}",
+	g_bleedPauseStarted = nowSettle;
+
+	// R160: Escape-break rebleed can briefly open then close before the Papyrus
+	// forcegreet fragment confirms the speaker. Treat that as an initial handoff
+	// blip, not a real player/dialogue close. R153's no-reopen settle remains
+	// correct for normal Bleedout choices, but during captive escape rebleed it
+	// makes the UI look like the forcegreet was cancelled before the handoff
+	// watchdog reopens it a tick later.
+	const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+	const bool escapeRebleedFlowSnapshot =
+		flowSnapshot.root == TFD::FlowController::RootFlow::Captive &&
+		flowSnapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
+		(flowSnapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+			flowSnapshot.sub == TFD::FlowController::SubFlow::Recapture ||
+			flowSnapshot.sub == TFD::FlowController::SubFlow::EscapeAttempt);
+	const bool escapeRebleedHandoff =
+		TFD::Captive::IsEscapeBleedoutActive() ||
+		TFD::Captive::HasEscapeBreakRebleedPending() ||
+		escapeRebleedFlowSnapshot;
+	if (escapeRebleedHandoff) {
+		// R209A: Escape-break rebleed is mandatory forcegreet. The speaker is
+		// already pacified by BleedoutSuppress after the first open, so the reopen
+		// gate must not require hostile/in-combat state. Loaded, nearby, same-space
+		// NPC is enough for this owner-owned close-no-commit recovery.
+		auto* reopenSpeaker = probe.speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(probe.speakerFormID) : CurrentBleedSpeaker();
+		float reopenDist = 99999.0f;
+		ClearBleedStickyReopenGrace("r209a_escape_rebleed_forcegreet_reopen");
+		TFD::Bleedout::ClearSystemEventOutcomeWindow("r209a_escape_rebleed_forcegreet_reopen");
+		TFD::BleedoutGreet::ClearFlowGreetConfirmed("r209a_escape_rebleed_forcegreet_reopen");
+		if (CanForceReopenClosedBleedoutGreet(player, reopenSpeaker, probe, reopenDist)) {
+			TFD::BleedoutGreet::MarkStickyReopenPending(true, "r218a_escape_rebleed_commit_grace");
+			TFD::Bleedout::ArmSystemEventOutcomeWindow("r218a_escape_rebleed_commit_grace", 3.0);
+			ArmBleedStickyReopenGrace(
+				reopenSpeaker ? reopenSpeaker->GetFormID() : probe.speakerFormID,
+				reopenDist,
+				std::chrono::milliseconds(2250),
+				"r218a_escape_rebleed_commit_grace");
+			g_bleedPaused = true;
+			g_bleedPauseStarted = nowSettle;
+			g_bleedLastSeconds = -1;
+			spdlog::info("[TFD][Defeat][R218A] escape rebleed dialogue closed; waiting for outcome fragment before owner reopen speaker={:08X} dist={:.1f} root={} gate={} sub={}",
+				reopenSpeaker ? reopenSpeaker->GetFormID() : 0u,
+				reopenDist,
+				TFD::FlowController::Controller::ToString(flowSnapshot.root),
+				TFD::FlowController::Controller::ToString(flowSnapshot.gate),
+				TFD::FlowController::Controller::ToString(flowSnapshot.sub));
+		}
+		else {
+			TFD::BleedoutGreet::MarkStickyReopenPending(true, "r209a_escape_rebleed_reopen_retry");
+			TFD::Bleedout::ArmSystemEventOutcomeWindow("r209a_escape_rebleed_reopen_retry", 3.0);
+			spdlog::info("[TFD][Defeat][R209A] escape rebleed forcegreet reopen deferred speaker={:08X} loaded={} dead={} dist={:.1f} root={} gate={} sub={}",
+				probe.speakerFormID,
+				probe.loaded ? 1 : 0,
+				probe.dead ? 1 : 0,
+				probe.distance,
+				TFD::FlowController::Controller::ToString(flowSnapshot.root),
+				TFD::FlowController::Controller::ToString(flowSnapshot.gate),
+				TFD::FlowController::Controller::ToString(flowSnapshot.sub));
+		}
+		return;
+	}
+
+	auto* reopenSpeaker = probe.speakerFormID != 0 ? RE::TESForm::LookupByID<RE::Actor>(probe.speakerFormID) : CurrentBleedSpeaker();
+	float reopenDist = 99999.0f;
+	if (CanForceReopenClosedBleedoutGreet(player, reopenSpeaker, probe, reopenDist)) {
+		TFD::BleedoutGreet::MarkStickyReopenPending(true, "r218a_bleedout_closed_commit_grace");
+		TFD::Bleedout::ArmSystemEventOutcomeWindow("r218a_bleedout_closed_commit_grace", 3.0);
+		ArmBleedStickyReopenGrace(
+			reopenSpeaker ? reopenSpeaker->GetFormID() : probe.speakerFormID,
+			reopenDist,
+			std::chrono::milliseconds(2250),
+			"r218a_bleedout_closed_commit_grace");
+		g_bleedPaused = true;
+		g_bleedPauseStarted = nowSettle;
+		g_bleedLastSeconds = -1;
+		spdlog::info("[TFD][Defeat][R218A] bleedout dialogue closed; waiting for outcome fragment before owner reopen speaker={:08X} dist={:.1f}",
+			reopenSpeaker ? reopenSpeaker->GetFormID() : 0u,
+			reopenDist);
+		return;
+	}
+
+	ClearBleedStickyReopenGrace("r153_dialogue_closed_no_reopen");
+	TFD::BleedoutGreet::MarkStickyReopenPending(false, "r153_dialogue_closed_no_reopen");
+	TFD::Bleedout::ArmSystemEventOutcomeWindow("r153_dialogue_closed_no_reopen", 3.0);
+	spdlog::info("[TFD][Defeat][R153] bleedout dialogue closed without committed outcome -> settle no reopen speaker={:08X} dist={:.1f}",
 		probe.speakerFormID,
 		probe.distance);
 },
@@ -3078,6 +3329,9 @@ else {
 			const float pct = (hpNow / hpMax) * 100.0f;
 			const float thresh = TFD::Settings::GetDefeatThresholdPct();
 			if (pct <= thresh) {
+				if (IsPostTerminalBleedoutLockoutActive("player_threshold", pct, thresh)) {
+					return;
+				}
 				auto thresholdScan = ScanPlayerThresholdOutcome(player);
 				const bool immediateThreat = player->IsInCombat() || thresholdScan.initialAggressor != nullptr || thresholdScan.hostileCoalitionStanding;
 				if (!immediateThreat) {
@@ -3113,6 +3367,9 @@ else {
 				}
 
 				if (TFD::FlowController::HandleOutcomeModEvent(rawName, ev->strArg.c_str(), ev->numArg, ev->sender)) {
+					if (IsBleedoutTerminalOutcomeEvent(rawName)) {
+						ArmPostTerminalBleedoutLockout(rawName, ResolvePostTerminalBleedoutLockoutSeconds(rawName, ev->numArg), "mod_event_terminal_outcome");
+					}
 					return RE::BSEventNotifyControl::kContinue;
 				}
 

@@ -105,6 +105,8 @@ namespace TFD::Location
 		static constexpr float kCaptiveWorkFurnitureScanRadius = 12000.0f;
 		static constexpr float kCaptiveWorkMineOccupiedRadius = 512.0f;
 		static constexpr auto kCaptiveWorkResourceScanMinInterval = std::chrono::milliseconds(750);
+		static constexpr auto kCaptiveWorkUpdateTickScanInterval = std::chrono::milliseconds(8000);
+		static constexpr auto kReleasedWorkResourceTickScanInterval = std::chrono::milliseconds(15000);
 
 		RE::FormID g_lastWorkResourceCellId = 0;
 		int g_lastWorkMiningState = -1;
@@ -114,6 +116,7 @@ namespace TFD::Location
 		RE::FormID g_lastWorkCraftingRefId = 0;
 		std::array<RE::FormID, 10> g_lastWorkCraftingRefIds{};
 		Clock::time_point g_lastWorkResourceScan{};
+		Clock::time_point g_nextReleasedWorkResourceRefresh{};
 		std::unordered_set<RE::FormID> g_depletedWorkMiningRefs{};
 
 		struct OccupiedWorkMineEntry
@@ -284,16 +287,16 @@ namespace TFD::Location
 		static int GetActiveCaptiveWorkCraftingSubtypeRequest()
 		{
 			// WorkJobType: 2 = shared Crafting channel.
-			// WorkAssignmentState: 2 = Doing Work, 3 = Return Report.
-			// During an active job, periodic resource refresh must preserve the selected
-			// station subtype. Otherwise a generic tick with no requested state can
-			// replace Chopping/Tanning/Tempering/Cooking/Alchemy/Enchant aliases with
-			// the default Forge alias.
+			// WorkAssignmentState: 1 = Talk/offer ready, 2 = Doing Work, 3 = Return Report.
+			// The selected crafting subtype must be preserved not only during an active
+			// assignment, but also while the player is still seeing the prepared job offer.
+			// Otherwise a generic released-work/resource tick can reset Improve/Chopping/etc.
+			// back to default Forge before CK chooses the correct dialogue line.
 			const int jobType = GetGlobalInt(g_workJobTypeGlobal);
 			const int assignment = GetGlobalInt(g_workAssignmentStateGlobal);
 			const int currentCraftingState = GetGlobalInt(g_workCraftingStateGlobal);
 
-			if (jobType != 2 || (assignment != 2 && assignment != 3)) {
+			if (jobType != 2 || (assignment != 1 && assignment != 2 && assignment != 3)) {
 				if (g_activeWorkCraftingSubtypeRequest != 0) {
 					spdlog::info(
 						"[TFD][Location][W07] active crafting subtype latch cleared job={} assignment={} oldLatch={}",
@@ -834,15 +837,13 @@ namespace TFD::Location
 
 		static bool IsUsableCampfireCookingStation(std::string_view edid)
 		{
-			// W19: Do not treat UC_* campfire activators as captive-work cooking stations.
-			// Runtime testing showed UC_Campfire01Burning can be selected as the marker
-			// target while normal cookpot COBJ recipes such as BYOH mudcrab food do not
-			// appear in the menu the player opens. Captive Work should only assign cooking
-			// when the nearby reference is an actual TESFurniture cooking station, such as
-			// CookingPot/CookingSpit/Cookpot. This prevents valid recipes from being paired
-			// with a nonstandard activator/campfire menu and creating stuck assignments.
-			(void)edid;
-			return false;
+			// R189: Usable Campfires replaces vanilla burning campfire activators with
+			// UC_Campfire* activators and uses UC_CampfireUse as the temporary furniture
+			// menu target.  Treat those known UC forms as captive-work cooking stations,
+			// but do not broadly accept every decorative campfire.
+			return ContainsNoCase(edid, "UC_Campfire") ||
+				ContainsNoCase(edid, "UsableCampfire") ||
+				ContainsNoCase(edid, "CampfireUse");
 		}
 
 		static int CaptiveWorkMiningStatePriority(int state)
@@ -2148,6 +2149,7 @@ namespace TFD::Location
 		g_lastWorkCraftingRefId = 0;
 		g_lastWorkCraftingRefIds = {};
 		g_lastWorkResourceScan = {};
+		g_nextReleasedWorkResourceRefresh = {};
 		spdlog::info("[TFD][Location] captive work resource state cleared reason={}", reason ? reason : "unknown");
 	}
 
@@ -2173,6 +2175,27 @@ namespace TFD::Location
 		auto* cell = player ? player->GetParentCell() : nullptr;
 		const RE::FormID cellId = cell ? cell->GetFormID() : 0;
 		const auto now = Clock::now();
+		const bool releasedWorkTick = reasonView == "released_work_tick";
+		const bool workUpdateTick = reasonView == "work_update";
+		const bool cachedCellMatches = cellId != 0 &&
+			g_lastWorkResourceCellId == cellId &&
+			g_lastWorkResourceScan.time_since_epoch().count() != 0;
+		const bool cachedRequestMatches = requestedCraftingState <= 0 || g_lastWorkCraftingState == requestedCraftingState;
+
+		// R159/R160: ReleasedWork and Papyrus work_update ticks are maintenance
+		// self-heals, not per-frame discovery passes.  Re-scan immediately on forced
+		// refresh, cell/request changes, or depleted-resource invalidation; otherwise
+		// keep the expensive 12k reference sweep on a coarse cadence.
+		if (!force && releasedWorkTick && cachedCellMatches && cachedRequestMatches &&
+			g_nextReleasedWorkResourceRefresh != Clock::time_point{} &&
+			now < g_nextReleasedWorkResourceRefresh) {
+			return true;
+		}
+
+		if (!force && workUpdateTick && cachedCellMatches && cachedRequestMatches &&
+			now - g_lastWorkResourceScan < kCaptiveWorkUpdateTickScanInterval) {
+			return true;
+		}
 
 		if (!force && requestedCraftingState <= 0 && cellId != 0 && g_lastWorkResourceCellId == cellId &&
 			g_lastWorkResourceScan.time_since_epoch().count() != 0 &&
@@ -2191,13 +2214,26 @@ namespace TFD::Location
 			g_lastWorkCraftingRefId = 0;
 			g_lastWorkCraftingRefIds = {};
 			g_lastWorkResourceScan = now;
+			g_nextReleasedWorkResourceRefresh = {};
 			spdlog::warn("[TFD][Location] captive work resource refresh failed reason={}", reason ? reason : "unknown");
 			return false;
 		}
 
-		SetGlobalInt(g_workMiningStateGlobal, result.miningState);
-		SetGlobalInt(g_workCraftingStateGlobal, result.craftingState);
-		SetCaptiveWorkFurnitureGlobals(result.craftingAvailable);
+		const bool hadPreviousSnapshot = g_lastWorkResourceScan.time_since_epoch().count() != 0;
+		const bool snapshotChanged =
+			!hadPreviousSnapshot ||
+			g_lastWorkResourceCellId != result.cellId ||
+			g_lastWorkMiningState != result.miningState ||
+			g_lastWorkCraftingState != result.craftingState ||
+			g_lastWorkMiningRefId != result.miningRefId ||
+			g_lastWorkCraftingRefId != result.craftingRefId ||
+			g_lastWorkCraftingRefIds != result.craftingRefIds;
+
+		if (snapshotChanged || force || !(releasedWorkTick || workUpdateTick)) {
+			SetGlobalInt(g_workMiningStateGlobal, result.miningState);
+			SetGlobalInt(g_workCraftingStateGlobal, result.craftingState);
+			SetCaptiveWorkFurnitureGlobals(result.craftingAvailable);
+		}
 		g_lastWorkResourceCellId = result.cellId;
 		g_lastWorkMiningState = result.miningState;
 		g_lastWorkCraftingState = result.craftingState;
@@ -2205,25 +2241,34 @@ namespace TFD::Location
 		g_lastWorkCraftingRefId = result.craftingRefId;
 		g_lastWorkCraftingRefIds = result.craftingRefIds;
 		g_lastWorkResourceScan = now;
+		if (releasedWorkTick || workUpdateTick) {
+			g_nextReleasedWorkResourceRefresh = now + (releasedWorkTick ? kReleasedWorkResourceTickScanInterval : kCaptiveWorkUpdateTickScanInterval);
+		}
+		else {
+			g_nextReleasedWorkResourceRefresh = {};
+		}
 
-		spdlog::info(
-			"[TFD][Location] captive work globals refreshed reason={} requestedCraftingState={} activeCraftingRequest={} cell={:08X} TFDMiningState={} TFDCraftingState={} furnitureRadius={} furniture[forge={} smelter={} tanning={} sharpening={} workbench={} chopping={} cooking={} alchemy={} enchanting={}]",
-			reason ? reason : "unknown",
-			requestedCraftingState,
-			g_activeWorkCraftingSubtypeRequest,
-			result.cellId,
-			result.miningState,
-			result.craftingState,
-			static_cast<int>(kCaptiveWorkFurnitureScanRadius),
-			result.craftingAvailable[1] ? 1 : 0,
-			result.craftingAvailable[2] ? 1 : 0,
-			result.craftingAvailable[3] ? 1 : 0,
-			result.craftingAvailable[4] ? 1 : 0,
-			result.craftingAvailable[5] ? 1 : 0,
-			result.craftingAvailable[6] ? 1 : 0,
-			result.craftingAvailable[7] ? 1 : 0,
-			result.craftingAvailable[8] ? 1 : 0,
-			result.craftingAvailable[9] ? 1 : 0);
+		if (snapshotChanged || force || !(releasedWorkTick || workUpdateTick)) {
+			spdlog::info(
+				"[TFD][Location][R161] captive work globals refreshed reason={} changed={} requestedCraftingState={} activeCraftingRequest={} cell={:08X} TFDMiningState={} TFDCraftingState={} furnitureRadius={} furniture[forge={} smelter={} tanning={} sharpening={} workbench={} chopping={} cooking={} alchemy={} enchanting={}]",
+				reason ? reason : "unknown",
+				snapshotChanged ? 1 : 0,
+				requestedCraftingState,
+				g_activeWorkCraftingSubtypeRequest,
+				result.cellId,
+				result.miningState,
+				result.craftingState,
+				static_cast<int>(kCaptiveWorkFurnitureScanRadius),
+				result.craftingAvailable[1] ? 1 : 0,
+				result.craftingAvailable[2] ? 1 : 0,
+				result.craftingAvailable[3] ? 1 : 0,
+				result.craftingAvailable[4] ? 1 : 0,
+				result.craftingAvailable[5] ? 1 : 0,
+				result.craftingAvailable[6] ? 1 : 0,
+				result.craftingAvailable[7] ? 1 : 0,
+				result.craftingAvailable[8] ? 1 : 0,
+				result.craftingAvailable[9] ? 1 : 0);
+		}
 
 		return true;
 	}
@@ -2255,6 +2300,7 @@ namespace TFD::Location
 
 		g_depletedWorkMiningRefs.insert(g_lastWorkMiningRefId);
 		g_lastWorkResourceScan = Clock::time_point{};
+		g_nextReleasedWorkResourceRefresh = {};
 		spdlog::info(
 			"[TFD][Location] captive work mining ref marked depleted ref={:08X} reason={} blockedCount={}",
 			g_lastWorkMiningRefId,

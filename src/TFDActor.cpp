@@ -12,6 +12,7 @@
 #include <limits>
 #include <numeric>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -1918,6 +1919,7 @@ namespace TFD::Actor::Ops
 		{
 			RE::ActorHandle actor{};
 			std::chrono::steady_clock::time_point expiresAt{};
+			std::chrono::steady_clock::time_point nextDeferredLogAt{};
 			std::string source{};
 			bool hadHelperFaction{ false };
 			bool addedHelperFaction{ false };
@@ -1925,6 +1927,20 @@ namespace TFD::Actor::Ops
 			bool addedDialogueHelperFaction{ false };
 			bool hasOriginalAggression{ false };
 			float originalAggression{ 0.0f };
+			bool waitForDialogueClear{ false };
+		};
+
+		struct ReleaseFollowGraceClearRequest
+		{
+			RE::Actor* actor{ nullptr };
+			const char* reason{ nullptr };
+		};
+
+		struct TemporaryFollowLockEntry
+		{
+			RE::ActorHandle actor{};
+			std::chrono::steady_clock::time_point expiresAt{};
+			std::string source{};
 		};
 
 		bool g_initialized = false;
@@ -1936,6 +1952,7 @@ namespace TFD::Actor::Ops
 		TruceQuestRegistryCache g_truceQuestRegistry{};
 		DefeatedEnemyRegistryCache g_defeatedEnemyRegistry{};
 		std::unordered_map<RE::FormID, ReleaseFollowGraceEntry> g_releaseFollowGraceEntries{};
+		std::unordered_map<RE::FormID, TemporaryFollowLockEntry> g_temporaryFollowLocks{};
 		TFD::Actor::Ops::DefeatedEnemyQueryHooks g_defeatedEnemyQueryHooks{};
 		TFD::Actor::Ops::DefeatedEnemyStateHooks g_defeatedEnemyStateHooks{};
 		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedReentrySuppress{};
@@ -2105,6 +2122,38 @@ namespace TFD::Actor::Ops
 				}
 			}
 			return false;
+		}
+
+		static bool IsForcedReleaseFollowGraceRemovalReason(const char* reason)
+		{
+			if (!reason || !reason[0]) {
+				return false;
+			}
+
+			const std::string_view why(reason);
+			return why.find("reset") != std::string_view::npos ||
+				why.find("load") != std::string_view::npos ||
+				why.find("clear_all") != std::string_view::npos ||
+				why.find("hard_clear") != std::string_view::npos ||
+				why.find("passive_break") != std::string_view::npos ||
+				why.find("player_attack") != std::string_view::npos ||
+				why.find("pleasure_failed") != std::string_view::npos ||
+				why.find("failed_fight") != std::string_view::npos ||
+				why.find("fight_choice") != std::string_view::npos ||
+				why.find("FightChoice") != std::string_view::npos ||
+				why.find("emergency") != std::string_view::npos ||
+				why.find("actor_invalid") != std::string_view::npos ||
+				why.find("temporary_follow_exit") != std::string_view::npos ||
+				why.find("post_incombat_teammate_rearm") != std::string_view::npos;
+		}
+
+		static bool ShouldDeferReleaseFollowGraceRemovalForDialogue(RE::Actor* actor, const char* reason)
+		{
+			return actor &&
+				!actor->IsDead() &&
+				!actor->IsDisabled() &&
+				ActorHasActiveDialoguePhaseFaction(actor) &&
+				!IsForcedReleaseFollowGraceRemovalReason(reason);
 		}
 
 		static RE::BGSKeyword* LookupKeyword(const char* editorID)
@@ -2685,7 +2734,7 @@ namespace TFD::Actor::Ops
 			}
 
 			if (actor->IsWeaponDrawn()) {
-				actor->DrawWeaponMagicHands(false);
+				// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 			}
 
 			if (changedFaction || changedAggression) {
@@ -2708,6 +2757,52 @@ namespace TFD::Actor::Ops
 			}
 		}
 
+		static void RemoveReleaseFollowGraceFromActorForFightChoice(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+
+			ResolveReleaseFollowHelperFaction();
+
+			const auto actorFormID = actor->GetFormID();
+			const bool hadEntry = g_releaseFollowGraceEntries.find(actorFormID) != g_releaseFollowGraceEntries.end();
+			bool removedHelper = false;
+			bool removedDialogueHelper = false;
+
+			// R152: PleasureFailed -> Fight is not a release/follow outcome.
+			// The normal grace removal restores the aggression value captured while
+			// the actor was being pacified; for pleasure-failed fights that captured
+			// value is often 0, which immediately drops the actor back into a
+			// sheathed vanilla package after native rehostile.  Remove only the
+			// grace ownership/factions here and let HostilityController perform the
+			// final combat aggression/target/draw handoff.
+			if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
+				actor->RemoveFromFaction(g_releaseFollowHelperFaction);
+				removedHelper = true;
+			}
+
+			if (g_dialogueHelperFaction && actor->IsInFaction(g_dialogueHelperFaction)) {
+				actor->RemoveFromFaction(g_dialogueHelperFaction);
+				removedDialogueHelper = true;
+			}
+
+			g_releaseFollowGraceEntries.erase(actorFormID);
+
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->runDetection = true;
+				process->ClearCachedFactionFightReactions();
+			}
+
+			spdlog::info(
+				"[TFD][FactionManager][R152] grace removed for fight choice actor={:08X} reason={} hadEntry={} helperRemoved={} pacifyRemoved={} preservedAggression=1",
+				actorFormID,
+				reason ? reason : "fight_choice_grace_remove",
+				hadEntry ? 1 : 0,
+				removedHelper ? 1 : 0,
+				removedDialogueHelper ? 1 : 0);
+		}
+
 		static void RemoveReleaseFollowGraceFromActor(RE::Actor* actor, const char* reason)
 		{
 			if (!actor) {
@@ -2715,55 +2810,114 @@ namespace TFD::Actor::Ops
 			}
 			ResolveReleaseFollowHelperFaction();
 
+			const auto actorFormID = actor->GetFormID();
 			ReleaseFollowGraceEntry entry{};
 			bool hadEntry = false;
-			if (auto it = g_releaseFollowGraceEntries.find(actor->GetFormID()); it != g_releaseFollowGraceEntries.end()) {
+			if (auto it = g_releaseFollowGraceEntries.find(actorFormID); it != g_releaseFollowGraceEntries.end()) {
 				entry = it->second;
 				hadEntry = true;
 			}
 
-			const bool keepPacifyForPermanentTeammate = ActorHasPermanentTeammateFaction(actor);
-			const bool keepPacifyForActiveDialogue = ActorHasActiveDialoguePhaseFaction(actor);
+			const bool forcedCleanup = IsForcedReleaseFollowGraceRemovalReason(reason);
+			if (!hadEntry && !forcedCleanup) {
+				spdlog::info(
+					"[TFD][FactionManager][P1] grace remove skipped actor={:08X} reason={} cause=no_owned_entry",
+					actorFormID,
+					reason ? reason : "unknown");
+				return;
+			}
+
+			const bool keepPacifyForPermanentTeammate = !forcedCleanup && ActorHasPermanentTeammateFaction(actor);
+			const bool keepPacifyForActiveDialogue = !forcedCleanup && ActorHasActiveDialoguePhaseFaction(actor);
+
+			// P1: do not half-remove a release grace while a dialogue/phase faction is
+			// still the visible owner. The old path kept TFDPacifyFaction but restored
+			// Aggression and refreshed combat, which produced hostile/passive blink.
+			// Keep the entry alive without re-adding TFDExpiredTeammate until the
+			// dialogue bridge clears its phase faction, then restore once.
+			if (hadEntry && ShouldDeferReleaseFollowGraceRemovalForDialogue(actor, reason)) {
+				bool removedHelper = false;
+				if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
+					if (entry.addedHelperFaction || !entry.hadHelperFaction) {
+						actor->RemoveFromFaction(g_releaseFollowHelperFaction);
+						removedHelper = true;
+					}
+				}
+
+				if (auto it = g_releaseFollowGraceEntries.find(actorFormID); it != g_releaseFollowGraceEntries.end()) {
+					it->second.waitForDialogueClear = true;
+					const auto now = Now();
+					if (now >= it->second.nextDeferredLogAt) {
+						it->second.nextDeferredLogAt = now + std::chrono::seconds(2);
+						spdlog::info(
+							"[TFD][FactionManager][P1] grace removal deferred actor={:08X} reason={} guard=active_dialogue_phase helperRemoved={} aggressionHeld={} source={}",
+							actorFormID,
+							reason ? reason : "unknown",
+							removedHelper ? 1 : 0,
+							entry.hasOriginalAggression ? 1 : 0,
+							entry.source.empty() ? "-" : entry.source.c_str());
+					}
+				}
+
+				if (removedHelper) {
+					if (auto* process = RE::ProcessLists::GetSingleton()) {
+						process->ClearCachedFactionFightReactions();
+					}
+					actor->EvaluatePackage(false, true);
+					actor->EvaluatePackage(true, true);
+				}
+				return;
+			}
 
 			if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
-				if (!hadEntry || entry.addedHelperFaction || !entry.hadHelperFaction) {
+				if (forcedCleanup || !hadEntry || entry.addedHelperFaction || !entry.hadHelperFaction) {
 					actor->RemoveFromFaction(g_releaseFollowHelperFaction);
 				}
 			}
+
+			const bool keepPacify = keepPacifyForPermanentTeammate || keepPacifyForActiveDialogue;
 			if (g_dialogueHelperFaction && actor->IsInFaction(g_dialogueHelperFaction)) {
-				if (keepPacifyForPermanentTeammate || keepPacifyForActiveDialogue) {
+				if (keepPacify) {
 					spdlog::info(
 						"[TFD][FactionManager] grace keep pacify actor={:08X} reason={} guard={}",
-						actor->GetFormID(),
+						actorFormID,
 						reason ? reason : "unknown",
 						keepPacifyForPermanentTeammate ? "permanent_teammate" : "active_dialogue_phase");
 				}
-				else if (!hadEntry || entry.addedDialogueHelperFaction || !entry.hadDialogueHelperFaction) {
+				else if (forcedCleanup || !hadEntry || entry.addedDialogueHelperFaction || !entry.hadDialogueHelperFaction) {
 					actor->RemoveFromFaction(g_dialogueHelperFaction);
 				}
 			}
 
-			if (hadEntry && entry.hasOriginalAggression) {
+			const bool shouldRestoreAggression =
+				hadEntry &&
+				entry.hasOriginalAggression &&
+				!keepPacify;
+			if (shouldRestoreAggression) {
 				if (auto* avo = actor->AsActorValueOwner()) {
 					avo->SetActorValue(RE::ActorValue::kAggression, entry.originalAggression);
 				}
 			}
 
-			g_releaseFollowGraceEntries.erase(actor->GetFormID());
+			g_releaseFollowGraceEntries.erase(actorFormID);
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				process->ClearCachedFactionFightReactions();
 			}
 			actor->EvaluatePackage(false, true);
 			actor->EvaluatePackage(true, true);
-			actor->UpdateCombat();
-			if (auto* player = Player()) {
-				player->UpdateCombat();
+			if (!keepPacify) {
+				actor->UpdateCombat();
+				if (auto* player = Player()) {
+					player->UpdateCombat();
+				}
 			}
 			spdlog::info(
-				"[TFD][FactionManager] grace removed actor={:08X} reason={} restoredAggression={}",
-				actor->GetFormID(),
+				"[TFD][FactionManager] grace removed actor={:08X} reason={} restoredAggression={} keepPacify={} forcedCleanup={}",
+				actorFormID,
 				reason ? reason : "unknown",
-				(hadEntry && entry.hasOriginalAggression) ? 1 : 0);
+				shouldRestoreAggression ? 1 : 0,
+				keepPacify ? 1 : 0,
+				forcedCleanup ? 1 : 0);
 		}
 
 		static void ApplyReleaseFollowGraceToActor(RE::Actor* actor, double durationSeconds, const char* reason)
@@ -2783,6 +2937,8 @@ namespace TFD::Actor::Ops
 			entry.actor = actor->GetHandle();
 			entry.expiresAt = Now() + std::chrono::milliseconds(static_cast<int>((std::max)(0.0, durationSeconds) * 1000.0));
 			entry.source = reason ? reason : "unknown";
+			entry.waitForDialogueClear = false;
+			entry.nextDeferredLogAt = {};
 
 			StabilizeReleaseFollowGraceActor(actor, entry, reason ? reason : "grace_apply");
 
@@ -2793,6 +2949,77 @@ namespace TFD::Actor::Ops
 				durationSeconds,
 				reason ? reason : "unknown",
 				entry.hasOriginalAggression ? 1 : 0);
+		}
+
+
+		static void RemoveTemporaryFollowLockByFormID(RE::FormID formID, const char* reason)
+		{
+			if (formID == 0) {
+				return;
+			}
+
+			auto it = g_temporaryFollowLocks.find(formID);
+			if (it == g_temporaryFollowLocks.end()) {
+				return;
+			}
+
+			g_temporaryFollowLocks.erase(it);
+			spdlog::info(
+				"[TFD][TemporaryFollow][R142] lock removed actor={:08X} reason={}",
+				formID,
+				reason ? reason : "unknown");
+		}
+
+		static bool HasTemporaryFollowLockInternal(RE::Actor* actor)
+		{
+			if (!actor) {
+				return false;
+			}
+
+			const auto formID = actor->GetFormID();
+			auto it = g_temporaryFollowLocks.find(formID);
+			if (it == g_temporaryFollowLocks.end()) {
+				return false;
+			}
+
+			const auto now = Now();
+			const bool expired = now >= it->second.expiresAt;
+			const bool invalid = actor->IsDead() || actor->IsDisabled();
+			if (expired || invalid) {
+				RemoveTemporaryFollowLockByFormID(formID, expired ? "expired" : "invalid_actor");
+				return false;
+			}
+
+			return true;
+		}
+
+		static void ApplyTemporaryFollowLockToActor(RE::Actor* actor, double durationSeconds, const char* reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return;
+			}
+			if (durationSeconds <= 0.0) {
+				durationSeconds = 60.0;
+			}
+
+			auto& entry = g_temporaryFollowLocks[actor->GetFormID()];
+			entry.actor = actor->GetHandle();
+			entry.expiresAt = Now() + std::chrono::milliseconds(static_cast<int>((std::max)(0.0, durationSeconds) * 1000.0));
+			entry.source = reason ? reason : "unknown";
+
+			spdlog::info(
+				"[TFD][TemporaryFollow][R142] lock applied actor={:08X} duration={:.2f} reason={}",
+				actor->GetFormID(),
+				durationSeconds,
+				reason ? reason : "unknown");
+		}
+
+		static void RemoveTemporaryFollowLockFromActor(RE::Actor* actor, const char* reason)
+		{
+			if (!actor) {
+				return;
+			}
+			RemoveTemporaryFollowLockByFormID(actor->GetFormID(), reason ? reason : "remove_actor");
 		}
 	}
 
@@ -2949,6 +3176,12 @@ namespace TFD::Actor::Ops
 		RemoveReleaseFollowGraceFromActor(actor, reason);
 	}
 
+	void RemoveReleaseFollowGraceFromActorOnlyForFightChoice(RE::Actor* actor, const char* reason)
+	{
+		Initialize();
+		RemoveReleaseFollowGraceFromActorForFightChoice(actor, reason);
+	}
+
 	void ApplyReleaseFollowGraceToSpeakerAndCrowd(RE::Actor* speaker, double durationSeconds, const char* reason)
 	{
 		Initialize();
@@ -2978,27 +3211,45 @@ namespace TFD::Actor::Ops
 		if (g_releaseFollowGraceEntries.empty()) {
 			return;
 		}
-		std::vector<RE::Actor*> actorsToClear{};
+		std::vector<ReleaseFollowGraceClearRequest> actorsToClear{};
 		std::vector<RE::FormID> staleIds{};
 		const auto now = Now();
 		for (auto& [formID, entry] : g_releaseFollowGraceEntries) {
 			auto actorPtr = RE::Actor::LookupByHandle(entry.actor.native_handle());
 			auto* actor = actorPtr.get();
-			const bool expired = now >= entry.expiresAt;
 			const bool invalid = !actor || actor->IsDead() || actor->IsDisabled();
-			if (!expired && !invalid) {
+			if (invalid) {
+				if (actor) {
+					actorsToClear.push_back({ actor, "actor_invalid" });
+				} else {
+					staleIds.push_back(formID);
+					spdlog::info("[TFD][FactionManager] grace removed stale handle actor={:08X} reason=actor_missing", formID);
+				}
+				continue;
+			}
+
+			if (entry.waitForDialogueClear) {
+				if (ActorHasActiveDialoguePhaseFaction(actor)) {
+					if (g_releaseFollowHelperFaction && actor->IsInFaction(g_releaseFollowHelperFaction)) {
+						if (entry.addedHelperFaction || !entry.hadHelperFaction) {
+							actor->RemoveFromFaction(g_releaseFollowHelperFaction);
+						}
+					}
+					continue;
+				}
+				actorsToClear.push_back({ actor, "dialogue_phase_clear" });
+				continue;
+			}
+
+			const bool expired = now >= entry.expiresAt;
+			if (!expired) {
 				StabilizeReleaseFollowGraceActor(actor, entry, entry.source.c_str());
 				continue;
 			}
-			if (actor) {
-				actorsToClear.push_back(actor);
-			} else {
-				staleIds.push_back(formID);
-				spdlog::info("[TFD][FactionManager] grace removed stale handle actor={:08X} reason={}", formID, expired ? "timer_expired_missing_actor" : "actor_missing");
-			}
+			actorsToClear.push_back({ actor, "timer_expired" });
 		}
-		for (auto* actor : actorsToClear) {
-			RemoveReleaseFollowGraceFromActor(actor, "timer_or_invalid");
+		for (const auto& request : actorsToClear) {
+			RemoveReleaseFollowGraceFromActor(request.actor, request.reason);
 		}
 		for (auto formID : staleIds) {
 			g_releaseFollowGraceEntries.erase(formID);
@@ -3027,6 +3278,38 @@ namespace TFD::Actor::Ops
 		}
 		for (auto formID : ids) {
 			g_releaseFollowGraceEntries.erase(formID);
+		}
+	}
+
+	bool HasTemporaryFollowLock(RE::Actor* actor)
+	{
+		return HasTemporaryFollowLockInternal(actor);
+	}
+
+	void ApplyTemporaryFollowLockToActorOnly(RE::Actor* actor, double durationSeconds, const char* reason)
+	{
+		Initialize();
+		ApplyTemporaryFollowLockToActor(actor, durationSeconds, reason ? reason : "temporary_follow");
+	}
+
+	void RemoveTemporaryFollowLockFromActorOnly(RE::Actor* actor, const char* reason)
+	{
+		Initialize();
+		RemoveTemporaryFollowLockFromActor(actor, reason ? reason : "temporary_follow_remove");
+	}
+
+	void ClearAllTemporaryFollowLocks(const char* reason)
+	{
+		if (g_temporaryFollowLocks.empty()) {
+			return;
+		}
+		std::vector<RE::FormID> ids{};
+		ids.reserve(g_temporaryFollowLocks.size());
+		for (const auto& [formID, _entry] : g_temporaryFollowLocks) {
+			ids.push_back(formID);
+		}
+		for (const auto formID : ids) {
+			RemoveTemporaryFollowLockByFormID(formID, reason ? reason : "clear_all_temporary_follow");
 		}
 	}
 

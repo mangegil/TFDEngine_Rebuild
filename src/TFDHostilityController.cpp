@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -59,6 +60,7 @@ namespace
 
         std::size_t StopCombatAndAlarmActor(RE::Actor* actor, RE::ProcessLists* process, bool drawWeapon, bool evaluatePackage)
         {
+            (void)drawWeapon;
             if (!actor || actor->IsDead() || actor->IsDisabled()) {
                 return 0;
             }
@@ -69,9 +71,9 @@ namespace
             actor->StopAlarmOnActor();
             actor->StopCombat();
 
-            if (drawWeapon && actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(false);
-            }
+            // R240A: never force weapon sheathe. Proper pacify/combat state lets
+            // Skyrim settle stance naturally. Forced sheathe can leave actors
+            // hostile with weapon in hand but no combat stance.
             if (evaluatePackage) {
                 actor->EvaluatePackage(false, true);
                 actor->EvaluatePackage(true, true);
@@ -286,6 +288,70 @@ namespace
         inline TFD::HostilityController::BleedTruceRuntimeProviders g_runtimeProviders{};
     }
 
+    double SuppressionNowSec()
+    {
+        static const auto t0 = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    namespace FightChoiceCombatOwnerInternal
+    {
+        std::mutex g_lock{};
+        std::unordered_map<RE::FormID, double> g_untilByActor{};
+        std::unordered_map<RE::FormID, std::string> g_reasonByActor{};
+
+        constexpr double kDefaultHoldSec = 12.0;
+
+        void CleanupExpired(double nowSec)
+        {
+            for (auto it = g_untilByActor.begin(); it != g_untilByActor.end();) {
+                if (it->second <= nowSec) {
+                    g_reasonByActor.erase(it->first);
+                    it = g_untilByActor.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+
+        bool IsActive(RE::Actor* actor, double nowSec = -1.0)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            if (nowSec < 0.0) {
+                nowSec = SuppressionNowSec();
+            }
+            const auto actorId = actor->GetFormID();
+            std::scoped_lock lock(g_lock);
+            CleanupExpired(nowSec);
+            auto it = g_untilByActor.find(actorId);
+            return it != g_untilByActor.end() && it->second > nowSec;
+        }
+
+        void Arm(RE::Actor* actor, double durationSec, const char* reason)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return;
+            }
+            const auto nowSec = SuppressionNowSec();
+            const auto untilSec = nowSec + std::max(1.0, durationSec > 0.0 ? durationSec : kDefaultHoldSec);
+            const auto actorId = actor->GetFormID();
+            {
+                std::scoped_lock lock(g_lock);
+                CleanupExpired(nowSec);
+                g_untilByActor[actorId] = untilSec;
+                g_reasonByActor[actorId] = reason ? reason : "fight_choice_combat_owner";
+            }
+            spdlog::info(
+                "[TFD][HostilityController][R224A] fight combat-owner suppression bypass armed actor={:08X} durationSec={:.2f} reason={}",
+                actorId,
+                untilSec - nowSec,
+                reason ? reason : "fight_choice_combat_owner");
+        }
+    }
+
     namespace CaptiveSuppressionInternal
     {
         using Clock = std::chrono::steady_clock;
@@ -457,9 +523,7 @@ namespace
                 }
                 actor->StopAlarmOnActor();
                 actor->StopCombat();
-                if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
-                }
+                // R240A: no forced sheathe; let Skyrim settle weapon state naturally.
                 actor->EvaluatePackage(true, false);
             }
 
@@ -657,6 +721,11 @@ namespace TFD::HostilityController
         ResetCaptiveSuppression();
         CancelPendingWaves();
     }
+
+    void ArmFightChoiceCombatOwnerBypass(RE::Actor* actor, double durationSec, const char* reason)
+    {
+        FightChoiceCombatOwnerInternal::Arm(actor, durationSec, reason ? reason : "manual_fight_choice_combat_owner");
+    }
 }
 
 
@@ -684,6 +753,7 @@ namespace TFD::HostilityController
             double expireSec{ 0.0 };
             std::uint8_t attemptsRemaining{ 0 };
             bool drawWeapon{ true };
+            std::uint8_t successPulses{ 0 };
         };
 
         using Clock = std::chrono::steady_clock;
@@ -702,6 +772,7 @@ namespace TFD::HostilityController
 
             constexpr const char* k_editorIds[] = {
                 "TFDAfterPleasureFaction",
+                "TFDPleasureFailedFaction",
                 "TFDBleedOutFaction",
                 "TFDBleedoutFaction",
                 // TFDCaptiveFaction is a dialogue-condition tag only.
@@ -769,6 +840,633 @@ namespace TFD::HostilityController
                 }
 
                 return false;
+            }
+        }
+
+        bool IsActorStillValid(RE::Actor* actor);
+        bool IsPlayerSideActorAfterInCombatTruce(RE::Actor* actor);
+        double SuppressionNowSec();
+
+        namespace PayDialoguePassiveGuardInternal
+        {
+            struct Entry
+            {
+                RE::FormID actorId{ 0 };
+                double expireSec{ 0.0 };
+                double combatHookBlockUntilSec{ 0.0 };
+                bool persistent{ false };
+                float originalAggression{ 0.0f };
+                bool hasOriginalAggression{ false };
+                bool hadPacifyFaction{ false };
+                bool addedPacifyFaction{ false };
+                bool persistentTakeoverPending{ false };
+                bool removePacifyOnRelease{ false };
+            };
+
+            inline RE::TESFaction* g_pacifyFaction = nullptr;
+            inline bool g_triedResolvePacify = false;
+            inline std::unordered_map<RE::FormID, Entry> g_entries{};
+
+            constexpr double kDefaultDurationSec = 30.0;
+            constexpr double kMinDurationSec = 3.0;
+            constexpr double kMaxDurationSec = 180.0;
+            constexpr double kCombatHookBlockSec = 1.25;
+            constexpr double kPersistentTakeoverHookBlockSec = 6.0;
+            constexpr double kMaxCombatHookBlockSec = 12.0;
+
+            RE::TESFaction* ResolvePacifyFaction()
+            {
+                if (g_pacifyFaction || g_triedResolvePacify) {
+                    return g_pacifyFaction;
+                }
+
+                g_triedResolvePacify = true;
+                g_pacifyFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPacifyFaction");
+                if (!g_pacifyFaction) {
+                    spdlog::warn("[TFD][HostilityController][P5PAY] pay passive guard faction missing editorId=TFDPacifyFaction");
+                }
+                else {
+                    spdlog::info("[TFD][HostilityController][P5PAY] pay passive guard faction resolved -> {:08X}",
+                        g_pacifyFaction->GetFormID());
+                }
+                return g_pacifyFaction;
+            }
+
+            double ClampDuration(double durationSec)
+            {
+                if (durationSec <= 0.0 || !std::isfinite(durationSec)) {
+                    durationSec = kDefaultDurationSec;
+                }
+                return std::clamp(durationSec, kMinDurationSec, kMaxDurationSec);
+            }
+
+            bool IsActive(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                const auto actorId = actor->GetFormID();
+                auto it = g_entries.find(actorId);
+                if (it == g_entries.end()) {
+                    return false;
+                }
+
+                const auto nowSec = SuppressionNowSec();
+                const auto& entry = it->second;
+                return entry.persistent || entry.expireSec > nowSec;
+            }
+
+            bool IsCombatHookBlocked(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                auto it = g_entries.find(actor->GetFormID());
+                if (it == g_entries.end()) {
+                    return false;
+                }
+
+                const auto nowSec = SuppressionNowSec();
+                const auto& entry = it->second;
+                return entry.combatHookBlockUntilSec > nowSec;
+            }
+
+            double ClampCombatHookDuration(double durationSec)
+            {
+                if (durationSec <= 0.0 || !std::isfinite(durationSec)) {
+                    durationSec = kCombatHookBlockSec;
+                }
+                return std::clamp(durationSec, 0.25, kMaxCombatHookBlockSec);
+            }
+
+            void ExtendCombatHookBlock(RE::Actor* actor, double durationSec, const char* reason);
+
+            void Stabilize(RE::Actor* actor, Entry& entry, const char* reason)
+            {
+                if (!IsActorStillValid(actor)) {
+                    return;
+                }
+
+                auto* pacifyFaction = ResolvePacifyFaction();
+                auto* avo = actor->AsActorValueOwner();
+                bool changedFaction = false;
+                bool changedAggression = false;
+                bool stoppedCombat = false;
+
+                if (avo && !entry.hasOriginalAggression) {
+                    entry.originalAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                    entry.hasOriginalAggression = true;
+                }
+
+                if (pacifyFaction && !actor->IsInFaction(pacifyFaction)) {
+                    actor->AddToFaction(pacifyFaction, 0);
+                    entry.addedPacifyFaction = true;
+                    changedFaction = true;
+                }
+
+                if (avo) {
+                    const float currentAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                    if (currentAggression > 0.0f) {
+                        avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+                        changedAggression = true;
+                    }
+                }
+
+                auto* player = RE::PlayerCharacter::GetSingleton();
+                if (actor->IsInCombat() || (player && actor->IsHostileToActor(player))) {
+                    actor->StopAlarmOnActor();
+                    actor->StopCombat();
+                    stoppedCombat = true;
+                }
+                // R240A: no forced sheathe in passive stabilization.
+
+                if (changedFaction || changedAggression || stoppedCombat) {
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->ClearCachedFactionFightReactions();
+                    }
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
+                }
+
+                spdlog::info(
+                    "[TFD][HostilityController][P5PAY] pay passive guard stabilize actor={:08X} persistent={} addedPacify={} changedAgg={} stoppedCombat={} forcedSheathe=0 origAgg={} reason={}",
+                    actor->GetFormID(),
+                    entry.persistent ? 1 : 0,
+                    entry.addedPacifyFaction ? 1 : 0,
+                    changedAggression ? 1 : 0,
+                    stoppedCombat ? 1 : 0,
+                    entry.hasOriginalAggression ? entry.originalAggression : -1.0f,
+                    reason ? reason : "pay_passive_guard");
+            }
+
+            void Arm(RE::Actor* actor, double durationSec, const char* reason)
+            {
+                if (!IsActorStillValid(actor)) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                const auto nowSec = SuppressionNowSec();
+                const auto clampedDuration = ClampDuration(durationSec);
+                auto* pacifyFaction = ResolvePacifyFaction();
+                auto& entry = g_entries[actorId];
+                const bool wasActive = entry.actorId != 0;
+
+                if (!wasActive) {
+                    entry.actorId = actorId;
+                    entry.hadPacifyFaction = pacifyFaction ? actor->IsInFaction(pacifyFaction) : false;
+                    entry.addedPacifyFaction = false;
+                    entry.hasOriginalAggression = false;
+                    entry.originalAggression = 0.0f;
+                    entry.combatHookBlockUntilSec = 0.0;
+                    entry.persistent = false;
+                    entry.persistentTakeoverPending = false;
+                    entry.removePacifyOnRelease = false;
+                }
+
+                entry.expireSec = std::max(entry.expireSec, nowSec + clampedDuration);
+                // P9: combat/detection hooks only need to block the engine's immediate
+                // reacquire window.  The Pay guard itself may remain active for a long
+                // Release/Follow owner, but keeping DoDetect/UpdateCombat blocked for
+                // the whole owner lifetime can blind a converted follower.
+                entry.combatHookBlockUntilSec = std::max(entry.combatHookBlockUntilSec, nowSec + kCombatHookBlockSec);
+                Stabilize(actor, entry, reason ? reason : "pay_passive_guard_arm");
+
+                spdlog::info(
+                    "[TFD][HostilityController][P5PAY] pay passive guard armed actor={:08X} duration={:.2f} expireIn={:.2f} wasActive={} hadPacify={} addedPacify={} reason={}",
+                    actorId,
+                    clampedDuration,
+                    entry.expireSec - nowSec,
+                    wasActive ? 1 : 0,
+                    entry.hadPacifyFaction ? 1 : 0,
+                    entry.addedPacifyFaction ? 1 : 0,
+                    reason ? reason : "pay_passive_guard_arm");
+            }
+
+            void ExtendCombatHookBlock(RE::Actor* actor, double durationSec, const char* reason)
+            {
+                if (!IsActorStillValid(actor)) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                const auto nowSec = SuppressionNowSec();
+                const auto clampedDuration = ClampCombatHookDuration(durationSec);
+
+                auto it = g_entries.find(actorId);
+                if (it == g_entries.end()) {
+                    Arm(actor, std::max(clampedDuration, kMinDurationSec), reason ? reason : "pay_guard_hook_block_extend_arm");
+                    it = g_entries.find(actorId);
+                    if (it == g_entries.end()) {
+                        return;
+                    }
+                }
+
+                auto& entry = it->second;
+                entry.expireSec = std::max(entry.expireSec, nowSec + clampedDuration);
+                entry.combatHookBlockUntilSec = std::max(entry.combatHookBlockUntilSec, nowSec + clampedDuration);
+                Stabilize(actor, entry, reason ? reason : "pay_guard_hook_block_extend");
+
+                spdlog::info(
+                    "[TFD][HostilityController][P10] pay passive guard combat hook extended actor={:08X} duration={:.2f} blockFor={:.2f} expireIn={:.2f} reason={}",
+                    actorId,
+                    durationSec,
+                    entry.combatHookBlockUntilSec - nowSec,
+                    entry.expireSec - nowSec,
+                    reason ? reason : "pay_guard_hook_block_extend");
+            }
+
+            void AdoptOriginalAggression(RE::Actor* actor, float originalAggression, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                auto it = g_entries.find(actor->GetFormID());
+                if (it == g_entries.end()) {
+                    return;
+                }
+
+                auto& entry = it->second;
+                entry.originalAggression = originalAggression;
+                entry.hasOriginalAggression = true;
+                spdlog::info(
+                    "[TFD][HostilityController][P5PAY] pay passive guard adopted session aggression actor={:08X} origAgg={} reason={}",
+                    actor->GetFormID(),
+                    originalAggression,
+                    reason ? reason : "session_handoff");
+            }
+
+            void Release(RE::Actor* actor, bool restoreAggression, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                auto it = g_entries.find(actorId);
+                if (it == g_entries.end()) {
+                    return;
+                }
+
+                Entry entry = it->second;
+                g_entries.erase(it);
+
+                auto* pacifyFaction = ResolvePacifyFaction();
+                bool removedPacify = false;
+                bool restoredAggression = false;
+
+                const bool shouldRemovePacify = restoreAggression &&
+                    pacifyFaction &&
+                    actor->IsInFaction(pacifyFaction) &&
+                    (entry.removePacifyOnRelease || (entry.addedPacifyFaction && !entry.hadPacifyFaction));
+                if (shouldRemovePacify) {
+                    actor->RemoveFromFaction(pacifyFaction);
+                    removedPacify = true;
+                }
+
+                if (restoreAggression && entry.hasOriginalAggression) {
+                    if (auto* avo = actor->AsActorValueOwner()) {
+                        avo->SetActorValue(RE::ActorValue::kAggression, entry.originalAggression);
+                        restoredAggression = true;
+                    }
+                }
+
+                if (removedPacify || restoredAggression) {
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->ClearCachedFactionFightReactions();
+                    }
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
+                }
+
+                spdlog::info(
+                    "[TFD][HostilityController][P5PAY] pay passive guard released actor={:08X} restore={} removedPacify={} restoredAgg={} origAgg={} reason={}",
+                    actorId,
+                    restoreAggression ? 1 : 0,
+                    removedPacify ? 1 : 0,
+                    restoredAggression ? 1 : 0,
+                    entry.hasOriginalAggression ? entry.originalAggression : -1.0f,
+                    reason ? reason : "pay_passive_guard_release");
+            }
+
+            void ConsumePersistent(RE::Actor* actor, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                auto it = g_entries.find(actorId);
+                if (it == g_entries.end()) {
+                    return;
+                }
+
+                auto& entry = it->second;
+                const auto nowSec = SuppressionNowSec();
+                entry.persistent = false;
+                entry.persistentTakeoverPending = true;
+                entry.expireSec = std::max(entry.expireSec, nowSec + 8.0);
+                entry.combatHookBlockUntilSec = std::max(entry.combatHookBlockUntilSec, nowSec + kPersistentTakeoverHookBlockSec);
+                Stabilize(actor, entry, reason ? reason : "pay_persistent_owner_pending");
+                spdlog::info(
+                    "[TFD][HostilityController][P6PAY] pay passive guard persistent takeover pending actor={:08X} expireIn={:.2f} keptPacify={} origAgg={} reason={}",
+                    actorId,
+                    entry.expireSec - nowSec,
+                    entry.addedPacifyFaction ? 1 : 0,
+                    entry.hasOriginalAggression ? entry.originalAggression : -1.0f,
+                    reason ? reason : "pay_persistent_owner_pending");
+            }
+
+            void MarkRemovePacifyOnRelease(RE::Actor* actor, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                auto it = g_entries.find(actor->GetFormID());
+                if (it == g_entries.end()) {
+                    return;
+                }
+
+                it->second.removePacifyOnRelease = true;
+                spdlog::info(
+                    "[TFD][HostilityController][P6PAY] pay passive guard owns pacify release actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "pay_guard_remove_pacify_on_release");
+            }
+
+            bool IsPersistentTakeoverPending(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                auto it = g_entries.find(actor->GetFormID());
+                return it != g_entries.end() && it->second.persistentTakeoverPending && IsActive(actor);
+            }
+
+            void FinalizePersistentTakeover(RE::Actor* actor, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                const auto actorId = actor->GetFormID();
+                auto it = g_entries.find(actorId);
+                if (it == g_entries.end()) {
+                    return;
+                }
+
+                const Entry entry = it->second;
+                if (!entry.persistentTakeoverPending) {
+                    return;
+                }
+
+                g_entries.erase(it);
+                spdlog::info(
+                    "[TFD][HostilityController][P6PAY] pay passive guard persistent takeover finalized actor={:08X} keptPacify={} origAgg={} reason={}",
+                    actorId,
+                    entry.addedPacifyFaction ? 1 : 0,
+                    entry.hasOriginalAggression ? entry.originalAggression : -1.0f,
+                    reason ? reason : "pay_persistent_owner_finalized");
+            }
+
+            void Tick(double nowSec)
+            {
+                std::vector<RE::FormID> expiredIds;
+                expiredIds.reserve(g_entries.size());
+
+                for (const auto& [actorId, entry] : g_entries) {
+                    if (!entry.persistent && entry.expireSec <= nowSec) {
+                        expiredIds.push_back(actorId);
+                        continue;
+                    }
+
+                    auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+                    if (!IsActorStillValid(actor)) {
+                        expiredIds.push_back(actorId);
+                    }
+                }
+
+                for (const auto actorId : expiredIds) {
+                    auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId);
+                    auto it = g_entries.find(actorId);
+                    const bool persistentTakeoverPending = it != g_entries.end() && it->second.persistentTakeoverPending;
+                    if (actor) {
+                        Release(
+                            actor,
+                            !persistentTakeoverPending,
+                            persistentTakeoverPending ? "pay_persistent_takeover_expired_no_restore" : "pay_passive_guard_expired");
+                    }
+                    else {
+                        g_entries.erase(actorId);
+                    }
+                }
+            }
+
+            void ReleaseAll(const char* reason, bool restoreAggression)
+            {
+                std::vector<RE::FormID> actorIds;
+                actorIds.reserve(g_entries.size());
+                for (const auto& [actorId, _] : g_entries) {
+                    actorIds.push_back(actorId);
+                }
+
+                for (const auto actorId : actorIds) {
+                    if (auto* actor = RE::TESForm::LookupByID<RE::Actor>(actorId)) {
+                        Release(actor, restoreAggression, reason ? reason : "pay_passive_guard_release_all");
+                    }
+                    else {
+                        g_entries.erase(actorId);
+                    }
+                }
+                g_pacifyFaction = nullptr;
+                g_triedResolvePacify = false;
+            }
+        }
+
+        namespace StableSessionPacifyInternal
+        {
+            inline RE::TESFaction* g_pacifyFaction = nullptr;
+            inline bool g_triedResolvePacify = false;
+
+            RE::TESFaction* ResolvePacifyFaction()
+            {
+                if (g_pacifyFaction || g_triedResolvePacify) {
+                    return g_pacifyFaction;
+                }
+
+                g_triedResolvePacify = true;
+                g_pacifyFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPacifyFaction");
+                if (!g_pacifyFaction) {
+                    spdlog::warn("[TFD][HostilityController][R139] session pacify faction missing editorId=TFDPacifyFaction");
+                }
+                else {
+                    spdlog::info("[TFD][HostilityController][R139] session pacify faction resolved -> {:08X}",
+                        g_pacifyFaction->GetFormID());
+                }
+                return g_pacifyFaction;
+            }
+
+            bool ShouldKeepActorPacifiedAfterSession(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                // R162: narrow pacify handoff for Temporary Follow.
+                // R141 was correct that teammate status alone must not keep session
+                // pacify, but Pay -> Follow has a real owner lock before the old
+                // PreCombat truce session releases.  If we remove TFDPacifyFaction and
+                // restore aggression while TemporaryFollowerQuest is taking ownership,
+                // the actor can blink hostile / turn back for a frame.  Keep the old
+                // session pacify only for explicit release-follow grace or an explicit
+                // TemporaryFollowLock, never merely because the actor is a teammate.
+                if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+                    return true;
+                }
+
+                // P7: active dialogue phase factions are ownership markers.  If a
+                // PreCombat/InCombat/Bleedout dialogue still owns the actor, old session
+                // cleanup must not remove pacify or restore aggression for one tick before
+                // the real outcome owner confirms.  This is the visible aggression blink.
+                if (TFD::HostilityController::HasActiveDialoguePhaseFaction(actor)) {
+                    return true;
+                }
+
+                return TFD::Actor::Ops::HasReleaseFollowGrace(actor) ||
+                    TFD::Actor::Ops::HasTemporaryFollowLock(actor);
+            }
+
+            void Apply(RE::Actor* actor, Entry& entry, const char* reason)
+            {
+                if (!IsActorStillValid(actor) || entry.disposition == TameDisposition::Companion) {
+                    return;
+                }
+
+                auto* avo = actor->AsActorValueOwner();
+                auto* pacifyFaction = ResolvePacifyFaction();
+
+                bool addPacifyFaction = false;
+                bool changedFaction = false;
+                bool changedAggression = false;
+                float originalAggression = 0.0f;
+
+                if (avo && !entry.hasOriginalAggression) {
+                    originalAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                    entry.originalAggression = originalAggression;
+                    entry.hasOriginalAggression = true;
+                }
+                else if (entry.hasOriginalAggression) {
+                    originalAggression = entry.originalAggression;
+                }
+
+                if (!entry.stablePacifyInitialized) {
+                    entry.stablePacifyInitialized = true;
+                    entry.hadPacifyFaction = pacifyFaction ? actor->IsInFaction(pacifyFaction) : false;
+                    if (pacifyFaction && !entry.hadPacifyFaction) {
+                        entry.addedPacifyFaction = true;
+                        addPacifyFaction = true;
+                    }
+                }
+
+                if (addPacifyFaction && pacifyFaction) {
+                    actor->AddToFaction(pacifyFaction, 0);
+                    changedFaction = true;
+                }
+
+                if (avo) {
+                    const float currentAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                    if (currentAggression > 0.0f) {
+                        avo->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+                        changedAggression = true;
+                    }
+                }
+
+                if (changedFaction || changedAggression) {
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->ClearCachedFactionFightReactions();
+                    }
+                    actor->StopAlarmOnActor();
+                    actor->StopCombat();
+                    // R240A: no forced sheathe in stable session pacify.
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
+
+                    spdlog::info(
+                        "[TFD][HostilityController][R139] stable session pacify applied actor={:08X} mode={} origAgg={} addedPacify={} changedAgg={} reason={}",
+                        actor->GetFormID(),
+                        ToString(entry.mode),
+                        originalAggression,
+                        entry.addedPacifyFaction ? 1 : 0,
+                        changedAggression ? 1 : 0,
+                        reason ? reason : "session_suppression");
+                }
+            }
+
+            void Restore(RE::Actor* actor, Entry& entry, const char* reason)
+            {
+                if (!actor) {
+                    return;
+                }
+
+                auto* pacifyFaction = ResolvePacifyFaction();
+                const bool keepPacified = ShouldKeepActorPacifiedAfterSession(actor);
+                bool changedFaction = false;
+                bool restoredAggression = false;
+
+                if (entry.addedPacifyFaction && pacifyFaction && actor->IsInFaction(pacifyFaction) && !keepPacified) {
+                    actor->RemoveFromFaction(pacifyFaction);
+                    changedFaction = true;
+                }
+
+                if (entry.hasOriginalAggression && keepPacified && PayDialoguePassiveGuardInternal::IsActive(actor)) {
+                    PayDialoguePassiveGuardInternal::AdoptOriginalAggression(
+                        actor,
+                        entry.originalAggression,
+                        reason ? reason : "stable_session_restore_keep_pay_guard");
+                }
+
+                if (entry.hasOriginalAggression && !keepPacified) {
+                    if (auto* avo = actor->AsActorValueOwner()) {
+                        avo->SetActorValue(RE::ActorValue::kAggression, entry.originalAggression);
+                        restoredAggression = true;
+                    }
+                }
+
+                if (changedFaction || restoredAggression) {
+                    if (auto* process = RE::ProcessLists::GetSingleton()) {
+                        process->ClearCachedFactionFightReactions();
+                    }
+                    actor->EvaluatePackage(false, true);
+                    actor->EvaluatePackage(true, true);
+                }
+
+                if (entry.stablePacifyInitialized || entry.hasOriginalAggression || entry.addedPacifyFaction) {
+                    spdlog::info(
+                        "[TFD][HostilityController][R139] stable session pacify restored actor={:08X} mode={} keepPacified={} removedPacify={} restoredAgg={} reason={}",
+                        actor->GetFormID(),
+                        ToString(entry.mode),
+                        keepPacified ? 1 : 0,
+                        changedFaction ? 1 : 0,
+                        restoredAggression ? 1 : 0,
+                        reason ? reason : "session_suppression_release");
+                }
+
+                if (keepPacified && PayDialoguePassiveGuardInternal::IsPersistentTakeoverPending(actor)) {
+                    PayDialoguePassiveGuardInternal::FinalizePersistentTakeover(
+                        actor,
+                        reason ? reason : "stable_session_restore_persistent_takeover");
+                }
+
+                entry.originalAggression = 0.0f;
+                entry.hasOriginalAggression = false;
+                entry.hadPacifyFaction = false;
+                entry.addedPacifyFaction = false;
+                entry.stablePacifyInitialized = false;
             }
         }
 
@@ -870,9 +1568,18 @@ namespace TFD::HostilityController
         constexpr double kPackageEvalIntervalSec = 1.0;
 
         constexpr double kRehostileRetryDelaySec = 0.20;
-        constexpr double kRehostileRetryExtendSec = 0.35;
-        constexpr double kRehostileRetryLifetimeSec = 1.60;
-        constexpr std::uint8_t kRehostileRetryCount = 4;
+        constexpr double kRehostileRetryExtendSec = 0.30;
+        constexpr double kRehostileRetryLifetimeSec = 3.50;
+        // R204A/R208A: FightChoice must not spam combat/package/draw pulses while
+        // Skyrim is settling from dialogue/OStim, but it also must not declare
+        // victory only because the weapon graph reports drawn. Log 67 showed
+        // hostile=1, targetingPlayer=1, weaponDrawn=1, but inCombat=0 and the
+        // actor stayed visually passive. Keep the retry window short and require
+        // actual IsInCombat() before the native handoff is considered complete.
+        constexpr double kFightChoiceRehostileRetryLifetimeSec = 4.00;
+        constexpr double kFightChoiceRehostileRetryDelaySec = 0.45;
+        constexpr std::uint8_t kRehostileRetryCount = 7;
+        constexpr std::uint8_t kFightChoiceRehostileRetryCount = 6;
 
         constexpr double kArmedGraceSec = 1.25;
         constexpr double kArmedDebounceSec = 0.50;
@@ -913,10 +1620,11 @@ namespace TFD::HostilityController
         bool IsActorStillValid(RE::Actor* actor);
         void PulseGlobalDetection(const char* reason);
         bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
+        bool IsPlayerSideActorAfterInCombatTruce(RE::Actor* actor);
 
         bool IsFiniteDurationMode(Mode mode)
         {
-            return mode == Mode::Tame;
+            return mode == Mode::Tame || mode == Mode::BleedoutSuppress || mode == Mode::BleedoutPayReleaseSuppress;
         }
 
         bool ShouldResumeCombatAfterTruceRelease(Mode mode, ReleaseReason reason)
@@ -932,6 +1640,9 @@ namespace TFD::HostilityController
             if (mode == Mode::Tame) {
                 return requestedDurationSec > 0.0 ? requestedDurationSec : kTameDurationSec;
             }
+            if (mode == Mode::BleedoutSuppress || mode == Mode::BleedoutPayReleaseSuppress) {
+                return requestedDurationSec > 0.0 ? requestedDurationSec : 0.0;
+            }
             return 0.0;
         }
 
@@ -943,6 +1654,36 @@ namespace TFD::HostilityController
         RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor);
         bool IsEnemyToPlayer(RE::Actor* player, RE::Actor* actor);
         bool IsActorBoundToDifferentActiveTameSession(RE::FormID actorId, RE::FormID targetSessionId);
+
+        bool ForceCombatTargetForFightChoice(RE::Actor* actor, RE::Actor* player, const char* reason)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                return false;
+            }
+
+            auto beforeSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            const bool beforeTargetingPlayer = beforeSp && beforeSp->GetFormID() == player->GetFormID();
+
+            actor->GetActorRuntimeData().currentCombatTarget = player->GetHandle();
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            auto afterSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            const bool afterTargetingPlayer = afterSp && afterSp->GetFormID() == player->GetFormID();
+
+            spdlog::info(
+                "TFDHostilityController: [R151] fight choice combat target lock actor={:08X} player={:08X} beforeTargeting={} afterTargeting={} reason={}",
+                actor->GetFormID(),
+                player->GetFormID(),
+                beforeTargetingPlayer ? 1 : 0,
+                afterTargetingPlayer ? 1 : 0,
+                reason ? reason : "fight_choice_target_lock");
+
+            return afterTargetingPlayer && !beforeTargetingPlayer;
+        }
+
         bool ForceRehostile(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
         {
             if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
@@ -978,29 +1719,76 @@ namespace TFD::HostilityController
             (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
             (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
 
-            if (drawWeapon && !actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(true);
+            const bool fightChoice = reason == ReleaseReason::FightChoice;
+            bool fightChoiceDrawIssued = false;
+            if (fightChoice) {
+                if (auto* avo = actor->AsActorValueOwner()) {
+                    const float oldAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                    if (oldAggression < 1.0f) {
+                        avo->SetActorValue(RE::ActorValue::kAggression, 1.0f);
+                    }
+                }
+                (void)ForceCombatTargetForFightChoice(actor, player, "fight_choice_rehostile_pre_handoff");
+
+                // R254A: PleasureFailed > Fight is the only branch allowed to force
+                // the weapon draw. The dialogue package must not request drawn weapon,
+                // but once the user explicitly chooses Fight, combat should start from
+                // a clean sheathed/dialogue posture and then draw here.
+                if (drawWeapon) {
+                    const bool beforeDraw = actor->IsWeaponDrawn();
+                    actor->DrawWeaponMagicHands(true);
+                    fightChoiceDrawIssued = true;
+                    spdlog::info(
+                        "TFDHostilityController: [R254A] fight choice forced draw actor={:08X} player={:08X} beforeDraw={} afterDraw={} reason={}",
+                        actor->GetFormID(),
+                        player->GetFormID(),
+                        beforeDraw ? 1 : 0,
+                        actor->IsWeaponDrawn() ? 1 : 0,
+                        ToString(reason));
+                }
+            }
+            else {
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
             }
 
-            actor->EvaluatePackage(false, true);
-            actor->EvaluatePackage(true, true);
-
-            // R93U: Do not call Actor::UpdateCombat directly while an InCombat truce
-            // session is active. R93T crash logs pointed at TFDEngine from the engine
-            // combat update path with the current truce speaker on stack. During this
-            // phase Papyrus already receives TFDInCombatResumeCombat and calls
-            // StartCombat() after aliases/factions are released, which is safer than
-            // forcing UpdateCombat from native while the suppression hook is still
-            // intercepting UpdateCombat.
+            // R93U/R148: Do not call Actor::UpdateCombat directly for passive
+            // dialogue-close/player-armed interruption while an InCombat truce may
+            // still be releasing.  Explicit FightChoice is different: by the time
+            // it reaches rehostile, the final-owner break has already removed
+            // passive entries/factions, and delaying UpdateCombat is exactly what
+            // left actors red-but-passive in PleasureFailed -> Fight.
             const bool deferredUnsafeCombatUpdate =
                 TFD::InCombat::IsActive() &&
                 (reason == ReleaseReason::DialogueClosed ||
-                    reason == ReleaseReason::PlayerArmed ||
-                    reason == ReleaseReason::FightChoice);
+                    reason == ReleaseReason::PlayerArmed);
 
             if (!deferredUnsafeCombatUpdate) {
+                if (fightChoice) {
+                    (void)ForceCombatTargetForFightChoice(actor, player, "fight_choice_rehostile_pre_update");
+                }
                 actor->UpdateCombat();
                 player->UpdateCombat();
+
+                if (fightChoice) {
+                    // R245A: explicit FightChoice must not call EvaluatePackage during
+                    // the first combat handoff.  In BO5/BO6 the package eval step
+                    // briefly removed the player target and left the actor hostile but
+                    // not attack-ready.  Keep this path to aggression, detection,
+                    // target lock, and UpdateCombat only; let Skyrim enter stance
+                    // naturally after combat ownership is committed.
+                    (void)ForceCombatTargetForFightChoice(actor, player, "fight_choice_rehostile_no_package_eval");
+                    actor->UpdateCombat();
+                    player->UpdateCombat();
+                    spdlog::info(
+                        "TFDHostilityController: [R254A] fight choice package eval skipped actor={:08X} player={:08X} reason={} inCombat={} weaponDrawn={} forcedDraw={}",
+                        actor->GetFormID(),
+                        player->GetFormID(),
+                        ToString(reason),
+                        actor->IsInCombat() ? 1 : 0,
+                        actor->IsWeaponDrawn() ? 1 : 0,
+                        fightChoiceDrawIssued ? 1 : 0);
+                }
             } else {
                 spdlog::info(
                     "TFDHostilityController: [R93U] deferred direct UpdateCombat actor={:08X} player={:08X} reason={} activeInCombat=1",
@@ -1009,21 +1797,85 @@ namespace TFD::HostilityController
                     ToString(reason));
             }
 
+            if (fightChoice) {
+                (void)ForceCombatTargetForFightChoice(actor, player, "fight_choice_rehostile_post_update");
+            }
+
+            if (fightChoice) {
+                (void)ForceCombatTargetForFightChoice(actor, player, "fight_choice_rehostile_final_target");
+                spdlog::info(
+                    "TFDHostilityController: [R254A] fight choice final forced-draw handoff actor={:08X} player={:08X} inCombat={} weaponDrawn={} packageEval=0 forcedDraw={}",
+                    actor->GetFormID(),
+                    player->GetFormID(),
+                    actor->IsInCombat() ? 1 : 0,
+                    actor->IsWeaponDrawn() ? 1 : 0,
+                    fightChoiceDrawIssued ? 1 : 0);
+            }
+
             const auto* combatTarget = ResolveCurrentCombatTarget(actor);
             const bool inCombat = actor->IsInCombat();
             const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
             const bool hostile = IsEnemyToPlayer(player, actor);
+            const bool weaponDrawn = actor->IsWeaponDrawn();
+
+            // R254A: weaponDrawn alone is not a valid combat commit, but Fight
+            // should also not be considered stable while Skyrim still reports an
+            // explicitly sheathed actor.  The broken pre-dialogue draw is fixed in
+            // the ESP package; after the player chooses Fight, forced draw is valid.
+            const bool fightChoiceIntentStable = fightChoice && hostile && targetingPlayer;
+            const bool fightChoicePartialStable = fightChoiceIntentStable && weaponDrawn && !inCombat;
+            const bool fightChoiceSheathedCombat = fightChoiceIntentStable && inCombat && !weaponDrawn;
+            const bool fightChoiceFullStable = fightChoiceIntentStable && inCombat && (!drawWeapon || weaponDrawn);
+            const bool satisfied = fightChoice ? fightChoiceFullStable : (inCombat || targetingPlayer);
 
             spdlog::info(
-                "TFDHostilityController: rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={}",
+                "TFDHostilityController: [R227A] rehostile actor={:08X} player={:08X} reason={} hostile={} inCombat={} targetingPlayer={} weaponDrawn={} satisfied={} partialDrawOnly={} sheathedCombat={} fullStable={}",
                 actor->GetFormID(),
                 player->GetFormID(),
                 ToString(reason),
                 hostile ? 1 : 0,
                 inCombat ? 1 : 0,
-                targetingPlayer ? 1 : 0);
+                targetingPlayer ? 1 : 0,
+                weaponDrawn ? 1 : 0,
+                satisfied ? 1 : 0,
+                fightChoicePartialStable ? 1 : 0,
+                fightChoiceSheathedCombat ? 1 : 0,
+                fightChoiceFullStable ? 1 : 0);
 
-            return inCombat || targetingPlayer || (deferredUnsafeCombatUpdate && hostile);
+            if (fightChoice && satisfied) {
+                spdlog::info(
+                    "TFDHostilityController: [R227A] fight choice combat-owned handoff stable actor={:08X} player={:08X} inCombat={} weaponDrawn={}",
+                    actor->GetFormID(),
+                    player->GetFormID(),
+                    inCombat ? 1 : 0,
+                    weaponDrawn ? 1 : 0);
+            }
+            else if ((deferredUnsafeCombatUpdate || fightChoice) && hostile && !satisfied) {
+                spdlog::info(
+                    "TFDHostilityController: [R227A] rehostile not stabilized actor={:08X} player={:08X} reason={} keepRetry=1 inCombat={} targetingPlayer={} weaponDrawn={} partialDrawOnly={} sheathedCombat={}",
+                    actor->GetFormID(),
+                    player->GetFormID(),
+                    ToString(reason),
+                    inCombat ? 1 : 0,
+                    targetingPlayer ? 1 : 0,
+                    weaponDrawn ? 1 : 0,
+                    fightChoicePartialStable ? 1 : 0,
+                    fightChoiceSheathedCombat ? 1 : 0);
+            }
+
+            return satisfied;
+        }
+
+        bool ShouldQueueRehostileRetryAfterForce(RE::Actor* actor, ReleaseReason reason, bool satisfied)
+        {
+            // R240A: explicit FightChoice is complete when combat ownership is
+            // restored. Do not use weaponDrawn as a success gate; forced draw/
+            // sheathe can desync the animation graph from real combat stance.
+            if (reason == ReleaseReason::FightChoice) {
+                return !satisfied;
+            }
+
+            return !satisfied || !actor || !actor->IsInCombat();
         }
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon);
         void ProcessRehostileRetries(double nowSec);
@@ -1901,6 +2753,16 @@ namespace TFD::HostilityController
                 TFD::Actor::Ops::HasReleaseFollowGrace(actor);
         }
 
+        bool IsActorTargetingPlayerSideForTruce(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+
+            auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            return combatTarget && IsPlayerSideForHostilityDecision(player, combatTarget);
+        }
+
         bool IsPlayerSideActorAfterInCombatTruce(RE::Actor* actor)
         {
             if (!actor) {
@@ -1913,6 +2775,34 @@ namespace TFD::HostilityController
                 TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
                 TFD::Recruit::IsRecruitLike(actor) ||
                 TFD::Tame::IsCompanion(actor);
+        }
+
+        bool IsConfirmedPlayerSideActorForHookBypass(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return false;
+            }
+
+            // P10: hook bypass must be stricter than Recruit::IsRecruitLike().
+            // During RecruitPending the actor can already look recruit-like from
+            // transient state, while still raw-hostile to the player.  Bypassing
+            // hooks there reopens the draw/sheath race.  Confirmed followers still
+            // bypass so they can detect enemies and assist normally.
+            const bool confirmedPlayerSide = actor->IsPlayerTeammate() ||
+                TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+                TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+                TFD::Tame::IsCompanion(actor);
+            if (!confirmedPlayerSide) {
+                return false;
+            }
+
+            return !actor->IsHostileToActor(player);
         }
 
         bool IsProtectedByReleaseGraceAfterInCombatTruce(RE::Actor* actor)
@@ -2320,9 +3210,9 @@ namespace TFD::HostilityController
         void RefreshSessionEntries(Session& session, double nowSec, double durationSec)
         {
             const double effectiveDurationSec = ResolveSessionDurationSec(session.primaryMode, durationSec);
-            const double endTimeSec =
-                IsFiniteDurationMode(session.primaryMode) ?
-                ClampTameEndTime(nowSec, nowSec + effectiveDurationSec) :
+            const bool finiteDurationRequest = IsFiniteDurationMode(session.primaryMode) && effectiveDurationSec > 0.0;
+            const double endTimeSec = finiteDurationRequest ?
+                (session.primaryMode == Mode::Tame ? ClampTameEndTime(nowSec, nowSec + effectiveDurationSec) : nowSec + effectiveDurationSec) :
                 0.0;
 
             if (session.primaryMode != Mode::Tame) {
@@ -2441,6 +3331,10 @@ namespace TFD::HostilityController
                 return;
             }
 
+            if (entry.disposition != TameDisposition::Companion) {
+                StableSessionPacifyInternal::Apply(actor, entry, "session_suppression");
+            }
+
             if (entry.disposition != TameDisposition::Companion && (nowSec - entry.lastSuppressionApplySec) >= kSuppressionApplyIntervalSec) {
                 if (auto* process = RE::ProcessLists::GetSingleton()) {
                     const bool runDetection = process->runDetection;
@@ -2452,9 +3346,7 @@ namespace TFD::HostilityController
 
                 actor->StopCombat();
 
-                if (actor->IsWeaponDrawn()) {
-                    actor->DrawWeaponMagicHands(false);
-                }
+                // R240A: no forced sheathe during suppression pulse.
 
                 entry.lastSuppressionApplySec = nowSec;
             }
@@ -2471,12 +3363,13 @@ namespace TFD::HostilityController
                 return;
             }
 
+            StableSessionPacifyInternal::Restore(actor, entry, "session_suppression_release");
+
             if (auto* process = RE::ProcessLists::GetSingleton()) {
                 process->ClearCachedFactionFightReactions();
             }
 
             actor->EvaluatePackage(true, false);
-            (void)entry;
         }
 
         void PulseGlobalDetection(const char* reason)
@@ -2499,6 +3392,69 @@ namespace TFD::HostilityController
                 process->runDetection ? 1 : 0);
         }
 
+        bool RemoveFactionByEditorIDForFightChoice(RE::Actor* actor, const char* editorId, const char* reason)
+        {
+            if (!actor || !editorId || !editorId[0]) {
+                return false;
+            }
+
+            auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>(editorId);
+            if (!faction || !actor->IsInFaction(faction)) {
+                return false;
+            }
+
+            actor->RemoveFromFaction(faction);
+            spdlog::info(
+                "[TFD][HostilityController][R148] fight owner removed faction actor={:08X} faction={} reason={}",
+                actor->GetFormID(),
+                editorId,
+                reason ? reason : "fight_choice_owner_break");
+            return true;
+        }
+
+        bool ForceCombatAggressionForFightChoice(RE::Actor* actor, RE::Actor* player, const char* reason)
+        {
+            if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                return false;
+            }
+
+            bool changed = false;
+            float oldAggression = -1.0f;
+            float newAggression = -1.0f;
+
+            if (auto* avo = actor->AsActorValueOwner()) {
+                oldAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+                if (oldAggression < 1.0f) {
+                    avo->SetActorValue(RE::ActorValue::kAggression, 1.0f);
+                    changed = true;
+                }
+                newAggression = avo->GetActorValue(RE::ActorValue::kAggression);
+            }
+
+            actor->AllowPCDialogue(true);
+            actor->SetBeenAttacked(true);
+            player->SetBeenAttacked(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+            changed = ForceCombatTargetForFightChoice(actor, player, reason ? reason : "fight_choice_owner_break") || changed;
+
+            // R240A: this owner-break helper restores aggression/target only.
+            // Weapon draw/stance must be handled by Skyrim's combat graph naturally.
+
+            PulseGlobalDetection(reason ? reason : "fight_choice_owner_break");
+
+            spdlog::info(
+                "[TFD][HostilityController][R148] fight owner aggression refresh actor={:08X} player={:08X} oldAgg={} newAgg={} changed={} reason={}",
+                actor->GetFormID(),
+                player->GetFormID(),
+                oldAggression,
+                newAggression,
+                changed ? 1 : 0,
+                reason ? reason : "fight_choice_owner_break");
+
+            return changed;
+        }
+
         void QueueRehostileRetry(RE::Actor* actor, RE::Actor* player, RE::FormID sessionId, ReleaseReason reason, double nowSec, bool drawWeapon)
         {
             if (!actor || !player) {
@@ -2519,9 +3475,10 @@ namespace TFD::HostilityController
             req.playerId = player->GetFormID();
             req.sessionId = sessionId;
             req.reason = reason;
-            req.nextAttemptSec = nowSec + kRehostileRetryDelaySec;
-            req.expireSec = nowSec + kRehostileRetryLifetimeSec;
-            req.attemptsRemaining = kRehostileRetryCount;
+            const bool fightChoice = reason == ReleaseReason::FightChoice;
+            req.nextAttemptSec = fightChoice ? nowSec : nowSec + kRehostileRetryDelaySec;
+            req.expireSec = nowSec + (fightChoice ? kFightChoiceRehostileRetryLifetimeSec : kRehostileRetryLifetimeSec);
+            req.attemptsRemaining = fightChoice ? kFightChoiceRehostileRetryCount : kRehostileRetryCount;
             req.drawWeapon = drawWeapon;
 
             g_rehostileRequests[req.actorId] = req;
@@ -2546,6 +3503,13 @@ namespace TFD::HostilityController
 
             for (auto& [actorId, req] : g_rehostileRequests) {
                 if (req.attemptsRemaining == 0 || nowSec >= req.expireSec) {
+                    spdlog::info(
+                        "TFDHostilityController: [R146] queued rehostile expired actor={:08X} player={:08X} session={} reason={} attemptsLeft={}",
+                        req.actorId,
+                        req.playerId,
+                        req.sessionId,
+                        ToString(req.reason),
+                        static_cast<unsigned int>(req.attemptsRemaining));
                     toErase.push_back(actorId);
                     continue;
                 }
@@ -2573,15 +3537,32 @@ namespace TFD::HostilityController
                 }
 
                 if (g_entries.find(actorId) != g_entries.end()) {
-                    req.nextAttemptSec = nowSec + kRehostileRetryDelaySec;
+                    req.nextAttemptSec = nowSec + (req.reason == ReleaseReason::FightChoice ? kFightChoiceRehostileRetryDelaySec : kRehostileRetryDelaySec);
+                    spdlog::info(
+                        "TFDHostilityController: [R148] queued rehostile waiting active owner actor={:08X} player={:08X} session={} reason={} attemptsLeft={}",
+                        req.actorId,
+                        req.playerId,
+                        req.sessionId,
+                        ToString(req.reason),
+                        static_cast<unsigned int>(req.attemptsRemaining));
                     continue;
                 }
 
                 const bool satisfied = ForceRehostile(actor, player, req.reason, req.drawWeapon);
                 if (satisfied) {
+                    if (req.reason == ReleaseReason::FightChoice) {
+                        spdlog::info(
+                            "TFDHostilityController: [R208A] fight choice rehostile complete actor={:08X} player={:08X} session={} attemptsLeft={}",
+                            req.actorId,
+                            req.playerId,
+                            req.sessionId,
+                            static_cast<unsigned int>(req.attemptsRemaining));
+                    }
                     toErase.push_back(actorId);
                     continue;
                 }
+
+                req.successPulses = 0;
 
                 if (req.attemptsRemaining > 0) {
                     --req.attemptsRemaining;
@@ -2591,7 +3572,14 @@ namespace TFD::HostilityController
                     continue;
                 }
 
-                req.nextAttemptSec = nowSec + kRehostileRetryDelaySec + (kRehostileRetryExtendSec * (kRehostileRetryCount - req.attemptsRemaining));
+                if (req.reason == ReleaseReason::FightChoice) {
+                    req.nextAttemptSec = nowSec + kFightChoiceRehostileRetryDelaySec;
+                }
+                else {
+                    const auto totalAttempts = kRehostileRetryCount;
+                    const auto attemptsUsed = totalAttempts > req.attemptsRemaining ? totalAttempts - req.attemptsRemaining : 0;
+                    req.nextAttemptSec = nowSec + kRehostileRetryDelaySec + (kRehostileRetryExtendSec * attemptsUsed);
+                }
             }
 
             for (auto actorId : toErase) {
@@ -2675,6 +3663,17 @@ namespace TFD::HostilityController
                 session.endTimeSec > 0.0 &&
                 nowSec >= session.endTimeSec) {
                 return ReleaseReason::TameExpired;
+            }
+
+            if (session.primaryMode == Mode::BleedoutSuppress || session.primaryMode == Mode::BleedoutPayReleaseSuppress) {
+                session.armedSinceSec = 0.0;
+                session.tooFarSinceSec = 0.0;
+                session.tameStartleSinceSec = 0.0;
+                session.invalidSinceSec = 0.0;
+                if (session.endTimeSec > 0.0 && nowSec >= session.endTimeSec) {
+                    return ReleaseReason::HardFailsafeExpired;
+                }
+                return ReleaseReason::Generic;
             }
 
             if (session.primaryMode == Mode::Tame && session.disposition == TameDisposition::Companion) {
@@ -2770,9 +3769,9 @@ namespace TFD::HostilityController
 
             nowSec = SuppressionNowSec();
             const double effectiveDurationSec = ResolveSessionDurationSec(mode, durationSec);
-            const double endTimeSec =
-                IsFiniteDurationMode(mode) ?
-                ClampTameEndTime(nowSec, nowSec + effectiveDurationSec) :
+            const bool finiteDurationRequest = IsFiniteDurationMode(mode) && effectiveDurationSec > 0.0;
+            const double endTimeSec = finiteDurationRequest ?
+                (mode == Mode::Tame ? ClampTameEndTime(nowSec, nowSec + effectiveDurationSec) : nowSec + effectiveDurationSec) :
                 0.0;
 
             if (IsTruceMode(mode) && !ignoreSpent) {
@@ -2787,7 +3786,7 @@ namespace TFD::HostilityController
             }
 
             if (IsPlayerArmedForSuppression(player)) {
-                const bool allowForcedSheath = (mode == Mode::TruceInCombat || mode == Mode::TrucePreCombat);
+                const bool allowForcedSheath = (mode == Mode::TruceInCombat || mode == Mode::TrucePreCombat || mode == Mode::BleedoutSuppress || mode == Mode::BleedoutPayReleaseSuppress);
                 if (allowForcedSheath) {
                     player->DrawWeaponMagicHands(false);
                     spdlog::info(
@@ -3385,6 +4384,9 @@ namespace TFD::HostilityController
         if (!actor) {
             return false;
         }
+        if (FightChoiceCombatOwnerInternal::IsActive(actor)) {
+            return false;
+        }
         constexpr const char* kPhaseFactionEditorIds[] = {
             "TFDPreCombatTruceFaction",
             "TFDInCombatTruceFaction",
@@ -3394,6 +4396,7 @@ namespace TFD::HostilityController
             // detection/combat once the player enters Escape.
             "TFDWorkingCaptiveFaction",
             "TFDAfterPleasureFaction",
+            "TFDPleasureFailedFaction",
             "TFDSaviorFaction"
         };
         for (auto* editorID : kPhaseFactionEditorIds) {
@@ -3410,13 +4413,17 @@ namespace TFD::HostilityController
         if (!actor || actor->IsDead() || actor->IsDisabled()) {
             return false;
         }
+        if (FightChoiceCombatOwnerInternal::IsActive(actor)) {
+            return false;
+        }
         if (IsSuppressed(actor)) {
             return true;
         }
         // R99A: after InCombat -> Pleasure -> Recruit, converted teammates can still
         // carry short-lived phase factions or release-grace markers for a few ticks.
-        // The hook must not treat those stale markers as combat suppression, otherwise
-        // teammates and nearby enemies end up in a blind/search state with no target.
+        // This generic helper intentionally does not include PayDialoguePassiveGuard;
+        // P9 hook suppression uses a narrower, short-lived hook gate instead so
+        // converted followers do not inherit a dead DoDetect path.
         if (IsPlayerSideActorAfterInCombatTruce(actor)) {
             return false;
         }
@@ -3534,10 +4541,43 @@ namespace TFD::HostilityController
         g_preCombatDialogueArmedHoldNextLogSec.clear();
     }
 
+    void ResetForLoad()
+    {
+        const auto sessionCount = g_sessions.size();
+        const auto entryCount = g_entries.size();
+        const auto rehostileCount = g_rehostileRequests.size();
+
+        // P12LOAD: loading a save must clear transient TFD ownership without
+        // waking vanilla hostility. The normal Reset()/ReleaseAll path can restore
+        // pay-guard aggression, release sessions through Generic cleanup, and later
+        // allow TFDInCombatResumeCombat to be queued. On load that is wrong: the
+        // loaded save should decide combat state, not stale TFD runtime state.
+        PayDialoguePassiveGuardInternal::ReleaseAll("load_reset_release_all_no_restore", false);
+
+        g_entries.clear();
+        g_sessions.clear();
+        g_rehostileRequests.clear();
+        g_truceState.clear();
+        g_preCombatDialogueArmedHoldNextLogSec.clear();
+        g_nextSessionId = 1;
+
+        SendModEvent("TFDTameClearAll", nullptr);
+        SendModEvent("TFDPreCombatClearAll", nullptr);
+        SendModEvent("TFDTruceClearAll", nullptr);
+        SendModEvent("TFDInCombatClearAll", nullptr);
+
+        spdlog::info(
+            "[TFD][HostilityController][P12LOAD] ResetForLoad cleared transient state sessions={} entries={} rehostile={} noRestore=1 noResume=1",
+            static_cast<unsigned int>(sessionCount),
+            static_cast<unsigned int>(entryCount),
+            static_cast<unsigned int>(rehostileCount));
+    }
+
     void Update(double nowSec)
     {
         (void)nowSec;
         nowSec = SuppressionNowSec();
+        PayDialoguePassiveGuardInternal::Tick(nowSec);
 
         std::vector<std::pair<RE::FormID, ReleaseReason>> sessionsToRelease;
         sessionsToRelease.reserve(g_sessions.size());
@@ -3619,6 +4659,29 @@ namespace TFD::HostilityController
         bool ignoreSpent,
         bool suppressBridgeEvents)
     {
+        if (allowDialogue && primaryTarget && !IsActorTargetingPlayerSideForTruce(primaryTarget, player)) {
+            auto* currentTarget = ResolveCurrentCombatTarget(primaryTarget);
+            spdlog::info(
+                "[TFD][HostilityController][P8TRUCE] reject dialogue InCombat session actor={:08X} reason=not_targeting_player_side currentTarget={:08X} ignoreSpent={} suppressBridge={}",
+                primaryTarget->GetFormID(),
+                currentTarget ? currentTarget->GetFormID() : 0u,
+                ignoreSpent ? 1 : 0,
+                suppressBridgeEvents ? 1 : 0);
+            return std::nullopt;
+        }
+
+        if (!allowDialogue && primaryTarget &&
+            (PayDialoguePassiveGuardInternal::IsActive(primaryTarget) ||
+                TFD::Actor::Ops::HasReleaseFollowGrace(primaryTarget) ||
+                TFD::Actor::Ops::HasTemporaryFollowLock(primaryTarget))) {
+            spdlog::info(
+                "[TFD][HostilityController][P6PAY] reject suppression-only InCombat session actor={:08X} reason=passive_handoff_guarded ignoreSpent={} suppressBridge={}",
+                primaryTarget->GetFormID(),
+                ignoreSpent ? 1 : 0,
+                suppressBridgeEvents ? 1 : 0);
+            return std::nullopt;
+        }
+
         const bool applyCellBubble = allowDialogue;
         const float cellBubbleRadius = allowDialogue ? 12000.0f : 0.0f;
 
@@ -3655,6 +4718,168 @@ namespace TFD::HostilityController
             radius,
             false,
             true);
+    }
+
+    std::optional<RE::FormID> BeginBleedoutSuppressSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec,
+        bool applyCellBubble,
+        float radius,
+        const char* reason)
+    {
+        // P14OWN: distinct owner. It intentionally uses Mode::BleedoutSuppress,
+        // not TruceInCombat/Tame, so no truce_spent, ignoreSpent, TFDInCombatClear,
+        // TFDTruceClear, or Tame promotion can leak into Bleedout.
+        const auto sessionId = BeginSessionCommon(
+            player,
+            primaryTarget,
+            Mode::BleedoutSuppress,
+            nowSec,
+            durationSec,
+            false,
+            applyCellBubble,
+            false,
+            radius,
+            true,
+            true);
+
+        spdlog::info(
+            "[TFD][HostilityController][P14OWN] bleedout suppress {} actor={:08X} session={} duration={:.2f} bubble={} radius={:.1f} reason={}",
+            sessionId.has_value() ? "armed" : "rejected",
+            primaryTarget ? primaryTarget->GetFormID() : 0u,
+            sessionId.value_or(0),
+            durationSec,
+            applyCellBubble ? 1 : 0,
+            radius,
+            reason ? reason : "unknown");
+
+        return sessionId;
+    }
+
+    std::optional<RE::FormID> BeginBleedoutSuppressBurst(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec,
+        float radius,
+        const char* reason)
+    {
+        return BeginBleedoutSuppressSession(
+            player,
+            primaryTarget,
+            nowSec,
+            durationSec,
+            true,
+            radius,
+            reason ? reason : "bleedout_suppress_burst");
+    }
+
+    std::optional<RE::FormID> BeginBleedoutPayReleaseSuppressSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec,
+        const char* reason)
+    {
+        // P15BOWN: Bleedout Pay is terminal PayRelease, not a linked Pay > Release branch.
+        // This owner is separate from Mode::BleedoutSuppress so dialogue cleanup cannot
+        // release the final Pay terminal safe pass in the same frame.
+        const auto sessionId = BeginSessionCommon(
+            player,
+            primaryTarget,
+            Mode::BleedoutPayReleaseSuppress,
+            nowSec,
+            durationSec,
+            false,
+            false,
+            false,
+            0.0f,
+            true,
+            true);
+
+        if (sessionId.has_value() && primaryTarget) {
+            const auto actorId = primaryTarget->GetFormID();
+            auto payIt = PayDialoguePassiveGuardInternal::g_entries.find(actorId);
+            auto ownerIt = g_entries.find(actorId);
+            if (payIt != PayDialoguePassiveGuardInternal::g_entries.end() &&
+                ownerIt != g_entries.end() &&
+                ownerIt->second.mode == Mode::BleedoutPayReleaseSuppress) {
+                const auto payEntry = payIt->second;
+                auto& ownerEntry = ownerIt->second;
+                bool adoptedAggression = false;
+                bool adoptedPacify = false;
+
+                if (payEntry.hasOriginalAggression) {
+                    ownerEntry.originalAggression = payEntry.originalAggression;
+                    ownerEntry.hasOriginalAggression = true;
+                    adoptedAggression = true;
+                }
+
+                if (payEntry.addedPacifyFaction || payEntry.removePacifyOnRelease) {
+                    ownerEntry.hadPacifyFaction = payEntry.hadPacifyFaction;
+                    ownerEntry.addedPacifyFaction = true;
+                    ownerEntry.stablePacifyInitialized = true;
+                    adoptedPacify = true;
+                }
+
+                PayDialoguePassiveGuardInternal::g_entries.erase(payIt);
+
+                spdlog::info(
+                    "[TFD][HostilityController][P15BOWN] pay guard transferred to BleedoutPayReleaseSuppress actor={:08X} session={} adoptedAgg={} origAgg={} adoptedPacify={} reason={}",
+                    actorId,
+                    sessionId.value_or(0),
+                    adoptedAggression ? 1 : 0,
+                    adoptedAggression ? ownerEntry.originalAggression : -1.0f,
+                    adoptedPacify ? 1 : 0,
+                    reason ? reason : "unknown");
+            }
+        }
+
+        spdlog::info(
+            "[TFD][HostilityController][P15BOWN] bleedout pay-release suppress {} actor={:08X} session={} duration={:.2f} reason={}",
+            sessionId.has_value() ? "armed" : "rejected",
+            primaryTarget ? primaryTarget->GetFormID() : 0u,
+            sessionId.value_or(0),
+            durationSec,
+            reason ? reason : "unknown");
+
+        return sessionId;
+    }
+
+    bool ReleaseBleedoutSuppressSession(RE::FormID sessionId, ReleaseReason reason, const char* debugReason)
+    {
+        if (sessionId == 0) {
+            return false;
+        }
+
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished || sessionIt->second.primaryMode != Mode::BleedoutSuppress) {
+            return false;
+        }
+
+        ReleaseSession(sessionId, reason);
+        spdlog::info(
+            "[TFD][HostilityController][P14OWN] bleedout suppress released session={} reason={} debug={}",
+            sessionId,
+            ToString(reason),
+            debugReason ? debugReason : "-");
+        return true;
+    }
+
+    bool IsBleedoutSuppressed(RE::Actor* actor)
+    {
+        if (!actor) {
+            return false;
+        }
+        const auto mode = GetMode(actor);
+        return mode == Mode::BleedoutSuppress || mode == Mode::BleedoutPayReleaseSuppress;
+    }
+
+    bool IsBleedoutPayReleaseSuppressed(RE::Actor* actor)
+    {
+        return actor && GetMode(actor) == Mode::BleedoutPayReleaseSuppress;
     }
 
     std::vector<RE::Actor*> CollectInCombatStyleTruceActors(
@@ -3885,6 +5110,132 @@ namespace TFD::HostilityController
             reason ? reason : "unknown");
 
         return true;
+    }
+
+    void ArmPayDialoguePassiveGuard(RE::Actor* actor, double durationSec, const char* reason)
+    {
+        PayDialoguePassiveGuardInternal::Arm(actor, durationSec, reason ? reason : "pay_dialogue_passive_guard");
+    }
+
+    bool IsPayDialoguePassiveGuardActive(RE::Actor* actor)
+    {
+        return PayDialoguePassiveGuardInternal::IsActive(actor);
+    }
+
+    void ReleasePayDialoguePassiveGuard(RE::Actor* actor, bool restoreAggression, const char* reason)
+    {
+        PayDialoguePassiveGuardInternal::Release(actor, restoreAggression, reason ? reason : "pay_dialogue_passive_guard_release");
+    }
+
+    void ConsumePayDialoguePassiveGuardAsPersistent(RE::Actor* actor, const char* reason)
+    {
+        PayDialoguePassiveGuardInternal::ConsumePersistent(actor, reason ? reason : "pay_dialogue_passive_guard_persistent");
+    }
+
+    void ExtendPayDialoguePassiveGuardCombatBlock(RE::Actor* actor, double durationSec, const char* reason)
+    {
+        PayDialoguePassiveGuardInternal::ExtendCombatHookBlock(actor, durationSec, reason ? reason : "pay_dialogue_passive_guard_combat_hook_extend");
+    }
+
+    void MarkPayDialoguePassiveGuardRemovePacifyOnRelease(RE::Actor* actor, const char* reason)
+    {
+        PayDialoguePassiveGuardInternal::MarkRemovePacifyOnRelease(actor, reason ? reason : "pay_guard_remove_pacify_on_release");
+    }
+
+    bool IsPayDialoguePersistentTakeoverPending(RE::Actor* actor)
+    {
+        return PayDialoguePassiveGuardInternal::IsPersistentTakeoverPending(actor);
+    }
+
+    bool ShouldBlockCombatUpdateForActor(RE::Actor* actor)
+    {
+        if (!actor || actor->IsDead() || actor->IsDisabled()) {
+            return false;
+        }
+
+        // P9: never keep a recruited/teammate actor blind because of stale TFD
+        // dialogue markers.  This preserves follower assist after Recruit.
+        if (IsConfirmedPlayerSideActorForHookBypass(actor)) {
+            return false;
+        }
+
+        if (FightChoiceCombatOwnerInternal::IsActive(actor)) {
+            return false;
+        }
+
+        // P27: the Pay guard itself is a safe-pass / branch passive owner, not
+        // merely a short repair pulse.  While it is active for a hostile actor,
+        // UpdateCombat must not run; otherwise the engine can reacquire the
+        // player for a frame, draw the weapon, and then our maintenance tick
+        // sheaths it again.  Confirmed followers already bypassed above so
+        // Recruit assist is not blinded by this full-window block.
+        if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+            return true;
+        }
+
+        if (IsSuppressed(actor)) {
+            return true;
+        }
+
+        if (CaptiveSuppressionInternal::IsSuppressed(actor)) {
+            return true;
+        }
+
+        if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+            return true;
+        }
+
+        return HasActiveDialoguePhaseFaction(actor);
+    }
+
+    bool ShouldBlockPlayerSideDetection(RE::Actor* viewer, RE::Actor* target)
+    {
+        if (!viewer || !target || viewer->IsDead() || viewer->IsDisabled()) {
+            return false;
+        }
+
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        if (!player) {
+            return false;
+        }
+
+        // Only block detection attempts aimed at player/player-side actors.
+        // Do not block viewer -> hostile enemy detection; that was the old
+        // failure mode where converted followers stopped assisting the player.
+        if (!IsPlayerSideForHostilityDecision(player, target)) {
+            return false;
+        }
+
+        if (IsConfirmedPlayerSideActorForHookBypass(viewer)) {
+            return false;
+        }
+
+        if (FightChoiceCombatOwnerInternal::IsActive(viewer)) {
+            return false;
+        }
+
+        // P27: same policy as UpdateCombat.  During Pay followup / Release
+        // safe-pass, the hostile actor must not reacquire the player through
+        // detection.  This only blocks detection aimed at player/player-side
+        // targets; follower -> enemy detection is still allowed, and confirmed
+        // followers bypassed above.
+        if (PayDialoguePassiveGuardInternal::IsActive(viewer)) {
+            return true;
+        }
+
+        if (IsSuppressed(viewer)) {
+            return true;
+        }
+
+        if (CaptiveSuppressionInternal::IsSuppressed(viewer)) {
+            return true;
+        }
+
+        if (TFD::Actor::Ops::HasReleaseFollowGrace(viewer)) {
+            return true;
+        }
+
+        return HasActiveDialoguePhaseFaction(viewer);
     }
 
     bool IsFlowHandoffHoldActive(RE::Actor* actor)
@@ -4160,7 +5511,7 @@ namespace TFD::HostilityController
             if (shouldRehostileTruce) {
                 const bool drawWeapon = true;
                 const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
-                if (!satisfied || !actor->IsInCombat()) {
+                if (ShouldQueueRehostileRetryAfterForce(actor, reason, satisfied)) {
                     QueueRehostileRetry(actor, player, sessionId, reason, releaseNowSec, drawWeapon);
                 }
             }
@@ -4527,7 +5878,7 @@ namespace TFD::HostilityController
                 else if (shouldRehostileTruce) {
                     const bool drawWeapon = true;
                     const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
-                    if (!satisfied || !actor->IsInCombat()) {
+                    if (ShouldQueueRehostileRetryAfterForce(actor, reason, satisfied)) {
                         QueueRehostileRetry(actor, player, sessionId, reason, releaseNowSec, drawWeapon);
                     }
                 }
@@ -4904,7 +6255,7 @@ namespace TFD::HostilityController
         if (player && ShouldResumeCombatAfterTruceRelease(releasedEntry.mode, reason)) {
             const bool drawWeapon = true;
             const bool satisfied = ForceRehostile(actor, player, reason, drawWeapon);
-            if (!satisfied || !actor->IsInCombat()) {
+            if (ShouldQueueRehostileRetryAfterForce(actor, reason, satisfied)) {
                 QueueRehostileRetry(actor, player, sessionId, reason, SuppressionNowSec(), drawWeapon);
             }
         }
@@ -4968,6 +6319,8 @@ namespace TFD::HostilityController
 
     void ReleaseAll()
     {
+        PayDialoguePassiveGuardInternal::ReleaseAll("release_all", true);
+
         std::vector<RE::FormID> sessionIds;
         sessionIds.reserve(g_sessions.size());
 
@@ -5151,15 +6504,14 @@ namespace TFD::HostilityController
             (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
             (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
 
-            if (!actor->IsWeaponDrawn()) {
-                actor->DrawWeaponMagicHands(true);
-            }
+            // R240A: no forced draw during captive combat break; StartCombat/
+            // aggression/targeting own the hostile transition.
 
             actor->EvaluatePackage(false, true);
             actor->EvaluatePackage(true, true);
 
             const bool satisfied = ForceRehostile(actor, player, reason, true);
-            if (!satisfied || !actor->IsInCombat()) {
+            if (ShouldQueueRehostileRetryAfterForce(actor, reason, satisfied)) {
                 QueueRehostileRetry(actor, player, 0, reason, nowSec, true);
             }
 
@@ -5187,6 +6539,142 @@ namespace TFD::HostilityController
             static_cast<unsigned int>(rehostileCount));
 
         return rehostileCount;
+    }
+
+    bool BreakPassiveOwnershipForFightChoice(RE::Actor* actor, RE::Actor* player, const char* debugReason)
+    {
+        const char* why = debugReason ? debugReason : "fight_choice_final_owner";
+        if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+            spdlog::warn(
+                "[TFD][HostilityController][R148] fight owner break rejected actor={:08X} player={:08X} reason={}",
+                actor ? actor->GetFormID() : 0u,
+                player ? player->GetFormID() : 0u,
+                why);
+            return false;
+        }
+
+        const auto actorId = actor->GetFormID();
+        bool changed = false;
+
+        if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+            PayDialoguePassiveGuardInternal::Release(actor, false, why);
+            changed = true;
+        }
+
+        std::vector<RE::FormID> sessionIds;
+        sessionIds.reserve(4);
+
+        auto addSession = [&](RE::FormID sessionId) {
+            if (sessionId == 0) {
+                return;
+            }
+            if (std::find(sessionIds.begin(), sessionIds.end(), sessionId) == sessionIds.end()) {
+                sessionIds.push_back(sessionId);
+            }
+        };
+
+        if (auto entryIt = g_entries.find(actorId); entryIt != g_entries.end()) {
+            addSession(entryIt->second.sessionId);
+        }
+
+        for (const auto& [sessionId, session] : g_sessions) {
+            if (session.finished) {
+                continue;
+            }
+            if (session.primaryTargetId == actorId) {
+                addSession(sessionId);
+                continue;
+            }
+            if (std::find(session.dialogueAssignedActorIds.begin(), session.dialogueAssignedActorIds.end(), actorId) != session.dialogueAssignedActorIds.end()) {
+                addSession(sessionId);
+            }
+        }
+
+        for (RE::FormID sessionId : sessionIds) {
+            auto sessionIt = g_sessions.find(sessionId);
+            const Mode mode = sessionIt != g_sessions.end() ? sessionIt->second.primaryMode : Mode::None;
+            ReleaseSession(sessionId, ReleaseReason::FightChoice);
+            changed = true;
+            spdlog::info(
+                "[TFD][HostilityController][R148] fight owner released session actor={:08X} session={} mode={} reason={}",
+                actorId,
+                sessionId,
+                ToString(mode),
+                why);
+        }
+
+        if (auto staleEntry = g_entries.find(actorId); staleEntry != g_entries.end()) {
+            Entry releasedEntry = staleEntry->second;
+            RemoveSuppression(actor, releasedEntry);
+            g_entries.erase(staleEntry);
+            changed = true;
+            spdlog::warn(
+                "[TFD][HostilityController][R148] fight owner erased stale entry actor={:08X} session={} mode={} reason={}",
+                actorId,
+                releasedEntry.sessionId,
+                ToString(releasedEntry.mode),
+                why);
+        }
+
+        const char* passiveFactionEditorIDs[] = {
+            "TFDAfterPleasureFaction",
+            "TFDPleasureFailedFaction",
+            "TFDWorkingCaptiveFaction",
+            "TFDPacifyFaction",
+            "TFDPreCombatTruceFaction",
+            "TFDInCombatTruceFaction",
+            "TFDBleedOutFaction",
+            "TFDBleedoutFaction",
+            "TFDCaptiveFaction",
+            "TFDPleasureRejectFaction",
+            "TFDPleasureWatcherFaction",
+            "TFDDesireFaction",
+            "TFDSaviorFaction",
+            "TFDDefeatedFaction",
+            "TFDTeammateFaction",
+            "TFDExpiredTeammate"
+        };
+
+        for (const char* editorId : passiveFactionEditorIDs) {
+            changed = RemoveFactionByEditorIDForFightChoice(actor, editorId, why) || changed;
+        }
+
+        if (auto reqIt = g_rehostileRequests.find(actorId); reqIt != g_rehostileRequests.end()) {
+            if (reqIt->second.reason == ReleaseReason::FightChoice) {
+                spdlog::info(
+                    "[TFD][HostilityController][R149] fight owner preserved queued rehostile actor={:08X} session={} reason={} ownerReason={}",
+                    actorId,
+                    reqIt->second.sessionId,
+                    ToString(reqIt->second.reason),
+                    why);
+            }
+            else {
+                g_rehostileRequests.erase(reqIt);
+            }
+        }
+        TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnlyForFightChoice(actor, why);
+        FightChoiceCombatOwnerInternal::Arm(actor, 12.0, why);
+
+        ClearAggressionClamp();
+        TFD::Actor::Ops::ClearAggressorFactionContext();
+
+        changed = ForceCombatAggressionForFightChoice(actor, player, why) || changed;
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+        }
+
+        spdlog::info(
+            "[TFD][HostilityController][R148] fight owner break complete actor={:08X} player={:08X} sessionsReleased={} changed={} stillSuppressed={} reason={}",
+            actorId,
+            player->GetFormID(),
+            static_cast<unsigned int>(sessionIds.size()),
+            changed ? 1 : 0,
+            IsSuppressed(actor) ? 1 : 0,
+            why);
+
+        return changed;
     }
 
     bool ForceDetectionAndCombatRefresh(RE::Actor* actor, RE::Actor* player, ReleaseReason reason, bool drawWeapon)
@@ -5218,6 +6706,10 @@ namespace TFD::HostilityController
             return "TrucePreCombat";
         case Mode::TruceInCombat:
             return "TruceInCombat";
+        case Mode::BleedoutSuppress:
+            return "BleedoutSuppress";
+        case Mode::BleedoutPayReleaseSuppress:
+            return "BleedoutPayReleaseSuppress";
         default:
             return "Unknown";
         }

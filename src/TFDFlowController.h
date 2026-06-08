@@ -78,6 +78,10 @@ namespace TFD::FlowController
         VictoryPleasure,
         VictoryAfterPleasure,
 
+        // R223A: PleasureFailed is a terminal dialogue owner separate from
+        // AfterPleasure. It must not be counted as an AfterPleasure subflow.
+        PleasureFailedDialogue,
+
         CaptiveIdle,
         CaptivePleasure,
         CaptiveAfterPleasure,
@@ -85,7 +89,13 @@ namespace TFD::FlowController
         EscapeAttempt,
         EscapeFailed,
         Recapture,
-        JoinedEnemyIdle
+        JoinedEnemyIdle,
+
+        // R206A: Captive/Work PleasureFailed > Fight is not generic InCombat or
+        // generic Bleedout.  It is an escape-break combat overlay that must
+        // preserve Captive/Work context for the next terminal dialogue.
+        InCombatEscapeBreak,
+        BleedoutEscapeBreak
     };
 
     enum class PreCombatOutcome : std::uint8_t
@@ -413,6 +423,7 @@ namespace TFD::FlowController
 
         bool RequestPreCombat(std::uint32_t actorFormID, std::string_view reason);
         bool RequestInCombat(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestInCombatEscapeBreak(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason);
         bool RequestVictory(std::uint32_t actorFormID, std::string_view reason);
 
@@ -429,6 +440,8 @@ namespace TFD::FlowController
         bool RequestResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
 
         bool RequestBeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
+        bool RequestBeginPleasureFailed(std::uint32_t actorFormID, int sourceFlow, std::string_view reason);
+        bool RequestResumePleasureFromPleasureFailed(std::uint32_t actorFormID, int sourceFlow, std::string_view reason);
         bool RequestCompleteAfterPleasure(std::string_view reason);
         bool RequestCompleteTerminalContext(std::string_view reason);
         bool RequestAbortPreCombat(std::uint32_t actorFormID, std::string_view reason);
@@ -453,6 +466,8 @@ namespace TFD::FlowController
         bool ResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
 
         bool BeginAfterPleasure(std::uint32_t actorFormID, std::string_view reason);
+        bool BeginPleasureFailed(std::uint32_t actorFormID, int sourceFlow, std::string_view reason);
+        bool ResumePleasureFromPleasureFailed(std::uint32_t actorFormID, int sourceFlow, std::string_view reason);
         bool CompleteAfterPleasure(std::string_view reason);
         bool CompleteTerminalContext(std::string_view reason);
         bool AbortPreCombat(std::uint32_t actorFormID, std::string_view reason);
@@ -474,6 +489,9 @@ namespace TFD::FlowController
         bool IsRecoveryRootActive() const;
         bool IsLeftForDeadRootActive() const;
         bool IsCaptiveEscapeContextActive() const;
+        bool IsCaptiveEscapeBreakContextActive() const;
+        bool IsCaptiveCombatEscapeBreakContextActive() const;
+        bool IsPleasureFailedSubFlowActive() const;
         bool IsPleasureSubFlowActive() const;
         bool IsAfterPleasureSubFlowActive() const;
         bool IsInCombatAfterPleasureContextActive() const;

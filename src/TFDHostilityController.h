@@ -17,7 +17,9 @@ namespace TFD::HostilityController
         None = 0,
         Tame,
         TrucePreCombat,
-        TruceInCombat
+        TruceInCombat,
+        BleedoutSuppress,
+        BleedoutPayReleaseSuppress
     };
 
     enum class ReleaseReason : std::uint8_t
@@ -59,6 +61,12 @@ namespace TFD::HostilityController
         double lastSuppressionApplySec{ 0.0 };
         double lastPackageEvalSec{ 0.0 };
 
+        float originalAggression{ 0.0f };
+        bool hasOriginalAggression{ false };
+        bool hadPacifyFaction{ false };
+        bool addedPacifyFaction{ false };
+        bool stablePacifyInitialized{ false };
+
         TFD::Tame::TameDisposition disposition{ static_cast<TFD::Tame::TameDisposition>(0) };
         bool temporaryTeammateApplied{ false };
         bool allowDialogue{ false };
@@ -98,6 +106,7 @@ namespace TFD::HostilityController
     };
 
     void Reset();
+    void ResetForLoad();
     void Update(double nowSec);
 
     std::optional<RE::FormID> BeginTrucePreCombatSession(
@@ -120,11 +129,66 @@ namespace TFD::HostilityController
         double durationSec,
         float radius);
 
+    // P14OWN: Bleedout owns its own suppression. It must not borrow
+    // TruceInCombat/Tame sessions because that makes InCombat bridge events,
+    // truce_spent, ignoreSpent retry, and tame promotion leak into Bleedout.
+    std::optional<RE::FormID> BeginBleedoutSuppressSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec = 0.0,
+        bool applyCellBubble = false,
+        float radius = 0.0f,
+        const char* reason = nullptr);
+
+    std::optional<RE::FormID> BeginBleedoutSuppressBurst(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec,
+        float radius,
+        const char* reason = nullptr);
+
+    // P15BOWN: Bleedout Pay is terminal PayRelease, not a linked Pay > Release branch.
+    // This final owner starts after dialogue cleanup, so cleanup cannot kill it in the same frame.
+    std::optional<RE::FormID> BeginBleedoutPayReleaseSuppressSession(
+        RE::Actor* player,
+        RE::Actor* primaryTarget,
+        double nowSec,
+        double durationSec = 0.0,
+        const char* reason = nullptr);
+
+    bool ReleaseBleedoutSuppressSession(
+        RE::FormID sessionId,
+        ReleaseReason reason = ReleaseReason::Generic,
+        const char* debugReason = nullptr);
+    bool IsBleedoutSuppressed(RE::Actor* actor);
+    bool IsBleedoutPayReleaseSuppressed(RE::Actor* actor);
+
     bool IsSuppressed(RE::Actor* actor);
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
     bool PreserveTruceSessionForFlowHandoff(RE::Actor* primaryTarget, double durationSec, const char* reason = nullptr);
     bool IsFlowHandoffHoldActive(RE::Actor* actor);
+
+    // P5PAY: lightweight in-dialogue passive guard for CK Pay linked topics.
+    // This is not a dialogue closer and not a terminal outcome owner. It only
+    // prevents old truce/session cleanup from restoring aggression between
+    // Pay and the real follow-up choice.
+    void ArmPayDialoguePassiveGuard(RE::Actor* actor, double durationSec = 30.0, const char* reason = nullptr);
+    bool IsPayDialoguePassiveGuardActive(RE::Actor* actor);
+    void ReleasePayDialoguePassiveGuard(RE::Actor* actor, bool restoreAggression = true, const char* reason = nullptr);
+    void ConsumePayDialoguePassiveGuardAsPersistent(RE::Actor* actor, const char* reason = nullptr);
+    void ExtendPayDialoguePassiveGuardCombatBlock(RE::Actor* actor, double durationSec = 5.0, const char* reason = nullptr);
+    void MarkPayDialoguePassiveGuardRemovePacifyOnRelease(RE::Actor* actor, const char* reason = nullptr);
+    bool IsPayDialoguePersistentTakeoverPending(RE::Actor* actor);
+
+    // P9: hook-facing suppression is split. UpdateCombat may be blocked during
+    // a short passive handoff, but DoDetect is only blocked when a still-hostile
+    // actor tries to detect the player/player-side. Do not blind converted
+    // followers or block follower detection of enemies.
+    bool ShouldBlockCombatUpdateForActor(RE::Actor* actor);
+    bool ShouldBlockPlayerSideDetection(RE::Actor* viewer, RE::Actor* target);
     [[nodiscard]] std::vector<RE::Actor*> CollectActiveTruceActors(RE::Actor* primaryTarget);
     [[nodiscard]] std::vector<RE::Actor*> CollectDialogueTruceActors(RE::Actor* primaryTarget);
     [[nodiscard]] std::vector<RE::Actor*> CollectInCombatStyleTruceActors(
@@ -158,6 +222,11 @@ namespace TFD::HostilityController
         RE::Actor* actor,
         ReleaseReason reason = ReleaseReason::DialogueClosed,
         bool onlyIfStillHostile = false);
+    bool BreakPassiveOwnershipForFightChoice(
+        RE::Actor* actor,
+        RE::Actor* player,
+        const char* debugReason = nullptr);
+
     bool ForceDetectionAndCombatRefresh(
         RE::Actor* actor,
         RE::Actor* player,
@@ -200,6 +269,7 @@ namespace TFD::HostilityController
         bool forceTriggerActor = true);
 
     void ClearAllTemporaryHostility();
+    void ArmFightChoiceCombatOwnerBypass(RE::Actor* actor, double durationSec = 12.0, const char* reason = nullptr);
 
     struct BleedTruceRuntimeProviders
     {

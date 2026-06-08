@@ -895,7 +895,7 @@ namespace TFD::Tame
         if (actor->IsInCombat()) {
             actor->StopCombat();
         }
-        actor->DrawWeaponMagicHands(false);
+        // R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
         spdlog::info("[TFD][Tame] defeated creature recruit actor={:08X}", actor->GetFormID());
         return true;
     }

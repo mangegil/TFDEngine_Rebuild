@@ -386,7 +386,8 @@ namespace TFDMenu
 
 				const auto phase = TFD::PleasureRuntime::GetPhase();
 				if (phase != TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest &&
-					phase != TFD::PleasureRuntime::Phase::AfterPleasureDialogue) {
+					phase != TFD::PleasureRuntime::Phase::AfterPleasureDialogue &&
+					phase != TFD::PleasureRuntime::Phase::PleasureFailedDialogue) {
 					return false;
 				}
 
@@ -409,16 +410,17 @@ namespace TFDMenu
 					process->StopCombatAndAlarmOnActor(actor, false);
 				}
 				if (actor->IsWeaponDrawn()) {
-					actor->DrawWeaponMagicHands(false);
+					// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 				}
 				actor->EvaluatePackage(false, true);
 				actor->EvaluatePackage(true, true);
 
 				spdlog::info(
-					"[TFD][Menu][R109] after pleasure activation prepared actor={:08X} phase={} source={} reason={} action=prepared_for_native_activation",
+					"[TFD][Menu][R226A] pleasure terminal activation prepared actor={:08X} phase={} source={} failedActive={} reason={} action=prepared_for_native_activation",
 					actor->GetFormID(),
 					TFD::PleasureRuntime::GetPhaseName(),
 					TFD::PleasureRuntime::GetSourceContextName(),
+					TFD::PleasureRuntime::IsPleasureFailedDialogueActive() ? 1 : 0,
 					reason ? reason : "after_pleasure_activation");
 				return true;
 			}
@@ -526,7 +528,9 @@ namespace TFDMenu
 
 						ResolveGlobals();
 						const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
-						if ((!openReport && assignmentState != 1) || (openReport && assignmentState != 3)) {
+						const bool openWorkOffer = !openReport && assignmentState == 1;
+						const bool openReportOffer = openReport && (assignmentState == 3 || assignmentState == 7);
+						if (!openWorkOffer && !openReportOffer) {
 							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} assignment={} ({}) report={} reason={} action=assignment_changed",
 								serial,
 								actorFormID,
@@ -546,7 +550,7 @@ namespace TFDMenu
 							process->StopCombatAndAlarmOnActor(actor, false);
 						}
 						if (actor->IsWeaponDrawn()) {
-							actor->DrawWeaponMagicHands(false);
+							// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 						}
 						actor->EvaluatePackage(false, true);
 						actor->EvaluatePackage(true, true);
@@ -614,25 +618,13 @@ namespace TFDMenu
 
 				ResolveGlobals();
 				const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
-				if (assignmentState == 7) {
-					actor->SetDialogueWithPlayer(false, false, nullptr);
-					spdlog::info("[TFD][Menu][Work][C38] activate blocked work actor={:08X} currentBoss={} reason={} assignment={} ({}) action=block_cooldown_dialogue",
+				const bool escapeBreakActive = TFD::FlowController::Controller::GetSingleton().IsCaptiveEscapeBreakContextActive();
+				if (escapeBreakActive) {
+					TFD::Captive::ClearReleasedWorkDialogueActorForCombatBreak(actor, "work_activation_escape_break_pre_block");
+					spdlog::info("[TFD][Menu][Work][R222A] activate blocked during escape-break before work actor prepare actor={:08X} assignment={} ({}) reason={} action=block_escape_break_before_prepare",
 						actor->GetFormID(),
-						isCurrentBoss ? 1 : 0,
-						reason ? reason : "work_activation",
 						assignmentState,
-						DecodeWorkAssignmentState(assignmentState));
-					return WorkActivationResult::kStop;
-				}
-
-				// WorkBoss owns the quest objective and marker.  Only the current Boss
-				// alias may open Working/Report dialogue; other captors remain captive
-				// ambience and must not be promoted into job givers by activation.
-				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_activation_current_boss")) {
-					actor->SetDialogueWithPlayer(false, false, nullptr);
-					spdlog::info("[TFD][Menu][Work] activate blocked work boss actor={:08X} inScope={} reason={} action=prepare_failed",
-						actor->GetFormID(),
-						inWorkScope ? 1 : 0,
+						DecodeWorkAssignmentState(assignmentState),
 						reason ? reason : "work_activation");
 					return WorkActivationResult::kStop;
 				}
@@ -649,10 +641,22 @@ namespace TFDMenu
 
 				if (assignmentState == 4) {
 					actor->SetDialogueWithPlayer(false, false, nullptr);
-					spdlog::info("[TFD][Menu][Work] activate blocked boss during pleasure assignment boss={:08X} assignment={} ({}) reason={} action=block_during_work_pleasure",
+					spdlog::info("[TFD][Menu][Work][R222A] activate blocked boss during pleasure assignment before work actor prepare boss={:08X} assignment={} ({}) reason={} action=block_during_work_pleasure_before_prepare",
 						actor->GetFormID(),
 						assignmentState,
 						DecodeWorkAssignmentState(assignmentState),
+						reason ? reason : "work_activation");
+					return WorkActivationResult::kStop;
+				}
+
+				// WorkBoss owns the quest objective and marker.  Only the current Boss
+				// alias may open Working/Report dialogue; other captors remain captive
+				// ambience and must not be promoted into job givers by activation.
+				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_activation_current_boss")) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] activate blocked work boss actor={:08X} inScope={} reason={} action=prepare_failed",
+						actor->GetFormID(),
+						inWorkScope ? 1 : 0,
 						reason ? reason : "work_activation");
 					return WorkActivationResult::kStop;
 				}
@@ -666,7 +670,7 @@ namespace TFDMenu
 					process->StopCombatAndAlarmOnActor(actor, false);
 				}
 				if (actor->IsWeaponDrawn()) {
-					actor->DrawWeaponMagicHands(false);
+					// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
 				}
 				actor->EvaluatePackage(false, true);
 				actor->EvaluatePackage(true, true);
@@ -679,13 +683,13 @@ namespace TFDMenu
 				s_lastWorkActivationActor = actor->GetFormID();
 				s_nextWorkActivationOpenAt = Clock::now() + std::chrono::milliseconds(900);
 
-				const bool openReport = assignmentState == 3;
+				const bool openReport = assignmentState == 3 || assignmentState == 7;
 				auto* targetGreetInfo = openReport ? ResolveCaptiveReportGreetTopicInfo() : ResolveCaptiveWorkingGreetTopicInfo();
 				ClearInteractionStateValue();
 				SetGlobalInt(gDialogueState, 0);
 				QueueCaptiveWorkDialogueOpen(actor, targetGreetInfo, openReport, reason ? reason : "work_activation_delayed_native_open");
-				spdlog::info("[TFD][Menu][Work] activate queued {} dialogue actor={:08X} currentBoss={} reason={} assignment={} ({}) topicInfo={:08X} explicit={} markerStable=1 interactionCleared=1 dialogueState=0 action=queue_delayed_native_open_block_vanilla",
-					openReport ? "report" : "working",
+				spdlog::info("[TFD][Menu][Work][R208B] activate queued {} dialogue actor={:08X} currentBoss={} reason={} assignment={} ({}) topicInfo={:08X} explicit={} markerStable=1 interactionCleared=1 dialogueState=0 action=queue_delayed_native_open_block_vanilla",
+					openReport ? (assignmentState == 7 ? "report_rework" : "report") : "working",
 					actor->GetFormID(),
 					isCurrentBoss ? 1 : 0,
 					reason ? reason : "work_activation",
@@ -1085,7 +1089,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 			case 2: return "Doing Work";
 			case 3: return "Return Report";
 			case 4: return "Pleasure Active";
-			case 7: return "Cooldown";
+			case 7: return "Rework";
 			default: return "Custom";
 			}
 		}
@@ -2385,9 +2389,11 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 					!targetPlayer &&
 					!targetPlayerSide &&
 					info.currentTargetFormID == 0;
+				// P8: match runtime truce acquisition. InCombat candidate status is
+				// target-driven; a non-zero target that is not player-side is not valid.
 				const bool inCombatContext =
 					actorInCombat &&
-					(targetPlayer || targetPlayerSide || info.currentTargetFormID != 0);
+					(targetPlayer || targetPlayerSide);
 				const bool preCombatTruceAble = truceAble && preCombatContext;
 				const bool inCombatTruceAble = truceAble && inCombatContext;
 
@@ -2720,7 +2726,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 											process->StopCombatAndAlarmOnActor(teammateTalkTarget, false);
 										}
 										if (teammateTalkTarget->IsWeaponDrawn()) {
-											teammateTalkTarget->DrawWeaponMagicHands(false);
+											// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: teammateTalkTarget->DrawWeaponMagicHands(false);
 										}
 									}
 

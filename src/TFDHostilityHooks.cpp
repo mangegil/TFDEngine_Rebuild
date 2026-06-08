@@ -43,9 +43,14 @@ namespace TFD::HostilityHooks
             }
 
         private:
-            static bool IsScopedSuppressed(RE::Actor* actor)
+            static bool ShouldBlockUpdateCombat(RE::Actor* actor)
             {
-                return actor && TFD::HostilityController::IsActorTemporarilySuppressed(actor);
+                return actor && TFD::HostilityController::ShouldBlockCombatUpdateForActor(actor);
+            }
+
+            static bool ShouldBlockDoDetect(RE::Actor* viewer, RE::Actor* target)
+            {
+                return viewer && target && TFD::HostilityController::ShouldBlockPlayerSideDetection(viewer, target);
             }
 
             // R100C: Keep the virtual UpdateCombat hook lightweight.
@@ -64,7 +69,7 @@ namespace TFD::HostilityHooks
             static void UpdateCombat(RE::Character* character)
             {
                 auto* actor = static_cast<RE::Actor*>(character);
-                if (IsScopedSuppressed(actor)) {
+                if (ShouldBlockUpdateCombat(actor)) {
                     return;
                 }
 
@@ -83,7 +88,7 @@ namespace TFD::HostilityHooks
                 float& unk09,
                 float& unk10)
             {
-                if (IsScopedSuppressed(viewer) || IsScopedSuppressed(target)) {
+                if (ShouldBlockDoDetect(viewer, target)) {
                     detectVal = -1000;
                     return nullptr;
                 }

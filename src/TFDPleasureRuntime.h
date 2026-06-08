@@ -15,6 +15,7 @@ namespace TFD::PleasureRuntime
 		PleasureEnding,
 		AfterPleasureAwaitQuest,
 		AfterPleasureDialogue,
+		PleasureFailedDialogue,
 		RedoPending,
 		Finalizing,
 		Closed

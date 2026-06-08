@@ -99,6 +99,7 @@ namespace TFD::Transition
 	void HideBlackoutFader();
 
 	void ClearNoMarkerFallbackState();
+	void AbortCalmWindowForCombat(RE::Actor* actor = nullptr, const char* reason = nullptr);
 	bool IsRecoveryActive();
 	bool HasRecoveryPotionAvailable();
 	void BeginLeftForDeadCooldown(int seconds);

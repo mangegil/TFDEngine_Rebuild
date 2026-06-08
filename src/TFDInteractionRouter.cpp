@@ -307,7 +307,29 @@ namespace TFD::InteractionRouter
             if (!actor || !player) {
                 return -1.0e30f;
             }
+            const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+            if (flowSnapshot.sub == TFD::FlowController::SubFlow::PreCombatPayFollowup &&
+                flowSnapshot.primaryActorFormID != 0) {
+                spdlog::info(
+                    "[TFD][Router][R143] reject truce target={:08X} reason=precombat_pay_followup_owner primary={:08X} desired={}",
+                    actor->GetFormID(),
+                    flowSnapshot.primaryActorFormID,
+                    static_cast<int>(desiredAction));
+                return -1.0e30f;
+            }
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(actor)) {
+                spdlog::info(
+                    "[TFD][Router][R142] reject truce target={:08X} reason=temporary_follow_lock",
+                    actor->GetFormID());
+                return -1.0e30f;
+            }
             if (IsPlayerSideActor(actor, player)) {
+                return -1.0e30f;
+            }
+            if (TFD::Actor::Ops::HasReleaseFollowGrace(actor)) {
+                spdlog::info(
+                    "[TFD][Router][R141] reject truce target={:08X} reason=release_follow_grace",
+                    actor->GetFormID());
                 return -1.0e30f;
             }
             if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
@@ -322,6 +344,7 @@ namespace TFD::InteractionRouter
             bool targetingPlayerSide = false;
             bool actorInCombat = false;
             ResolveSnapshotTargetContext(snapshot, actor, player, info, targetPlayer, targetingPlayerSide, actorInCombat);
+            const bool activelyTargetingPlayerSide = targetPlayer || targetingPlayerSide;
 
             const bool committedHostile = actorInCombat || targetingPlayerSide;
 
@@ -397,11 +420,11 @@ namespace TFD::InteractionRouter
             }
 
             if (desiredAction == Action::TruceInCombat) {
-                const bool inCombatContext = actorInCombat && (targetPlayer || targetingPlayerSide || info.currentTargetFormID != 0);
+                const bool inCombatContext = actorInCombat && activelyTargetingPlayerSide;
                 if (!inCombatContext) {
                     if (classify.valid && classify.intent == TFD::Actor::Interaction::Intent::Truce) {
                         spdlog::info(
-                            "[TFD][Router] reject incombat target={:08X} reason=context combat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
+                            "[TFD][Router][P8TRUCE] reject incombat target={:08X} reason=not_targeting_player_side combat={} targetPlayer={} targetPlayerSide={} currentTarget={:08X}",
                             actor->GetFormID(),
                             actorInCombat ? 1 : 0,
                             targetPlayer ? 1 : 0,
@@ -566,6 +589,16 @@ namespace TFD::InteractionRouter
                     target ? target->GetFormID() : 0u);
             }
 
+            if (TFD::Actor::Ops::HasTemporaryFollowLock(target)) {
+                spdlog::info(
+                    "[TFD][Router][R144] reject target={:08X} reason=temporary_follow_lock_direct",
+                    target->GetFormID());
+                return MakeResolveFailure(
+                    FailReason::TargetRejected,
+                    player->GetFormID(),
+                    target->GetFormID());
+            }
+
             if (IsPlayerSideActor(target, player->As<RE::PlayerCharacter>())) {
                 spdlog::info(
                     "[TFD][Router] reject target={:08X} reason=player_side_actor",
@@ -607,14 +640,25 @@ namespace TFD::InteractionRouter
                     target->GetFormID());
             }
 
-            if (classify.intent == TFD::Actor::Interaction::Intent::Truce && targetInCombat && !enemyToPlayer) {
-                spdlog::info(
-                    "[TFD][Router] reject target={:08X} reason=not_enemy_to_player_incombat",
-                    target->GetFormID());
-                return MakeResolveFailure(
-                    FailReason::TargetRejected,
-                    player->GetFormID(),
-                    target->GetFormID());
+            if (classify.intent == TFD::Actor::Interaction::Intent::Truce && targetInCombat) {
+                auto* pc = player->As<RE::PlayerCharacter>();
+                if (!pc) {
+                    pc = RE::PlayerCharacter::GetSingleton();
+                }
+                const bool targetingPlayerSide = IsActorActivelyTargetingPlayerSide(target, pc);
+                if (!enemyToPlayer || !targetingPlayerSide) {
+                    auto* currentTarget = ResolveCurrentCombatTarget(target);
+                    spdlog::info(
+                        "[TFD][Router][P8TRUCE] reject target={:08X} reason=incombat_requires_player_side_target enemyToPlayer={} targetingPlayerSide={} currentTarget={:08X}",
+                        target->GetFormID(),
+                        enemyToPlayer ? 1 : 0,
+                        targetingPlayerSide ? 1 : 0,
+                        currentTarget ? currentTarget->GetFormID() : 0u);
+                    return MakeResolveFailure(
+                        FailReason::TargetRejected,
+                        player->GetFormID(),
+                        target->GetFormID());
+                }
             }
 
             const Action action = ResolveIntentAction(classify.intent, targetInCombat);
@@ -1691,15 +1735,17 @@ namespace TFD::InteractionRouter
             constexpr auto kPreCombatRangeGateLogInterval = std::chrono::milliseconds(900);
             constexpr auto kApproachRefreshInterval = std::chrono::milliseconds(900);
             constexpr auto kPreCombatApproachAssistDelay = std::chrono::milliseconds(10000);
-            constexpr auto kBleedoutApproachAssistDelay = std::chrono::milliseconds(10000);
+            constexpr auto kInCombatApproachAssistDelay = std::chrono::milliseconds(10000);
+            constexpr auto kBleedoutApproachAssistDelay = std::chrono::milliseconds(0);
             constexpr auto kCaptiveApproachAssistDelay = std::chrono::milliseconds(10000);
             constexpr float kPreCombatForceGreetMaxDistance = 420.0f;
             constexpr float kPreCombatApproachAssistDistance = 240.0f;
             constexpr float kCaptiveApproachAssistDistance = 240.0f;
             constexpr float kPreCombatForceGreetMaxDistanceSq = kPreCombatForceGreetMaxDistance * kPreCombatForceGreetMaxDistance;
-            constexpr float kInCombatForceGreetMaxDistance = 160.0f;
+            constexpr float kInCombatForceGreetMaxDistance = 420.0f;
+            constexpr float kInCombatApproachAssistDistance = 240.0f;
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
-            constexpr float kBleedoutForceGreetMaxDistance = 320.0f;
+            constexpr float kBleedoutForceGreetMaxDistance = 900.0f;
             constexpr float kBleedoutForceGreetMaxDistanceSq = kBleedoutForceGreetMaxDistance * kBleedoutForceGreetMaxDistance;
             constexpr float kCaptiveForceGreetMaxDistance = 360.0f;
             constexpr float kCaptiveForceGreetMaxDistanceSq = kCaptiveForceGreetMaxDistance * kCaptiveForceGreetMaxDistance;
@@ -1803,6 +1849,48 @@ namespace TFD::InteractionRouter
                 }
             }
 
+			bool IsCaptivePleasureConditionContext()
+			{
+				if (TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Captive) {
+					return true;
+				}
+
+				const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+				if (snapshot.root == TFD::FlowController::RootFlow::Captive ||
+					snapshot.contextRoot == TFD::FlowController::RootFlow::Captive) {
+					return true;
+				}
+
+				switch (snapshot.sub) {
+				case TFD::FlowController::SubFlow::CaptiveIdle:
+				case TFD::FlowController::SubFlow::CaptivePleasure:
+				case TFD::FlowController::SubFlow::CaptiveAfterPleasure:
+				case TFD::FlowController::SubFlow::WorkForEnemy:
+				case TFD::FlowController::SubFlow::EscapeAttempt:
+				case TFD::FlowController::SubFlow::EscapeFailed:
+				case TFD::FlowController::SubFlow::Recapture:
+				case TFD::FlowController::SubFlow::InCombatEscapeBreak:
+				case TFD::FlowController::SubFlow::BleedoutEscapeBreak:
+					return true;
+				default:
+					break;
+				}
+
+				return TFD::Captive::IsActive() ||
+					TFD::Captive::IsReleasedWorkActive() ||
+					TFD::Captive::IsEscapeBleedoutActive();
+			}
+
+			int ResolveCaptivePleasureConditionValue()
+			{
+				int value = static_cast<int>(TFD::Captive::GetPhaseRaw());
+				if (value == static_cast<int>(TFD::Captive::PhaseValue::None) ||
+					value == static_cast<int>(TFD::Captive::PhaseValue::Scene)) {
+					value = static_cast<int>(TFD::Captive::PhaseValue::Captive);
+				}
+				return value;
+			}
+
             void SyncApproachConditionGlobals(Mode mode, const char* reason)
             {
                 if (mode != Mode::PreCombatTruce &&
@@ -1838,9 +1926,15 @@ namespace TFD::InteractionRouter
                     break;
                 case Mode::AfterPleasure:
                     pleasure = 2;
+                    if (IsCaptivePleasureConditionContext()) {
+                        captive = ResolveCaptivePleasureConditionValue();
+                    }
                     break;
                 case Mode::PleasureFailed:
                     pleasure = 3;
+                    if (IsCaptivePleasureConditionContext()) {
+                        captive = ResolveCaptivePleasureConditionValue();
+                    }
                     break;
                 default:
                     break;
@@ -1858,7 +1952,7 @@ namespace TFD::InteractionRouter
                 SetDialogueStateValue(1);
 
                 spdlog::info(
-                    "[TFD][DialogueOpen][R137] condition globals synced mode={} pre={} in={} captive={} defeat={} victory={} pleasure={} dialogue=1 reason={}",
+                    "[TFD][DialogueOpen][R202B] condition globals synced mode={} pre={} in={} captive={} defeat={} victory={} pleasure={} dialogue=1 pleasureSource={} captiveCtx={} reason={}",
                     ModeName(mode),
                     preCombat,
                     inCombat,
@@ -1866,6 +1960,8 @@ namespace TFD::InteractionRouter
                     defeat,
                     victory,
                     pleasure,
+                    TFD::PleasureRuntime::GetSourceContextName(),
+                    IsCaptivePleasureConditionContext() ? 1 : 0,
                     reason ? reason : "unknown");
             }
 
@@ -1878,7 +1974,23 @@ namespace TFD::InteractionRouter
                     attempted = true;
                     faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDAfterPleasureFaction");
                     if (!faction) {
-                        spdlog::warn("[TFD][DialogueOpen] TFDAfterPleasureFaction unresolved; after-pleasure/pleasure-failed CK conditions may reject dialogue");
+                        spdlog::warn("[TFD][DialogueOpen] TFDAfterPleasureFaction unresolved; after-pleasure CK conditions may reject dialogue");
+                    }
+                }
+
+                return faction;
+            }
+
+            RE::TESFaction* ResolvePleasureFailedDialogueFaction()
+            {
+                static RE::TESFaction* faction = nullptr;
+                static bool attempted = false;
+
+                if (!attempted) {
+                    attempted = true;
+                    faction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPleasureFailedFaction");
+                    if (!faction) {
+                        spdlog::warn("[TFD][DialogueOpen][R203A] TFDPleasureFailedFaction unresolved; pleasure-failed CK conditions may reject dialogue");
                     }
                 }
 
@@ -1891,9 +2003,23 @@ namespace TFD::InteractionRouter
                     return false;
                 }
 
-                auto* faction = ResolveAfterPleasureDialogueFaction();
+                auto* faction = mode == Mode::PleasureFailed ?
+                    ResolvePleasureFailedDialogueFaction() :
+                    ResolveAfterPleasureDialogueFaction();
                 if (!faction) {
                     return false;
+                }
+
+                if (mode == Mode::PleasureFailed) {
+                    if (auto* afterFaction = ResolveAfterPleasureDialogueFaction()) {
+                        if (speaker->IsInFaction(afterFaction)) {
+                            speaker->RemoveFromFaction(afterFaction);
+                            spdlog::info(
+                                "[TFD][DialogueOpen][R203A] stripped after-pleasure marker for pleasure-failed speaker={:08X} reason={}",
+                                speaker->GetFormID(),
+                                reason ? reason : "unknown");
+                        }
+                    }
                 }
 
                 const bool alreadyHadFaction = speaker->IsInFaction(faction);
@@ -1902,9 +2028,10 @@ namespace TFD::InteractionRouter
                 }
 
                 spdlog::info(
-                    "[TFD][DialogueOpen] after-pleasure speaker marker ensured mode={} speaker={:08X} added={} hadFaction={} reason={}",
+                    "[TFD][DialogueOpen][R203A] dialogue marker ensured mode={} speaker={:08X} marker={} added={} hadFaction={} reason={}",
                     ModeName(mode),
                     speaker->GetFormID(),
+                    mode == Mode::PleasureFailed ? "TFDPleasureFailedFaction" : "TFDAfterPleasureFaction",
                     alreadyHadFaction ? 0 : 1,
                     alreadyHadFaction ? 1 : 0,
                     reason ? reason : "unknown");
@@ -2494,6 +2621,71 @@ namespace TFD::InteractionRouter
             }
 
 
+            bool AssistInCombatApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
+            {
+                if (!player || !speaker || speaker == player) {
+                    return false;
+                }
+
+                if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+
+                std::vector<RE::Actor*> actors = TFD::HostilityController::CollectDialogueTruceActors(speaker);
+                if (actors.empty()) {
+                    actors.push_back(speaker);
+                }
+
+                if (std::find(actors.begin(), actors.end(), speaker) == actors.end()) {
+                    actors.insert(actors.begin(), speaker);
+                }
+                else if (actors.front() != speaker) {
+                    actors.erase(std::remove(actors.begin(), actors.end(), speaker), actors.end());
+                    actors.insert(actors.begin(), speaker);
+                }
+
+                EnsureDialogueAssistCrowdFallback(actors, speaker);
+
+                unsigned movedCount = 0;
+                unsigned crowdMovedCount = 0;
+                for (std::size_t i = 0; i < actors.size(); ++i) {
+                    auto* actor = actors[i];
+                    if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                        continue;
+                    }
+
+                    float yawOffset = 0.0f;
+                    float distance = kInCombatApproachAssistDistance;
+                    const char* role = i == 0 ? "speaker" : "crowd";
+
+                    if (i > 0) {
+                        const float side = (i % 2) == 1 ? 1.0f : -1.0f;
+                        const float ring = static_cast<float>((i - 1) / 2);
+                        yawOffset = side * (0.75f + (0.20f * ring));
+                        distance = kInCombatApproachAssistDistance + 70.0f + (30.0f * ring);
+                    }
+
+                    if (MoveActorNearPlayerForApproach(player, actor, yawOffset, distance, role, reason, "InCombatTruce", kInCombatForceGreetMaxDistance)) {
+                        ++movedCount;
+                        if (i > 0) {
+                            ++crowdMovedCount;
+                        }
+                    }
+                }
+
+                const auto participantCount = static_cast<unsigned>(actors.size());
+                spdlog::warn(
+                    "[TFD][DialogueOpen][R149] approach assist moveto group mode=InCombatTruce speaker={:08X} moved={} crowdMoved={} participants={} reason={}",
+                    speaker->GetFormID(),
+                    movedCount,
+                    crowdMovedCount,
+                    participantCount,
+                    reason ? reason : "unknown");
+
+                return movedCount > 0;
+            }
+
+
             bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
             {
                 if (!actor || !editorID || !editorID[0]) {
@@ -2737,7 +2929,19 @@ namespace TFD::InteractionRouter
                     mode == Mode::PleasureFailed;
             }
 
-            void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset)
+            bool ShouldPreservePleasureFailedDrawnPosture(Mode mode, RE::Actor* speaker)
+            {
+                // R253A: The OStim/dialogue handoff can report weaponDrawn=false
+                // after the stance graph has already become fragile.  PleasureFailed
+                // uses a hard topic open, so it must never rely on StopCombat or
+                // package refresh to become dialogue-safe.
+                return mode == Mode::PleasureFailed &&
+                    speaker &&
+                    !speaker->IsDead() &&
+                    !speaker->IsDisabled();
+            }
+
+            void PrepareSpeakerForDialogue(RE::PlayerCharacter* player, RE::Actor* speaker, bool hardReset, Mode mode)
             {
                 if (!player || !speaker) {
                     return;
@@ -2753,8 +2957,25 @@ namespace TFD::InteractionRouter
                     speaker->SetDialogueWithPlayer(false, false, nullptr);
                 }
 
-                speaker->EvaluatePackage(false, true);
-                speaker->EvaluatePackage(true, true);
+                // R253A: PleasureFailed hard-forcegreet must not reevaluate package.
+                // BO11/R252A showed the broken state is created before the Fight
+                // choice: package refresh can settle the actor into idle posture while
+                // the weapon graph remains dirty.  The topic is opened directly by
+                // SetDialogueWithPlayer, so skip package settle for PleasureFailed.
+                const bool preserveDrawnPosture = ShouldPreservePleasureFailedDrawnPosture(mode, speaker);
+                if (!preserveDrawnPosture) {
+                    speaker->EvaluatePackage(false, true);
+                    speaker->EvaluatePackage(true, true);
+                }
+                else {
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R253A] preserve pleasure failed posture during dialogue package refresh mode={} speaker={:08X} hardReset={} inCombat={} weaponDrawn={}",
+                        ModeName(mode),
+                        speaker->GetFormID(),
+                        hardReset ? 1 : 0,
+                        speaker->IsInCombat() ? 1 : 0,
+                        speaker->IsWeaponDrawn() ? 1 : 0);
+                }
             }
 
             void RefreshApproachPackage(RE::PlayerCharacter* player, RE::Actor* speaker)
@@ -2785,7 +3006,7 @@ namespace TFD::InteractionRouter
                 }
             }
 
-            void PrepareSpeakerForNativeDialogueOpen(RE::PlayerCharacter* player, RE::Actor* speaker)
+            void PrepareSpeakerForNativeDialogueOpen(RE::PlayerCharacter* player, RE::Actor* speaker, Mode mode)
             {
                 if (!player || !speaker) {
                     return;
@@ -2797,8 +3018,21 @@ namespace TFD::InteractionRouter
 
                 speaker->AllowPCDialogue(true);
 
-                if (speaker->IsInCombat()) {
+                // R253A: For PleasureFailed forcegreet, do not call StopCombat.
+                // StopCombat/Alarm + package settle is the path that produced BO11's
+                // idle-with-weapon-in-hand actor before Fight was selected.  Other
+                // forcegreet modes keep the old safe dialogue prep.
+                const bool preserveDrawnPosture = ShouldPreservePleasureFailedDrawnPosture(mode, speaker);
+                if (!preserveDrawnPosture && speaker->IsInCombat()) {
                     speaker->StopCombat();
+                }
+                else if (preserveDrawnPosture) {
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R253A] preserve pleasure failed posture during native open mode={} speaker={:08X} inCombat={} weaponDrawn={}",
+                        ModeName(mode),
+                        speaker->GetFormID(),
+                        speaker->IsInCombat() ? 1 : 0,
+                        speaker->IsWeaponDrawn() ? 1 : 0);
                 }
             }
 
@@ -2838,6 +3072,43 @@ namespace TFD::InteractionRouter
                 const auto now = Clock::now();
                 double cooldownRemainingSec = 0.0;
                 if (speaker && IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
+                    if (mode == Mode::PleasureFailed && !speaker->IsDead() && !speaker->IsDisabled()) {
+                        ResetLocked();
+
+                        const auto retryDelay = std::chrono::duration_cast<Clock::duration>(
+                            std::chrono::duration<double>(std::max(0.10, cooldownRemainingSec + 0.12)));
+
+                        g_pending.speaker = speaker->GetHandle();
+                        g_pending.mode = mode;
+                        g_pending.active = true;
+                        g_pending.succeeded = false;
+                        g_pending.requestIssued = false;
+                        g_pending.attempts = 0;
+                        g_pending.started = now;
+                        g_pending.nextAttempt = now + retryDelay;
+                        g_pending.deadline = now + kAfterPleasureTimeout + retryDelay;
+                        g_pending.quietUntil = {};
+                        g_pending.lastPackageRefresh = {};
+                        g_pending.lastHardReset = {};
+                        g_pending.lastRangeGateLog = {};
+                        g_pending.lastApproachRefresh = {};
+                        g_pending.nextApproachAssist = Clock::time_point{};
+                        g_pending.approachAssistUsed = false;
+
+                        SyncApproachConditionGlobals(mode, reason);
+                        EnsureAfterPleasureDialogueMarker(speaker, mode, reason);
+                        SetDialogueStateValue(1);
+                        SyncDialogueStateLocked(IsDialogueOpen());
+
+                        spdlog::info(
+                            "[TFD][DialogueOpen][R243A] pleasure failed auto-open deferred by temporary cooldown speaker={:08X} remaining={:.2f}s retryMs={} reason={}",
+                            speaker->GetFormID(),
+                            cooldownRemainingSec,
+                            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(retryDelay).count()),
+                            reason ? reason : "unknown");
+                        return;
+                    }
+
                     CancelLocked("temporary_dialogue_cooldown");
                     SyncDialogueStateLocked(IsDialogueOpen());
                     spdlog::info(
@@ -2877,7 +3148,8 @@ namespace TFD::InteractionRouter
                 g_pending.requestIssued = false;
                 g_pending.attempts = 0;
                 g_pending.started = now;
-                g_pending.nextAttempt = now + kInitialDelay;
+                const auto initialDelay = mode == Mode::Bleedout ? std::chrono::milliseconds(0) : kInitialDelay;
+                g_pending.nextAttempt = now + initialDelay;
                 g_pending.deadline = now + timeout;
                 g_pending.quietUntil = {};
                 g_pending.lastPackageRefresh = {};
@@ -2886,6 +3158,8 @@ namespace TFD::InteractionRouter
                 g_pending.lastApproachRefresh = {};
                 if (mode == Mode::PreCombatTruce) {
                     g_pending.nextApproachAssist = now + kPreCombatApproachAssistDelay;
+                } else if (mode == Mode::InCombatTruce) {
+                    g_pending.nextApproachAssist = now + kInCombatApproachAssistDelay;
                 } else if (mode == Mode::Bleedout) {
                     g_pending.nextApproachAssist = now + kBleedoutApproachAssistDelay;
                 } else if (mode == Mode::CaptiveMarker) {
@@ -2899,6 +3173,19 @@ namespace TFD::InteractionRouter
                     SyncApproachConditionGlobals(mode, reason);
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
                         RefreshApproachPackage(player, speaker);
+                        if (mode == Mode::Bleedout && !IsBleedoutForceGreetRangeReady(player, speaker)) {
+                            const bool moved = AssistBleedoutApproach(player, speaker, "bleedout_begin_immediate_assist");
+                            g_pending.approachAssistUsed = moved;
+                            g_pending.lastApproachRefresh = now;
+                            g_pending.lastPackageRefresh = now;
+                            g_pending.nextAttempt = now;
+                            spdlog::info(
+                                "[TFD][DialogueOpen][P7BLEED] immediate bleedout approach assist speaker={:08X} moved={} dist={:.1f} max={:.1f}",
+                                speaker ? speaker->GetFormID() : 0u,
+                                moved ? 1 : 0,
+                                std::sqrt(DistanceSquared(player, speaker)),
+                                kBleedoutForceGreetMaxDistance);
+                        }
                         if (mode == Mode::CaptiveMarker) {
                             spdlog::info(
                                 "[TFD][DialogueOpen] captive approach package refresh at begin speaker={:08X} policy=native_maintain_until_bridge",
@@ -2909,7 +3196,7 @@ namespace TFD::InteractionRouter
                 else if (mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) {
                     SyncApproachConditionGlobals(mode, reason);
                     if (auto* player = RE::PlayerCharacter::GetSingleton()) {
-                        PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                        PrepareSpeakerForNativeDialogueOpen(player, speaker, mode);
                     }
                     EnsureAfterPleasureDialogueMarker(speaker, mode, reason);
                     SetDialogueStateValue(1);
@@ -2926,7 +3213,7 @@ namespace TFD::InteractionRouter
                     ModeName(mode),
                     reason ? reason : "unknown",
                     speaker->GetFormID(),
-                    static_cast<int>(kInitialDelay.count()),
+                    static_cast<int>(initialDelay.count()),
                     static_cast<int>(timeout.count()));
             }
         }
@@ -3027,6 +3314,20 @@ namespace TFD::InteractionRouter
 
             double cooldownRemainingSec = 0.0;
             if (IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
+                if (g_pending.mode == Mode::PleasureFailed && speaker) {
+                    const auto retryDelay = std::chrono::duration_cast<Clock::duration>(
+                        std::chrono::duration<double>(std::max(0.08, cooldownRemainingSec + 0.08)));
+                    g_pending.nextAttempt = now + retryDelay;
+                    g_pending.quietUntil = {};
+                    SyncDialogueStateLocked(false);
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R243A] pending pleasure failed auto-open held by temporary cooldown speaker={:08X} remaining={:.2f}s retryMs={}",
+                        speaker->GetFormID(),
+                        cooldownRemainingSec,
+                        static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(retryDelay).count()));
+                    return;
+                }
+
                 spdlog::info(
                     "[TFD][DialogueOpen] pending cancelled by temporary cooldown mode={} speaker={:08X} remaining={:.2f}s",
                     ModeName(g_pending.mode),
@@ -3129,10 +3430,10 @@ namespace TFD::InteractionRouter
                 g_pending.mode == Mode::InCombatTruce &&
                 !g_pending.requestIssued &&
                 !IsInCombatForceGreetRangeReady(player, speaker);
-            const bool needsBleedoutRangeGate =
-                g_pending.mode == Mode::Bleedout &&
-                !g_pending.requestIssued &&
-                !IsBleedoutForceGreetRangeReady(player, speaker);
+            // P7: Bleedout should attempt native forcegreet immediately.  The old
+            // 320-unit hard gate made the player walk into the captor before the dialogue
+            // could open, leaving the radar hostile during downed-player state.
+            const bool needsBleedoutRangeGate = false;
             const bool needsCaptiveRangeGate =
                 g_pending.mode == Mode::CaptiveMarker &&
                 !g_pending.requestIssued &&
@@ -3142,11 +3443,14 @@ namespace TFD::InteractionRouter
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
-                if ((needsPreCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) &&
+                if ((needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) &&
                     !g_pending.approachAssistUsed &&
                     g_pending.nextApproachAssist.time_since_epoch().count() != 0 &&
                     now >= g_pending.nextApproachAssist) {
-                    if (needsBleedoutRangeGate) {
+                    if (needsInCombatRangeGate) {
+                        g_pending.approachAssistUsed = AssistInCombatApproach(player, speaker, "range_gate_stuck");
+                    }
+                    else if (needsBleedoutRangeGate) {
                         g_pending.approachAssistUsed = AssistBleedoutApproach(player, speaker, "range_gate_stuck");
                     }
                     else if (needsCaptiveRangeGate) {
@@ -3209,7 +3513,7 @@ namespace TFD::InteractionRouter
                     (now - g_pending.lastHardReset) >= kHardResetDelay);
 
             if (shouldHardReset) {
-                PrepareSpeakerForDialogue(player, speaker, true);
+                PrepareSpeakerForDialogue(player, speaker, true, g_pending.mode);
                 g_pending.lastHardReset = now;
                 spdlog::info(
                     "[TFD][DialogueOpen] handshake reset mode={} speaker={:08X} attempts={} requestIssued={}",
@@ -3222,10 +3526,10 @@ namespace TFD::InteractionRouter
                 (g_pending.lastPackageRefresh.time_since_epoch().count() == 0 ||
                     (now - g_pending.lastPackageRefresh) >= kPackageRefreshDelay)) {
                 if (truceMode) {
-                    PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                    PrepareSpeakerForNativeDialogueOpen(player, speaker, g_pending.mode);
                 }
                 else {
-                    PrepareSpeakerForDialogue(player, speaker, false);
+                    PrepareSpeakerForDialogue(player, speaker, false, g_pending.mode);
                 }
                 g_pending.lastPackageRefresh = now;
             }
@@ -3273,7 +3577,7 @@ namespace TFD::InteractionRouter
             }
 
             if (forceGreet) {
-                PrepareSpeakerForNativeDialogueOpen(player, speaker);
+                PrepareSpeakerForNativeDialogueOpen(player, speaker, g_pending.mode);
                 if (afterPleasureMode || pleasureFailedMode) {
                     EnsureAfterPleasureDialogueMarker(speaker, g_pending.mode, "dialogue_open_attempt");
                 }
