@@ -126,6 +126,7 @@ namespace
     constexpr const char* kPleasureFailedEnterEvent = "TFDPleasureFailedEnter";
     constexpr const char* kPleasureFailedAggroEvent = "TFDPleasureFailedAggro";
     constexpr const char* kPleasureFailedStartCombatEvent = "TFDPleasureFailedStartCombat";
+    constexpr const char* kCaptivePleasureFailedFightStartCombatEvent = "TFDCaptivePleasureFailedFightStartCombat";
     constexpr const char* kAfterPleasureChoiceReleaseEvent = "TFDAfterPleasureChoiceRelease";
     constexpr const char* kAfterPleasureChoiceRecruitEvent = "TFDAfterPleasureChoiceRecruit";
     constexpr const char* kAfterPleasureChoiceFinishEvent = "TFDAfterPleasureChoiceFinish";
@@ -2713,6 +2714,42 @@ namespace TFD::FlowController
 
         (void)TFD::PleasureRuntime::HandleModEvent(eventName, strArg ? strArg : "", numArg, sender);
 
+        // R264A: Redo/Pleading from PleasureFailed is not a terminal AfterPleasure
+        // choice, so it is intentionally excluded from
+        // IsAfterPleasureTerminalChoiceEvent().  The old resume hook lived inside
+        // that terminal-only block and therefore never ran.  If FlowController keeps
+        // sub=PleasureFailedDialogue while PleasureRuntime already accepted Redo,
+        // the next successful scene can reach TFDAfterPleasureEnter with
+        // runtimeFailed=0 but flowFailed=1 and the AfterPleasure forcegreet is
+        // dropped.  Resume the flow owner immediately when Redo is chosen.
+        if (name == kAfterPleasureChoicePleasureEvent) {
+            auto* actor = ResolveActorFromEventArg(arg);
+            const int reportedSourceFlow = ResolveSourceFlowFromEventArg(arg);
+            const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
+            const int effectiveSourceFlow = runtimeSource != TFD::PleasureRuntime::SourceContext::None
+                ? static_cast<int>(runtimeSource)
+                : reportedSourceFlow;
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const auto snapshot = flow.GetSnapshot();
+            if (actor && snapshot.sub == SubFlow::PleasureFailedDialogue) {
+                const bool resumed = flow.RequestResumePleasureFromPleasureFailed(
+                    actor->GetFormID(),
+                    effectiveSourceFlow,
+                    "pleasure_failed_pleading_redo_r264");
+                spdlog::info(
+                    "[TFD][Flow][R264A] pleasure failed pleading redo resumed flow reportedSource={} effectiveSource={} runtimeSource={} actor={:08X} resumed={} oldRoot={} oldCtx={} oldSub={}",
+                    reportedSourceFlow,
+                    effectiveSourceFlow,
+                    TFD::PleasureRuntime::GetSourceContextName(),
+                    actor->GetFormID(),
+                    resumed ? 1 : 0,
+                    Controller::ToString(snapshot.root),
+                    Controller::ToString(snapshot.contextRoot),
+                    Controller::ToString(snapshot.sub));
+                return true;
+            }
+        }
+
         if (IsAfterPleasureTerminalChoiceEvent(name)) {
             auto* actor = ResolveActorFromEventArg(arg);
             const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
@@ -3040,6 +3077,16 @@ namespace TFD::FlowController
             bool combatRootCommitted = false;
             bool captiveEscapeArmed = false;
             bool captiveFightBreakArmed = false;
+            std::size_t captiveCrowdSoftReleaseCount = 0;
+            auto breakFightPassiveOwner = [&](const char* reason) -> bool {
+                if (!actor || !player) {
+                    return false;
+                }
+                if (captiveFailureOwner) {
+                    return TFD::HostilityController::BreakCaptiveFightPassiveOwnership(actor, player, reason);
+                }
+                return TFD::HostilityController::BreakPassiveOwnershipForFightChoice(actor, player, reason);
+            };
             if (actor) {
                 TFD::Transition::AbortCalmWindowForCombat(actor, "pleasure_failed_fight_pre_break");
                 (void)SuppressDefeatedEnemyAutoDeathForFightChoiceIfNeeded(actor, "pleasure_failed_fight_speaker");
@@ -3072,12 +3119,21 @@ namespace TFD::FlowController
                     combatRootCommitted = true;
                 }
 
+                if (captiveFailureOwner && player) {
+                    // R273A: do not hard-force captive crowd/watchers into drawn weapon
+                    // or direct combat updates here.  Release TFD pacify/passive
+                    // ownership only, then EvaluatePackage once and let Skyrim's
+                    // normal combat AI decide who joins the fight.
+                    captiveCrowdSoftReleaseCount = TFD::HostilityController::SoftReleaseCaptiveCrowdPassiveForCombat(
+                        player,
+                        actor,
+                        "pleasure_failed_fight_captive_crowd_soft_release",
+                        false);
+                }
+
                 TFD::Transition::AbortCalmWindowForCombat(actor, "pleasure_failed_fight_after_root_commit");
                 ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_post_root_commit");
-                passiveOwnerCleared = TFD::HostilityController::BreakPassiveOwnershipForFightChoice(
-                    actor,
-                    player,
-                    "pleasure_failed_fight_post_root_commit_owner") || passiveOwnerCleared;
+                passiveOwnerCleared = breakFightPassiveOwner("pleasure_failed_fight_post_root_commit_owner") || passiveOwnerCleared;
             }
             bool truceHardCleared = false;
             bool bleedoutCleared = false;
@@ -3099,10 +3155,7 @@ namespace TFD::FlowController
                     actor,
                     TFD::HostilityController::ReleaseReason::FightChoice,
                     false);
-                passiveOwnerCleared = TFD::HostilityController::BreakPassiveOwnershipForFightChoice(
-                    actor,
-                    player,
-                    "pleasure_failed_fight_after_truce_release_owner") || passiveOwnerCleared;
+                passiveOwnerCleared = breakFightPassiveOwner("pleasure_failed_fight_after_truce_release_owner") || passiveOwnerCleared;
             }
 
             if (actor && captiveFailureOwner) {
@@ -3128,21 +3181,30 @@ namespace TFD::FlowController
                 // R152: do not EvaluatePackage between fight selection and final
                 // FightChoice owner break. The combat handoff must not let a stale
                 // after-pleasure/dialogue package win after the actor is handed to combat.
-                passiveOwnerCleared = TFD::HostilityController::BreakPassiveOwnershipForFightChoice(
-                    actor,
-                    player,
-                    "pleasure_failed_fight_pre_rehostile_owner") || passiveOwnerCleared;
-                nativeCombatRefresh = TFD::HostilityController::ForceDetectionAndCombatRefresh(
-                    actor,
-                    player,
-                    TFD::HostilityController::ReleaseReason::FightChoice,
-                    true);
-                if (!nativeCombatRefresh) {
-                    TFD::HostilityController::QueueDetectionAndCombatRefresh(
+                passiveOwnerCleared = breakFightPassiveOwner("pleasure_failed_fight_pre_rehostile_owner") || passiveOwnerCleared;
+                if (captiveFailureOwner) {
+                    // R277A: Captive PleasureFailed > Fight must not use the generic
+                    // native FightChoice refresh because that path force-locks combat
+                    // target and can issue DrawWeapon. The SystemEvent captive no-draw
+                    // bridge owns the StartCombat commit for speaker + crowd.
+                    nativeCombatRefresh = false;
+                    spdlog::info(
+                        "[TFD][Flow][R277A] captive pleasure failed fight native hard refresh skipped actor={:08X} reason=no_draw_owner_specific_bridge",
+                        actor->GetFormID());
+                }
+                else {
+                    nativeCombatRefresh = TFD::HostilityController::ForceDetectionAndCombatRefresh(
                         actor,
                         player,
                         TFD::HostilityController::ReleaseReason::FightChoice,
                         true);
+                    if (!nativeCombatRefresh) {
+                        TFD::HostilityController::QueueDetectionAndCombatRefresh(
+                            actor,
+                            player,
+                            TFD::HostilityController::ReleaseReason::FightChoice,
+                            true);
+                    }
                 }
                 if (!combatRootCommitted) {
                     flow.NotifyCombatStarted(actor->GetFormID(), "pleasure_failed_fight");
@@ -3151,17 +3213,29 @@ namespace TFD::FlowController
                 TFD::Transition::AbortCalmWindowForCombat(actor, "pleasure_failed_fight_post_rehostile");
                 (void)SuppressDefeatedEnemyAutoDeathForFightChoiceIfNeeded(actor, "pleasure_failed_fight_post_rehostile");
                 ClearPleasureFailedFightSpeakerSuppressors(actor, "pleasure_failed_fight_post_rehostile");
-                passiveOwnerCleared = TFD::HostilityController::BreakPassiveOwnershipForFightChoice(
-                    actor,
-                    player,
-                    "pleasure_failed_fight_post_rehostile_owner") || passiveOwnerCleared;
+                passiveOwnerCleared = breakFightPassiveOwner("pleasure_failed_fight_post_rehostile_owner") || passiveOwnerCleared;
             }
 
-            combatQueued = TFD::FlowController::QueueBridgeModEvent(
-                kPleasureFailedStartCombatEvent,
-                actor,
-                "pleasure_failed_fight",
-                static_cast<float>(effectiveSourceFlow));
+            if (actor && captiveFailureOwner) {
+                // R278A: Captive PleasureFailed > Fight must not emit the generic
+                // TFDPleasureFailedStartCombat event. TFDTruceBridge also listens to
+                // that event and can arm/clear combat handoff for unrelated Truce
+                // ownership. Route the speaker through the captive-specific no-draw
+                // SystemEvent bridge instead; crowd/watchers already use the paired
+                // captive crowd bridge from HostilityController.
+                combatQueued = TFD::FlowController::QueueBridgeModEvent(
+                    kCaptivePleasureFailedFightStartCombatEvent,
+                    actor,
+                    "pleasure_failed_fight_captive_speaker",
+                    static_cast<float>(effectiveSourceFlow));
+            }
+            else {
+                combatQueued = TFD::FlowController::QueueBridgeModEvent(
+                    kPleasureFailedStartCombatEvent,
+                    actor,
+                    "pleasure_failed_fight",
+                    static_cast<float>(effectiveSourceFlow));
+            }
 
             // R198/R260A/R261A: native PleasureRuntime::Break() only clears the
             // native runtime.  Papyrus Pleasure/SystemEvent/Truce/Bleedout aliases
@@ -3183,12 +3257,13 @@ namespace TFD::FlowController
             bleedoutCleared = false;
 
             spdlog::info(
-                "[TFD][Flow][R261A] pleasure failed fight actor={:08X} reportedSource={} effectiveSource={} captiveOwner={} passiveOwnerCleared={} combatRootCommitted={} truceReleased={} truceHardCleared={} bleedoutCleared={} pleasureClearQueued={} delayedSystemClearQueued={} captiveEscapeArmed={} captiveFightBreakArmed={} nativeCombatRefresh={} combatQueued={} oldRoot={} oldCtx={} oldSub={} reason=no_speaker_climax",
+                "[TFD][Flow][R278A] pleasure failed fight actor={:08X} reportedSource={} effectiveSource={} captiveOwner={} passiveOwnerCleared={} captiveCrowdSoftRelease={} combatRootCommitted={} truceReleased={} truceHardCleared={} bleedoutCleared={} pleasureClearQueued={} delayedSystemClearQueued={} captiveEscapeArmed={} captiveFightBreakArmed={} nativeCombatRefresh={} combatQueued={} oldRoot={} oldCtx={} oldSub={} reason=no_speaker_climax",
                 actor ? actor->GetFormID() : 0u,
                 sourceFlow,
                 effectiveSourceFlow,
                 captiveFailureOwner ? 1 : 0,
                 passiveOwnerCleared ? 1 : 0,
+                static_cast<unsigned int>(captiveCrowdSoftReleaseCount),
                 combatRootCommitted ? 1 : 0,
                 truceReleased ? 1 : 0,
                 truceHardCleared ? 1 : 0,
@@ -3207,27 +3282,71 @@ namespace TFD::FlowController
 
         if (name == kAfterPleasureEnterEvent) {
             auto* actor = ResolveActorFromEventArg(arg);
-            const int sourceFlow = ResolveSourceFlowFromEventArg(arg);
+            const int reportedSourceFlow = ResolveSourceFlowFromEventArg(arg);
+            const auto runtimeSource = TFD::PleasureRuntime::GetSourceContext();
+            const auto runtimePhase = TFD::PleasureRuntime::GetPhase();
+            const int sourceFlow = runtimeSource != TFD::PleasureRuntime::SourceContext::None
+                ? static_cast<int>(runtimeSource)
+                : reportedSourceFlow;
             auto& flow = TFD::FlowController::Controller::GetSingleton();
-            if (actor && (TFD::PleasureRuntime::IsPleasureFailedDialogueActive() || flow.IsPleasureFailedSubFlowActive())) {
-                spdlog::info(
-                    "[TFD][Flow][R223A] after pleasure enter ignored while pleasure failed owns dialogue source={} actor={:08X} runtimeFailed={} flowFailed={}",
-                    sourceFlow,
-                    actor->GetFormID(),
-                    TFD::PleasureRuntime::IsPleasureFailedDialogueActive() ? 1 : 0,
-                    flow.IsPleasureFailedSubFlowActive() ? 1 : 0);
-                return true;
+            bool runtimeFailed = TFD::PleasureRuntime::IsPleasureFailedDialogueActive();
+            bool flowFailed = flow.IsPleasureFailedSubFlowActive();
+            if (actor && (runtimeFailed || flowFailed)) {
+                const bool runtimeIsAfterPleasure =
+                    runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureAwaitQuest ||
+                    runtimePhase == TFD::PleasureRuntime::Phase::AfterPleasureDialogue;
+
+                if (!runtimeFailed && flowFailed && runtimeIsAfterPleasure) {
+                    const bool resumed = flow.RequestResumePleasureFromPleasureFailed(
+                        actor->GetFormID(),
+                        sourceFlow,
+                        "after_pleasure_stale_failed_owner_recover_r264");
+                    flowFailed = flow.IsPleasureFailedSubFlowActive();
+                    spdlog::info(
+                        "[TFD][Flow][R264A] after pleasure recovered stale failed owner reportedSource={} effectiveSource={} runtimeSource={} runtimePhase={} actor={:08X} resumed={} flowFailedAfter={}",
+                        reportedSourceFlow,
+                        sourceFlow,
+                        TFD::PleasureRuntime::GetSourceContextName(),
+                        TFD::PleasureRuntime::GetPhaseName(),
+                        actor->GetFormID(),
+                        resumed ? 1 : 0,
+                        flowFailed ? 1 : 0);
+                }
+
+                if (runtimeFailed || flowFailed) {
+                    spdlog::info(
+                        "[TFD][Flow][R264A] after pleasure enter ignored while pleasure failed owns dialogue reportedSource={} effectiveSource={} actor={:08X} runtimeFailed={} flowFailed={} runtimePhase={} runtimeSource={}",
+                        reportedSourceFlow,
+                        sourceFlow,
+                        actor->GetFormID(),
+                        runtimeFailed ? 1 : 0,
+                        flowFailed ? 1 : 0,
+                        TFD::PleasureRuntime::GetPhaseName(),
+                        TFD::PleasureRuntime::GetSourceContextName());
+                    return true;
+                }
             }
             if (actor && sourceFlow == static_cast<int>(TFD::PleasureRuntime::SourceContext::Bleedout)) {
-                if (flow.IsCaptiveEscapeBreakContextActive()) {
-                    const bool beginAfter = flow.RequestBeginAfterPleasure(actor->GetFormID(), "bleedout_escape_break_after_pleasure_enter");
-                    const bool captiveOpen = TFD::CaptiveGreet::BeginAfterPleasure(actor, "bleedout_escape_break_after_pleasure_enter");
+                const auto beforeAfter = flow.GetSnapshot();
+                const bool captiveLayerAfterPleasure =
+                    flow.IsCaptiveEscapeBreakContextActive() ||
+                    beforeAfter.root == RootFlow::Captive ||
+                    beforeAfter.contextRoot == RootFlow::Captive ||
+                    beforeAfter.sub == SubFlow::CaptiveAfterPleasure ||
+                    beforeAfter.sub == SubFlow::BleedoutEscapeBreak;
+
+                if (captiveLayerAfterPleasure) {
+                    const bool beginAfter = flow.RequestBeginAfterPleasure(actor->GetFormID(), "bleedout_captive_after_pleasure_enter");
+                    const bool captiveOpen = TFD::CaptiveGreet::BeginAfterPleasure(actor, "bleedout_captive_after_pleasure_enter");
                     spdlog::info(
-                        "[TFD][Flow][R206A] bleedout escape-break after pleasure routed captive source={} actor={:08X} flowBegin={} captiveOpen={}",
+                        "[TFD][Flow][R274A] bleedout captive after pleasure routed captive source={} actor={:08X} flowBegin={} captiveOpen={} oldRoot={} oldCtx={} oldSub={}",
                         sourceFlow,
                         actor->GetFormID(),
                         beginAfter ? 1 : 0,
-                        captiveOpen ? 1 : 0);
+                        captiveOpen ? 1 : 0,
+                        Controller::ToString(beforeAfter.root),
+                        Controller::ToString(beforeAfter.contextRoot),
+                        Controller::ToString(beforeAfter.sub));
                     return true;
                 }
 
@@ -3938,13 +4057,21 @@ namespace TFD::FlowController
         if (name == kBleedoutOutcomePleasureEvent) {
             const auto actorFormID = ResolveBleedFlowActorFormIDFromProviders();
             auto* flowActor = RE::TESForm::LookupByID<RE::Actor>(actorFormID);
+            auto& flow = TFD::FlowController::Controller::GetSingleton();
+            const bool bleedActive = IsBleedStateActiveFromProviders();
+            const bool captiveEscapeBleedout = bleedActive && IsCaptiveEscapeGuardActive(flow);
             TFD::Bleedout::OutcomeEventContext context{};
             context.eventName = "mod_event_pleasure";
             context.rawEventName = eventName;
             context.actor = flowActor;
             context.actorFormID = actorFormID;
-            context.inBleedState = IsBleedStateActiveFromProviders();
-            context.preserveCaptive = TFD::Captive::IsCaptivePassiveHoldActive() || TFD::Captive::IsEscapeBleedoutActive();
+            context.inBleedState = bleedActive;
+            context.preserveCaptive = captiveEscapeBleedout || TFD::Captive::IsCaptivePassiveHoldActive() || TFD::Captive::IsEscapeBleedoutActive();
+            if (captiveEscapeBleedout) {
+                spdlog::info(
+                    "[TFD][Flow][R273A] bleedout pleasure preserved captive escape-break actor={:08X} reason=mod_event_pleasure",
+                    actorFormID);
+            }
             (void)TFD::Bleedout::HandleOutcomePleasureEvent(context, bleedOutcomeEventHandlers);
             return true;
         }
@@ -4097,12 +4224,15 @@ namespace TFD::FlowController
             return DialogueContextKind::JoinedEnemy;
         }
 
-        if (TFD::Captive::GetStateFlag()) {
-            return DialogueContextKind::Captive;
-        }
-
+        // R274A: terminal dialogue overlays must win over the persistent Captive
+        // base context.  Otherwise manual activation after an AfterPleasure close is
+        // classified as generic Captive/Calling Captor and steals the active route.
         if (flow.IsAfterPleasureSubFlowActive()) {
             return DialogueContextKind::AfterPleasure;
+        }
+
+        if (TFD::Captive::GetStateFlag()) {
+            return DialogueContextKind::Captive;
         }
 
         if (IsBleedoutRuntimeActive()) {

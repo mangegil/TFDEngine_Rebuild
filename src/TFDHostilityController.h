@@ -226,6 +226,10 @@ namespace TFD::HostilityController
         RE::Actor* actor,
         RE::Actor* player,
         const char* debugReason = nullptr);
+    bool BreakCaptiveFightPassiveOwnership(
+        RE::Actor* actor,
+        RE::Actor* player,
+        const char* debugReason = nullptr);
 
     bool ForceDetectionAndCombatRefresh(
         RE::Actor* actor,
@@ -267,6 +271,12 @@ namespace TFD::HostilityController
         const char* debugReason = nullptr,
         bool requireLineOfSightForCrowd = true,
         bool forceTriggerActor = true);
+
+    std::size_t SoftReleaseCaptiveCrowdPassiveForCombat(
+        RE::Actor* player,
+        RE::Actor* triggerActor,
+        const char* debugReason = nullptr,
+        bool requireLineOfSightForCrowd = true);
 
     void ClearAllTemporaryHostility();
     void ArmFightChoiceCombatOwnerBypass(RE::Actor* actor, double durationSec = 12.0, const char* reason = nullptr);

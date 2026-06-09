@@ -450,6 +450,148 @@ namespace TFDMenu
 			}
 
 
+			static bool IsDialogueMenuOpen()
+			{
+				auto* ui = RE::UI::GetSingleton();
+				return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+			}
+
+			static bool IsExpectedWorkAssignmentForOpen(bool openReport, int assignmentState)
+			{
+				if (openReport) {
+					return assignmentState == 3 || assignmentState == 7;
+				}
+				return assignmentState == 1;
+			}
+
+			static bool PrepareCaptiveWorkNativeDialogueActor(RE::Actor* actor, const char* reason)
+			{
+				if (!actor) {
+					return false;
+				}
+
+				const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
+				if (!TFD::Captive::IsCurrentWorkBoss(actor)) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work][C46] native work open blocked non-boss actor={:08X} inScope={} reason={} action=block_non_boss_work_dialogue",
+						actor->GetFormID(),
+						inWorkScope ? 1 : 0,
+						reason ? reason : "work_native_open_prepare");
+					return false;
+				}
+
+				if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, reason ? reason : "work_native_open_current_boss")) {
+					actor->SetDialogueWithPlayer(false, false, nullptr);
+					spdlog::info("[TFD][Menu][Work] native work open blocked actor={:08X} currentBoss=1 inScope={} reason={} action=prepare_failed",
+						actor->GetFormID(),
+						inWorkScope ? 1 : 0,
+						reason ? reason : "work_native_open_prepare");
+					return false;
+				}
+
+				if (!actor->IsAIEnabled()) {
+					actor->EnableAI(true);
+				}
+				actor->AllowPCDialogue(true);
+				actor->StopCombat();
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+				if (actor->IsWeaponDrawn()) {
+					// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
+				}
+				actor->EvaluatePackage(false, true);
+				actor->EvaluatePackage(true, true);
+				return true;
+			}
+
+			static void QueueCaptiveWorkDialogueOpenVerify(
+				std::uint32_t actorHandle,
+				RE::FormID actorFormID,
+				RE::TESTopicInfo* topicInfo,
+				RE::FormID topicFormID,
+				bool openReport,
+				std::string reasonText,
+				std::uint64_t serial)
+			{
+				std::thread([actorHandle, actorFormID, topicInfo, topicFormID, openReport, reasonText, serial]() {
+					std::this_thread::sleep_for(std::chrono::milliseconds(450));
+
+					auto* tasks = SKSE::GetTaskInterface();
+					if (!tasks) {
+						spdlog::warn("[TFD][Menu][Work][R263A] verify failed serial={} actor={:08X} reason={} action=no_task_interface",
+							serial,
+							actorFormID,
+							reasonText);
+						return;
+					}
+
+					tasks->AddTask([actorHandle, actorFormID, topicInfo, topicFormID, openReport, reasonText, serial]() {
+						ResolveGlobals();
+						const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
+						const int dialogueState = GetGlobalValueInt(gDialogueState);
+						const bool dialogueMenuOpen = IsDialogueMenuOpen();
+
+						if (dialogueMenuOpen || dialogueState == 1) {
+							spdlog::info("[TFD][Menu][Work][R263A] verify ok serial={} actor={:08X} menuOpen={} dialogueState={} assignment={} ({}) report={} reason={} action=no_retry_dialogue_active",
+								serial,
+								actorFormID,
+								dialogueMenuOpen ? 1 : 0,
+								dialogueState,
+								assignmentState,
+								DecodeWorkAssignmentState(assignmentState),
+								openReport ? 1 : 0,
+								reasonText);
+							return;
+						}
+
+						if (!TFD::Captive::IsReleasedWorkActive() || !IsExpectedWorkAssignmentForOpen(openReport, assignmentState)) {
+							spdlog::info("[TFD][Menu][Work][R263A] verify aborted serial={} actor={:08X} assignment={} ({}) report={} workActive={} reason={} action=assignment_changed_or_work_inactive",
+								serial,
+								actorFormID,
+								assignmentState,
+								DecodeWorkAssignmentState(assignmentState),
+								openReport ? 1 : 0,
+								TFD::Captive::IsReleasedWorkActive() ? 1 : 0,
+								reasonText);
+							return;
+						}
+
+						auto actorSp = RE::Actor::LookupByHandle(actorHandle);
+						auto* actor = actorSp.get();
+						if (!actor) {
+							spdlog::warn("[TFD][Menu][Work][R263A] verify aborted serial={} actor={:08X} reason={} action=actor_handle_invalid",
+								serial,
+								actorFormID,
+								reasonText);
+							return;
+						}
+
+						if (!PrepareCaptiveWorkNativeDialogueActor(actor, "work_verify_retry_current_boss")) {
+							spdlog::info("[TFD][Menu][Work][R263A] verify retry blocked serial={} actor={:08X} reason={} action=prepare_failed",
+								serial,
+								actorFormID,
+								reasonText);
+							return;
+						}
+
+						ClearInteractionStateValue();
+						SetGlobalInt(gDialogueState, 0);
+						actor->SetDialogueWithPlayer(false, false, nullptr);
+						const bool retried = topicInfo ? actor->SetDialogueWithPlayer(true, true, topicInfo) : false;
+						spdlog::warn("[TFD][Menu][Work][R263A] verify retry serial={} actor={:08X} retried={} assignment={} ({}) topicInfo={:08X} report={} reason={} action=retry_explicit_dialogue_after_false_success",
+							serial,
+							actorFormID,
+							retried ? 1 : 0,
+							assignmentState,
+							DecodeWorkAssignmentState(assignmentState),
+							topicFormID,
+							openReport ? 1 : 0,
+							reasonText);
+					});
+				}).detach();
+			}
+
 			static void QueueCaptiveWorkDialogueOpen(RE::Actor* actor, RE::TESTopicInfo* topicInfo, bool openReport, const char* reason)
 			{
 				if (!actor || !topicInfo) {
@@ -504,33 +646,13 @@ namespace TFDMenu
 							return;
 						}
 
-						const bool isCurrentBoss = TFD::Captive::IsCurrentWorkBoss(actor);
-						const bool inWorkScope = TFD::Captive::IsReleasedWorkActorInScope(actor);
-						if (!isCurrentBoss) {
-							actor->SetDialogueWithPlayer(false, false, nullptr);
-							spdlog::info("[TFD][Menu][Work][C46] delayed native open blocked non-boss serial={} actor={:08X} inScope={} reason={} action=block_non_boss_work_dialogue",
-								serial,
-								actorFormID,
-								inWorkScope ? 1 : 0,
-								reasonText);
-							return;
-						}
-
-						if (!TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_delayed_native_open_current_boss")) {
-							actor->SetDialogueWithPlayer(false, false, nullptr);
-							spdlog::info("[TFD][Menu][Work] delayed native open blocked serial={} actor={:08X} currentBoss=1 inScope={} reason={} action=prepare_failed",
-								serial,
-								actorFormID,
-								inWorkScope ? 1 : 0,
-								reasonText);
+						if (!PrepareCaptiveWorkNativeDialogueActor(actor, "work_delayed_native_open_current_boss")) {
 							return;
 						}
 
 						ResolveGlobals();
 						const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
-						const bool openWorkOffer = !openReport && assignmentState == 1;
-						const bool openReportOffer = openReport && (assignmentState == 3 || assignmentState == 7);
-						if (!openWorkOffer && !openReportOffer) {
+						if (!IsExpectedWorkAssignmentForOpen(openReport, assignmentState)) {
 							spdlog::info("[TFD][Menu][Work] delayed native open aborted serial={} actor={:08X} assignment={} ({}) report={} reason={} action=assignment_changed",
 								serial,
 								actorFormID,
@@ -540,20 +662,6 @@ namespace TFDMenu
 								reasonText);
 							return;
 						}
-
-						if (!actor->IsAIEnabled()) {
-							actor->EnableAI(true);
-						}
-						actor->AllowPCDialogue(true);
-						actor->StopCombat();
-						if (auto* process = RE::ProcessLists::GetSingleton()) {
-							process->StopCombatAndAlarmOnActor(actor, false);
-						}
-						if (actor->IsWeaponDrawn()) {
-							// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
-						}
-						actor->EvaluatePackage(false, true);
-						actor->EvaluatePackage(true, true);
 
 						// Work dialogue must not inherit the old Calling Captor/CaptiveMarker
 						// interaction route.  The CK Working GREET requires neutral dialogue
@@ -572,6 +680,8 @@ namespace TFDMenu
 							topicFormID,
 							openReport ? 1 : 0,
 							reasonText);
+
+						QueueCaptiveWorkDialogueOpenVerify(actorHandle, actorFormID, topicInfo, topicFormID, openReport, reasonText, serial);
 					});
 				}).detach();
 			}

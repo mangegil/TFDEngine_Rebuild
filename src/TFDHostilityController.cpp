@@ -1523,6 +1523,7 @@ namespace TFD::HostilityController
         constexpr const char* kCreatureTeammateAssignEvent = "TFDCreatureTeammateAssign";
         constexpr const char* kCreatureTeammateUnassignEvent = "TFDCreatureTeammateUnassign";
         constexpr const char* kInCombatResumeCombatEvent = "TFDInCombatResumeCombat";
+        constexpr const char* kCaptivePleasureFailedFightCrowdStartCombatEvent = "TFDCaptivePleasureFailedFightCrowdStartCombat";
         constexpr double kCompanionInitialHours = 3.0;
         constexpr double kCompanionExtendHours = 3.0;
         constexpr double kCompanionMaxHours = 9.0;
@@ -6539,6 +6540,237 @@ namespace TFD::HostilityController
             static_cast<unsigned int>(rehostileCount));
 
         return rehostileCount;
+    }
+
+    std::size_t SoftReleaseCaptiveCrowdPassiveForCombat(
+        RE::Actor* player,
+        RE::Actor* triggerActor,
+        const char* debugReason,
+        bool requireLineOfSightForCrowd)
+    {
+        const char* why = debugReason ? debugReason : "captive_crowd_soft_release";
+        if (!IsActorStillValid(player)) {
+            spdlog::warn("[TFD][HostilityController][R274A] soft wake rejected reason={} no_player", why);
+            return 0;
+        }
+
+        auto actors = CollectCaptiveCombatBreakActors(
+            player,
+            triggerActor,
+            requireLineOfSightForCrowd,
+            false,
+            why);
+
+        // R274A: PleasureFailed > Fight inside Captive must not hard-push every
+        // watcher through DrawWeapon/StartCombat/UpdateCombat.  R272B proved that
+        // mass combat forcing can collide with the next Bleedout forcegreet
+        // sheathe/evaluate window and crash the behavior graph.  This helper only
+        // releases TFD's pacify/passive ownership, pulses global detection, and asks
+        // Skyrim to naturally re-evaluate AI.
+        ResetCaptiveSuppression();
+        ClearAggressionClamp();
+        TFD::Actor::Ops::ClearAggressorFactionContext();
+        CancelPendingWaves();
+        PulseGlobalDetection(why);
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+        }
+
+        const char* passiveFactionEditorIDs[] = {
+            "TFDAfterPleasureFaction",
+            "TFDPleasureFailedFaction",
+            "TFDWorkingCaptiveFaction",
+            "TFDPacifyFaction",
+            "TFDPreCombatTruceFaction",
+            "TFDInCombatTruceFaction",
+            "TFDBleedOutFaction",
+            "TFDBleedoutFaction",
+            "TFDCaptiveFaction",
+            "TFDPleasureRejectFaction",
+            "TFDPleasureWatcherFaction",
+            "TFDDesireFaction",
+            "TFDSaviorFaction",
+            "TFDDefeatedFaction",
+            "TFDTeammateFaction",
+            "TFDExpiredTeammate"
+        };
+
+        const RE::FormID triggerId = triggerActor ? triggerActor->GetFormID() : 0u;
+        std::size_t releasedCount = 0;
+        for (auto* actor : actors) {
+            if (!IsActorStillValid(actor) || actor == player) {
+                continue;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (actorId == 0) {
+                continue;
+            }
+
+            // The speaker is already handled by the explicit FightChoice path.
+            // Do not double-touch its behavior graph from the crowd release pass.
+            if (triggerId != 0 && actorId == triggerId) {
+                spdlog::info(
+                    "[TFD][HostilityController][R274A] soft wake skipped trigger actor={:08X} reason={}",
+                    actorId,
+                    why);
+                continue;
+            }
+
+            bool changed = false;
+
+            if (auto entryIt = g_entries.find(actorId); entryIt != g_entries.end()) {
+                Entry releasedEntry = entryIt->second;
+                RemoveSuppression(actor, releasedEntry);
+                g_entries.erase(entryIt);
+                changed = true;
+                spdlog::info(
+                    "[TFD][HostilityController][R274A] soft wake removed suppression actor={:08X} session={} mode={} reason={}",
+                    actorId,
+                    releasedEntry.sessionId,
+                    ToString(releasedEntry.mode),
+                    why);
+            }
+
+            if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+                PayDialoguePassiveGuardInternal::Release(actor, false, why);
+                changed = true;
+            }
+
+            for (const char* editorId : passiveFactionEditorIDs) {
+                changed = RemoveFactionByEditorIDForFightChoice(actor, editorId, why) || changed;
+            }
+
+            actor->AllowPCDialogue(true);
+            (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+            (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+
+            // Do not call DrawWeaponMagicHands, native StartCombat, UpdateCombat,
+            // or force combat target here.  Two package evaluations are still soft;
+            // they only let Skyrim notice that the pacify/package blockers are gone.
+            actor->EvaluatePackage(false, true);
+            actor->EvaluatePackage(true, true);
+
+            const bool hostileNow = IsEnemyToPlayer(player, actor);
+            bool startCombatQueued = false;
+            if (hostileNow) {
+                startCombatQueued = TFD::FlowController::QueueBridgeModEvent(
+                    kCaptivePleasureFailedFightCrowdStartCombatEvent,
+                    actor,
+                    why,
+                    3.0f);
+            }
+
+            if (changed) {
+                ++releasedCount;
+            }
+
+            const auto* combatTarget = ResolveCurrentCombatTarget(actor);
+            const bool targetingPlayer = combatTarget && combatTarget->GetFormID() == player->GetFormID();
+            spdlog::info(
+                "[TFD][HostilityController][R277A] captive soft wake actor={:08X} trigger={:08X} changed={} hostile={} inCombat={} targetingPlayer={} weaponDrawn={} startCombatQueued={} reason={}",
+                actorId,
+                triggerId,
+                changed ? 1 : 0,
+                hostileNow ? 1 : 0,
+                actor->IsInCombat() ? 1 : 0,
+                targetingPlayer ? 1 : 0,
+                actor->IsWeaponDrawn() ? 1 : 0,
+                startCombatQueued ? 1 : 0,
+                why);
+        }
+
+        spdlog::info(
+            "[TFD][HostilityController][R277A] captive soft wake complete reason={} trigger={:08X} released={}",
+            why,
+            triggerId,
+            static_cast<unsigned int>(releasedCount));
+
+        return releasedCount;
+    }
+
+    bool BreakCaptiveFightPassiveOwnership(RE::Actor* actor, RE::Actor* player, const char* debugReason)
+    {
+        const char* why = debugReason ? debugReason : "captive_fight_owner_break";
+        if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+            spdlog::warn(
+                "[TFD][HostilityController][R277A] captive fight owner break rejected actor={:08X} player={:08X} reason={}",
+                actor ? actor->GetFormID() : 0u,
+                player ? player->GetFormID() : 0u,
+                why);
+            return false;
+        }
+
+        const auto actorId = actor->GetFormID();
+        bool changed = false;
+
+        if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+            PayDialoguePassiveGuardInternal::Release(actor, false, why);
+            changed = true;
+        }
+
+        if (auto entryIt = g_entries.find(actorId); entryIt != g_entries.end()) {
+            Entry releasedEntry = entryIt->second;
+            RemoveSuppression(actor, releasedEntry);
+            g_entries.erase(entryIt);
+            changed = true;
+            spdlog::info(
+                "[TFD][HostilityController][R277A] captive fight owner erased local suppression actor={:08X} session={} mode={} reason={}",
+                actorId,
+                releasedEntry.sessionId,
+                ToString(releasedEntry.mode),
+                why);
+        }
+
+        // Captive-specific fight ownership break. Do not release generic Hostility
+        // sessions and do not touch teammate/savior/defeated ownership here; this
+        // branch belongs only to Captive + InCombat Escape Phase.
+        const char* passiveFactionEditorIDs[] = {
+            "TFDAfterPleasureFaction",
+            "TFDPleasureFailedFaction",
+            "TFDWorkingCaptiveFaction",
+            "TFDPacifyFaction",
+            "TFDBleedOutFaction",
+            "TFDBleedoutFaction",
+            "TFDCaptiveFaction",
+            "TFDPleasureRejectFaction",
+            "TFDPleasureWatcherFaction",
+            "TFDDesireFaction"
+        };
+
+        for (const char* editorId : passiveFactionEditorIDs) {
+            changed = RemoveFactionByEditorIDForFightChoice(actor, editorId, why) || changed;
+        }
+
+        TFD::Actor::Ops::RemoveReleaseFollowGraceFromActorOnlyForFightChoice(actor, why);
+        FightChoiceCombatOwnerInternal::Arm(actor, 8.0, why);
+
+        ClearAggressionClamp();
+        TFD::Actor::Ops::ClearAggressorFactionContext();
+
+        actor->AllowPCDialogue(true);
+        actor->SetBeenAttacked(true);
+        player->SetBeenAttacked(true);
+        (void)actor->RequestDetectionLevel(player, RE::DETECTION_PRIORITY::kCritical);
+        (void)player->RequestDetectionLevel(actor, RE::DETECTION_PRIORITY::kCritical);
+        PulseGlobalDetection(why);
+
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->runDetection = true;
+            process->ClearCachedFactionFightReactions();
+        }
+
+        spdlog::info(
+            "[TFD][HostilityController][R277A] captive fight owner break complete actor={:08X} player={:08X} changed={} stillSuppressed={} reason={} noGenericSessionRelease=1 noNativeTargetLock=1 noDraw=1",
+            actorId,
+            player->GetFormID(),
+            changed ? 1 : 0,
+            IsSuppressed(actor) ? 1 : 0,
+            why);
+
+        return changed;
     }
 
     bool BreakPassiveOwnershipForFightChoice(RE::Actor* actor, RE::Actor* player, const char* debugReason)

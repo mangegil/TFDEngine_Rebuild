@@ -134,6 +134,7 @@ namespace TFD::DefeatMonitor
 		std::chrono::steady_clock::time_point g_postTerminalBleedoutLockoutUntil{};
 		std::chrono::steady_clock::time_point g_postTerminalBleedoutLockoutLastLog{};
 		std::string g_postTerminalBleedoutLockoutReason{};
+		float g_postTerminalBleedoutLockoutArmHpPct = -1.0f;
 
 		std::atomic_bool g_grace{ false };
 		std::chrono::steady_clock::time_point g_graceUntil{};
@@ -360,10 +361,17 @@ namespace TFD::DefeatMonitor
 			g_postTerminalBleedoutLockoutUntil = Now() + std::chrono::milliseconds(static_cast<int>(duration * 1000.0));
 			g_postTerminalBleedoutLockoutLastLog = {};
 			g_postTerminalBleedoutLockoutReason = reason && reason[0] ? reason : (eventName && eventName[0] ? eventName : "terminal_outcome");
-			spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout armed event={} seconds={:.1f} reason={}",
+			g_postTerminalBleedoutLockoutArmHpPct = -1.0f;
+			if (auto* player = Player()) {
+				const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
+				const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
+				g_postTerminalBleedoutLockoutArmHpPct = (hpNow / hpMax) * 100.0f;
+			}
+			spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout armed event={} seconds={:.1f} reason={} armHpPct={:.1f}",
 				eventName && eventName[0] ? eventName : "<none>",
 				duration,
-				g_postTerminalBleedoutLockoutReason);
+				g_postTerminalBleedoutLockoutReason,
+				g_postTerminalBleedoutLockoutArmHpPct);
 		}
 
 		static bool IsPostTerminalBleedoutLockoutActive(const char* checkReason, float hpPct, float thresholdPct)
@@ -373,12 +381,40 @@ namespace TFD::DefeatMonitor
 			}
 			const auto now = Now();
 			if (now >= g_postTerminalBleedoutLockoutUntil) {
+				// R272A: terminal Release/Pay can leave the player exactly on the
+				// defeat threshold floor.  When the temporary pacify owner expires,
+				// hostile projection can return without any new damage and immediately
+				// reopen Bleedout.  Hold the lockout while the player has not taken
+				// fresh post-terminal damage; if HP drops below the armed floor, allow
+				// normal re-bleed because that is a real new defeat.
+				const bool stillAtThresholdFloor = hpPct <= (thresholdPct + 0.25f);
+				const bool noFreshPostTerminalDamage = g_postTerminalBleedoutLockoutArmHpPct >= 0.0f &&
+					hpPct >= (g_postTerminalBleedoutLockoutArmHpPct - 0.50f);
+				if (stillAtThresholdFloor && noFreshPostTerminalDamage) {
+					g_postTerminalBleedoutLockoutUntil = now + std::chrono::milliseconds(1500);
+					if (g_postTerminalBleedoutLockoutLastLog.time_since_epoch().count() == 0 ||
+						(now - g_postTerminalBleedoutLockoutLastLog) >= std::chrono::milliseconds(900)) {
+						g_postTerminalBleedoutLockoutLastLog = now;
+						spdlog::info("[TFD][Defeat][R272A] post-terminal lockout held until player recovery check={} hpPct={:.1f} armHpPct={:.1f} threshold={:.1f} reason={}",
+							checkReason && checkReason[0] ? checkReason : "threshold",
+							hpPct,
+							g_postTerminalBleedoutLockoutArmHpPct,
+							thresholdPct,
+							g_postTerminalBleedoutLockoutReason.empty() ? "unknown" : g_postTerminalBleedoutLockoutReason.c_str());
+					}
+					return true;
+				}
+
 				g_postTerminalBleedoutLockoutActive = false;
 				g_postTerminalBleedoutLockoutUntil = {};
 				g_postTerminalBleedoutLockoutLastLog = {};
-				spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout expired reason={}",
-					g_postTerminalBleedoutLockoutReason.empty() ? "unknown" : g_postTerminalBleedoutLockoutReason.c_str());
+				spdlog::info("[TFD][Defeat][R216A] post-terminal bleedout threshold lockout expired reason={} hpPct={:.1f} armHpPct={:.1f} threshold={:.1f}",
+					g_postTerminalBleedoutLockoutReason.empty() ? "unknown" : g_postTerminalBleedoutLockoutReason.c_str(),
+					hpPct,
+					g_postTerminalBleedoutLockoutArmHpPct,
+					thresholdPct);
 				g_postTerminalBleedoutLockoutReason.clear();
+				g_postTerminalBleedoutLockoutArmHpPct = -1.0f;
 				return false;
 			}
 			if (g_postTerminalBleedoutLockoutLastLog.time_since_epoch().count() == 0 ||
@@ -520,6 +556,7 @@ namespace TFD::DefeatMonitor
 
 		std::unordered_map<RE::FormID, BleedLockEntry> g_bleedLocks{};
 		std::chrono::steady_clock::time_point g_bleedLockLastScan{};
+		std::chrono::steady_clock::time_point g_thresholdScanImmediateDispatchLast{};
 
 		bool g_prevDialogueOpen = false;
 
@@ -1812,6 +1849,99 @@ namespace TFD::DefeatMonitor
 			return true;
 		}
 
+		static bool DispatchThresholdScanImmediateBleedout(
+			RE::Actor* player,
+			float playerHpPct,
+			float playerThreshold,
+			const char* reason)
+		{
+			if (!player) {
+				return false;
+			}
+
+			const auto now = Now();
+			if (g_thresholdScanImmediateDispatchLast.time_since_epoch().count() != 0 &&
+				(now - g_thresholdScanImmediateDispatchLast) < std::chrono::milliseconds(900)) {
+				spdlog::info(
+					"[TFD][Defeat][R270A] threshold scan immediate bleedout skipped reason=recent_dispatch hpPct={:.1f} threshold={:.1f}",
+					playerHpPct,
+					std::clamp(playerThreshold, 2.0f, 95.0f));
+				return false;
+			}
+
+			auto& flow = TFD::FlowController::Controller::GetSingleton();
+			const bool flowDecisionActive = flow.IsBleedDecisionActive();
+			const auto flowSnapshot = flow.GetSnapshot();
+			const bool staleEscapeBreakBleedRuntime =
+				g_inBleedState.load(std::memory_order_acquire) &&
+				!flowDecisionActive &&
+				flowSnapshot.root == TFD::FlowController::RootFlow::InCombat &&
+				flowSnapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
+				flowSnapshot.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak;
+
+			if (flowDecisionActive) {
+				spdlog::info(
+					"[TFD][Defeat][R270A] threshold scan immediate bleedout skipped reason=bleed_decision_active hpPct={:.1f} threshold={:.1f}",
+					playerHpPct,
+					std::clamp(playerThreshold, 2.0f, 95.0f));
+				return false;
+			}
+
+			if (g_inBleedState.load(std::memory_order_acquire) && !staleEscapeBreakBleedRuntime) {
+				spdlog::info(
+					"[TFD][Defeat][R270A] threshold scan immediate bleedout skipped reason=bleed_runtime_active root={} ctx={} sub={} hpPct={:.1f} threshold={:.1f}",
+					TFD::FlowController::Controller::ToString(flowSnapshot.root),
+					TFD::FlowController::Controller::ToString(flowSnapshot.contextRoot),
+					TFD::FlowController::Controller::ToString(flowSnapshot.sub),
+					playerHpPct,
+					std::clamp(playerThreshold, 2.0f, 95.0f));
+				return false;
+			}
+
+			if (staleEscapeBreakBleedRuntime) {
+				g_inBleedState.store(false, std::memory_order_release);
+				g_minHp = 0.0f;
+				TFD::BleedoutGreet::ResetRuntime("r270_stale_escape_break_rebleed");
+				TFD::Bleedout::ClearDialogueOutcome("r270_stale_escape_break_rebleed");
+				spdlog::info(
+					"[TFD][Defeat][R270A] stale escape-break bleed runtime released root={} ctx={} sub={} primary={:08X}",
+					TFD::FlowController::Controller::ToString(flowSnapshot.root),
+					TFD::FlowController::Controller::ToString(flowSnapshot.contextRoot),
+					TFD::FlowController::Controller::ToString(flowSnapshot.sub),
+					flowSnapshot.primaryActorFormID);
+			}
+
+			auto thresholdScan = ScanPlayerThresholdOutcome(player);
+			const bool immediateThreat = player->IsInCombat() ||
+				thresholdScan.initialAggressor != nullptr ||
+				thresholdScan.hostileCoalitionStanding;
+			if (!immediateThreat) {
+				spdlog::info(
+					"[TFD][Defeat][R270A] threshold scan immediate bleedout skipped reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}",
+					playerHpPct,
+					std::clamp(playerThreshold, 2.0f, 95.0f));
+				return false;
+			}
+
+			ClearEnemyTargetsToPlayerForDefeat(player, thresholdScan.scanRadius, reason ? reason : "threshold_scan_player_immediate");
+			auto thresholdClassification = ClassifyPlayerThresholdOutcome(thresholdScan);
+			const bool dispatched = DispatchPlayerThresholdOutcome(player, thresholdScan, thresholdClassification);
+			spdlog::info(
+				"[TFD][Defeat][R270A] threshold scan immediate bleedout dispatch dispatched={} staleEscapeBreak={} hpPct={:.1f} threshold={:.1f} root={} ctx={} sub={} speaker={:08X}",
+				dispatched ? 1 : 0,
+				staleEscapeBreakBleedRuntime ? 1 : 0,
+				playerHpPct,
+				std::clamp(playerThreshold, 2.0f, 95.0f),
+				TFD::FlowController::Controller::ToString(flowSnapshot.root),
+				TFD::FlowController::Controller::ToString(flowSnapshot.contextRoot),
+				TFD::FlowController::Controller::ToString(flowSnapshot.sub),
+				thresholdClassification.rememberedAggressor ? thresholdClassification.rememberedAggressor->GetFormID() : 0u);
+			if (dispatched) {
+				g_thresholdScanImmediateDispatchLast = now;
+			}
+			return dispatched;
+		}
+
 		static FollowerResolution ResolveFollowerCandidates(float radius)
 		{
 			auto external = TFD::TeammateManager::ResolveFollowerCandidates(radius);
@@ -2426,38 +2556,15 @@ namespace TFD::DefeatMonitor
 			if (!terminalLockout && ShouldEnterBleedLock(player, playerThreshold, playerSideThreat)) {
 				EnterBleedLock(player, BleedLockKind::Player, playerThreshold, "threshold_scan_player");
 
-				// R259A: threshold_scan_player is already the first hard defeat point.
+				// R270A/R259A: threshold_scan_player is already the first hard defeat point.
 				// Do not leave the player in hard-invuln while combat continues until
-				// the later player_threshold branch eventually fires.  Start the same
-				// Bleedout decision route immediately, using the normal threshold
-				// classifier, so enemies are detached and forcegreet can own the state
-				// on the first down tick.
-				if (!g_inBleedState.load(std::memory_order_acquire) &&
-					!TFD::FlowController::Controller::GetSingleton().IsBleedDecisionActive()) {
-					auto thresholdScan = ScanPlayerThresholdOutcome(player);
-					const bool immediateThreat = player->IsInCombat() ||
-						thresholdScan.initialAggressor != nullptr ||
-						thresholdScan.hostileCoalitionStanding;
-					if (immediateThreat) {
-						ClearEnemyTargetsToPlayerForDefeat(player, thresholdScan.scanRadius, "threshold_scan_player_immediate");
-						auto thresholdClassification = ClassifyPlayerThresholdOutcome(thresholdScan);
-						const bool dispatched = DispatchPlayerThresholdOutcome(player, thresholdScan, thresholdClassification);
-						spdlog::info(
-							"[TFD][Defeat][R259A] threshold scan immediate bleedout dispatch dispatched={} hpPct={:.1f} threshold={:.1f} threat=1 rootBleedActive={}",
-							dispatched ? 1 : 0,
-							playerHpPct,
-							std::clamp(playerThreshold, 2.0f, 95.0f),
-							g_inBleedState.load(std::memory_order_acquire) ? 1 : 0);
-						if (dispatched) {
-							return;
-						}
-					}
-					else {
-						spdlog::info(
-							"[TFD][Defeat][R259A] threshold scan immediate bleedout skipped reason=no_immediate_threat hpPct={:.1f} threshold={:.1f}",
-							playerHpPct,
-							std::clamp(playerThreshold, 2.0f, 95.0f));
-					}
+				// the later player_threshold branch eventually fires.  This is especially
+				// important after Pleasure Failed > Fight, where Captive/InCombat escape
+				// break can leave a stale player_bleed_runtime flag without an active
+				// Bleedout decision route.  Start the normal Bleedout route immediately,
+				// and allow one stale escape-break runtime to be overwritten.
+				if (DispatchThresholdScanImmediateBleedout(player, playerHpPct, playerThreshold, "threshold_scan_player_immediate")) {
+					return;
 				}
 			}
 			else if (!terminalLockout && playerHpPct <= std::clamp(playerThreshold, 2.0f, 95.0f) && !playerSideThreat) {

@@ -1184,13 +1184,6 @@ namespace TFD::Captive
 				return false;
 			}
 
-			// R230A: R221A/R229A still treated PhaseValue::Escape, generic
-			// hostility, and weapon-drawn state as enough reason to skip captive
-			// role/pacify re-application.  That was correct for the actual
-			// InCombatEscapeBreak speaker, but wrong for Bleedout/AfterPleasure
-			// crowd: those actors can remain hostile/drawn for a few ticks while
-			// the dialogue owner needs them fully pacified.  Only a real combat
-			// owner may block this sweep.  BleedoutEscapeBreak must not block it.
 			auto& flow = TFD::FlowController::Controller::GetSingleton();
 			const auto snapshot = flow.GetSnapshot();
 			const bool phaseEscape = g_phase == PhaseValue::Escape;
@@ -1198,12 +1191,9 @@ namespace TFD::Captive
 				snapshot.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak;
 			const bool bleedoutEscapeBreak = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
 				snapshot.sub == TFD::FlowController::SubFlow::BleedoutEscapeBreak;
+			const bool captiveThreatOverlay = inCombatEscapeBreak || bleedoutEscapeBreak;
 
-			if (bleedoutEscapeBreak) {
-				return false;
-			}
-
-			if (!phaseEscape && !inCombatEscapeBreak) {
+			if (!phaseEscape && !captiveThreatOverlay) {
 				return false;
 			}
 
@@ -1212,35 +1202,42 @@ namespace TFD::Captive
 			const bool hostile = actor->IsHostileToActor(player);
 			const bool inCombat = actor->IsInCombat();
 			const bool weaponDrawn = actor->IsWeaponDrawn();
-			const bool primaryInCombatEscapeBreak = inCombatEscapeBreak && snapshot.primaryActorFormID == actor->GetFormID();
-			const bool activeCombatOwner = targetingPlayer || inCombat || primaryInCombatEscapeBreak;
+			const bool primaryEscapeBreak = captiveThreatOverlay && snapshot.primaryActorFormID == actor->GetFormID();
 
+			// R271A: Captive is the base context, while InCombatEscapeBreak and
+			// BleedoutEscapeBreak are threat overlays above it. During those overlays
+			// Captive runtime must not refresh TFDCaptiveFaction/package ownership;
+			// combat or bleedout owns hostility, stance, and forcegreet settlement.
+			if (captiveThreatOverlay) {
+				const bool removed = RemoveNativeCaptorRoleFactionForActor(actor,
+					bleedoutEscapeBreak ? "captive_runtime_tick_bleedout_escape_break_suspend" : "captive_runtime_tick_incombat_escape_break_suspend");
+				spdlog::info("[TFD][Captive][R271A] native captive role apply suspended for captive threat overlay actor={:08X} overlay={} phaseEscape={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} removed={} reason={}",
+					actor->GetFormID(),
+					bleedoutEscapeBreak ? "BleedoutEscapeBreak" : "InCombatEscapeBreak",
+					phaseEscape ? 1 : 0,
+					hostile ? 1 : 0,
+					targetingPlayer ? 1 : 0,
+					inCombat ? 1 : 0,
+					weaponDrawn ? 1 : 0,
+					primaryEscapeBreak ? 1 : 0,
+					removed ? 1 : 0,
+					reason ? reason : "unknown");
+				return true;
+			}
+
+			const bool activeCombatOwner = targetingPlayer || inCombat || hostile || weaponDrawn;
 			if (!activeCombatOwner) {
-				if (hostile || inCombat || weaponDrawn) {
-					spdlog::info("[TFD][Captive][R230A] native captive role apply allowed for non-combat crowd actor={:08X} phaseEscape={} inCombatEscapeBreak={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} reason={}",
-						actor->GetFormID(),
-						phaseEscape ? 1 : 0,
-						inCombatEscapeBreak ? 1 : 0,
-						hostile ? 1 : 0,
-						targetingPlayer ? 1 : 0,
-						inCombat ? 1 : 0,
-						weaponDrawn ? 1 : 0,
-						primaryInCombatEscapeBreak ? 1 : 0,
-						reason ? reason : "unknown");
-				}
 				return false;
 			}
 
-			(void)RemoveNativeCaptorRoleFactionForActor(actor, "captive_runtime_tick_escape_break_combat_owner");
-			spdlog::info("[TFD][Captive][R230A] native captive role apply skipped for active combat owner actor={:08X} phaseEscape={} inCombatEscapeBreak={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} reason={}",
+			(void)RemoveNativeCaptorRoleFactionForActor(actor, "captive_runtime_tick_escape_phase_combat_owner");
+			spdlog::info("[TFD][Captive][R271A] native captive role apply skipped for escape phase combat owner actor={:08X} phaseEscape={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} reason={}",
 				actor->GetFormID(),
 				phaseEscape ? 1 : 0,
-				inCombatEscapeBreak ? 1 : 0,
 				hostile ? 1 : 0,
 				targetingPlayer ? 1 : 0,
 				inCombat ? 1 : 0,
 				weaponDrawn ? 1 : 0,
-				primaryInCombatEscapeBreak ? 1 : 0,
 				reason ? reason : "unknown");
 
 			return true;
