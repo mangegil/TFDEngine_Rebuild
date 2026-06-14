@@ -82,6 +82,8 @@ namespace TFD::DefeatMonitor
 		constexpr const char* kPleasureOutcomeReleaseEvent = "TFDPleasureOutcomeRelease";
 		constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
 		constexpr const char* kBleedoutGreetConfirmedEvent = "TFDBleedoutGreetConfirmed";
+		constexpr const char* kVictoryRecoverDefeatedEnemyEvent = "TFDVictoryRecoverDefeatedEnemy";
+		constexpr const char* kVictoryPleasureRestoreDefeatedEnemyEvent = "TFDVictoryPleasureRestoreDefeatedEnemy";
 
 		static std::uint32_t ResolveBleedFlowActorFormID();
 		static TFD::Bleedout::RuntimeHostStateRefs BuildBleedRuntimeHostStateRefs();
@@ -549,6 +551,8 @@ namespace TFD::DefeatMonitor
 			bool defeatedFatalDamageApplied{ false };
 			int defeatedAliasSlot{ -1 };
 			std::chrono::steady_clock::time_point defeatedDeadline{};
+			bool victoryPleasureSceneHold{ false };
+			std::chrono::steady_clock::time_point victoryPleasureSceneHoldUntil{};
 			std::chrono::steady_clock::time_point lastPulse{};
 			std::chrono::steady_clock::time_point lastDamageLog{};
 			std::chrono::steady_clock::time_point lastHealGain{};
@@ -556,11 +560,17 @@ namespace TFD::DefeatMonitor
 
 		std::unordered_map<RE::FormID, BleedLockEntry> g_bleedLocks{};
 		std::chrono::steady_clock::time_point g_bleedLockLastScan{};
+		std::chrono::steady_clock::time_point g_enemyDefeatedLifecycleLastScan{};
+		std::chrono::steady_clock::time_point g_enemyDefeatedLifecycleLastLog{};
+		std::unordered_map<RE::FormID, std::chrono::steady_clock::time_point> g_defeatedEnemyVictoryDialogueHoldLastLog{};
 		std::chrono::steady_clock::time_point g_thresholdScanImmediateDispatchLast{};
+
+		static void EnterBleedLock(RE::Actor* actor, BleedLockKind kind, float thresholdPct, const char* reason);
 
 		bool g_prevDialogueOpen = false;
 
-		static constexpr double kDefeatedEnemyKnockSeconds = 5.0;
+		static constexpr double kDefeatedEnemyKnockSeconds = 10.0;
+		static constexpr double kDefeatedEnemyVictoryDialogueHoldSeconds = 1.5;
 		static constexpr double kDefeatedReentrySuppressSeconds = 6.0;
 		RE::ObjectRefHandle g_pendingDefeatedDialogueTarget{};
 		std::chrono::steady_clock::time_point g_pendingDefeatedDialogueExpiry{};
@@ -1124,6 +1134,7 @@ namespace TFD::DefeatMonitor
 		static void MaintainBleedSpeakerKick();
 		static void ClearBleedDialogueOutcome(const char* reason);
 		static bool IsDialogueOpen();
+		static bool RecoverDefeatedEnemyForVictoryPleasure(RE::Actor* actor, double holdSeconds, const char* reason);
 		static void ApplyCalmBubble(float radius);
 		static void ClearCaptiveOrchestrationResidue(bool clearPendingFadeIn = true);
 		static RE::Actor* ResolveBleedRuntimeSpeaker();
@@ -2309,6 +2320,231 @@ namespace TFD::DefeatMonitor
 			}
 		}
 
+		static bool IsVictoryPleasureSceneHoldActive(const BleedLockEntry& entry, std::chrono::steady_clock::time_point now)
+		{
+			return entry.victoryPleasureSceneHold &&
+				entry.victoryPleasureSceneHoldUntil.time_since_epoch().count() != 0 &&
+				now < entry.victoryPleasureSceneHoldUntil;
+		}
+
+		static bool EnsureVictoryPleasureDefeatedLock(RE::Actor* actor, const char* reason)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+			const auto formID = actor->GetFormID();
+			if (g_bleedLocks.find(formID) == g_bleedLocks.end()) {
+				EnterBleedLock(actor, BleedLockKind::Other, TFD::Settings::GetEnemyDownedThresholdPct(), reason && reason[0] ? reason : "victory_pleasure_ensure_defeated_lock");
+			}
+			auto it = g_bleedLocks.find(formID);
+			if (it == g_bleedLocks.end()) {
+				return false;
+			}
+			auto& entry = it->second;
+			entry.handle = actor->GetHandle();
+			entry.kind = BleedLockKind::Other;
+			entry.thresholdPct = TFD::Settings::GetEnemyDownedThresholdPct();
+			entry.defeatedManaged = true;
+			entry.defeatedAutoDeathIssued = false;
+			entry.defeatedFatalDamageApplied = false;
+			TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
+			TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.defeatedAliasSlot, entry.defeatedFactionApplied);
+			return true;
+		}
+
+		static bool EnsureVictoryPleasureLogicalHold(RE::Actor* actor, double holdSeconds, const char* reason)
+		{
+			const char* why = reason && reason[0] ? reason : "victory_pleasure_logical_hold";
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+
+			const auto formID = actor->GetFormID();
+			auto& entry = g_bleedLocks[formID];
+			entry.handle = actor->GetHandle();
+			entry.kind = BleedLockKind::Other;
+			entry.thresholdPct = TFD::Settings::GetEnemyDownedThresholdPct();
+
+			// R325A: during Victory -> Pleasure, OStim must be the only visual/animation owner.
+			// Keep a logical defeated hold for auto-death/Victory ownership, but remove the
+			// defeated alias/faction/passive aggression override and do not pulse BleedoutStart.
+			if (entry.defeatedManaged || entry.defeatedFactionApplied || entry.defeatedAliasSlot >= 0 || entry.aggressionOverridden) {
+				TFD::Actor::Ops::ClearDefeatedEnemyState(
+					actor,
+					entry.defeatedAliasSlot,
+					entry.defeatedFactionApplied,
+					entry.defeatedManaged,
+					entry.defeatedAutoDeathIssued,
+					entry.defeatedFatalDamageApplied,
+					entry.defeatedDeadline,
+					entry.savedAggression,
+					entry.aggressionOverridden,
+					why);
+			}
+
+			const double safeSeconds = std::clamp(holdSeconds > 0.0 ? holdSeconds : 30.0, 8.0, 60.0);
+			const auto holdUntil = Now() + std::chrono::milliseconds(static_cast<int>(safeSeconds * 1000.0));
+			entry.handle = actor->GetHandle();
+			entry.kind = BleedLockKind::Other;
+			entry.thresholdPct = TFD::Settings::GetEnemyDownedThresholdPct();
+			entry.defeatedManaged = true;
+			entry.defeatedAutoDeathIssued = false;
+			entry.defeatedFatalDamageApplied = false;
+			entry.defeatedDeadline = holdUntil;
+			entry.victoryPleasureSceneHold = true;
+			entry.victoryPleasureSceneHoldUntil = holdUntil;
+			entry.lastPulse = Now();
+
+			TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, safeSeconds, why);
+			TFD::HostilityController::ApplyAggressionClamp(actor);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				const bool oldRunDetection = process->runDetection;
+				process->runDetection = false;
+				process->ClearCachedFactionFightReactions();
+				process->StopCombatAndAlarmOnActor(actor, false);
+				process->runDetection = oldRunDetection;
+			}
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+
+			spdlog::info(
+				"[TFD][Defeat][R325A] victory pleasure logical hold armed actor={:08X} seconds={:.1f} reason={} aliasCleared={} factionCleared={} passiveCleared={} hpPct={:.1f}",
+				formID,
+				safeSeconds,
+				why,
+				entry.defeatedAliasSlot < 0 ? 1 : 0,
+				entry.defeatedFactionApplied ? 0 : 1,
+				entry.aggressionOverridden ? 0 : 1,
+				GetActorHealthPct(actor));
+			return true;
+		}
+
+		static bool ArmVictoryPleasureSceneHold(RE::Actor* actor, double holdSeconds, const char* reason)
+		{
+			const char* why = reason && reason[0] ? reason : "victory_pleasure_scene_hold";
+			if (!EnsureVictoryPleasureLogicalHold(actor, holdSeconds, why)) {
+				spdlog::warn("[TFD][Defeat][R325A] victory pleasure logical hold skipped actor={:08X} reason={} invalid=1",
+					actor ? actor->GetFormID() : 0u,
+					why);
+				return false;
+			}
+			return true;
+		}
+
+		static bool RestoreDefeatedEnemyAfterVictoryPleasure(RE::Actor* actor, const char* reason)
+		{
+			const char* why = reason && reason[0] ? reason : "victory_pleasure_restore_defeated_after_scene";
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				spdlog::warn("[TFD][Defeat][R323B] victory pleasure restore skipped actor={:08X} reason={} invalid=1",
+					actor ? actor->GetFormID() : 0u,
+					why);
+				return false;
+			}
+
+			if (!EnsureVictoryPleasureDefeatedLock(actor, why)) {
+				spdlog::warn("[TFD][Defeat][R323B] victory pleasure restore skipped actor={:08X} reason={} lock=0",
+					actor ? actor->GetFormID() : 0u,
+					why);
+				return false;
+			}
+
+			auto& entry = g_bleedLocks[actor->GetFormID()];
+			entry.victoryPleasureSceneHold = false;
+			entry.victoryPleasureSceneHoldUntil = {};
+			entry.defeatedAutoDeathIssued = false;
+			entry.defeatedFatalDamageApplied = false;
+			entry.defeatedDeadline = Now() + std::chrono::milliseconds(static_cast<int>(kDefeatedEnemyKnockSeconds * 1000.0));
+			entry.lastPulse = Now();
+
+			RestoreActorHealthToSafePct(actor, TFD::Settings::GetEnemyDownedThresholdPct(), 3.0f, 10.0f, 35.0f, 10.0f, why);
+			TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
+			TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.defeatedAliasSlot, entry.defeatedFactionApplied);
+			SetPendingDefeatedDialogueTargetInternal(actor);
+			TFD::Victory::MarkDefeatedDialogueAvailable(actor);
+			TFD::Victory::SetStateValue(TFD::Victory::CanAdvertiseVictoryNow(actor, why) ? 2 : 1);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				process->StopCombatAndAlarmOnActor(actor, false);
+			}
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			actor->NotifyAnimationGraph("BleedoutStart");
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+			spdlog::info("[TFD][Defeat][R323B] victory pleasure restored defeated state actor={:08X} reason={} deadlineSeconds={:.1f} aliasSlot={} factionApplied={} hpPct={:.1f}",
+				actor->GetFormID(),
+				why,
+				kDefeatedEnemyKnockSeconds,
+				entry.defeatedAliasSlot,
+				entry.defeatedFactionApplied ? 1 : 0,
+				GetActorHealthPct(actor));
+			return true;
+		}
+
+		static bool RecoverDefeatedEnemyForVictoryPleasure(RE::Actor* actor, double holdSeconds, const char* reason)
+		{
+			const char* why = reason && reason[0] ? reason : "victory_pleasure_pre_ostim_recover";
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				spdlog::warn("[TFD][Defeat][R322A] victory pleasure recovery skipped actor={:08X} reason={} invalid=1",
+					actor ? actor->GetFormID() : 0u,
+					why);
+				return false;
+			}
+
+			const double safeHoldSeconds = std::clamp(holdSeconds > 0.0 ? holdSeconds : 30.0, 8.0, 60.0);
+			const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+			const bool wasInCombat = actor->IsInCombat();
+			const bool wasWeaponDrawn = actor->IsWeaponDrawn();
+
+			RestoreActorHealthToSafePct(
+				actor,
+				TFD::Settings::GetEnemyDownedThresholdPct(),
+				20.0f,
+				70.0f,
+				95.0f,
+				30.0f,
+				why);
+
+			ArmVictoryPleasureSceneHold(actor, safeHoldSeconds, why);
+			RestoreActorHealthToSafePct(
+				actor,
+				TFD::Settings::GetEnemyDownedThresholdPct(),
+				20.0f,
+				70.0f,
+				95.0f,
+				30.0f,
+				why);
+
+			TFD::HostilityController::ApplyAggressionClamp(actor);
+			if (auto* process = RE::ProcessLists::GetSingleton()) {
+				const bool oldRunDetection = process->runDetection;
+				process->runDetection = false;
+				process->ClearCachedFactionFightReactions();
+				process->StopCombatAndAlarmOnActor(actor, false);
+				process->runDetection = oldRunDetection;
+			}
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			actor->NotifyAnimationGraph("BleedoutStop");
+			actor->NotifyAnimationGraph("GetUpStart");
+			actor->EvaluatePackage(false, true);
+			actor->EvaluatePackage(true, true);
+			TFD::HostilityController::ScheduleStopCombatAndAlarmWaves(1800.0f, false, 4, 120, why);
+
+			spdlog::info("[TFD][Defeat][R322A] victory pleasure target recovered actor={:08X} reason={} hold={:.1f}s hpBefore={:.2f} hpAfter={:.2f} wasCombat={} wasDrawn={} isCombat={} isDrawn={}",
+				actor->GetFormID(),
+				why,
+				safeHoldSeconds,
+				hpBefore,
+				actor->GetActorValue(RE::ActorValue::kHealth),
+				wasInCombat ? 1 : 0,
+				wasWeaponDrawn ? 1 : 0,
+				actor->IsInCombat() ? 1 : 0,
+				actor->IsWeaponDrawn() ? 1 : 0);
+			return true;
+		}
+
 		static void TickPendingCaptiveRecaptureRecoveryPulse()
 		{
 			if (!g_pendingCaptiveRecaptureRecovery) {
@@ -2437,6 +2673,10 @@ namespace TFD::DefeatMonitor
 					entry.defeatedDeadline = Now() + std::chrono::milliseconds(static_cast<int>(kDefeatedEnemyKnockSeconds * 1000.0));
 					entry.defeatedAutoDeathIssued = false;
 					entry.defeatedFatalDamageApplied = false;
+					spdlog::info("[TFD][Defeat][R304A] defeated enemy countdown armed actor={:08X} seconds={:.1f} reason={}",
+						formID,
+						kDefeatedEnemyKnockSeconds,
+						reason ? reason : "unknown");
 				}
 				TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
 				TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.defeatedAliasSlot, entry.defeatedFactionApplied);
@@ -2486,6 +2726,7 @@ namespace TFD::DefeatMonitor
 			auto entry = it->second;
 			const auto kind = entry.kind;
 			g_bleedLocks.erase(it);
+			g_defeatedEnemyVictoryDialogueHoldLastLog.erase(formID);
 			RestoreBleedRegenOverride(actor, entry);
 			if (entry.defeatedManaged) {
 				if (actor && reason && std::strstr(reason, "recruit")) {
@@ -2534,7 +2775,10 @@ namespace TFD::DefeatMonitor
 				spdlog::info("[TFD][Defeat] bleed lock clear actor={:08X} reason={}", formID, reason ? reason : "unknown");
 			}
 			g_bleedLocks.clear();
+			g_defeatedEnemyVictoryDialogueHoldLastLog.clear();
 			g_bleedLockLastScan = {};
+			g_enemyDefeatedLifecycleLastScan = {};
+			g_enemyDefeatedLifecycleLastLog = {};
 			TFD::Actor::Ops::ClearAllDefeatedEnemyMirrors(reason);
 		}
 
@@ -2607,6 +2851,267 @@ namespace TFD::DefeatMonitor
 				if (ShouldEnterBleedLock(actor, threshold, enemyThreat)) {
 					EnterBleedLock(actor, ResolveBleedLockKind(actor), threshold, "threshold_scan_other");
 				}
+			}
+		}
+
+		static void ScanEnemyDefeatedLockCandidatesOnly(const char* reason)
+		{
+			auto* player = Player();
+			if (!player) {
+				return;
+			}
+
+			const float radius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 600.0f);
+			auto snapshot = TFD::Actor::BuildSnapshot(radius, false);
+
+			for (const auto& info : snapshot.actors) {
+				auto* actor = info.get();
+				if (!actor || actor == player || actor->IsDisabled() || actor->IsDead()) {
+					continue;
+				}
+
+				// R305A: enemy defeated lifecycle is owned by DefeatMonitor, not Captive.
+				// Do not let Captive escape/player-state gates delay individual enemy
+				// threshold detection. Player-side actors still use the normal full
+				// TickBleedLocks path so recovery/dialogue ownership stays unchanged.
+				if (TFD::TeammateManager::IsPlayerSideTeammateActor(actor) || IsActiveFollowerActor(actor)) {
+					continue;
+				}
+
+				if (!TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor)) {
+					continue;
+				}
+
+				const float threshold = ResolveBleedLockThresholdPct(actor);
+				if (ShouldEnterBleedLock(actor, threshold, true)) {
+					EnterBleedLock(actor, BleedLockKind::Other, threshold, reason && reason[0] ? reason : "threshold_scan_enemy_lifecycle_always");
+				}
+			}
+		}
+
+		static bool HoldDefeatedEnemyAutoDeathForVictoryDialogue(
+			RE::Actor* actor,
+			BleedLockEntry& entry,
+			std::chrono::steady_clock::time_point now,
+			const char* source)
+		{
+			if (!actor || entry.kind != BleedLockKind::Other || !entry.defeatedManaged) {
+				return false;
+			}
+			if (actor->IsDisabled() || actor->IsDead()) {
+				return false;
+			}
+
+			const auto actorID = actor->GetFormID();
+			const auto flowSnapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			if (flowSnapshot.primaryActorFormID != 0 && flowSnapshot.primaryActorFormID != actorID) {
+				return false;
+			}
+
+			const bool dialogueMenuOpen = IsDialogueOpen();
+			const bool nativeDialogueOpenPending = TFD::InteractionRouter::DialogueOpen::IsActive();
+			const bool victoryDialogueHold =
+				flowSnapshot.root == TFD::FlowController::RootFlow::Victory &&
+				(dialogueMenuOpen || nativeDialogueOpenPending);
+
+			// R321C: once the player commits Victory -> Pleasure, FlowController
+			// intentionally stores the state as a terminal Victory context
+			// (root=None, contextRoot=Victory, sub=VictoryPleasure). At that
+			// point the Victory dialogue has closed and OStim may still be
+			// preparing aliases, so the old dialogue-only hold releases too
+			// early and the defeated target dies before the scene can start.
+			const bool victoryPleasureContext =
+				(flowSnapshot.contextRoot == TFD::FlowController::RootFlow::Victory ||
+					flowSnapshot.root == TFD::FlowController::RootFlow::Victory) &&
+				flowSnapshot.sub == TFD::FlowController::SubFlow::VictoryPleasure;
+
+			const bool victoryPleasureRuntime =
+				TFD::PleasureRuntime::GetSourceContext() == TFD::PleasureRuntime::SourceContext::Victory &&
+				(TFD::PleasureRuntime::IsActive() || TFD::PleasureRuntime::IsBlocking());
+
+			if (!victoryDialogueHold && !victoryPleasureContext && !victoryPleasureRuntime) {
+				return false;
+			}
+
+			const auto holdDuration = std::chrono::milliseconds(static_cast<int>(kDefeatedEnemyVictoryDialogueHoldSeconds * 1000.0));
+			const auto extendedDeadline = now + holdDuration;
+			if (entry.defeatedDeadline.time_since_epoch().count() == 0 || entry.defeatedDeadline < extendedDeadline) {
+				entry.defeatedDeadline = extendedDeadline;
+			}
+			if (victoryPleasureContext || victoryPleasureRuntime) {
+				entry.victoryPleasureSceneHold = true;
+				entry.victoryPleasureSceneHoldUntil = extendedDeadline;
+			}
+
+			if (entry.defeatedAutoDeathIssued && !entry.defeatedFatalDamageApplied) {
+				entry.defeatedAutoDeathIssued = false;
+				entry.lastPulse = now;
+				if (!victoryPleasureContext && !victoryPleasureRuntime) {
+					actor->NotifyAnimationGraph("BleedoutStart");
+				}
+			}
+
+			auto& lastLog = g_defeatedEnemyVictoryDialogueHoldLastLog[actorID];
+			if (lastLog.time_since_epoch().count() == 0 || (now - lastLog) >= std::chrono::milliseconds(1500)) {
+				lastLog = now;
+				spdlog::info(
+					"[TFD][Defeat][R321C] defeated enemy auto-death held by Victory dialogue/pleasure actor={:08X} dialogueOpen={} pendingOpen={} root={} ctx={} sub={} runtimeSource={} runtimeActive={} runtimeBlocking={} primary={:08X} source={}",
+					actorID,
+					dialogueMenuOpen ? 1 : 0,
+					nativeDialogueOpenPending ? 1 : 0,
+					TFD::FlowController::Controller::ToString(flowSnapshot.root),
+					TFD::FlowController::Controller::ToString(flowSnapshot.contextRoot),
+					TFD::FlowController::Controller::ToString(flowSnapshot.sub),
+					TFD::PleasureRuntime::GetSourceContextName(),
+					TFD::PleasureRuntime::IsActive() ? 1 : 0,
+					TFD::PleasureRuntime::IsBlocking() ? 1 : 0,
+					flowSnapshot.primaryActorFormID,
+					source && source[0] ? source : "unknown");
+			}
+
+			return true;
+		}
+
+		static void TickEnemyDefeatedLifecycleAlways(const char* reason)
+		{
+			const auto now = Now();
+			if (g_enemyDefeatedLifecycleLastScan.time_since_epoch().count() == 0 ||
+				(now - g_enemyDefeatedLifecycleLastScan) >= std::chrono::milliseconds(250)) {
+				g_enemyDefeatedLifecycleLastScan = now;
+				ScanEnemyDefeatedLockCandidatesOnly(reason && reason[0] ? reason : "enemy_lifecycle_always");
+			}
+
+			std::vector<std::tuple<RE::FormID, RE::Actor*, const char*, bool>> releases;
+			bool servicedAny = false;
+			for (auto& [formID, entry] : g_bleedLocks) {
+				if (entry.kind != BleedLockKind::Other || !entry.defeatedManaged) {
+					continue;
+				}
+				servicedAny = true;
+
+				auto sp = entry.handle.get();
+				auto* actor = sp.get();
+				if (!actor || actor->IsDisabled()) {
+					releases.emplace_back(formID, actor, "invalid", false);
+					continue;
+				}
+
+				if (actor->IsDead()) {
+					releases.emplace_back(formID, actor, "dead", false);
+					continue;
+				}
+
+				ApplyBleedRegenOverride(actor, entry);
+				const bool victoryPleasureSceneHold = IsVictoryPleasureSceneHoldActive(entry, now);
+				if (entry.victoryPleasureSceneHold && !victoryPleasureSceneHold) {
+					entry.victoryPleasureSceneHold = false;
+					entry.victoryPleasureSceneHoldUntil = {};
+				}
+				if (!victoryPleasureSceneHold) {
+					TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
+					TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.defeatedAliasSlot, entry.defeatedFactionApplied);
+				}
+				if (actor->IsInCombat()) {
+					actor->StopCombat();
+				}
+				if (auto* process = RE::ProcessLists::GetSingleton()) {
+					process->StopCombatAndAlarmOnActor(actor, false);
+				}
+
+				HoldDefeatedEnemyAutoDeathForVictoryDialogue(actor, entry, now, reason);
+				if (entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
+					if (!entry.defeatedAutoDeathIssued) {
+						if (actor->IsEssential() || actor->IsProtected()) {
+							spdlog::warn("[TFD][Defeat][R305A] defeated enemy auto-death skipped actor={:08X} reason=protected_or_essential source={}",
+								actor->GetFormID(),
+								reason && reason[0] ? reason : "enemy_lifecycle_always");
+							releases.emplace_back(formID, actor, "timeout_skip_kill", true);
+							continue;
+						}
+						entry.defeatedAutoDeathIssued = true;
+						entry.defeatedFatalDamageApplied = false;
+						entry.defeatedDeadline = now + std::chrono::milliseconds(450);
+						entry.lastPulse = now;
+						actor->NotifyAnimationGraph("BleedoutStop");
+						actor->EvaluatePackage(false, true);
+						actor->EvaluatePackage(true, true);
+						spdlog::info("[TFD][Defeat][R305A] defeated enemy auto-death queued actor={:08X} source={}",
+							actor->GetFormID(),
+							reason && reason[0] ? reason : "enemy_lifecycle_always");
+						continue;
+					}
+
+					if (!entry.defeatedFatalDamageApplied) {
+						if (actor->IsDead()) {
+							spdlog::info("[TFD][Defeat][R305A] defeated enemy auto-death confirmed actor={:08X} source={}",
+								actor->GetFormID(),
+								reason && reason[0] ? reason : "enemy_lifecycle_always");
+							releases.emplace_back(formID, actor, "timeout_dead", false);
+							continue;
+						}
+						const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+						const float fatalDamage = (std::max)(25.0f, hpNow + 5000.0f);
+						actor->RestoreActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, RE::ActorValue::kHealth, -fatalDamage);
+						entry.defeatedFatalDamageApplied = true;
+						entry.defeatedDeadline = now + std::chrono::milliseconds(1500);
+						spdlog::info("[TFD][Defeat][R305A] defeated enemy auto-death damage actor={:08X} hpBefore={:.2f} damage={:.2f} source={}",
+							actor->GetFormID(),
+							hpNow,
+							fatalDamage,
+							reason && reason[0] ? reason : "enemy_lifecycle_always");
+						continue;
+					}
+
+					if (actor->IsDead()) {
+						spdlog::info("[TFD][Defeat][R305A] defeated enemy auto-death confirmed actor={:08X} source={}",
+							actor->GetFormID(),
+							reason && reason[0] ? reason : "enemy_lifecycle_always");
+						releases.emplace_back(formID, actor, "timeout_dead", false);
+						continue;
+					}
+
+					if ((now - entry.defeatedDeadline) >= std::chrono::milliseconds(1500)) {
+						spdlog::warn("[TFD][Defeat][R305A] defeated enemy auto-death fallback kill actor={:08X} source={}",
+							actor->GetFormID(),
+							reason && reason[0] ? reason : "enemy_lifecycle_always");
+						actor->KillImmediate();
+						releases.emplace_back(formID, actor, "timeout_dead_fallback", false);
+						continue;
+					}
+				}
+
+				const bool suppressBleedPulse = entry.defeatedAutoDeathIssued || IsVictoryPleasureSceneHoldActive(entry, now);
+				const bool pulseDue = entry.lastPulse.time_since_epoch().count() == 0 || (now - entry.lastPulse) >= std::chrono::milliseconds(250);
+				if (!suppressBleedPulse && (!IsActorBleedingOut(actor) || pulseDue)) {
+					actor->NotifyAnimationGraph("BleedoutStart");
+					entry.lastPulse = now;
+				}
+			}
+
+			for (auto& [formID, actor, releaseReason, playGetUp] : releases) {
+				if (actor) {
+					ReleaseBleedLock(actor, releaseReason, playGetUp);
+				}
+				else {
+					auto it = g_bleedLocks.find(formID);
+					if (it != g_bleedLocks.end()) {
+						spdlog::info("[TFD][Defeat][R305A] defeated enemy lock release actor={:08X} reason={} getUp=0 source={}",
+							formID,
+							releaseReason ? releaseReason : "unknown",
+							reason && reason[0] ? reason : "enemy_lifecycle_always");
+						g_bleedLocks.erase(it);
+						g_defeatedEnemyVictoryDialogueHoldLastLog.erase(formID);
+					}
+				}
+			}
+
+			if (servicedAny &&
+				(g_enemyDefeatedLifecycleLastLog.time_since_epoch().count() == 0 ||
+					(now - g_enemyDefeatedLifecycleLastLog) >= std::chrono::milliseconds(1500))) {
+				g_enemyDefeatedLifecycleLastLog = now;
+				spdlog::info("[TFD][Defeat][R305A] enemy defeated lifecycle serviced source={} activeLocks={}",
+					reason && reason[0] ? reason : "enemy_lifecycle_always",
+					static_cast<unsigned>(g_bleedLocks.size()));
 			}
 		}
 
@@ -2687,7 +3192,12 @@ namespace TFD::DefeatMonitor
 						releases.emplace_back(formID, actor, "recovered", true);
 						continue;
 					}
-					if (entry.defeatedManaged) {
+					const bool victoryPleasureSceneHold = IsVictoryPleasureSceneHoldActive(entry, now);
+					if (entry.victoryPleasureSceneHold && !victoryPleasureSceneHold) {
+						entry.victoryPleasureSceneHold = false;
+						entry.victoryPleasureSceneHoldUntil = {};
+					}
+					if (entry.defeatedManaged && !victoryPleasureSceneHold) {
 						TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
 						TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.defeatedAliasSlot, entry.defeatedFactionApplied);
 					}
@@ -2699,6 +3209,9 @@ namespace TFD::DefeatMonitor
 					}
 					if (actor->IsWeaponDrawn()) {
 						// R244A: no forced weapon stance; Skyrim handles sheath/draw naturally. Disabled: actor->DrawWeaponMagicHands(false);
+					}
+					if (entry.defeatedManaged) {
+						HoldDefeatedEnemyAutoDeathForVictoryDialogue(actor, entry, now, "bleed_lock_tick");
 					}
 					if (entry.defeatedManaged && entry.defeatedDeadline.time_since_epoch().count() != 0 && now >= entry.defeatedDeadline) {
 						if (!entry.defeatedAutoDeathIssued) {
@@ -2751,7 +3264,7 @@ namespace TFD::DefeatMonitor
 					}
 				}
 
-				const bool suppressBleedPulse = entry.defeatedManaged && entry.defeatedAutoDeathIssued;
+				const bool suppressBleedPulse = (entry.defeatedManaged && entry.defeatedAutoDeathIssued) || IsVictoryPleasureSceneHoldActive(entry, now);
 				const bool allyRecoveryDialogueHold =
 					entry.kind == BleedLockKind::Ally && TFD::TeammateManager::IsDownedTeammateRecoveryDialogueHoldActor(actor);
 				const auto pulseInterval = entry.kind == BleedLockKind::Ally ? std::chrono::milliseconds(250) : std::chrono::milliseconds(250);
@@ -2831,15 +3344,38 @@ namespace TFD::DefeatMonitor
 				reason ? reason : "unknown");
 		}
 
+		static void CancelBleedStickyReopenAfterTerminalOutcome(const char* eventName, const char* reason)
+		{
+			const bool wasActive = g_bleedStickyReopenGraceActive;
+			const std::uint32_t speakerID = g_bleedStickyReopenGraceSpeakerID;
+			const char* why = reason && reason[0] ? reason : "terminal_outcome";
+
+			ClearBleedStickyReopenGrace(why);
+			TFD::BleedoutGreet::MarkStickyReopenPending(false, why);
+
+			if (wasActive) {
+				spdlog::info("[TFD][Defeat][R300C] bleed sticky reopen cancelled by terminal outcome event={} speaker={:08X} reason={}",
+					eventName && eventName[0] ? eventName : "unknown",
+					speakerID,
+					why);
+			}
+		}
+
 		static bool TickBleedStickyReopenGrace(RE::Actor* player, std::chrono::steady_clock::time_point now)
 		{
 			if (!g_bleedStickyReopenGraceActive) {
 				return false;
 			}
 
+			if (g_postTerminalBleedoutLockoutActive) {
+				CancelBleedStickyReopenAfterTerminalOutcome("post_terminal_lockout", "post_terminal_lockout_active");
+				return true;
+			}
+
 			const auto outcome = TFD::Bleedout::GetDialogueOutcome();
 			if (TFD::Bleedout::HasTerminalCommit() || outcome != BleedDialogueOutcome::None || TFD::PleasureRuntime::IsBlocking() || TFD::PleasureRuntime::IsActive()) {
 				ClearBleedStickyReopenGrace("terminal_or_runtime_claimed");
+				TFD::BleedoutGreet::MarkStickyReopenPending(false, "terminal_or_runtime_claimed");
 				return true;
 			}
 
@@ -2904,6 +3440,12 @@ namespace TFD::DefeatMonitor
 				return;
 			}
 			RefreshPostDefeatGlobals();
+
+			// R305A: Enemy defeated/knockdown lifecycle belongs to DefeatMonitor.
+			// Service it before Captive/player-state/dialogue gates so Captive Escape
+			// cannot delay enemy threshold knockdown or freeze the 10s auto-death window.
+			TickEnemyDefeatedLifecycleAlways("pre_owner_gate");
+
 			const bool inCombatDialogueOpen = IsDialogueOpen();
 			if (!inCombatDialogueOpen &&
 				!TFD::InteractionRouter::DialogueOpen::IsActive() &&
@@ -3467,6 +4009,19 @@ else {
 					return RE::BSEventNotifyControl::kContinue;
 				}
 
+				if (std::strcmp(rawName, kVictoryRecoverDefeatedEnemyEvent) == 0) {
+					auto* speaker = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
+					const double holdSeconds = ev->numArg > 0.0f ? static_cast<double>(ev->numArg) : 30.0;
+					(void)RecoverDefeatedEnemyForVictoryPleasure(speaker, holdSeconds, ev->strArg.c_str());
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
+				if (std::strcmp(rawName, kVictoryPleasureRestoreDefeatedEnemyEvent) == 0) {
+					auto* speaker = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
+					(void)RestoreDefeatedEnemyAfterVictoryPleasure(speaker, ev->strArg.c_str());
+					return RE::BSEventNotifyControl::kContinue;
+				}
+
 				if (std::strcmp(rawName, kBleedoutGreetConfirmedEvent) == 0) {
 					auto* speaker = ev->sender ? ev->sender->As<RE::Actor>() : nullptr;
 					TFD::BleedoutGreet::NotifyFlowGreetConfirmed(speaker, ev->strArg.c_str());
@@ -3475,6 +4030,7 @@ else {
 
 				if (TFD::FlowController::HandleOutcomeModEvent(rawName, ev->strArg.c_str(), ev->numArg, ev->sender)) {
 					if (IsBleedoutTerminalOutcomeEvent(rawName)) {
+						CancelBleedStickyReopenAfterTerminalOutcome(rawName, "mod_event_terminal_outcome");
 						ArmPostTerminalBleedoutLockout(rawName, ResolvePostTerminalBleedoutLockoutSeconds(rawName, ev->numArg), "mod_event_terminal_outcome");
 					}
 					return RE::BSEventNotifyControl::kContinue;

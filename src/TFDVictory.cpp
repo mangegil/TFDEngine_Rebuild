@@ -1,6 +1,7 @@
 #include "TFDVictory.h"
 
 #include "TFDActor.h"
+#include "TFDHostilityController.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
 #include "TFDTame.h"
@@ -11,6 +12,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <vector>
 
 namespace TFD::Victory
 {
@@ -83,6 +86,29 @@ namespace TFD::Victory
             return true;
         }
 
+        bool HasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+            bool hasLOSData = false;
+            return actor->HasLineOfSight(player, hasLOSData);
+        }
+
+        bool IsTargetingPlayer(RE::Actor* actor, RE::Actor* player)
+        {
+            if (!actor || !player) {
+                return false;
+            }
+            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            auto* target = targetSp.get();
+            if (!target) {
+                return false;
+            }
+            return target == player || target->GetFormID() == player->GetFormID();
+        }
+
+
         bool IsRelevantLivingEnemyActor(RE::Actor* actor, RE::Actor* player)
         {
             if (!IsBasicLivingVictoryActor(actor, player)) {
@@ -137,6 +163,227 @@ namespace TFD::Victory
             return allowContextFallback || IsRelevantLivingEnemyActor(actor, player);
         }
 
+
+        bool IsStandingForVictoryBlock(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                return false;
+            }
+            if (actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f) {
+                return false;
+            }
+
+            // R304A: A TFD-knocked enemy remains alive during its defeated window,
+            // but it is no longer a standing combat blocker.  Treat it as an
+            // individual defeated candidate, not as proof that the encounter is
+            // still unresolved.
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
+                return false;
+            }
+            if (TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct())) {
+                return false;
+            }
+            return true;
+        }
+
+        bool IsDefeatedVictoryCandidate(RE::Actor* actor, RE::Actor* player, bool allowThresholdFallback)
+        {
+            if (!IsBasicLivingVictoryActor(actor, player)) {
+                return false;
+            }
+            if (TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
+                return true;
+            }
+            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
+                return true;
+            }
+            return IsThresholdDefeatedVictoryActor(actor, player, allowThresholdFallback);
+        }
+
+        bool SharesDefeatedEncounterFaction(RE::Actor* actor, const std::vector<RE::Actor*>& defeatedActors)
+        {
+            if (!actor) {
+                return false;
+            }
+            for (auto* defeated : defeatedActors) {
+                if (!defeated || defeated == actor) {
+                    continue;
+                }
+                if (TFD::Actor::SharesAllowedFactionExact(actor, defeated)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        struct CollectiveVictoryEvaluation
+        {
+            bool hasCandidate{ false };
+            bool resolved{ false };
+            bool hasStandingBlocker{ false };
+            RE::FormID candidateFormID{ 0 };
+            RE::FormID blockerFormID{ 0 };
+            std::uint32_t activeCoalitionCount{ 0 };
+            std::uint32_t standingHostileCoalitionCount{ 0 };
+        };
+
+        CollectiveVictoryEvaluation EvaluateCollectiveVictory(
+            float radius,
+            bool activeVictoryContext,
+            RE::Actor* requiredCandidate)
+        {
+            CollectiveVictoryEvaluation result{};
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (!player) {
+                return result;
+            }
+
+            const float scanRadius = (std::max)(radius, kActorLevelDefeatedScanRadius);
+            TFD::Actor::ScanOptions options{};
+            options.radius = scanRadius;
+            options.npcOnly = false;
+            const auto snapshot = TFD::Actor::BuildSnapshot(player, options);
+
+            const auto requiredFormID = requiredCandidate ? requiredCandidate->GetFormID() : 0;
+            std::vector<RE::Actor*> defeatedActors;
+            defeatedActors.reserve(snapshot.actors.size() + (requiredCandidate ? 1u : 0u));
+
+            auto addCandidate = [&](RE::Actor* actor) {
+                if (!actor || actor == player) {
+                    return;
+                }
+                if (!IsDefeatedVictoryCandidate(actor, player, activeVictoryContext)) {
+                    return;
+                }
+                for (auto* existing : defeatedActors) {
+                    if (existing == actor) {
+                        return;
+                    }
+                }
+                defeatedActors.push_back(actor);
+                result.hasCandidate = true;
+                if (result.candidateFormID == 0) {
+                    result.candidateFormID = actor->GetFormID();
+                }
+            };
+
+            if (requiredCandidate) {
+                addCandidate(requiredCandidate);
+            }
+
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || info.dist > scanRadius) {
+                    continue;
+                }
+                addCandidate(actor);
+            }
+
+            if (requiredFormID != 0) {
+                bool foundRequired = false;
+                for (auto* defeated : defeatedActors) {
+                    if (defeated && defeated->GetFormID() == requiredFormID) {
+                        foundRequired = true;
+                        break;
+                    }
+                }
+                if (!foundRequired) {
+                    result.hasCandidate = false;
+                    result.candidateFormID = 0;
+                    return result;
+                }
+                result.candidateFormID = requiredFormID;
+            }
+
+            if (!result.hasCandidate) {
+                return result;
+            }
+
+            auto isDefeatedActorRef = [&](RE::Actor* actor) {
+                for (auto* defeated : defeatedActors) {
+                    if (defeated == actor) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            std::vector<std::int32_t> effectiveStandingCoalitions;
+            std::vector<std::int32_t> effectiveHostileCoalitions;
+
+            auto pushUniqueCoalition = [](std::vector<std::int32_t>& values, std::int32_t coalitionID) {
+                if (coalitionID < 0) {
+                    return;
+                }
+                if (std::find(values.begin(), values.end(), coalitionID) == values.end()) {
+                    values.push_back(coalitionID);
+                }
+            };
+
+            auto markBlocker = [&](RE::Actor* actor) {
+                result.hasStandingBlocker = true;
+                if (actor && result.blockerFormID == 0) {
+                    result.blockerFormID = actor->GetFormID();
+                }
+            };
+
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || info.dist > scanRadius) {
+                    continue;
+                }
+                if (!IsBasicLivingVictoryActor(actor, player)) {
+                    continue;
+                }
+
+                // R304A: actor-level defeated is preserved, but it does not count
+                // as a standing coalition member during the 10s Victory window.
+                if (isDefeatedActorRef(actor)) {
+                    continue;
+                }
+                if (!IsStandingForVictoryBlock(actor)) {
+                    continue;
+                }
+
+                const bool standingEncounterCoalition = info.isBattleParticipant && !info.playerSide;
+                const bool activeEnemy = IsRelevantLivingEnemyActor(actor, player);
+                const bool suppressedByTFD =
+                    TFD::HostilityController::IsSuppressed(actor) ||
+                    TFD::HostilityController::IsActorTemporarilySuppressed(actor);
+                const bool sameDefeatedFaction = SharesDefeatedEncounterFaction(actor, defeatedActors);
+
+                const bool targetingPlayer = IsTargetingPlayer(actor, player);
+                const bool hasPlayerLOS = HasLineOfSightToPlayer(actor, player);
+                const bool activeThreatSignal = targetingPlayer || hasPlayerLOS;
+                const bool enemyIdentity =
+                    actor->IsHostileToActor(player) ||
+                    actor->IsInCombat() ||
+                    activeEnemy ||
+                    suppressedByTFD ||
+                    sameDefeatedFaction ||
+                    standingEncounterCoalition;
+
+                // R306A: Player Victory is blocked by an active threat to the
+                // player, not by every standing faction mate in the cell.  A
+                // standing enemy that is neither targeting the player nor able
+                // to see the player is not an immediate threat and must not
+                // erase the 10s defeated-enemy Victory window.
+                if (enemyIdentity && activeThreatSignal) {
+                    pushUniqueCoalition(effectiveStandingCoalitions, info.coalitionID);
+                    if (!info.playerSide) {
+                        pushUniqueCoalition(effectiveHostileCoalitions, info.coalitionID);
+                    }
+                    markBlocker(actor);
+                }
+            }
+
+            result.activeCoalitionCount = static_cast<std::uint32_t>(effectiveStandingCoalitions.size());
+            result.standingHostileCoalitionCount = static_cast<std::uint32_t>(effectiveHostileCoalitions.size());
+
+            result.resolved = result.hasCandidate && !result.hasStandingBlocker;
+            return result;
+        }
 
         bool HasActorLevelDefeatedLivingVictoryActor(float radius)
         {
@@ -333,14 +580,42 @@ namespace TFD::Victory
         if (!IsUsableDefeatedDialogueActor(actor, player)) {
             return;
         }
-        SetStateValue(kStateYes);
+        if (CanAdvertiseVictoryNow(actor, "mark_defeated_dialogue_available")) {
+            SetStateValue(kStateYes);
+        }
+        else {
+            SetStateValue(kStateNo);
+        }
+    }
+
+    bool CanAdvertiseVictoryNow(RE::Actor* requiredCandidate, const char* reason)
+    {
+        const auto evaluation = EvaluateCollectiveVictory(
+            kActorLevelDefeatedScanRadius,
+            true,
+            requiredCandidate);
+
+        if (reason && !evaluation.resolved) {
+            spdlog::info(
+                "[TFD][Victory][R306A] blocked Player Victory by active threat reason={} candidate={:08X} required={:08X} blocker={:08X} hasCandidate={} threatBlocker={} activeThreatCoalitions={} hostileThreatCoalitions={}",
+                reason,
+                evaluation.candidateFormID,
+                requiredCandidate ? requiredCandidate->GetFormID() : 0u,
+                evaluation.blockerFormID,
+                evaluation.hasCandidate ? 1 : 0,
+                evaluation.hasStandingBlocker ? 1 : 0,
+                evaluation.activeCoalitionCount,
+                evaluation.standingHostileCoalitionCount);
+        }
+
+        return evaluation.resolved;
     }
 
     int ComputeObservedState(const ObservedContext& context)
     {
         // 0 = Neutral: no living enemy remains relevant to the player.
-        // 1 = No: a live/standing enemy is still active, so Victory is not available yet.
-        // 2 = Yes: combat has resolved and at least one living humanoid enemy is downed below threshold.
+        // 1 = No: at least one active threat still targets or sees the player.
+        // 2 = Yes: at least one enemy is defeated and no active player threat remains.
         if (!context.hasPlayer) {
             ResetObservedContext();
             return kStateNeutral;
@@ -358,7 +633,31 @@ namespace TFD::Victory
             now < g_observedCombatContextUntil;
 
         if (IsDialogueReadyHoldActive()) {
+            const auto heldVictory = EvaluateCollectiveVictory(
+                kActorLevelDefeatedScanRadius,
+                true,
+                RE::TESForm::LookupByID<RE::Actor>(g_dialogueReadyHoldActorFormID));
+            return heldVictory.resolved ? kStateYes : kStateNo;
+        }
+
+        // R304A: Evaluate defeated candidates before the broad combat-context
+        // "hasEnemies" hold.  A TFD-knocked enemy is still alive for the 10s
+        // interaction window, so stale combat/enemy flags must not hide a valid
+        // last-man-standing Victory.
+        const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateYes;
+
+        const auto collectiveVictory = EvaluateCollectiveVictory(
+            kActorLevelDefeatedScanRadius,
+            activeVictoryContext,
+            nullptr);
+        if (collectiveVictory.resolved) {
             return kStateYes;
+        }
+        if (collectiveVictory.hasCandidate && collectiveVictory.hasStandingBlocker) {
+            if (context.combatContext) {
+                g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
+            }
+            return kStateNo;
         }
 
         if (context.hasEnemies && context.combatContext) {
@@ -369,22 +668,6 @@ namespace TFD::Victory
         // Standing observed enemies without combat proof are precombat/threat data,
         // not a committed combat-resolution context.  Do not advertise VictoryState=1
         // just because an actor can see or warn the player.
-        const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateYes;
-
-        if (HasDialogueCapableDefeatedEnemy(kDefeatedDialogueScanRadius)) {
-            return kStateYes;
-        }
-
-        // R93M: Actor-level defeated locks are the authoritative Victory truth.
-        // Enemy downed by a teammate after PreCombat may no longer look hostile or
-        // have an active combat context, but it is still a living defeated enemy.
-        if (HasActorLevelDefeatedLivingVictoryActor(kActorLevelDefeatedScanRadius)) {
-            return kStateYes;
-        }
-
-        if (HasThresholdDefeatedVictoryActor(kVictoryObservedScanRadius, activeVictoryContext)) {
-            return kStateYes;
-        }
 
         if (context.combatContext && HasRelevantLivingEnemyActor(kVictoryObservedScanRadius)) {
             g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);

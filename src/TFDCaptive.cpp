@@ -13,6 +13,7 @@
 #include "TFDPleasureRuntime.h"
 #include "TFDTransition.h"
 #include "TFDDefeatMonitor.h"
+#include "TFDForceGreetState.h"
 
 #include <SKSE/SKSE.h>
 
@@ -488,7 +489,16 @@ namespace TFD::Captive
 			const double elapsedMs = started.time_since_epoch().count() != 0
 				? static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Now() - started).count())
 				: -1.0;
-			if (!expectedActorFormID || expectedActorFormID != actorFormID) {
+			if (!expectedActorFormID) {
+				spdlog::info("[TFD][Captive][Handshake] ready event ignored actor={:08X} expected=00000000 serial={} reason={} token={:.0f} cause=no_pending_direct_or_completed",
+					actorFormID,
+					serial,
+					reason ? reason : "",
+					token);
+				return false;
+			}
+
+			if (expectedActorFormID != actorFormID) {
 				spdlog::warn("[TFD][Captive][Handshake] ready event ignored actor={:08X} expected={:08X} serial={} reason={} token={:.0f}",
 					actorFormID,
 					expectedActorFormID,
@@ -603,6 +613,50 @@ namespace TFD::Captive
 				reason ? reason : "unknown");
 		}
 
+		static void ClearPendingCaptorCallHandshake(RE::FormID actorFormID, const char* reason)
+		{
+			std::uint32_t serial = 0;
+			bool cleared = false;
+			{
+				std::scoped_lock lock(g_captorHandshakeLock);
+				if (g_pendingCaptorCallActorFormID != 0 &&
+					(actorFormID == 0 || g_pendingCaptorCallActorFormID == actorFormID)) {
+					g_pendingCaptorCallActorFormID = 0;
+					g_pendingCaptorCallStarted = {};
+					serial = g_pendingCaptorCallSerial;
+					cleared = true;
+				}
+			}
+
+			if (cleared) {
+				spdlog::info("[TFD][Captive][Handshake] cleared actor={:08X} serial={} reason={}",
+					actorFormID,
+					serial,
+					reason ? reason : "unknown");
+			}
+		}
+
+		static bool BeginCaptorCallApproachGreet(RE::Actor* actor, const char* reason)
+		{
+			if (!actor || actor->IsDead() || actor->IsDisabled()) {
+				return false;
+			}
+
+			LogCallingCaptorOwnershipSnapshot(actor, "approach_no_teleport_begin_before_greet");
+			actor->AllowPCDialogue(true);
+			if (actor->IsInCombat()) {
+				actor->StopCombat();
+			}
+
+			const bool began = TFD::CaptiveGreet::Begin(actor, reason ? reason : "call_captor_approach_no_teleport");
+			LogCallingCaptorOwnershipSnapshot(actor, began ? "approach_no_teleport_after_greet_begin" : "approach_no_teleport_greet_begin_failed");
+			spdlog::info("[TFD][Captive][Handshake] direct approach-window greet actor={:08X} began={} reason={} policy=walk_to_player_then_open_under_360_no_moveto",
+				actor->GetFormID(),
+				began ? 1 : 0,
+				reason ? reason : "unknown");
+			return began;
+		}
+
 		static constexpr auto kCaptorCallCooldown = std::chrono::milliseconds(5000);
 		static std::chrono::steady_clock::time_point g_captorCallCooldownUntil{};
 
@@ -693,6 +747,7 @@ namespace TFD::Captive
 		std::chrono::steady_clock::time_point g_nextCaptiveRoleFactionNoopLog{};
 		std::chrono::steady_clock::time_point g_releasedWorkWeaponDrawnNextLog{};
 		std::chrono::steady_clock::time_point g_nextReleasedWorkAliasSelfHeal{};
+		bool g_releasedWorkEscapeBreakResourcesCleared = false;
 		static constexpr auto kCaptiveRoleFactionSweepInterval = std::chrono::milliseconds(1500);
 		static constexpr auto kCaptiveRoleFactionNoopLogInterval = std::chrono::milliseconds(10000);
 		static constexpr auto kReleasedWorkAliasSelfHealInterval = std::chrono::milliseconds(5000);
@@ -2371,6 +2426,7 @@ namespace TFD::Captive
 	void BeginReleasedWorkRuntime(RE::Actor* actor, const char* reason)
 	{
 		const char* useReason = reason ? reason : "released_work_runtime";
+		g_releasedWorkEscapeBreakResourcesCleared = false;
 		auto* player = Player();
 		if (player) {
 			EnsureCaptiveNavigationContext(player, useReason);
@@ -2873,6 +2929,9 @@ namespace TFD::Captive
 	{
 		g_state = stateActive;
 		g_phase = phase;
+		if (stateActive && phase == PhaseValue::ReleasedWork) {
+			g_releasedWorkEscapeBreakResourcesCleared = false;
+		}
 		if (stateActive && phase == PhaseValue::Escape) {
 			// C52: EscapeStarted means active escape ownership has returned to
 			// Captive.  Any stale escape-bleedout latch from a previous failed
@@ -2897,6 +2956,7 @@ namespace TFD::Captive
 			TFD::HostilityController::ResetCaptiveSuppression();
 		}
 		if (!stateActive) {
+			TFD::ForceGreetState::ResetCaptive();
 			g_escapeBleedoutActive = false;
 			g_recaptureCommitActive = false;
 			g_recaptureCommitStarted = {};
@@ -3095,6 +3155,21 @@ namespace TFD::Captive
 		WriteQuestAlias(g_registry.approachPointAlias, target, reason ? reason : "sync_captor_approach_point");
 		spdlog::info("[TFD][Captive] ApproachPoint synced targetMode={} target={:08X} reason={}",
 			GetCaptorApproachTargetName(target, player),
+			target ? target->GetFormID() : 0u,
+			reason ? reason : "unknown");
+	}
+
+	static void SyncCaptorApproachPointAliasToPlayer(RE::Actor* player, const char* reason)
+	{
+		ResolveQuestRegistry();
+		if (!g_registry.quest || !g_registry.approachPointAlias) {
+			spdlog::warn("[TFD][Captive] ApproachPoint alias unavailable; TFDCaptiveApproach may have no player target reason={}", reason ? reason : "unknown");
+			return;
+		}
+
+		auto* target = player ? static_cast<RE::TESObjectREFR*>(player) : static_cast<RE::TESObjectREFR*>(Player());
+		WriteQuestAlias(g_registry.approachPointAlias, target, reason ? reason : "sync_captor_approach_point_player");
+		spdlog::info("[TFD][Captive] ApproachPoint synced targetMode=PlayerRef target={:08X} reason={} policy=calling_captor_walk_to_player_no_teleport",
 			target ? target->GetFormID() : 0u,
 			reason ? reason : "unknown");
 	}
@@ -3883,15 +3958,19 @@ namespace TFD::Captive
 				}
 			}
 			else {
-				// R206A: Captive/Work PleasureFailed > Fight temporarily keeps
-				// Captive as context while InCombat owns behavior. Do not run the
-				// ReleasedWork passive package maintainer here; it can sheathe the
-				// speaker right after the Fight commit. Keep resource aliases valid
-				// for the post-bleedout Work menu, but let combat AI own stance.
+				// R303A: once ReleasedWork has handed off to combat / bleedout /
+				// pleasure-failed ownership, Work is no longer allowed to maintain
+				// resource aliases. Re-scanning here re-latches TFDCraftingState and
+				// keeps the Papyrus work_update loop alive after native has already
+				// left Work. Clear once and let the new owner rebuild Work explicitly
+				// if the player later selects a Work outcome.
 				TFD::HostilityController::ResetCaptiveSuppression();
-				if (g_phase == PhaseValue::ReleasedWork) {
-					(void)TFD::Location::RefreshCaptiveWorkResourceState(false, "released_work_escape_break_tick");
-					SyncCaptiveWorkResourceAliases("released_work_escape_break_tick");
+				if (g_phase == PhaseValue::ReleasedWork && !g_releasedWorkEscapeBreakResourcesCleared) {
+					g_releasedWorkEscapeBreakResourcesCleared = true;
+					ClearReleasedWorkRuntime("released_work_escape_break_handoff");
+					TFD::Location::ClearCaptiveWorkResourceState("released_work_escape_break_handoff");
+					spdlog::info("[TFD][Captive][R303A] released work resource updater stopped for escape-break overlay phase={} reason=released_work_escape_break_handoff",
+						GetPhaseName());
 				}
 			}
 		}
@@ -4170,25 +4249,35 @@ namespace TFD::Captive
 			return false;
 		}
 
+		TFD::ForceGreetState::ResetCaptive();
 		EnsureCaptorApproachReadySinkRegistered();
 		ArmPendingCaptorCallHandshake(captor, "call_captor_hotkey");
 
-		// ApproachPoint-aware handshake:
-		// Native seeds ApproachPoint before OwnerCaptor so the CK package already
-		// has a valid travel target even if the TFDCaptiveAssign ModEvent is missed.
-		// Papyrus still owns package priming and sends TFDCaptiveApproachReady.
-		SyncCaptorApproachPointAlias(player, "call_captor_native_seed_approach_point");
+		// Calling Captor movement contract:
+		// Hotkey only selects/arms the captor. The actor must walk to the player via
+		// the CK alias package; native starts a pending CaptiveMarker open and waits
+		// for player distance <= 360. No MoveTo/teleport assist is allowed here.
+		SyncCaptorApproachPointAliasToPlayer(player, "call_captor_native_seed_player_approach_point");
 		WriteQuestAlias(g_registry.bossCaptorAliases[0], captor, "call_captor_native_owner_seed");
 		captor->AllowPCDialogue(true);
 		LogCallingCaptorOwnershipSnapshot(captor, "call_captor_after_native_seed_before_papyrus_assign");
 		ApplyCallCaptorCalmBubble(player, captor, 12288.0f);
 		LogCallingCaptorOwnershipSnapshot(captor, "call_captor_after_bridge_assign_with_native_seed");
 
+		const bool directBegan = BeginCaptorCallApproachGreet(captor, "call_captor_hotkey_walk_to_player");
+		if (directBegan) {
+			ClearPendingCaptorCallHandshake(captor->GetFormID(), "direct_approach_window_greet_started");
+		}
+		else {
+			spdlog::warn("[TFD][Captive][Handshake] Call Captor direct approach-window begin failed actor={:08X}; keeping Papyrus ready fallback",
+				captor->GetFormID());
+		}
 
 		g_captorCallCooldownUntil = Now() + kCaptorCallCooldown;
-		spdlog::info("[TFD][Captive][Handshake] Call Captor pending actor={:08X} cooldownMs={} reason=call_captor_hotkey policy=native_seed_plus_papyrus_ready_before_greet",
+		spdlog::info("[TFD][Captive][Handshake] Call Captor pending actor={:08X} cooldownMs={} reason=call_captor_hotkey policy=walk_to_player_then_open_under_360_no_moveto directBegan={}",
 			captor->GetFormID(),
-			static_cast<int>(kCaptorCallCooldown.count()));
+			static_cast<int>(kCaptorCallCooldown.count()),
+			directBegan ? 1 : 0);
 
 		if (outCaptor) {
 			*outCaptor = captor;
@@ -4290,6 +4379,7 @@ namespace TFD::Captive
 
 	void ResetForLoad()
 	{
+		TFD::ForceGreetState::ResetCaptive();
 		ClearNativeCaptorRoleFaction("reset_for_load");
 		ClearReleasedWorkRuntime("reset_for_load");
 		TFD::Location::ClearCaptiveWorkResourceState("reset_for_load");

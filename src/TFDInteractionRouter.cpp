@@ -12,6 +12,7 @@
 #include "TFDActor.h"
 #include "TFDBleedout.h"
 #include "TFDSettings.h"
+#include "TFDForceGreetState.h"
 
 #include <spdlog/spdlog.h>
 #include <SKSE/SKSE.h>
@@ -1747,6 +1748,7 @@ namespace TFD::InteractionRouter
             constexpr float kInCombatForceGreetMaxDistanceSq = kInCombatForceGreetMaxDistance * kInCombatForceGreetMaxDistance;
             constexpr float kBleedoutForceGreetMaxDistance = 900.0f;
             constexpr float kBleedoutForceGreetMaxDistanceSq = kBleedoutForceGreetMaxDistance * kBleedoutForceGreetMaxDistance;
+            constexpr float kCaptiveForceGreetSoftMinDistance = 120.0f;
             constexpr float kCaptiveForceGreetMaxDistance = 360.0f;
             constexpr float kCaptiveForceGreetMaxDistanceSq = kCaptiveForceGreetMaxDistance * kCaptiveForceGreetMaxDistance;
             constexpr auto kCaptiveTimeout = std::chrono::milliseconds(30000);
@@ -2360,7 +2362,14 @@ namespace TFD::InteractionRouter
 
             bool IsCaptiveForceGreetRangeReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
-                return IsForceGreetRangeReady(player, speaker, kCaptiveForceGreetMaxDistanceSq);
+                // CC02: Calling Captor uses player distance as the hard gate.
+                // The 120-unit value is an ideal lower bound for positioning/logs,
+                // not a hard blocker, because a close/overshooting actor must not
+                // leave CaptiveMarker pending forever.
+                if (!player || !speaker || !speaker->Is3DLoaded()) {
+                    return false;
+                }
+                return DistanceSquared(player, speaker) <= kCaptiveForceGreetMaxDistanceSq;
             }
 
 
@@ -2377,21 +2386,20 @@ namespace TFD::InteractionRouter
 
             bool IsCaptiveApproachReady(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
-                if (!player || !speaker || !speaker->Is3DLoaded()) {
-                    return false;
-                }
-
-                auto* target = ResolveCaptiveApproachTarget(player);
-                return target && DistanceSquaredRefs(speaker, target) <= kCaptiveForceGreetMaxDistanceSq;
+                return IsCaptiveForceGreetRangeReady(player, speaker);
             }
 
             float CaptiveApproachDisplayDistance(RE::PlayerCharacter* player, RE::Actor* speaker)
             {
-                if (!player || !speaker) {
+                if (!player || !speaker || !speaker->Is3DLoaded()) {
                     return -1.0f;
                 }
-                auto* target = ResolveCaptiveApproachTarget(player);
-                return target ? std::sqrt(DistanceSquaredRefs(speaker, target)) : -1.0f;
+                return std::sqrt(DistanceSquared(player, speaker));
+            }
+
+            float CaptiveApproachSoftMinDistance()
+            {
+                return kCaptiveForceGreetSoftMinDistance;
             }
 
             float CaptiveApproachTargetDistance()
@@ -2783,40 +2791,14 @@ namespace TFD::InteractionRouter
 
             bool AssistCaptiveApproach(RE::PlayerCharacter* player, RE::Actor* speaker, const char* reason)
             {
-                if (!player || !speaker || speaker == player) {
-                    return false;
+                (void)player;
+                if (speaker) {
+                    spdlog::info(
+                        "[TFD][DialogueOpen][CC02] captive approach assist disabled; actor must walk via CK package mode=CaptiveMarker speaker={:08X} reason={}",
+                        speaker->GetFormID(),
+                        reason ? reason : "unknown");
                 }
-
-                if (speaker->IsDead() || speaker->IsDisabled() || !speaker->Is3DLoaded()) {
-                    return false;
-                }
-
-                auto* target = ResolveCaptiveApproachTarget(player);
-                const char* targetName = CaptiveApproachTargetName(player, target);
-
-                TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, "dialogue_before_moveto_assist");
-                const bool moved = MoveActorNearRefForApproach(
-                    player,
-                    target,
-                    speaker,
-                    0.0f,
-                    kCaptiveApproachAssistDistance,
-                    "captor",
-                    reason,
-                    "CaptiveMarker",
-                    targetName,
-                    kCaptiveForceGreetMaxDistance);
-
-                TFD::Captive::LogCallingCaptorOwnershipSnapshot(speaker, moved ? "dialogue_after_moveto_assist_moved" : "dialogue_after_moveto_assist_failed");
-                spdlog::warn(
-                    "[TFD][DialogueOpen][R127] approach assist moveto group mode=CaptiveMarker speaker={:08X} targetMode={} target={:08X} moved={} crowdMoved=0 participants=1 reason={}",
-                    speaker->GetFormID(),
-                    targetName,
-                    target ? target->GetFormID() : 0u,
-                    moved ? 1 : 0,
-                    reason ? reason : "unknown");
-
-                return moved;
+                return false;
             }
 
             std::uint32_t PendingSpeakerFormID()
@@ -2927,6 +2909,18 @@ namespace TFD::InteractionRouter
                     mode == Mode::CaptiveMarker ||
                     mode == Mode::AfterPleasure ||
                     mode == Mode::PleasureFailed;
+            }
+
+            bool ShouldBypassTemporaryDialogueCooldown(Mode mode)
+            {
+                // AP01: AfterPleasure is the immediate post-OStim containment greet.
+                // It must not wait for the generic dialogue cooldown, otherwise the
+                // player gets a short escape window before the forcegreet opens.
+                // CC02: Calling Captor uses the hotkey cooldown only. Once the
+                // hotkey is accepted, the forcegreet pending state must not wait on
+                // generic dialogue cooldown; it only waits for the actor to walk
+                // inside the distance window.
+                return mode == Mode::AfterPleasure || mode == Mode::CaptiveMarker;
             }
 
             bool ShouldPreservePleasureFailedDrawnPosture(Mode mode, RE::Actor* speaker)
@@ -3072,7 +3066,15 @@ namespace TFD::InteractionRouter
                 const auto now = Clock::now();
                 double cooldownRemainingSec = 0.0;
                 if (speaker && IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
-                    if (mode == Mode::PleasureFailed && !speaker->IsDead() && !speaker->IsDisabled()) {
+                    if (ShouldBypassTemporaryDialogueCooldown(mode)) {
+                        spdlog::info(
+                            "[TFD][DialogueOpen][AP01] temporary cooldown bypassed at begin mode={} reason={} speaker={:08X} remaining={:.2f}s",
+                            ModeName(mode),
+                            reason ? reason : "unknown",
+                            speaker->GetFormID(),
+                            cooldownRemainingSec);
+                    }
+                    else if (mode == Mode::PleasureFailed && !speaker->IsDead() && !speaker->IsDisabled()) {
                         ResetLocked();
 
                         const auto retryDelay = std::chrono::duration_cast<Clock::duration>(
@@ -3108,16 +3110,17 @@ namespace TFD::InteractionRouter
                             reason ? reason : "unknown");
                         return;
                     }
-
-                    CancelLocked("temporary_dialogue_cooldown");
-                    SyncDialogueStateLocked(IsDialogueOpen());
-                    spdlog::info(
-                        "[TFD][DialogueOpen] begin blocked mode={} reason={} speaker={:08X} cooldownRemaining={:.2f}s",
-                        ModeName(mode),
-                        reason ? reason : "unknown",
-                        speaker->GetFormID(),
-                        cooldownRemainingSec);
-                    return;
+                    else {
+                        CancelLocked("temporary_dialogue_cooldown");
+                        SyncDialogueStateLocked(IsDialogueOpen());
+                        spdlog::info(
+                            "[TFD][DialogueOpen] begin blocked mode={} reason={} speaker={:08X} cooldownRemaining={:.2f}s",
+                            ModeName(mode),
+                            reason ? reason : "unknown",
+                            speaker->GetFormID(),
+                            cooldownRemainingSec);
+                        return;
+                    }
                 }
 
                 ResetLocked();
@@ -3148,7 +3151,9 @@ namespace TFD::InteractionRouter
                 g_pending.requestIssued = false;
                 g_pending.attempts = 0;
                 g_pending.started = now;
-                const auto initialDelay = mode == Mode::Bleedout ? std::chrono::milliseconds(0) : kInitialDelay;
+                const auto initialDelay = (mode == Mode::Bleedout || mode == Mode::AfterPleasure || mode == Mode::CaptiveMarker) ?
+                    std::chrono::milliseconds(0) :
+                    kInitialDelay;
                 g_pending.nextAttempt = now + initialDelay;
                 g_pending.deadline = now + timeout;
                 g_pending.quietUntil = {};
@@ -3163,7 +3168,9 @@ namespace TFD::InteractionRouter
                 } else if (mode == Mode::Bleedout) {
                     g_pending.nextApproachAssist = now + kBleedoutApproachAssistDelay;
                 } else if (mode == Mode::CaptiveMarker) {
-                    g_pending.nextApproachAssist = now + kCaptiveApproachAssistDelay;
+                    // CC02: no MoveTo assist for Calling Captor. Papyrus/CK package
+                    // owns the approach; native only opens when player distance <=360.
+                    g_pending.nextApproachAssist = Clock::time_point{};
                 } else {
                     g_pending.nextApproachAssist = Clock::time_point{};
                 }
@@ -3304,6 +3311,9 @@ namespace TFD::InteractionRouter
                     completedSpeaker,
                     g_pending.attempts,
                     g_pending.requestIssued ? 1 : 0);
+                if (completedMode == Mode::CaptiveMarker) {
+                    TFD::ForceGreetState::SetCaptiveOpened();
+                }
                 return;
             }
 
@@ -3313,7 +3323,8 @@ namespace TFD::InteractionRouter
             const auto now = Clock::now();
 
             double cooldownRemainingSec = 0.0;
-            if (IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
+            if (!ShouldBypassTemporaryDialogueCooldown(g_pending.mode) &&
+                IsTemporaryDialogueCooldownActiveLocked(speaker, now, &cooldownRemainingSec)) {
                 if (g_pending.mode == Mode::PleasureFailed && speaker) {
                     const auto retryDelay = std::chrono::duration_cast<Clock::duration>(
                         std::chrono::duration<double>(std::max(0.08, cooldownRemainingSec + 0.08)));
@@ -3411,11 +3422,13 @@ namespace TFD::InteractionRouter
                     } else {
                         RefreshApproachPackage(player, speaker);
                     }
+                    const float softMinDist = captiveMode ? CaptiveApproachSoftMinDistance() : 0.0f;
                     spdlog::info(
-                        "[TFD][DialogueOpen] request not confirmed; resume range gate mode={} speaker={:08X} dist={:.1f} max={:.1f} attempts={}",
+                        "[TFD][DialogueOpen] request not confirmed; resume range gate mode={} speaker={:08X} dist={:.1f} softMin={:.1f} max={:.1f} attempts={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         dist,
+                        softMinDist,
                         targetDist,
                         g_pending.attempts);
                     return;
@@ -3443,7 +3456,7 @@ namespace TFD::InteractionRouter
                 g_pending.nextAttempt = now + kRetryDelay;
                 SyncDialogueStateLocked(dialogueOpen);
 
-                if ((needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate || needsCaptiveRangeGate) &&
+                if ((needsPreCombatRangeGate || needsInCombatRangeGate || needsBleedoutRangeGate) &&
                     !g_pending.approachAssistUsed &&
                     g_pending.nextApproachAssist.time_since_epoch().count() != 0 &&
                     now >= g_pending.nextApproachAssist) {
@@ -3452,9 +3465,6 @@ namespace TFD::InteractionRouter
                     }
                     else if (needsBleedoutRangeGate) {
                         g_pending.approachAssistUsed = AssistBleedoutApproach(player, speaker, "range_gate_stuck");
-                    }
-                    else if (needsCaptiveRangeGate) {
-                        g_pending.approachAssistUsed = AssistCaptiveApproach(player, speaker, "range_gate_stuck");
                     }
                     else {
                         g_pending.approachAssistUsed = AssistPreCombatApproach(player, speaker, "range_gate_stuck");
@@ -3475,11 +3485,13 @@ namespace TFD::InteractionRouter
                         (needsBleedoutRangeGate ?
                             kBleedoutForceGreetMaxDistance :
                             (needsCaptiveRangeGate ? CaptiveApproachTargetDistance() : kPreCombatForceGreetMaxDistance));
+                    const float softMinDist = needsCaptiveRangeGate ? CaptiveApproachSoftMinDistance() : 0.0f;
                     spdlog::info(
-                        "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} targetDist={:.1f} refreshSuppressed={}",
+                        "[TFD][DialogueOpen] approach monitor mode={} speaker={:08X} dist={:.1f} softMin={:.1f} max={:.1f} refreshSuppressed={}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         needsCaptiveRangeGate ? CaptiveApproachDisplayDistance(player, speaker) : std::sqrt(DistanceSquared(player, speaker)),
+                        softMinDist,
                         targetDist,
                         suppressPackageRefresh ? 1 : 0);
                 }
@@ -3493,11 +3505,13 @@ namespace TFD::InteractionRouter
                         (needsBleedoutRangeGate ?
                             kBleedoutForceGreetMaxDistance :
                             (needsCaptiveRangeGate ? CaptiveApproachTargetDistance() : kPreCombatForceGreetMaxDistance));
+                    const float softMinDist = needsCaptiveRangeGate ? CaptiveApproachSoftMinDistance() : 0.0f;
                     spdlog::info(
-                        "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} max={:.1f}",
+                        "[TFD][DialogueOpen] wait range mode={} speaker={:08X} dist={:.1f} softMin={:.1f} max={:.1f}",
                         ModeName(g_pending.mode),
                         speaker->GetFormID(),
                         dist,
+                        softMinDist,
                         maxDist);
                 }
 
@@ -3603,6 +3617,7 @@ namespace TFD::InteractionRouter
             const float tryDist = g_pending.mode == Mode::CaptiveMarker ?
                 CaptiveApproachDisplayDistance(player, speaker) :
                 std::sqrt(DistanceSquared(player, speaker));
+            const float trySoftMinDist = g_pending.mode == Mode::CaptiveMarker ? CaptiveApproachSoftMinDistance() : 0.0f;
             const float tryMaxDist = g_pending.mode == Mode::PreCombatTruce ?
                 kPreCombatForceGreetMaxDistance :
                 (g_pending.mode == Mode::InCombatTruce ?
@@ -3611,13 +3626,14 @@ namespace TFD::InteractionRouter
                         kBleedoutForceGreetMaxDistance :
                         (g_pending.mode == Mode::CaptiveMarker ? kCaptiveForceGreetMaxDistance : 0.0f)));
             spdlog::info(
-                "[TFD][DialogueOpen][R93P] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} max={:.1f} force={} topicInfo={:08X} explicit={} reset={}",
+                "[TFD][DialogueOpen][R93P] try mode={} speaker={:08X} attempt={} ok={} requestIssued={} dist={:.1f} softMin={:.1f} max={:.1f} force={} topicInfo={:08X} explicit={} reset={}",
                 ModeName(g_pending.mode),
                 speaker->GetFormID(),
                 g_pending.attempts,
                 ok ? 1 : 0,
                 g_pending.requestIssued ? 1 : 0,
                 tryDist,
+                trySoftMinDist,
                 tryMaxDist,
                 forceGreet ? 1 : 0,
                 topicInfo ? topicInfo->GetFormID() : 0u,
@@ -3706,7 +3722,17 @@ namespace TFD::InteractionRouter
             auto pendingSpeakerSp = RE::Actor::LookupByHandle(g_pending.speaker.native_handle());
             auto* pendingSpeaker = pendingSpeakerSp.get();
             if (pendingSpeaker && pendingSpeaker == speaker) {
-                CancelLocked(reason ? reason : "temporary_dialogue_cooldown_armed");
+                if (ShouldBypassTemporaryDialogueCooldown(g_pending.mode)) {
+                    SyncDialogueStateLocked(IsDialogueOpen());
+                    spdlog::info(
+                        "[TFD][DialogueOpen][AP01] temporary cooldown armed but pending preserved mode={} speaker={:08X} reason={}",
+                        ModeName(g_pending.mode),
+                        speaker->GetFormID(),
+                        reason ? reason : "unknown");
+                }
+                else {
+                    CancelLocked(reason ? reason : "temporary_dialogue_cooldown_armed");
+                }
             }
             else {
                 SyncDialogueStateLocked(IsDialogueOpen());

@@ -24,6 +24,11 @@ namespace TFD::Victory
     int ComputeObservedState(const ObservedContext& context);
     void RefreshObservedState(const ObservedContext& context);
 
+    // Player Victory is threat-level, not actor-level. A defeated actor is
+    // only a candidate; Victory may be advertised only when no active enemy is
+    // targeting the player or has line of sight to the player.
+    bool CanAdvertiseVictoryNow(RE::Actor* requiredCandidate = nullptr, const char* reason = nullptr);
+
     RE::Actor* FindDialogueCapableDefeatedEnemy(float radius = 512.0f);
     bool HasDialogueCapableDefeatedEnemy(float radius = 512.0f);
     void MarkDefeatedDialogueAvailable(RE::Actor* actor);

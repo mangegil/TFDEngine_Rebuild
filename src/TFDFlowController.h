@@ -110,7 +110,8 @@ namespace TFD::FlowController
         Release,
         Follow,
         Cancel,
-        Failed
+        Failed,
+        DoNothing
     };
 
     enum class InCombatOutcome : std::uint8_t

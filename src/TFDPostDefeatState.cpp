@@ -222,10 +222,12 @@ namespace TFD::PostDefeatState
         static constexpr int kVictoryStateYes = 2;
         static constexpr int kVictoryRecruitGlobalRefreshIntervalMs = 1000;
         static constexpr int kStaleVictoryNeutralConfirmTicks = 2;
+        static constexpr int kSuppressedDialogueTerminalClearLogIntervalMs = 1000;
 
         int g_lastObservedVictoryStateForRecruitGlobals = -1;
         std::chrono::steady_clock::time_point g_nextVictoryRecruitGlobalRefresh{};
         std::chrono::steady_clock::time_point g_nextVictoryPreserveLog{};
+        std::chrono::steady_clock::time_point g_nextSuppressedDialogueTerminalClearLog{};
         int g_staleVictoryNeutralTicks = 0;
 
         bool IsBleedoutPleasureLockActive()
@@ -309,7 +311,10 @@ namespace TFD::PostDefeatState
                 return false;
             }
 
-            return TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor);
+            if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
+                return false;
+            }
+            return TFD::Victory::CanAdvertiseVictoryNow(actor, nullptr);
         }
 
         bool PreserveVictoryFlowIfBackedByDefeatedActor(const char* reason)
@@ -342,11 +347,11 @@ namespace TFD::PostDefeatState
             return true;
         }
 
-        void ClearStaleVictoryFlowWhenNeutral(int victoryState, const RefreshInput& input)
+        void ClearStaleVictoryFlowWhenNotReady(int victoryState, const RefreshInput& input)
         {
             (void)input;
 
-            if (victoryState != kVictoryStateNeutral) {
+            if (victoryState == kVictoryStateYes) {
                 g_staleVictoryNeutralTicks = 0;
                 return;
             }
@@ -380,11 +385,39 @@ namespace TFD::PostDefeatState
             }
 
             spdlog::info(
-                "[TFD][PostDefeatState] clearing stale Victory flow root because VictoryState is neutral primary={:08X} token={} reason=victory_state_neutral",
+                "[TFD][PostDefeatState][R301A] clearing stale Victory flow root because VictoryState is not ready primary={:08X} token={} state={} reason=victory_state_not_ready",
                 snapshot.primaryActorFormID,
-                snapshot.token);
-            flow.ResetRuntime("victory_state_neutral_stale_root_clear");
+                snapshot.token,
+                victoryState);
+            flow.ResetRuntime("victory_state_not_ready_stale_root_clear");
             g_staleVictoryNeutralTicks = 0;
+        }
+
+
+        void ClearSuppressedDialogueOnlyGlobalsTerminal(const RefreshInput& input, RefreshResult& result)
+        {
+            result.routerCombatContextActive = false;
+
+            SetGlobalInt(g_defeatStateGlobal, 0);
+            TFD::Victory::ResetObservedContext();
+            TFD::Victory::SetStateValue(kVictoryStateNeutral);
+            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
+            g_staleVictoryNeutralTicks = 0;
+            SetGlobalInt(g_hostileStateGlobal, 0);
+            SetGlobalInt(g_enemyFactionStateGlobal, 0);
+            SetGlobalInt(g_enemyRaceStateGlobal, 0);
+            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
+            SetGlobalInt(g_leftForDeadStateGlobal, 0);
+
+            const auto now = std::chrono::steady_clock::now();
+            if (g_nextSuppressedDialogueTerminalClearLog == std::chrono::steady_clock::time_point{} ||
+                now >= g_nextSuppressedDialogueTerminalClearLog) {
+                spdlog::info(
+                    "[TFD][PostDefeatState][R302A] suppressed dialogue-only enemies terminal clear defeat=0 victory=0 hostile=0 faction=0 race=0 leftForDead=0 count={} reason=only_suppressed_dialogue_enemies",
+                    input.suppressedEnemyCount);
+                g_nextSuppressedDialogueTerminalClearLog =
+                    now + std::chrono::milliseconds(kSuppressedDialogueTerminalClearLogIntervalMs);
+            }
         }
     }
 
@@ -394,14 +427,6 @@ namespace TFD::PostDefeatState
 
         RefreshResult result{};
         result.routerCombatContextActive = input.routerCombatContext;
-
-        if (input.onlySuppressedDialogueEnemies) {
-            TFD::Victory::ResetObservedContext();
-            result.routerCombatContextActive = false;
-            spdlog::info(
-                "[TFD][PostDefeatState] cleared transient hostile globals because only suppressed dialogue-phase enemies remain count={}",
-                input.suppressedEnemyCount);
-        }
 
         if (IsBleedoutDecisionRootActive()) {
             SetGlobalInt(g_defeatStateGlobal, 2);
@@ -477,6 +502,11 @@ namespace TFD::PostDefeatState
             return result;
         }
 
+        if (input.onlySuppressedDialogueEnemies) {
+            ClearSuppressedDialogueOnlyGlobalsTerminal(input, result);
+            return result;
+        }
+
         SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
 
         const bool forceVictoryNoForPlayerDefeat = input.player && playerDownNow && input.defeatContext;
@@ -503,7 +533,7 @@ namespace TFD::PostDefeatState
         if (!preservedActiveVictoryFlow && !forceVictoryNoForPlayerDefeat) {
             RefreshRecruitGlobalsWhenVictoryReady(victoryState);
         }
-        ClearStaleVictoryFlowWhenNeutral(victoryState, input);
+        ClearStaleVictoryFlowWhenNotReady(victoryState, input);
         SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies));
         SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
         SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));

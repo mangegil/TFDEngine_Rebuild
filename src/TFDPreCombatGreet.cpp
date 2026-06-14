@@ -75,6 +75,7 @@ namespace TFD::PreCombatGreet
         constexpr const char* kPreCombatOutcomeFollowEvent = "TFDPreCombatOutcomeFollow";
         constexpr const char* kPreCombatOutcomeFollowEndEvent = "TFDPreCombatOutcomeFollowEnd";
         constexpr const char* kPreCombatOutcomePleasureEvent = "TFDPreCombatOutcomePleasure";
+        constexpr const char* kPreCombatOutcomeDoNothingEvent = "TFDPreCombatOutcomeDoNothing";
         constexpr const char* kPreCombatOutcomeFailedEvent = "TFDPreCombatOutcomeFailed";
         constexpr const char* kPreCombatTerminalPendingEvent = "TFDPreCombatTerminalPending";
         constexpr const char* kPreCombatRecruitPendingEvent = "TFDPreCombatRecruitPending";
@@ -1718,7 +1719,8 @@ namespace TFD::PreCombatGreet
                 outcome == TFD::FlowController::PreCombatOutcome::Release ||
                 outcome == TFD::FlowController::PreCombatOutcome::Follow ||
                 outcome == TFD::FlowController::PreCombatOutcome::Cancel ||
-                outcome == TFD::FlowController::PreCombatOutcome::Failed) {
+                outcome == TFD::FlowController::PreCombatOutcome::Failed ||
+                outcome == TFD::FlowController::PreCombatOutcome::DoNothing) {
                 return flow.CompleteTerminalContext(reason ? reason : "unknown");
             }
 
@@ -2296,6 +2298,7 @@ namespace TFD::PreCombatGreet
                     name == kPreCombatOutcomeReleaseEvent ||
                     name == kPreCombatOutcomeFollowEvent ||
                     name == kPreCombatOutcomePleasureEvent ||
+                    name == kPreCombatOutcomeDoNothingEvent ||
                     name == kPreCombatOutcomeFailedEvent) {
                     std::scoped_lock lk(gLock);
                     RE::Actor* pendingActor = actor ? actor : ResolveSinglePendingActorLocked();
@@ -2446,6 +2449,18 @@ namespace TFD::PreCombatGreet
                         }
                         if (!ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::Pleasure, actorFormID, "mod_event_precombat_pleasure")) {
                             spdlog::warn("[TFD][PreCombatGreet] pleasure outcome rejected actor={:08X} reason=flow_reject", actorFormID);
+                        }
+                    }
+                    else if (name == kPreCombatOutcomeDoNothingEvent) {
+                        if (matchedPending) {
+                            MarkTerminalChoiceCommittedLocked(*matchedPending, rawName);
+                        }
+                        if (ResolvePreCombatTerminalOutcomeLocked(TFD::FlowController::PreCombatOutcome::DoNothing, actorFormID, "mod_event_precombat_do_nothing")) {
+                            shouldClearInteractionState = true;
+                            spdlog::info("[TFD][PreCombatGreet][R317B] do nothing outcome committed actor={:08X} terminal=1", actorFormID);
+                        }
+                        else {
+                            spdlog::warn("[TFD][PreCombatGreet][R317B] do nothing outcome rejected actor={:08X} reason=flow_reject", actorFormID);
                         }
                     }
                     else if (name == kPreCombatOutcomeFailedEvent) {

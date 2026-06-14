@@ -68,6 +68,7 @@ add_library(TFDEngine SHARED
     src/TFDCaptiveGreet.cpp
     src/TFDRescueGreet.cpp
     src/TFDPayModel.cpp
+    src/TFDForceGreetState.cpp
 )
 
 if(TFDEnableSmf)

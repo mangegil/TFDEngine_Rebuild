@@ -366,6 +366,17 @@ namespace
         inline std::mutex g_syncLock{};
 
         inline std::unordered_set<RE::FormID> g_knownConvertedTeammates{};
+        inline std::mutex g_defeatedRecruitPostLoadSettleLock{};
+        inline std::unordered_map<RE::FormID, double> g_defeatedRecruitPostLoadSettleUntilSec{};
+
+        struct PendingDefeatedRecruitFinalize
+        {
+            double dueSec{ 0.0 };
+            std::uint32_t attempts{ 0 };
+        };
+
+        inline std::mutex g_pendingDefeatedRecruitFinalizeLock{};
+        inline std::unordered_map<RE::FormID, PendingDefeatedRecruitFinalize> g_pendingDefeatedRecruitFinalizes{};
         inline std::unordered_map<RE::FormID, std::uint32_t> g_invalidAliasStrikes{};
         inline std::unordered_map<RE::FormID, double> g_contractEndDays{};
         inline std::unordered_set<RE::FormID> g_expiredContractActors{};
@@ -405,6 +416,15 @@ namespace
         constexpr double kContractExpiryPleasureHoldMaxSeconds = 300.0;
         constexpr double kContractExpiryPleasureHoldLogIntervalSeconds = 5.0;
         constexpr double kDownedRecoveryDialogueHoldLogIntervalSeconds = 2.0;
+        constexpr double kDefeatedRecruitPostLoadSettleSeconds = 180.0;
+        constexpr double kDefeatedRecruitRefreshBarrierSeconds = 1.20;
+        constexpr double kDefeatedRecruitRefreshBarrierRetrySeconds = 0.65;
+        constexpr std::uint32_t kDefeatedRecruitRefreshBarrierMaxAttempts = 6;
+        constexpr float kDefeatedRecruitPostLoadMoveDistance = 512.0f;
+        constexpr float kDefeatedRecruitPostLoadEvaluateDistance = 128.0f;
+        constexpr float kDefeatedRecruitPostLoadMoveSideOffset = 160.0f;
+        constexpr float kDefeatedRecruitPostLoadMoveBackOffset = -192.0f;
+        constexpr const char* kDefeatedRecruitLoadingCatchupReason = "defeated_recruit_loading_catchup";
         constexpr float kContractExpiryForcegreetRadius = 4096.0f;
         constexpr float kTeammateHealTargetPct = 0.85f;
         constexpr float kTeammateHealMinAbsHp = 45.0f;
@@ -648,6 +668,10 @@ namespace
 
             const auto actorId = actor->GetFormID();
             g_knownConvertedTeammates.erase(actorId);
+            {
+                std::scoped_lock settleLock(g_defeatedRecruitPostLoadSettleLock);
+                g_defeatedRecruitPostLoadSettleUntilSec.erase(actorId);
+            }
             g_invalidAliasStrikes.erase(actorId);
             spdlog::info(
                 "[TFD][TeammateManager] forget converted teammate actor={:08X} reason={}",
@@ -974,6 +998,172 @@ namespace
             using Clock = std::chrono::steady_clock;
             static const auto start = Clock::now();
             return std::chrono::duration<double>(Clock::now() - start).count();
+        }
+
+        bool IsActorBleedingOutUnsafe(RE::Actor* actor)
+        {
+            auto* state = actor ? actor->AsActorState() : nullptr;
+            return state && state->IsBleedingOut();
+        }
+
+        void ArmDefeatedRecruitPostLoadSettleUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player() || actor->GetFormID() == 0) {
+                return;
+            }
+
+            const double untilSec = NowRealSeconds() + kDefeatedRecruitPostLoadSettleSeconds;
+            {
+                std::scoped_lock settleLock(g_defeatedRecruitPostLoadSettleLock);
+                g_defeatedRecruitPostLoadSettleUntilSec[actor->GetFormID()] = untilSec;
+            }
+            spdlog::info(
+                "[TFD][TeammateManager][R308A] defeated recruit post-load settle armed actor={:08X} seconds={:.1f} reason={}",
+                actor->GetFormID(),
+                kDefeatedRecruitPostLoadSettleSeconds,
+                reason ? reason : "unknown");
+        }
+
+        bool ShouldRunDefeatedRecruitPostLoadSettleUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor == Player() || actor->GetFormID() == 0) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            const double now = NowRealSeconds();
+            bool expired = false;
+            {
+                std::scoped_lock settleLock(g_defeatedRecruitPostLoadSettleLock);
+                auto it = g_defeatedRecruitPostLoadSettleUntilSec.find(actorId);
+                if (it == g_defeatedRecruitPostLoadSettleUntilSec.end()) {
+                    return false;
+                }
+
+                if (it->second <= now) {
+                    g_defeatedRecruitPostLoadSettleUntilSec.erase(it);
+                    expired = true;
+                }
+            }
+
+            if (expired) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R308A] defeated recruit post-load settle expired actor={:08X} reason={}",
+                    actorId,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            return true;
+        }
+
+        void ClearDefeatedRecruitPostLoadSettleUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor->GetFormID() == 0) {
+                return;
+            }
+
+            bool erased = false;
+            {
+                std::scoped_lock settleLock(g_defeatedRecruitPostLoadSettleLock);
+                erased = g_defeatedRecruitPostLoadSettleUntilSec.erase(actor->GetFormID()) > 0;
+            }
+            if (erased) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R308A] defeated recruit post-load settle cleared actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+            }
+        }
+
+        void ClearPendingDefeatedRecruitFinalizeUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor->GetFormID() == 0) {
+                return;
+            }
+
+            bool erased = false;
+            {
+                std::scoped_lock finalizeLock(g_pendingDefeatedRecruitFinalizeLock);
+                erased = g_pendingDefeatedRecruitFinalizes.erase(actor->GetFormID()) > 0;
+            }
+
+            if (erased) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R309A] defeated recruit refresh barrier cleared actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+            }
+        }
+
+        bool IsPendingDefeatedRecruitFinalizeUnsafe(RE::Actor* actor)
+        {
+            if (!actor || actor == Player() || actor->GetFormID() == 0) {
+                return false;
+            }
+
+            std::scoped_lock finalizeLock(g_pendingDefeatedRecruitFinalizeLock);
+            return g_pendingDefeatedRecruitFinalizes.find(actor->GetFormID()) != g_pendingDefeatedRecruitFinalizes.end();
+        }
+
+        bool IsDefeatedRecruitFinalizeAllowedReason(const char* reason)
+        {
+            const std::string_view useReason = reason ? std::string_view(reason) : std::string_view{};
+            return useReason == "defeated_humanoid_recruit" ||
+                useReason == "defeated_humanoid_recruit_refresh_barrier" ||
+                useReason == "defeated_humanoid_recruit_refresh_barrier_done";
+        }
+
+        void ArmPendingDefeatedRecruitFinalizeUnsafe(RE::Actor* actor, const char* reason, double delaySeconds = kDefeatedRecruitRefreshBarrierSeconds, std::uint32_t attempts = 0)
+        {
+            if (!actor || actor == Player() || actor->GetFormID() == 0) {
+                return;
+            }
+
+            const double useDelay = std::max(0.05, delaySeconds);
+            const double dueSec = NowRealSeconds() + useDelay;
+            {
+                std::scoped_lock finalizeLock(g_pendingDefeatedRecruitFinalizeLock);
+                auto& entry = g_pendingDefeatedRecruitFinalizes[actor->GetFormID()];
+                entry.dueSec = dueSec;
+                entry.attempts = attempts;
+            }
+
+            spdlog::info(
+                "[TFD][TeammateManager][R309A] defeated recruit refresh barrier armed actor={:08X} delay={:.2f} attempts={} reason={}",
+                actor->GetFormID(),
+                useDelay,
+                attempts,
+                reason ? reason : "unknown");
+        }
+
+        bool PulseDefeatedRecruitGetUpAndEvaluateUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+
+            const bool loaded = actor->Is3DLoaded();
+            const bool bleedingBefore = IsActorBleedingOutUnsafe(actor);
+            bool animPulsed = false;
+
+            if (loaded) {
+                actor->NotifyAnimationGraph("BleedoutStop");
+                actor->NotifyAnimationGraph("GetUpStart");
+                animPulsed = true;
+            }
+
+            actor->EvaluatePackage();
+            const bool bleedingAfter = IsActorBleedingOutUnsafe(actor);
+            spdlog::info(
+                "[TFD][TeammateManager][R308A] defeated recruit get-up/package settle actor={:08X} reason={} loaded={} bleedingBefore={} bleedingAfter={} animPulsed={} eval=1",
+                actor->GetFormID(),
+                reason ? reason : "unknown",
+                loaded ? 1 : 0,
+                bleedingBefore ? 1 : 0,
+                bleedingAfter ? 1 : 0,
+                animPulsed ? 1 : 0);
+            return true;
         }
 
         void ClearDownedRecoveryDialogueHoldUnsafe(RE::FormID actorId, const char* reason)
@@ -2098,6 +2288,14 @@ namespace
                 return false;
             }
 
+            if (IsPendingDefeatedRecruitFinalizeUnsafe(actor) && !IsDefeatedRecruitFinalizeAllowedReason(reason)) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R310B] queue humanoid assign deferred by defeated recruit barrier actor={:08X} reason={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown");
+                return false;
+            }
+
             const bool chainActive = TFD::PleasureRuntime::IsInCombatPleasureChainActive();
             if (chainActive && !allowDuringInCombatPleasureChain) {
                 DeferHumanoidTeammateAssignEvent(actor, reason, "incombat_pleasure_chain_active");
@@ -2404,6 +2602,9 @@ namespace
                 const bool combatBehaviorProtected = TFD::CombatBehavior::ShouldSuppressTeammatePackageRepair(actor, useReason);
                 const bool vanillaAssistIsolationProtected = IsVanillaAssistIsolationCombatPressure(actor, player, combatTarget);
                 const bool packageRepairProtected = combatBehaviorProtected || vanillaAssistIsolationProtected;
+                const bool defeatedRecruitPostLoadSettle =
+                    !packageRepairProtected && ShouldRunDefeatedRecruitPostLoadSettleUnsafe(actor, useReason);
+                const char* bridgeReason = defeatedRecruitPostLoadSettle ? kDefeatedRecruitLoadingCatchupReason : useReason;
 
                 // R30: do not rubber-band followers during ordinary running.
                 // Move only on the final post-loading pass, and only if the actor
@@ -2411,8 +2612,28 @@ namespace
                 // R85: do not move/clear/recommit during live combat pressure. This keeps the
                 // vanilla follower package stack isolated from TFD catchup repair.
                 const bool allowEmergencyMove = attempt >= 3;
-                const bool shouldMove = !packageRepairProtected && allowEmergencyMove && (unloaded || far || wrongCellFar);
+                // R310B: defeated recruits must be repaired as vanilla/process state, not rubber-banded.
+                // Patch 14b's forced arrival MoveTo path is intentionally rolled back. Keep the
+                // generic emergency move for ordinary teammates only; defeated recruits get get-up/eval
+                // service and Papyrus hard process refresh instead.
+                const bool allowDefeatedRecruitSettleMove = false;
+                const bool defeatedRecruitNeedsMove = false;
+                if (defeatedRecruitPostLoadSettle && attempt >= 2 && (unloaded || wrongCell || dist > kDefeatedRecruitPostLoadMoveDistance)) {
+                    spdlog::info(
+                        "[TFD][TeammateManager][R310B] defeated recruit post-load MoveTo rollback active actor={:08X} reason={} attempt={} dist={:.1f} wrongCell={} unloaded={}",
+                        actor->GetFormID(),
+                        useReason,
+                        attempt,
+                        dist,
+                        wrongCell ? 1 : 0,
+                        unloaded ? 1 : 0);
+                }
+                const bool shouldMove = !packageRepairProtected &&
+                    allowEmergencyMove &&
+                    !defeatedRecruitPostLoadSettle &&
+                    (unloaded || far || wrongCellFar);
 
+                bool defeatedRecruitGetUpPulse = false;
 
                 if (!hasValidExternalCombatTarget && !packageRepairProtected) {
                     if (combatDiagActor || combatDiagTarget) {
@@ -2456,15 +2677,38 @@ namespace
                     actor->MoveTo(player);
                     auto pos = player->GetPosition();
                     const float side = (i % 2 == 0) ? 1.0f : -1.0f;
-                    pos.x += side * (kMoveOffsetBase + static_cast<float>(i) * kMoveOffsetStep);
-                    pos.y += kMoveBackOffset;
+                    if (defeatedRecruitPostLoadSettle) {
+                        pos.x += side * kDefeatedRecruitPostLoadMoveSideOffset;
+                        pos.y += kDefeatedRecruitPostLoadMoveBackOffset;
+                    }
+                    else {
+                        pos.x += side * (kMoveOffsetBase + static_cast<float>(i) * kMoveOffsetStep);
+                        pos.y += kMoveBackOffset;
+                    }
                     actor->SetPosition(pos, true);
                     moved = true;
+                    if (defeatedRecruitPostLoadSettle) {
+                        spdlog::info(
+                            "[TFD][TeammateManager][R308A] defeated recruit post-load settle moved actor={:08X} reason={} attempt={} distBefore={:.1f} wrongCell={} unloaded={}",
+                            actor->GetFormID(),
+                            useReason,
+                            attempt,
+                            dist,
+                            wrongCell ? 1 : 0,
+                            unloaded ? 1 : 0);
+                    }
+                }
+
+                if (defeatedRecruitPostLoadSettle && !hasValidExternalCombatTarget && !packageRepairProtected) {
+                    defeatedRecruitGetUpPulse = PulseDefeatedRecruitGetUpAndEvaluateUnsafe(actor, bridgeReason);
+                    if (defeatedRecruitGetUpPulse) {
+                        evaluated = true;
+                    }
                 }
 
                 TFD::Recruit::CommitOptions options{};
                 options.sourceFlow = TFD::Recruit::SourceFlow::Teammate;
-                options.reason = reason ? reason : "post_load_humanoid_catchup";
+                options.reason = bridgeReason;
                 options.quarantineHostileFactions = true;
                 options.clearCombat = !hasValidExternalCombatTarget && !packageRepairProtected;
                 options.evaluatePackage = false;
@@ -2474,12 +2718,21 @@ namespace
                 options.applyRuntimeProfile = true;
                 if (!packageRepairProtected) {
                     TFD::Recruit::CommitRecruit(actor, player, options);
-                    assigned = QueueHumanoidTeammateAssignEvent(actor, useReason);
+                    assigned = QueueHumanoidTeammateAssignEvent(actor, bridgeReason);
 
-                    const bool shouldEvaluateForPackageRepair = moved || wrongCell || dist > kEvaluateDistance || !actor->Is3DLoaded();
+                    const bool shouldEvaluateForPackageRepair =
+                        !defeatedRecruitGetUpPulse &&
+                        ((defeatedRecruitPostLoadSettle && (dist > kDefeatedRecruitPostLoadEvaluateDistance || !actor->Is3DLoaded())) ||
+                            moved ||
+                            wrongCell ||
+                            dist > kEvaluateDistance ||
+                            !actor->Is3DLoaded());
                     if (shouldEvaluateForPackageRepair) {
                         actor->EvaluatePackage();
                         evaluated = true;
+                    }
+                    if (defeatedRecruitPostLoadSettle && (moved || attempt >= 3)) {
+                        ClearDefeatedRecruitPostLoadSettleUnsafe(actor, moved ? "post_load_settle_moved" : "post_load_settle_final_attempt");
                     }
                 }
                 else {
@@ -2495,13 +2748,15 @@ namespace
                 }
 
                 spdlog::info(
-                    "[TFD][TeammateManager] humanoid post-load catchup actor={:08X} reason={} attempt={} moved={} assigned={} evaluated={} wrongCell={} unloaded={} activeCombatPreserved={} dist={:.1f} combatDiagActor={} actorRole={} target={:08X} targetRole={} targetDiag={}",
+                    "[TFD][TeammateManager] humanoid post-load catchup actor={:08X} reason={} attempt={} moved={} assigned={} evaluated={} defeatedRecruitSettle={} getUpPulse={} wrongCell={} unloaded={} activeCombatPreserved={} dist={:.1f} combatDiagActor={} actorRole={} target={:08X} targetRole={} targetDiag={}",
                     actor->GetFormID(),
                     reason ? reason : "post_load_humanoid_catchup",
                     attempt,
                     moved ? 1 : 0,
                     assigned ? 1 : 0,
                     evaluated ? 1 : 0,
+                    defeatedRecruitPostLoadSettle ? 1 : 0,
+                    defeatedRecruitGetUpPulse ? 1 : 0,
                     wrongCell ? 1 : 0,
                     unloaded ? 1 : 0,
                     (hasValidExternalCombatTarget || packageRepairProtected) ? 1 : 0,
@@ -2561,6 +2816,14 @@ namespace
                 spdlog::warn(
                     "[TFD][TeammateManager] register now failed actor={:08X} reason={} detail=invalid_input",
                     actor ? actor->GetFormID() : 0u,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            if (IsPendingDefeatedRecruitFinalizeUnsafe(actor) && !IsDefeatedRecruitFinalizeAllowedReason(reason)) {
+                spdlog::info(
+                    "[TFD][TeammateManager][R310B] register now deferred by defeated recruit barrier actor={:08X} reason={}",
+                    actor->GetFormID(),
                     reason ? reason : "unknown");
                 return false;
             }
@@ -2717,6 +2980,144 @@ namespace
 
             RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "register_now_fill");
             return true;
+        }
+
+        bool FinalizeDefeatedRecruitAfterRefreshBarrierUnsafe(RE::Actor* actor, const char* reason, std::uint32_t attempts)
+        {
+            const char* useReason = reason && reason[0] ? reason : "defeated_humanoid_recruit_refresh_barrier";
+            if (!actor || actor == Player() || actor->IsDead() || actor->IsDisabled()) {
+                spdlog::warn(
+                    "[TFD][TeammateManager][R309A] defeated recruit refresh barrier finalize failed actor={:08X} reason={} detail=invalid_actor attempts={}",
+                    actor ? actor->GetFormID() : 0u,
+                    useReason,
+                    attempts);
+                return true;
+            }
+
+            const bool getUpPulse = PulseDefeatedRecruitGetUpAndEvaluateUnsafe(actor, "defeated_humanoid_recruit_refresh_barrier_getup");
+
+            TFD::Recruit::CommitOptions recruitOptions{};
+            recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Victory;
+            recruitOptions.reason = "defeated_humanoid_recruit_refresh_barrier";
+            recruitOptions.quarantineHostileFactions = true;
+            recruitOptions.clearCombat = true;
+            recruitOptions.evaluatePackage = true;
+            recruitOptions.detailedLog = true;
+            recruitOptions.throttleObserve = false;
+            recruitOptions.ensurePacifyAlliance = true;
+            recruitOptions.applyRuntimeProfile = true;
+
+            const auto commit = TFD::Recruit::CommitRecruit(actor, recruitOptions);
+            const bool commitClean = (commit.attempted || commit.skipped) && !commit.rawHostileAfter && commit.hostileFactionMatchesAfter == 0;
+            if (!commitClean) {
+                spdlog::warn(
+                    "[TFD][TeammateManager][R309A] defeated recruit refresh barrier finalize retry actor={:08X} reason={} detail=commit_not_clean attempted={} skipped={} rawAfter={} hostileAfter={} attempts={}",
+                    actor->GetFormID(),
+                    useReason,
+                    commit.attempted ? 1 : 0,
+                    commit.skipped ? 1 : 0,
+                    commit.rawHostileAfter ? 1 : 0,
+                    commit.hostileFactionMatchesAfter,
+                    attempts);
+                return false;
+            }
+
+            const bool aliasOk = RegisterOrRefreshAliasForActor(actor, "defeated_humanoid_recruit");
+            if (!aliasOk) {
+                spdlog::warn(
+                    "[TFD][TeammateManager][R309A] defeated recruit refresh barrier finalize retry actor={:08X} reason={} detail=alias_assign_failed attempts={}",
+                    actor->GetFormID(),
+                    useReason,
+                    attempts);
+                return false;
+            }
+
+            if (!ConsumeHealthPotionFromPlayerUnsafe("defeated_humanoid_recruit")) {
+                ReleaseHumanoidTeammateContractUnsafe(actor, "defeated_humanoid_recruit_potion_consume_failed");
+                spdlog::warn(
+                    "[TFD][TeammateManager][R309A] defeated recruit refresh barrier finalize failed actor={:08X} reason={} detail=potion_consume_failed attempts={}",
+                    actor->GetFormID(),
+                    useReason,
+                    attempts);
+                return true;
+            }
+
+            EnsureContractForActorUnsafe(actor, "defeated_humanoid_recruit");
+            ArmDefeatedRecruitPostLoadSettleUnsafe(actor, "defeated_humanoid_recruit_refresh_barrier_done");
+
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+            }
+            if (actor->Is3DLoaded()) {
+                actor->EvaluatePackage();
+            }
+            RefreshRecruitCapacityGlobalsUnsafe("defeated_humanoid_recruit_done");
+            spdlog::info(
+                "[TFD][TeammateManager][R309A] defeated recruit refresh barrier finalized actor={:08X} aliasOk=1 getUpPulse={} attempts={}",
+                actor->GetFormID(),
+                getUpPulse ? 1 : 0,
+                attempts);
+            return true;
+        }
+
+        void TickPendingDefeatedRecruitFinalizeUnsafe(const char* reason)
+        {
+            struct DueFinalize
+            {
+                RE::FormID actorId{ 0 };
+                std::uint32_t attempts{ 0 };
+            };
+
+            const double now = NowRealSeconds();
+            std::vector<DueFinalize> due{};
+            {
+                std::scoped_lock finalizeLock(g_pendingDefeatedRecruitFinalizeLock);
+                for (auto it = g_pendingDefeatedRecruitFinalizes.begin(); it != g_pendingDefeatedRecruitFinalizes.end();) {
+                    if (it->second.dueSec > now) {
+                        ++it;
+                        continue;
+                    }
+                    due.push_back(DueFinalize{ it->first, it->second.attempts });
+                    it = g_pendingDefeatedRecruitFinalizes.erase(it);
+                }
+            }
+
+            if (due.empty()) {
+                return;
+            }
+
+            for (const auto& item : due) {
+                auto* actor = LookupActorById(item.actorId);
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                    spdlog::warn(
+                        "[TFD][TeammateManager][R309A] defeated recruit refresh barrier dropped actor={:08X} reason={} detail=invalid_actor attempts={}",
+                        item.actorId,
+                        reason ? reason : "tick_ui",
+                        item.attempts);
+                    continue;
+                }
+
+                const bool done = FinalizeDefeatedRecruitAfterRefreshBarrierUnsafe(actor, reason ? reason : "tick_ui", item.attempts);
+                if (done) {
+                    continue;
+                }
+
+                const auto nextAttempts = item.attempts + 1;
+                if (nextAttempts >= kDefeatedRecruitRefreshBarrierMaxAttempts) {
+                    spdlog::warn(
+                        "[TFD][TeammateManager][R309A] defeated recruit refresh barrier final drop actor={:08X} reason={} attempts={}",
+                        item.actorId,
+                        reason ? reason : "tick_ui",
+                        nextAttempts);
+                    continue;
+                }
+
+                ArmPendingDefeatedRecruitFinalizeUnsafe(
+                    actor,
+                    "defeated_humanoid_recruit_refresh_barrier_retry",
+                    kDefeatedRecruitRefreshBarrierRetrySeconds,
+                    nextAttempts);
+            }
         }
 
         bool IsContractExpiredUnsafe(RE::Actor* actor, double nowDays, double* endDayOut = nullptr)
@@ -3028,6 +3429,14 @@ namespace
                         continue;
                     }
 
+                    if (IsPendingDefeatedRecruitFinalizeUnsafe(current)) {
+                        spdlog::info(
+                            "[TFD][TeammateManager][R310B] defer clear alias='{}' actor={:08X} reason=defeated_recruit_barrier",
+                            alias->aliasName.c_str(),
+                            current->GetFormID());
+                        continue;
+                    }
+
                     if (ShouldPreserveInvalidConvertedAlias(alias, current, "sync_alias_invalid")) {
                         continue;
                     }
@@ -3042,6 +3451,17 @@ namespace
                 if (IsTFDConvertedTeammate(current)) {
                     RememberConvertedTeammate(current, "sync_alias_valid_converted");
                     ResetInvalidAliasStrike(current);
+                }
+
+                if (IsPendingDefeatedRecruitFinalizeUnsafe(current)) {
+                    remaining.erase(std::remove_if(remaining.begin(), remaining.end(), [&](RE::Actor* actor) {
+                        return actor == current || (actor && current && actor->GetFormID() == current->GetFormID());
+                        }), remaining.end());
+                    spdlog::info(
+                        "[TFD][TeammateManager][R310B] defer sync valid alias='{}' actor={:08X} reason=defeated_recruit_barrier",
+                        alias->aliasName.c_str(),
+                        current->GetFormID());
+                    continue;
                 }
 
                 SyncTeammateFaction(current, true);
@@ -3062,6 +3482,20 @@ namespace
                 if (current && IsKnownConvertedAliasActor(current) && !IsHardInvalidConvertedAliasActor(current)) {
                     continue;
                 }
+
+                while (!remaining.empty() && IsPendingDefeatedRecruitFinalizeUnsafe(remaining.front())) {
+                    auto* pendingActor = remaining.front();
+                    remaining.erase(remaining.begin());
+                    spdlog::info(
+                        "[TFD][TeammateManager][R310B] sync_fill_alias deferred actor={:08X} alias='{}' reason=defeated_recruit_barrier",
+                        pendingActor ? pendingActor->GetFormID() : 0u,
+                        alias->aliasName.c_str());
+                }
+
+                if (remaining.empty()) {
+                    continue;
+                }
+
                 auto* actor = remaining.front();
                 remaining.erase(remaining.begin());
                 WriteAlias(alias, actor);
@@ -3231,6 +3665,7 @@ namespace
         void TickUI()
 
         {
+            TickPendingDefeatedRecruitFinalizeUnsafe("tick_ui");
             SyncAliasesImpl();
             FlushDeferredHumanoidTeammateAssignEvents("tick_ui");
             g_tickPending.store(false, std::memory_order_release);
@@ -3729,9 +4164,9 @@ namespace TFD::TeammateManager
         if (BridgeInternal::g_runtimeProviders.suppressDefeatedReentry) {
             BridgeInternal::g_runtimeProviders.suppressDefeatedReentry(actor, BridgeInternal::kDefeatedReentrySuppressSeconds, "defeated_humanoid_recruit");
         }
-        if (BridgeInternal::g_runtimeProviders.releaseBleedLock) {
-            BridgeInternal::g_runtimeProviders.releaseBleedLock(actor, "defeated_humanoid_recruit", true);
-        }
+        // R308A: restore safe health before releasing the defeated lock.  Releasing
+        // while still under threshold can leave the actor visually rooted in the
+        // bleedout process even though the recruit commit succeeds.
         if (BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct) {
             BridgeInternal::g_runtimeProviders.restoreActorHealthToSafePct(actor,
                 TFD::Settings::GetEnemyDownedThresholdPct(),
@@ -3739,12 +4174,16 @@ namespace TFD::TeammateManager
                 0.58f,
                 0.92f,
                 45.0f,
-                "defeated_humanoid_recruit");
+                "defeated_humanoid_recruit_pre_getup");
         }
+        if (BridgeInternal::g_runtimeProviders.releaseBleedLock) {
+            BridgeInternal::g_runtimeProviders.releaseBleedLock(actor, "defeated_humanoid_recruit", true);
+        }
+        AliasInternal::PulseDefeatedRecruitGetUpAndEvaluateUnsafe(actor, "defeated_humanoid_recruit_initial_getup");
 
         TFD::Recruit::CommitOptions recruitOptions{};
         recruitOptions.sourceFlow = TFD::Recruit::SourceFlow::Victory;
-        recruitOptions.reason = "defeated_humanoid_recruit";
+        recruitOptions.reason = "defeated_humanoid_recruit_pre_contract_barrier";
         recruitOptions.quarantineHostileFactions = true;
         recruitOptions.clearCombat = true;
         recruitOptions.evaluatePackage = true;
@@ -3754,9 +4193,10 @@ namespace TFD::TeammateManager
         recruitOptions.applyRuntimeProfile = true;
 
         const auto commit = TFD::Recruit::CommitRecruit(actor, recruitOptions);
-        if (!commit.attempted || commit.skipped || commit.hostileFactionMatchesAfter > 0) {
+        const bool commitClean = commit.attempted && !commit.rawHostileAfter && commit.hostileFactionMatchesAfter == 0;
+        if (!commitClean) {
             spdlog::warn(
-                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=commit_not_clean attempted={} skipped={} rawAfter={} hostileAfter={}",
+                "[TFD][TeammateManager][R309A] defeated humanoid recruit failed actor={:08X} reason=pre_contract_commit_not_clean attempted={} skipped={} rawAfter={} hostileAfter={}",
                 actor->GetFormID(),
                 commit.attempted ? 1 : 0,
                 commit.skipped ? 1 : 0,
@@ -3765,25 +4205,6 @@ namespace TFD::TeammateManager
             return false;
         }
 
-        const bool aliasOk = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "defeated_humanoid_recruit");
-        if (!aliasOk) {
-            spdlog::warn(
-                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=alias_assign_failed",
-                actor->GetFormID());
-            return false;
-        }
-        if (!AliasInternal::ConsumeHealthPotionFromPlayerUnsafe("defeated_humanoid_recruit")) {
-            AliasInternal::ReleaseHumanoidTeammateContractUnsafe(actor, "defeated_humanoid_recruit_potion_consume_failed");
-            spdlog::warn(
-                "[TFD][TeammateManager] defeated humanoid recruit failed actor={:08X} reason=potion_consume_failed_after_alias",
-                actor->GetFormID());
-            return false;
-        }
-        AliasInternal::EnsureContractForActorUnsafe(actor, "defeated_humanoid_recruit");
-
-        // RegisterOrRefreshTeammateNow() already queues TFDHumanoidTeammateAssign
-        // with strArg="defeated_humanoid_recruit".
-        // Do not queue a second blank bridge event here.
         if (actor->IsInCombat()) {
             actor->StopCombat();
         }
@@ -3791,11 +4212,24 @@ namespace TFD::TeammateManager
         if (actor->Is3DLoaded()) {
             actor->EvaluatePackage();
         }
+
+        // R309A: do not finalize the teammate/PlayerTeammate contract in the same
+        // frame that releases the defeated bleedout lock.  The actor can already be
+        // visually standing, while the engine process still behaves like a downed
+        // pseudo-dead actor.  Keep the actor pacified/player-side now, then finalize
+        // the alias + SetPlayerTeammate contract after a short refresh barrier.
+        AliasInternal::ArmPendingDefeatedRecruitFinalizeUnsafe(
+            actor,
+            "defeated_humanoid_recruit_pre_contract_barrier",
+            AliasInternal::kDefeatedRecruitRefreshBarrierSeconds,
+            0);
         if (BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget) {
             BridgeInternal::g_runtimeProviders.clearPendingDefeatedDialogueTarget();
         }
-        AliasInternal::RefreshRecruitCapacityGlobalsUnsafe("defeated_humanoid_recruit_done");
-        spdlog::info("[TFD][TeammateManager] defeated humanoid recruit actor={:08X} aliasOk=1", actor->GetFormID());
+        AliasInternal::RefreshRecruitCapacityGlobalsUnsafe("defeated_humanoid_recruit_barrier_armed");
+        spdlog::info(
+            "[TFD][TeammateManager][R309A] defeated humanoid recruit barrier armed actor={:08X} commitClean=1",
+            actor->GetFormID());
         return true;
     }
     bool ExtendHumanoidTeammateContract(RE::Actor* actor, const char* reason)

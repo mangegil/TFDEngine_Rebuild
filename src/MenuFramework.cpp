@@ -730,13 +730,39 @@ namespace TFDMenu
 				const int assignmentState = GetGlobalValueInt(gWorkAssignmentState);
 				const bool escapeBreakActive = TFD::FlowController::Controller::GetSingleton().IsCaptiveEscapeBreakContextActive();
 				if (escapeBreakActive) {
-					TFD::Captive::ClearReleasedWorkDialogueActorForCombatBreak(actor, "work_activation_escape_break_pre_block");
-					spdlog::info("[TFD][Menu][Work][R222A] activate blocked during escape-break before work actor prepare actor={:08X} assignment={} ({}) reason={} action=block_escape_break_before_prepare",
-						actor->GetFormID(),
-						assignmentState,
-						DecodeWorkAssignmentState(assignmentState),
-						reason ? reason : "work_activation");
-					return WorkActivationResult::kStop;
+					// R296A/R297A: AfterPleasure -> Work can legally leave the native root in a
+					// Captive escape-break overlay for a short time while Papyrus has
+					// already rebound the Work Boss.  R296A allowed Talk Boss only; R297A
+					// also allows Return Report so completed work can be turned in while
+					// the same overlay is still settling.  Non-boss actors and active
+					// work/pleasure assignments still block.
+					const bool workDialogueAllowedDuringEscapeBreak =
+						isCurrentBoss && (assignmentState == 1 || assignmentState == 3);
+					if (workDialogueAllowedDuringEscapeBreak) {
+						const bool preparedDuringEscapeBreak = TFD::Captive::EnsureReleasedWorkDialogueActor(actor, "work_activation_escape_break_current_boss_talk_or_report");
+						if (!preparedDuringEscapeBreak) {
+							actor->SetDialogueWithPlayer(false, false, nullptr);
+							spdlog::info("[TFD][Menu][Work][R297A] activate blocked escape-break boss prepare failed actor={:08X} assignment={} ({}) reason={} action=block_prepare_failed",
+								actor->GetFormID(),
+								assignmentState,
+								DecodeWorkAssignmentState(assignmentState),
+								reason ? reason : "work_activation");
+							return WorkActivationResult::kStop;
+						}
+						spdlog::info("[TFD][Menu][Work][R297A] activate allowed escape-break current boss talk/report actor={:08X} assignment={} ({}) reason={} action=continue_work_dialogue_prepare",
+							actor->GetFormID(),
+							assignmentState,
+							DecodeWorkAssignmentState(assignmentState),
+							reason ? reason : "work_activation");
+					} else {
+						TFD::Captive::ClearReleasedWorkDialogueActorForCombatBreak(actor, "work_activation_escape_break_pre_block");
+						spdlog::info("[TFD][Menu][Work][R222A] activate blocked during escape-break before work actor prepare actor={:08X} assignment={} ({}) reason={} action=block_escape_break_before_prepare",
+							actor->GetFormID(),
+							assignmentState,
+							DecodeWorkAssignmentState(assignmentState),
+							reason ? reason : "work_activation");
+						return WorkActivationResult::kStop;
+					}
 				}
 
 				if (assignmentState == 2) {
@@ -2910,16 +2936,34 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 										return true;
 									}
 
+									const char* victoryReason = sourceReason ? sourceReason : "victory_activate_dialogue";
+									if (!TFD::Victory::CanAdvertiseVictoryNow(defeatedTalkTarget, victoryReason)) {
+										TFD::Victory::SetStateValue(1);
+										spdlog::info(
+											"[TFD][Menu][R301A] blocked manual Victory dialogue target={:08X} source={} reason=encounter_not_resolved",
+											defeatedTalkTarget->GetFormID(),
+											victoryReason);
+										return true;
+									}
+
 									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
-									TFD::Victory::ArmDialogueReadyHold(defeatedTalkTarget, kVictoryDialogueReadyHoldSec, sourceReason ? sourceReason : "victory_activate_dialogue");
+									TFD::Victory::ArmDialogueReadyHold(defeatedTalkTarget, kVictoryDialogueReadyHoldSec, victoryReason);
 									TFD::Victory::SetStateValue(2);
 									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
 										defeatedTalkTarget->GetFormID(),
-										sourceReason ? sourceReason : "victory_activate_dialogue");
+										victoryReason);
 									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=2 source={}",
 										defeatedTalkTarget->GetFormID(),
 										flowOk ? 1 : 0,
-										sourceReason ? sourceReason : "victory_activate_dialogue");
+										victoryReason);
+									if (!flowOk) {
+										TFD::Victory::SetStateValue(1);
+										spdlog::info(
+											"[TFD][Menu][R301A] aborted manual Victory dialogue target={:08X} source={} reason=flow_rejected",
+											defeatedTalkTarget->GetFormID(),
+											victoryReason);
+										return true;
+									}
 
 									if (!defeatedTalkTarget->IsAIEnabled()) {
 										defeatedTalkTarget->EnableAI(true);
