@@ -34,6 +34,10 @@ namespace TFD::Location
 		std::uint32_t safeLocationId{ 0 };
 		std::uint32_t bedRefId{ 0 };
 		std::uint32_t cellId{ 0 };
+		std::uint32_t ownerFormId{ 0 };
+		std::uint32_t ownerNpcFormId{ 0 };
+		std::uint32_t ownerFactionFormId{ 0 };
+		std::uint32_t ownerKind{ 0 };
 		std::uint32_t useSerial{ 0 };
 	};
 
@@ -92,6 +96,8 @@ namespace TFD::Location
 
 	bool GetLastSafeCheckpointForLocation(RE::BGSLocation* loc, SafeCheckpoint& outCp);
 	bool GetBestApprovedBedForLocation(RE::BGSLocation* loc, ApprovedBed& outBed);
+	RE::Actor* ResolveApprovedBedOwnerActor(RE::TESObjectREFR* bedRef, float radius = 8192.0f);
+	RE::Actor* ResolveBestApprovedBedOwnerActorForLocation(RE::BGSLocation* loc);
 	RE::BGSLocation* GetMostRecentCachedSafeLocation();
 
 RE::TESObjectREFR* ResolveMostRecentCachedRescueDestination(bool preferInterior = true);

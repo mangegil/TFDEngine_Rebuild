@@ -8,14 +8,11 @@
 #include <RE/Skyrim.h>
 #include <spdlog/spdlog.h>
 
-#include "TFDFlowController.h"
 #include "TFDActor.h"
 #include "TFDLocation.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
 #include "TFDTransition.h"
-#include "TFDVictory.h"
-#include "TFDPleasureRuntime.h"
 
 namespace TFD::PostDefeatState
 {
@@ -27,6 +24,7 @@ namespace TFD::PostDefeatState
         RE::TESGlobal* g_enemyRaceStateGlobal = nullptr;
         RE::TESGlobal* g_recoveryStateGlobal = nullptr;
         RE::TESGlobal* g_leftForDeadStateGlobal = nullptr;
+
         bool g_loggedDefeatStateGlobal = false;
         bool g_loggedHostileStateGlobal = false;
         bool g_loggedEnemyFactionStateGlobal = false;
@@ -34,50 +32,26 @@ namespace TFD::PostDefeatState
         bool g_loggedRecoveryStateGlobal = false;
         bool g_loggedLeftForDeadStateGlobal = false;
 
+        void ResolveGlobal(RE::TESGlobal*& global, bool& logged, const char* editorID)
+        {
+            if (global) {
+                return;
+            }
+            global = RE::TESForm::LookupByEditorID<RE::TESGlobal>(editorID);
+            if (global && !logged) {
+                logged = true;
+                spdlog::info("[TFD][PostDefeatState][R391B] {} resolved {:08X}", editorID, global->GetFormID());
+            }
+        }
+
         void ResolveGlobals()
         {
-            if (!g_defeatStateGlobal) {
-                g_defeatStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDDefeatState");
-                if (g_defeatStateGlobal && !g_loggedDefeatStateGlobal) {
-                    g_loggedDefeatStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDDefeatState resolved {:08X}", g_defeatStateGlobal->GetFormID());
-                }
-            }
-            if (!g_hostileStateGlobal) {
-                g_hostileStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDHostileState");
-                if (g_hostileStateGlobal && !g_loggedHostileStateGlobal) {
-                    g_loggedHostileStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDHostileState resolved {:08X}", g_hostileStateGlobal->GetFormID());
-                }
-            }
-            if (!g_enemyFactionStateGlobal) {
-                g_enemyFactionStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyFactionState");
-                if (g_enemyFactionStateGlobal && !g_loggedEnemyFactionStateGlobal) {
-                    g_loggedEnemyFactionStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDEnemyFactionState resolved {:08X}", g_enemyFactionStateGlobal->GetFormID());
-                }
-            }
-            if (!g_enemyRaceStateGlobal) {
-                g_enemyRaceStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDEnemyRaceState");
-                if (g_enemyRaceStateGlobal && !g_loggedEnemyRaceStateGlobal) {
-                    g_loggedEnemyRaceStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDEnemyRaceState resolved {:08X}", g_enemyRaceStateGlobal->GetFormID());
-                }
-            }
-            if (!g_recoveryStateGlobal) {
-                g_recoveryStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDRecoveryState");
-                if (g_recoveryStateGlobal && !g_loggedRecoveryStateGlobal) {
-                    g_loggedRecoveryStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDRecoveryState resolved {:08X}", g_recoveryStateGlobal->GetFormID());
-                }
-            }
-            if (!g_leftForDeadStateGlobal) {
-                g_leftForDeadStateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDLeftForDeadState");
-                if (g_leftForDeadStateGlobal && !g_loggedLeftForDeadStateGlobal) {
-                    g_loggedLeftForDeadStateGlobal = true;
-                    spdlog::info("[TFD][PostDefeatState] TFDLeftForDeadState resolved {:08X}", g_leftForDeadStateGlobal->GetFormID());
-                }
-            }
+            ResolveGlobal(g_defeatStateGlobal, g_loggedDefeatStateGlobal, "TFDDefeatState");
+            ResolveGlobal(g_hostileStateGlobal, g_loggedHostileStateGlobal, "TFDHostileState");
+            ResolveGlobal(g_enemyFactionStateGlobal, g_loggedEnemyFactionStateGlobal, "TFDEnemyFactionState");
+            ResolveGlobal(g_enemyRaceStateGlobal, g_loggedEnemyRaceStateGlobal, "TFDEnemyRaceState");
+            ResolveGlobal(g_recoveryStateGlobal, g_loggedRecoveryStateGlobal, "TFDRecoveryState");
+            ResolveGlobal(g_leftForDeadStateGlobal, g_loggedLeftForDeadStateGlobal, "TFDLeftForDeadState");
         }
 
         void SetGlobalInt(RE::TESGlobal* global, int value)
@@ -92,36 +66,36 @@ namespace TFD::PostDefeatState
             if (!player || player->IsDead() || player->IsDisabled()) {
                 return false;
             }
-
             const float hpNow = player->GetActorValue(RE::ActorValue::kHealth);
             const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
             const float pct = (hpNow / hpMax) * 100.0f;
-            const float thresh = TFD::Settings::GetDefeatThresholdPct();
-            return pct <= thresh;
+            return pct <= TFD::Settings::GetDefeatThresholdPct();
         }
 
-        int ComputeDefeatState(RE::Actor* player, bool combatContext)
+        int ComputeDefeatState(RE::Actor* player, bool combatContext, bool forcePlayerBleedout)
         {
-            if (!player || !combatContext) {
+            if (!player) {
+                return 0;
+            }
+            if (forcePlayerBleedout) {
+                return 2;
+            }
+            if (!combatContext) {
                 return 0;
             }
             return ComputePlayerBleedOutState(player) ? 2 : 1;
         }
 
-        int ComputeHostileState(RE::Actor* player, const std::vector<RE::Actor*>& enemies)
+        int ComputeHostileState(RE::Actor* player, const std::vector<RE::Actor*>& enemies, bool forcePlayerBleedout)
         {
-            if (!player || ComputePlayerBleedOutState(player)) {
+            if (!player || forcePlayerBleedout || ComputePlayerBleedOutState(player)) {
                 return 0;
             }
-
             const int count = static_cast<int>(enemies.size());
             if (count <= 0) {
                 return 0;
             }
-            if (count == 1) {
-                return 1;
-            }
-            return 2;
+            return count == 1 ? 1 : 2;
         }
 
         bool ActorHasKeywordByEditorID(RE::Actor* actor, const char* editorID)
@@ -212,212 +186,8 @@ namespace TFD::PostDefeatState
             const bool hasLivingFollower = (followers.standing != nullptr);
             const bool hasRescueMarker = (TFD::Location::ResolveMostRecentCachedRescueDestination(true) != nullptr) ||
                 (TFD::Location::ResolveMostRecentCachedRescueDestination(false) != nullptr);
-            const bool hasRescueFactor = hasLivingFollower && hasRescueMarker;
             const bool hasRecoveryFactor = TFD::Transition::HasRecoveryPotionAvailable();
-            return (hasRescueFactor || hasRecoveryFactor) ? 0 : 1;
-        }
-
-        static constexpr int kVictoryStateNeutral = 0;
-        static constexpr int kVictoryStateNo = 1;
-        static constexpr int kVictoryStateYes = 2;
-        static constexpr int kVictoryRecruitGlobalRefreshIntervalMs = 1000;
-        static constexpr int kStaleVictoryNeutralConfirmTicks = 2;
-        static constexpr int kSuppressedDialogueTerminalClearLogIntervalMs = 1000;
-
-        int g_lastObservedVictoryStateForRecruitGlobals = -1;
-        std::chrono::steady_clock::time_point g_nextVictoryRecruitGlobalRefresh{};
-        std::chrono::steady_clock::time_point g_nextVictoryPreserveLog{};
-        std::chrono::steady_clock::time_point g_nextSuppressedDialogueTerminalClearLog{};
-        int g_staleVictoryNeutralTicks = 0;
-
-        bool IsBleedoutPleasureLockActive()
-        {
-            // R248A: Bleedout -> Pleasure is a terminal handoff.  The old
-            // Bleedout decision must not keep projecting TFDDefeatState=2 after
-            // the player has committed the Pleasure outcome.  The source is kept
-            // only as PleasureRuntime metadata; PostDefeat/HUD/CK conditions must
-            // see the flow as neutral/pleasure-owned, not as an active Bleedout
-            // forcegreet context.
-            return false;
-        }
-
-        bool IsDialogueMenuOpen()
-        {
-            auto* ui = RE::UI::GetSingleton();
-            return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
-        }
-
-        bool IsBleedoutDecisionRootActive()
-        {
-            const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
-            if (snapshot.gate != TFD::FlowController::DecisionGate::PlayerBleedout ||
-                snapshot.terminalResolved ||
-                snapshot.primaryActorFormID == 0) {
-                return false;
-            }
-
-            if (snapshot.root == TFD::FlowController::RootFlow::Bleedout &&
-                snapshot.sub == TFD::FlowController::SubFlow::None) {
-                return true;
-            }
-
-            // Captive escape failure preserves the Captive root, but it is still a
-            // player-bleedout decision phase.  Keep TFDDefeatState at 2 so the
-            // shared Bleedout greet and its child choices stay condition-valid
-            // while the player is down during Escape/Recapture.
-            if (snapshot.root == TFD::FlowController::RootFlow::Captive &&
-                (snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
-                    snapshot.sub == TFD::FlowController::SubFlow::Recapture)) {
-                return true;
-            }
-
-            return false;
-        }
-
-        void RefreshRecruitGlobalsWhenVictoryReady(int victoryState)
-        {
-            if (victoryState != kVictoryStateYes) {
-                g_lastObservedVictoryStateForRecruitGlobals = victoryState;
-                g_nextVictoryRecruitGlobalRefresh = {};
-                return;
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            const bool enteredVictoryReady = g_lastObservedVictoryStateForRecruitGlobals != kVictoryStateYes;
-            const bool refreshDue =
-                g_nextVictoryRecruitGlobalRefresh == std::chrono::steady_clock::time_point{} ||
-                now >= g_nextVictoryRecruitGlobalRefresh;
-
-            if (enteredVictoryReady || refreshDue) {
-                TFD::TeammateManager::RefreshRecruitCapacityGlobals(
-                    enteredVictoryReady ? "victory_state_ready_enter" : "victory_state_ready_hold");
-                g_nextVictoryRecruitGlobalRefresh = now + std::chrono::milliseconds(kVictoryRecruitGlobalRefreshIntervalMs);
-            }
-
-            g_lastObservedVictoryStateForRecruitGlobals = victoryState;
-        }
-
-        bool IsVictoryFlowStillBackedByDefeatedActor(const TFD::FlowController::Snapshot& snapshot)
-        {
-            if (snapshot.root != TFD::FlowController::RootFlow::Victory) {
-                return false;
-            }
-            if (snapshot.primaryActorFormID == 0) {
-                return false;
-            }
-
-            auto* actor = RE::TESForm::LookupByID<RE::Actor>(snapshot.primaryActorFormID);
-            if (!actor) {
-                return false;
-            }
-
-            if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
-                return false;
-            }
-            return TFD::Victory::CanAdvertiseVictoryNow(actor, nullptr);
-        }
-
-        bool PreserveVictoryFlowIfBackedByDefeatedActor(const char* reason)
-        {
-            auto& flow = TFD::FlowController::Controller::GetSingleton();
-            const auto snapshot = flow.GetSnapshot();
-            if (!IsVictoryFlowStillBackedByDefeatedActor(snapshot)) {
-                return false;
-            }
-
-            const int previousVictoryState = TFD::Victory::GetStateValue();
-            TFD::Victory::SetStateValue(kVictoryStateYes);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateYes);
-            g_staleVictoryNeutralTicks = 0;
-
-            const auto now = std::chrono::steady_clock::now();
-            const bool shouldLog = previousVictoryState != kVictoryStateYes ||
-                g_nextVictoryPreserveLog == std::chrono::steady_clock::time_point{} ||
-                now >= g_nextVictoryPreserveLog;
-
-            if (shouldLog) {
-                spdlog::info(
-                    "[TFD][PostDefeatState][R93N] preserving Victory flow root primary={:08X} token={} previousState={} reason={}",
-                    snapshot.primaryActorFormID,
-                    snapshot.token,
-                    previousVictoryState,
-                    reason ? reason : "victory_flow_backed_by_defeated_actor");
-                g_nextVictoryPreserveLog = now + std::chrono::milliseconds(kVictoryRecruitGlobalRefreshIntervalMs);
-            }
-            return true;
-        }
-
-        void ClearStaleVictoryFlowWhenNotReady(int victoryState, const RefreshInput& input)
-        {
-            (void)input;
-
-            if (victoryState == kVictoryStateYes) {
-                g_staleVictoryNeutralTicks = 0;
-                return;
-            }
-
-            auto& flow = TFD::FlowController::Controller::GetSingleton();
-            const auto snapshot = flow.GetSnapshot();
-            if (snapshot.root != TFD::FlowController::RootFlow::Victory) {
-                g_staleVictoryNeutralTicks = 0;
-                return;
-            }
-
-            if (IsVictoryFlowStillBackedByDefeatedActor(snapshot)) {
-                TFD::Victory::SetStateValue(kVictoryStateYes);
-                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateYes);
-                g_staleVictoryNeutralTicks = 0;
-                spdlog::info(
-                    "[TFD][PostDefeatState] preserved Victory flow root despite neutral global primary={:08X} token={} reason=defeated_actor_still_dialogue_capable",
-                    snapshot.primaryActorFormID,
-                    snapshot.token);
-                return;
-            }
-
-            if (snapshot.terminalResolved || IsDialogueMenuOpen()) {
-                g_staleVictoryNeutralTicks = 0;
-                return;
-            }
-
-            ++g_staleVictoryNeutralTicks;
-            if (g_staleVictoryNeutralTicks < kStaleVictoryNeutralConfirmTicks) {
-                return;
-            }
-
-            spdlog::info(
-                "[TFD][PostDefeatState][R301A] clearing stale Victory flow root because VictoryState is not ready primary={:08X} token={} state={} reason=victory_state_not_ready",
-                snapshot.primaryActorFormID,
-                snapshot.token,
-                victoryState);
-            flow.ResetRuntime("victory_state_not_ready_stale_root_clear");
-            g_staleVictoryNeutralTicks = 0;
-        }
-
-
-        void ClearSuppressedDialogueOnlyGlobalsTerminal(const RefreshInput& input, RefreshResult& result)
-        {
-            result.routerCombatContextActive = false;
-
-            SetGlobalInt(g_defeatStateGlobal, 0);
-            TFD::Victory::ResetObservedContext();
-            TFD::Victory::SetStateValue(kVictoryStateNeutral);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
-            g_staleVictoryNeutralTicks = 0;
-            SetGlobalInt(g_hostileStateGlobal, 0);
-            SetGlobalInt(g_enemyFactionStateGlobal, 0);
-            SetGlobalInt(g_enemyRaceStateGlobal, 0);
-            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
-            SetGlobalInt(g_leftForDeadStateGlobal, 0);
-
-            const auto now = std::chrono::steady_clock::now();
-            if (g_nextSuppressedDialogueTerminalClearLog == std::chrono::steady_clock::time_point{} ||
-                now >= g_nextSuppressedDialogueTerminalClearLog) {
-                spdlog::info(
-                    "[TFD][PostDefeatState][R302A] suppressed dialogue-only enemies terminal clear defeat=0 victory=0 hostile=0 faction=0 race=0 leftForDead=0 count={} reason=only_suppressed_dialogue_enemies",
-                    input.suppressedEnemyCount);
-                g_nextSuppressedDialogueTerminalClearLog =
-                    now + std::chrono::milliseconds(kSuppressedDialogueTerminalClearLogIntervalMs);
-            }
+            return ((hasLivingFollower && hasRescueMarker) || hasRecoveryFactor) ? 0 : 1;
         }
     }
 
@@ -425,120 +195,39 @@ namespace TFD::PostDefeatState
     {
         ResolveGlobals();
 
+        if (input.forcePlayerBleedout) {
+            static std::chrono::steady_clock::time_point s_lastOwnerOverrideLog{};
+            const auto now = std::chrono::steady_clock::now();
+            if (s_lastOwnerOverrideLog.time_since_epoch().count() == 0 ||
+                (now - s_lastOwnerOverrideLog) >= std::chrono::milliseconds(1200)) {
+                s_lastOwnerOverrideLog = now;
+                spdlog::info(
+                    "[TFD][PostDefeatState][R20] bleedout owner override root={} gate={} lock={} runtime={} hpThresholdIgnored=1",
+                    input.ownerRootName ? input.ownerRootName : "None",
+                    input.ownerGateName ? input.ownerGateName : "None",
+                    input.playerBleedLockActive ? 1 : 0,
+                    input.playerBleedRuntimeActive ? 1 : 0);
+            }
+        }
+
         RefreshResult result{};
         result.routerCombatContextActive = input.routerCombatContext;
 
-        if (IsBleedoutDecisionRootActive()) {
-            SetGlobalInt(g_defeatStateGlobal, 2);
-            TFD::Victory::ResetObservedContext();
-            TFD::Victory::SetStateValue(kVictoryStateNo);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
-            g_staleVictoryNeutralTicks = 0;
-            SetGlobalInt(g_hostileStateGlobal, 0);
-            SetGlobalInt(g_enemyFactionStateGlobal, 0);
-            SetGlobalInt(g_enemyRaceStateGlobal, 0);
-            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
-            SetGlobalInt(g_leftForDeadStateGlobal, 0);
-            spdlog::info(
-                "[TFD][PostDefeatState][R132] preserving Bleedout decision root globals defeat=2 victory=No reason=bleedout_source_dialogue_active");
-            return result;
-        }
-
-        if (input.pleasurePassiveLock) {
+        if (input.pleasurePassiveLock || input.onlySuppressedDialogueEnemies) {
             result.routerCombatContextActive = false;
-
-            if (IsBleedoutPleasureLockActive()) {
-                SetGlobalInt(g_defeatStateGlobal, 2);
-                TFD::Victory::ResetObservedContext();
-                TFD::Victory::SetStateValue(kVictoryStateNo);
-                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
-                g_staleVictoryNeutralTicks = 0;
-                SetGlobalInt(g_hostileStateGlobal, 0);
-                SetGlobalInt(g_enemyFactionStateGlobal, 0);
-                SetGlobalInt(g_enemyRaceStateGlobal, 0);
-                SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
-                SetGlobalInt(g_leftForDeadStateGlobal, 0);
-                spdlog::info(
-                    "[TFD][PostDefeatState][R108] preserving Bleedout state during pleasure lock phase={} source={} defeat=2 victory=No",
-                    TFD::PleasureRuntime::GetPhaseName(),
-                    TFD::PleasureRuntime::GetSourceContextName());
-                return result;
-            }
-
-            SetGlobalInt(g_defeatStateGlobal, 0);
-            TFD::Victory::ResetObservedContext();
-            if (!PreserveVictoryFlowIfBackedByDefeatedActor("pleasure_passive_lock_ignored_for_active_victory")) {
-                TFD::Victory::SetStateValue(0);
-                RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNeutral);
-                g_staleVictoryNeutralTicks = 0;
-            }
-            SetGlobalInt(g_hostileStateGlobal, 0);
-            SetGlobalInt(g_enemyFactionStateGlobal, 0);
-            SetGlobalInt(g_enemyRaceStateGlobal, 0);
-            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
-            SetGlobalInt(g_leftForDeadStateGlobal, 0);
-            return result;
         }
 
-        const bool playerDownNow = ComputePlayerBleedOutState(input.player);
+        const bool playerDownNow = input.forcePlayerBleedout || ComputePlayerBleedOutState(input.player);
+        const bool defeatContext = input.forcePlayerBleedout || input.defeatContext || (input.battleObserveHold && input.player && playerDownNow);
 
-        if (input.battleObserveHold && input.player && playerDownNow) {
-            // CB03: player is down, but Bleedout dialogue must stay closed while standing allies are still resolving combat.
-            // Keep globals in defeat-combat hold instead of advertising TFDDefeatState=2 to CK forcegreet conditions.
-            SetGlobalInt(g_defeatStateGlobal, 1);
-            TFD::Victory::ResetObservedContext();
-            TFD::Victory::SetStateValue(kVictoryStateNo);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
-            g_staleVictoryNeutralTicks = 0;
-            SetGlobalInt(g_hostileStateGlobal, 0);
-            SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
-            SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));
-            SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
-            SetGlobalInt(g_leftForDeadStateGlobal, 0);
-            result.routerCombatContextActive = input.routerCombatContext;
-            spdlog::info(
-                "[TFD][PostDefeatState][CB03] battle observe hold globals defeat=1 victory=No enemies={} reason=defer_bleedout_forcegreet",
-                static_cast<unsigned int>(input.enemies.size()));
-            return result;
-        }
-
-        if (input.onlySuppressedDialogueEnemies) {
-            ClearSuppressedDialogueOnlyGlobalsTerminal(input, result);
-            return result;
-        }
-
-        SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, input.defeatContext));
-
-        const bool forceVictoryNoForPlayerDefeat = input.player && playerDownNow && input.defeatContext;
-        const bool playerCanOwnVictory = input.player && !playerDownNow;
-        const bool preservedActiveVictoryFlow = !forceVictoryNoForPlayerDefeat && playerCanOwnVictory &&
-            PreserveVictoryFlowIfBackedByDefeatedActor("active_victory_dialogue_actor_before_observed_refresh");
-
-        if (forceVictoryNoForPlayerDefeat) {
-            TFD::Victory::ResetObservedContext();
-            TFD::Victory::SetStateValue(kVictoryStateNo);
-            RefreshRecruitGlobalsWhenVictoryReady(kVictoryStateNo);
-            g_staleVictoryNeutralTicks = 0;
-        }
-        else if (!preservedActiveVictoryFlow) {
-            TFD::Victory::RefreshObservedState(TFD::Victory::ObservedContext{
-                .hasPlayer = (input.player != nullptr),
-                .playerDown = playerDownNow,
-                .combatContext = input.victoryContext,
-                .hasEnemies = !input.enemies.empty()
-                });
-        }
-
-        const int victoryState = TFD::Victory::GetStateValue();
-        if (!preservedActiveVictoryFlow && !forceVictoryNoForPlayerDefeat) {
-            RefreshRecruitGlobalsWhenVictoryReady(victoryState);
-        }
-        ClearStaleVictoryFlowWhenNotReady(victoryState, input);
-        SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies));
+        SetGlobalInt(g_defeatStateGlobal, ComputeDefeatState(input.player, defeatContext, input.forcePlayerBleedout));
+        SetGlobalInt(g_hostileStateGlobal, ComputeHostileState(input.player, input.enemies, input.forcePlayerBleedout));
         SetGlobalInt(g_enemyFactionStateGlobal, ComputeEnemyFactionState(input.enemies));
         SetGlobalInt(g_enemyRaceStateGlobal, ComputeEnemyRaceState(input.enemies));
         SetGlobalInt(g_recoveryStateGlobal, ComputeRecoveryState());
         SetGlobalInt(g_leftForDeadStateGlobal, ComputeLeftForDeadState(input.player));
+
+
         return result;
     }
 }

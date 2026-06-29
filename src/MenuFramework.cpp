@@ -39,7 +39,9 @@
 #include "TFDFlowController.h"
 #include "TFDCaptive.h"
 #include "TFDRescue.h"
+#include "TFDRescueGreet.h"
 #include "TFDPleasureRuntime.h"
+#include "TFDForceGreetState.h"
 #include "TFDVictory.h"
 #include "EditorIdCache.h"
 
@@ -109,11 +111,6 @@ namespace TFDMenu
 		constexpr double kDownedTeammateRecoveryActorCooldownSec = 0.85;
 		constexpr double kDownedTeammateRecoveryHoldSec = 10.0;
 
-		static Clock::time_point gNextVictoryManualDialogueOpen{};
-		static std::unordered_map<RE::FormID, Clock::time_point> gVictoryManualDialogueCooldownUntil{};
-		constexpr double kVictoryManualGlobalCooldownSec = 0.65;
-		constexpr double kVictoryManualActorCooldownSec = 1.50;
-		constexpr double kVictoryDialogueReadyHoldSec = 4.00;
 
 		static std::atomic_uint64_t gWorkDialogueOpenSerial{ 0 };
 
@@ -227,44 +224,6 @@ namespace TFDMenu
 
 			return info;
 		}
-
-
-
-		static RE::TESTopicInfo* ResolveVictoryGreetTopicInfo()
-		{
-			static RE::TESTopicInfo* info = nullptr;
-			static bool attempted = false;
-
-			if (!attempted) {
-				attempted = true;
-
-				// R93O: Victory after a real PreCombat dialogue can leave vanilla topic
-				// selection on the old dialogue route even when SetDialogueWithPlayer()
-				// returns true. Use the explicit INFO behind TFD_TIF__05195937
-				// so the Victory fragment always fires like direct Victory does.
-				constexpr RE::FormID kVictoryGreetInfoLocalFormID = 0x00195937;
-				constexpr std::string_view kPluginName{ "TFDEngine.esp" };
-
-				if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
-					info = dataHandler->LookupForm<RE::TESTopicInfo>(kVictoryGreetInfoLocalFormID, kPluginName);
-				}
-
-				if (info) {
-					spdlog::info("[TFD][Menu] TFDDialogueVictoryGreet INFO resolved {:08X} local={:06X}",
-						info->GetFormID(),
-						kVictoryGreetInfoLocalFormID);
-				}
-				else {
-					spdlog::warn("[TFD][Menu] TFDDialogueVictoryGreet INFO {:06X} not found in {}; victory hard dialogue will fall back to default topic selection",
-						kVictoryGreetInfoLocalFormID,
-						kPluginName);
-				}
-			}
-
-			return info;
-		}
-
-
 		static RE::TESTopicInfo* ResolveCaptiveWorkingGreetTopicInfo()
 		{
 			static RE::TESTopicInfo* info = nullptr;
@@ -427,11 +386,42 @@ namespace TFDMenu
 
 			static bool OpenAfterPleasureDialogueFromActivation(RE::Actor* actor, const char* reason)
 			{
-				if (!PrepareAfterPleasureActivationActor(actor, reason ? reason : "after_pleasure_activation_dialogue")) {
+				if (!IsAfterPleasureActivationActor(actor)) {
 					return false;
 				}
 
 				const bool pleasureFailedDialogue = TFD::PleasureRuntime::IsPleasureFailedDialogueActive();
+				const auto activeMode = TFD::InteractionRouter::DialogueOpen::GetMode();
+				const auto wantedMode = pleasureFailedDialogue ?
+					TFD::InteractionRouter::DialogueOpen::Mode::PleasureFailed :
+					TFD::InteractionRouter::DialogueOpen::Mode::AfterPleasure;
+
+				if (pleasureFailedDialogue ? TFD::ForceGreetState::IsPleasureFailedCommitted() : TFD::ForceGreetState::IsAfterPleasureCommitted()) {
+					spdlog::info(
+						"[TFD][Menu][R477A] after pleasure activation ignored committed actor={:08X} mode={} phase={} source={} reason={}",
+						actor->GetFormID(),
+						pleasureFailedDialogue ? "PleasureFailed" : "AfterPleasure",
+						TFD::PleasureRuntime::GetPhaseName(),
+						TFD::PleasureRuntime::GetSourceContextName(),
+						reason ? reason : "after_pleasure_activation_dialogue");
+					return true;
+				}
+
+				if (activeMode == wantedMode) {
+					spdlog::info(
+						"[TFD][Menu][R477A] after pleasure activation ignored pending native open actor={:08X} mode={} phase={} source={} reason={}",
+						actor->GetFormID(),
+						pleasureFailedDialogue ? "PleasureFailed" : "AfterPleasure",
+						TFD::PleasureRuntime::GetPhaseName(),
+						TFD::PleasureRuntime::GetSourceContextName(),
+						reason ? reason : "after_pleasure_activation_dialogue");
+					return true;
+				}
+
+				if (!PrepareAfterPleasureActivationActor(actor, reason ? reason : "after_pleasure_activation_dialogue")) {
+					return false;
+				}
+
 				if (pleasureFailedDialogue) {
 					TFD::InteractionRouter::DialogueOpen::BeginPleasureFailed(actor);
 				}
@@ -1035,67 +1025,6 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 					reason ? reason : "unknown");
 			}
 		}
-
-		static void PruneVictoryManualDialogueCooldowns(Clock::time_point now)
-		{
-			for (auto it = gVictoryManualDialogueCooldownUntil.begin(); it != gVictoryManualDialogueCooldownUntil.end();) {
-				if (now >= it->second) {
-					it = gVictoryManualDialogueCooldownUntil.erase(it);
-				}
-				else {
-					++it;
-				}
-			}
-		}
-
-		static bool IsVictoryManualDialogueBlocked(RE::Actor* actor, Clock::time_point now, const char*& outReason, double& outRemainingSec)
-		{
-			outReason = "none";
-			outRemainingSec = 0.0;
-
-			if (!actor) {
-				outReason = "no_actor";
-				return true;
-			}
-
-			if (now < gNextVictoryManualDialogueOpen) {
-				outReason = "global_cooldown";
-				outRemainingSec = std::chrono::duration<double>(gNextVictoryManualDialogueOpen - now).count();
-				return true;
-			}
-
-			PruneVictoryManualDialogueCooldowns(now);
-
-			const auto formID = actor->GetFormID();
-			if (auto it = gVictoryManualDialogueCooldownUntil.find(formID); it != gVictoryManualDialogueCooldownUntil.end()) {
-				if (now < it->second) {
-					outReason = "actor_cooldown";
-					outRemainingSec = std::chrono::duration<double>(it->second - now).count();
-					return true;
-				}
-				gVictoryManualDialogueCooldownUntil.erase(it);
-			}
-
-			return false;
-		}
-
-		static void ArmVictoryManualDialogueCooldown(RE::Actor* actor, Clock::time_point now, const char* reason)
-		{
-			gNextVictoryManualDialogueOpen = now + SecondsToClockDuration(kVictoryManualGlobalCooldownSec);
-
-			if (actor) {
-				const auto actorUntil = now + SecondsToClockDuration(kVictoryManualActorCooldownSec);
-				gVictoryManualDialogueCooldownUntil.insert_or_assign(actor->GetFormID(), actorUntil);
-
-				spdlog::info(
-					"[TFD][Menu] victory manual dialogue cooldown armed actor={:08X} global={:.2f}s actor={:.2f}s reason={}",
-					actor->GetFormID(),
-					kVictoryManualGlobalCooldownSec,
-					kVictoryManualActorCooldownSec,
-					reason ? reason : "unknown");
-			}
-		}
-
 		static void ResolveGlobals()
 		{
 			ResolveGlobal(gBossContainerMarkerState, gLoggedBossContainerMarkerStateFound, "TFDBossContainerMarkerState");
@@ -2796,6 +2725,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 								!ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::Console::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME) &&
+								!ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) &&
 								!ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)))) {
 							auto* player = RE::PlayerCharacter::GetSingleton();
@@ -2918,91 +2848,38 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 									return false;
 									};
 
-								auto openVictoryDialogue = [&](RE::Actor* defeatedTalkTarget, const char* sourceReason) -> bool {
+								auto openManualDefeatedInteraction = [&](RE::Actor* defeatedTalkTarget, const char* sourceReason) -> bool {
 									if (!defeatedTalkTarget) {
 										return false;
 									}
 
-									const auto victoryNow = Clock::now();
-									const char* blockReason = "none";
-									double blockRemainingSec = 0.0;
-									if (IsVictoryManualDialogueBlocked(defeatedTalkTarget, victoryNow, blockReason, blockRemainingSec)) {
-										spdlog::info(
-											"[TFD][Menu] victory manual dialogue blocked target={:08X} source={} reason={} remaining={:.2f}s",
-											defeatedTalkTarget->GetFormID(),
-											sourceReason ? sourceReason : "victory_activate_dialogue",
-											blockReason ? blockReason : "unknown",
-											blockRemainingSec);
-										return true;
-									}
-
-									const char* victoryReason = sourceReason ? sourceReason : "victory_activate_dialogue";
-									if (!TFD::Victory::CanAdvertiseVictoryNow(defeatedTalkTarget, victoryReason)) {
-										TFD::Victory::SetStateValue(1);
-										spdlog::info(
-											"[TFD][Menu][R301A] blocked manual Victory dialogue target={:08X} source={} reason=encounter_not_resolved",
-											defeatedTalkTarget->GetFormID(),
-											victoryReason);
-										return true;
-									}
-
-									TFD::TeammateManager::SetPendingDefeatedDialogueTarget(defeatedTalkTarget);
-									TFD::Victory::ArmDialogueReadyHold(defeatedTalkTarget, kVictoryDialogueReadyHoldSec, victoryReason);
-									TFD::Victory::SetStateValue(2);
-									const bool flowOk = TFD::FlowController::Controller::GetSingleton().RequestVictory(
+									const char* interactionReason = sourceReason ? sourceReason : "manual_defeated_activation";
+									const bool consumed = TFD::Victory::BeginManualInteraction(defeatedTalkTarget, interactionReason);
+									spdlog::info(
+										"[TFD][Menu][R394A] manual defeated activation target={:08X} source={} consumed={} policy=victory_selected_actor_session_owner",
 										defeatedTalkTarget->GetFormID(),
-										victoryReason);
-									spdlog::info("[TFD][Menu] activate victory flow request target={:08X} ok={} state=2 source={}",
-										defeatedTalkTarget->GetFormID(),
-										flowOk ? 1 : 0,
-										victoryReason);
-									if (!flowOk) {
-										TFD::Victory::SetStateValue(1);
-										spdlog::info(
-											"[TFD][Menu][R301A] aborted manual Victory dialogue target={:08X} source={} reason=flow_rejected",
-											defeatedTalkTarget->GetFormID(),
-											victoryReason);
-										return true;
-									}
-
-									if (!defeatedTalkTarget->IsAIEnabled()) {
-										defeatedTalkTarget->EnableAI(true);
-									}
-									defeatedTalkTarget->AllowPCDialogue(true);
-									if (auto* process = RE::ProcessLists::GetSingleton()) {
-										process->StopCombatAndAlarmOnActor(defeatedTalkTarget, false);
-									}
-									defeatedTalkTarget->EvaluatePackage(false, true);
-									defeatedTalkTarget->EvaluatePackage(true, true);
-
-									// RefreshObservedState may run in the same frame and downgrade VictoryState
-									// to No while other enemies are still present. Force it back to Yes
-									// immediately before opening so CK dialogue conditions stay valid.
-									TFD::Victory::SetStateValue(2);
-
-									auto* victoryGreetInfo = ResolveVictoryGreetTopicInfo();
-									defeatedTalkTarget->SetDialogueWithPlayer(false, false, nullptr);
-									const bool opened = defeatedTalkTarget->SetDialogueWithPlayer(true, true, victoryGreetInfo);
-									if (opened) {
-										TFD::Victory::SetStateValue(2);
-										ArmVictoryManualDialogueCooldown(defeatedTalkTarget, victoryNow, "hard_open_victory_manual_dialogue");
-									}
-									spdlog::info("[TFD][Menu][R93O] activate opened defeated victory dialogue target={:08X} opened={} action=native_activation_dialogue source={} topicInfo={:08X} explicit={} reset=1",
-										defeatedTalkTarget->GetFormID(),
-										opened ? 1 : 0,
-										sourceReason ? sourceReason : "victory_activate_dialogue",
-										victoryGreetInfo ? victoryGreetInfo->GetFormID() : 0u,
-										victoryGreetInfo ? 1 : 0);
-									return opened;
-									};
+										interactionReason,
+										consumed ? 1 : 0);
+									return consumed;
+								};
 
 								// R55: the normal teammate dialogue opener must be crosshair-exact.
 								// The R54 proximity scanner was too aggressive and could steal the E key
 								// from containers/chests when a teammate stood beside the player.
 								// If the crosshair has a non-actor activation target, never run TFD's
-								// teammate/Victory scans; let vanilla activation handle that target.
+								// teammate/manual-defeated scans; let vanilla activation handle that target.
 								auto* crosshairRef = initialCrosshairRef ? initialCrosshairRef : GetCrosshairTargetRef();
 								auto* crosshairActor = crosshairRef ? crosshairRef->As<RE::Actor>() : nullptr;
+
+								if (TFD::RescueGreet::IsActivationBlocked()) {
+									const auto rescueSpeaker = TFD::RescueGreet::GetSpeakerFormID();
+									spdlog::info(
+										"[TFD][Menu][R36D] activate consumed while Rescue ForceGreet owns input crosshair={:08X} savior={:08X} state={} action=block_activation_no_manual_retry",
+										crosshairActor ? crosshairActor->GetFormID() : (crosshairRef ? crosshairRef->GetFormID() : 0u),
+										rescueSpeaker,
+										TFD::RescueGreet::GetStateName());
+									return RE::BSEventNotifyControl::kStop;
+								}
 
 								if (crosshairRef && !crosshairActor) {
 									spdlog::info("[TFD][Menu] activate skipped TFD dialogue: crosshair target is non-actor ref={:08X} action=allow_vanilla_activation",
@@ -3015,7 +2892,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 										}
 									}
 									else if (TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(crosshairActor)) {
-										if (openVictoryDialogue(crosshairActor, "victory_crosshair_activate_dialogue")) {
+										if (openManualDefeatedInteraction(crosshairActor, "manual_defeated_crosshair_activation")) {
 											return RE::BSEventNotifyControl::kStop;
 										}
 									}
@@ -3061,7 +2938,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 												return RE::BSEventNotifyControl::kStop;
 											}
 										}
-										else if (openVictoryDialogue(defeatedTalkTarget, "victory_fallback_activate_dialogue")) {
+										else if (openManualDefeatedInteraction(defeatedTalkTarget, "manual_defeated_fallback_activation")) {
 											return RE::BSEventNotifyControl::kStop;
 										}
 									}
@@ -3126,6 +3003,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 							ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME) ||
 							ui->IsMenuOpen(RE::Console::MENU_NAME) ||
 							ui->IsMenuOpen(RE::InventoryMenu::MENU_NAME) ||
+							ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME) ||
 							ui->IsMenuOpen(RE::JournalMenu::MENU_NAME) ||
 							ui->IsMenuOpen(RE::LockpickingMenu::MENU_NAME)) {
 							continue;
@@ -3324,6 +3202,7 @@ static RE::TESObjectREFR* GetCrosshairTargetRef()
 				ResolveGlobals();
 				TFD::FeedPopup::Close();
 				TFD::PreCombatGreet::OnPreLoadGame();
+				TFD::Victory::SetLoadTransition(true, "menu_preload_game");
 				TFD::DefeatMonitor::SetLoadTransition(true);
 				spdlog::info("[TFD][Menu] PreLoadGame -> prepare only");
 			}

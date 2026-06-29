@@ -37,7 +37,6 @@ namespace TFD::StatusHUD
         constexpr auto kLiveScanInterval = std::chrono::milliseconds(300);
         constexpr auto kIncombatHoldDuration = std::chrono::milliseconds(1200);
         constexpr auto kPrecombatHoldDuration = std::chrono::milliseconds(1400);
-        constexpr auto kVictoryHoldDuration = std::chrono::milliseconds(2200);
 
         struct TextureSlot
         {
@@ -58,12 +57,10 @@ namespace TFD::StatusHUD
         static RE::TESGlobal* gCaptiveState = nullptr;
         static RE::TESGlobal* gDefeatState = nullptr;
         static RE::TESGlobal* gInCombatState = nullptr;
-        static RE::TESGlobal* gVictoryState = nullptr;
         static RE::TESGlobal* gPreCombatState = nullptr;
         static bool gLoggedCaptiveState = false;
         static bool gLoggedDefeatState = false;
         static bool gLoggedInCombatState = false;
-        static bool gLoggedVictoryState = false;
         static bool gLoggedPreCombatState = false;
 
         static PlayerFlowState gCachedLiveState = PlayerFlowState::Neutral;
@@ -71,13 +68,11 @@ namespace TFD::StatusHUD
         static std::chrono::steady_clock::time_point gLastLiveScan{};
         static std::chrono::steady_clock::time_point gLastIncombatSeen{};
         static std::chrono::steady_clock::time_point gLastPrecombatSeen{};
-        static std::chrono::steady_clock::time_point gLastVictorySeen{};
 
-        static std::array<TextureSlot, 6> gPlayerTextures{
+        static std::array<TextureSlot, 5> gPlayerTextures{
             TextureSlot{ PlayerFlowState::Neutral, "Data/Interface/TFD/Icons/State_Neutral.png" },
             TextureSlot{ PlayerFlowState::Precombat, "Data/Interface/TFD/Icons/State_Precombat.png" },
             TextureSlot{ PlayerFlowState::Incombat, "Data/Interface/TFD/Icons/State_Incombat.png" },
-            TextureSlot{ PlayerFlowState::Victory, "Data/Interface/TFD/Icons/State_Victory.png" },
             TextureSlot{ PlayerFlowState::Defeat, "Data/Interface/TFD/Icons/State_Defeat.png" },
             TextureSlot{ PlayerFlowState::Captive, "Data/Interface/TFD/Icons/State_Captive.png" }
         };
@@ -91,8 +86,6 @@ namespace TFD::StatusHUD
                 return "Precombat";
             case PlayerFlowState::Incombat:
                 return "Incombat";
-            case PlayerFlowState::Victory:
-                return "Victory";
             case PlayerFlowState::Defeat:
                 return "Defeat";
             case PlayerFlowState::Captive:
@@ -120,7 +113,6 @@ namespace TFD::StatusHUD
             ResolveGlobal(gCaptiveState, gLoggedCaptiveState, "TFDCaptiveState");
             ResolveGlobal(gDefeatState, gLoggedDefeatState, "TFDDefeatState");
             ResolveGlobal(gInCombatState, gLoggedInCombatState, "TFDInCombatState");
-            ResolveGlobal(gVictoryState, gLoggedVictoryState, "TFDVictoryState");
             ResolveGlobal(gPreCombatState, gLoggedPreCombatState, "TFDPreCombatState");
         }
 
@@ -224,7 +216,6 @@ namespace TFD::StatusHUD
 
             bool hasActiveCombatHostile = false;
             bool hasMutualLosHostile = false;
-            bool hasDownedHostile = false;
 
             for (const auto& info : snapshot.actors) {
                 auto* actor = info.get();
@@ -242,13 +233,9 @@ namespace TFD::StatusHUD
                     IsPlayerSideTarget(target, player);
                 const bool hostileToPlayer = info.hostileToPlayer || actor->IsHostileToActor(player);
 
-                // Authoritative defeated-enemy state must be checked before hostility.
-                // The defeat monitor intentionally pacifies locked enemies, so the last
-                // enemy downed by a teammate can stop being hostile even though the
-                // situation is still a Victory state until that enemy dies or is converted.
-                const bool defeatedKnocked = TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor);
-                if (defeatedKnocked) {
-                    hasDownedHostile = true;
+                // Defeated enemies belong to the manual interaction registry, not
+                // to the generic player-flow HUD projection.
+                if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
                     continue;
                 }
 
@@ -260,7 +247,6 @@ namespace TFD::StatusHUD
 
                 const bool downedByHealth = TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct());
                 if (downedByHealth) {
-                    hasDownedHostile = true;
                     continue;
                 }
 
@@ -291,18 +277,12 @@ namespace TFD::StatusHUD
             if (hasActiveCombatHostile) {
                 gLastIncombatSeen = now;
             }
-            if (hasDownedHostile) {
-                gLastVictorySeen = now;
-            }
             if (hasMutualLosHostile) {
                 gLastPrecombatSeen = now;
             }
 
             if ((now - gLastIncombatSeen) <= kIncombatHoldDuration) {
                 gCachedLiveState = PlayerFlowState::Incombat;
-            }
-            else if ((now - gLastVictorySeen) <= kVictoryHoldDuration) {
-                gCachedLiveState = PlayerFlowState::Victory;
             }
             else if ((now - gLastPrecombatSeen) <= kPrecombatHoldDuration) {
                 gCachedLiveState = PlayerFlowState::Precombat;
@@ -324,10 +304,9 @@ namespace TFD::StatusHUD
 
             auto* player = RE::PlayerCharacter::GetSingleton();
 
-            // Main player flow priority:
-            // Captive > Defeat > Incombat > Victory > Precombat > Neutral.
-            // R92D keeps Precombat as a mutual-LOS warning state and makes Victory
-            // follow authoritative defeated-enemy locks, including enemies downed by teammates.
+            // Main generic player-flow priority:
+            // Captive > Defeat > Incombat > Precombat > Neutral.
+            // Manual defeated-enemy interaction is owned outside this HUD state machine.
             if (GetGlobalValueInt(gCaptiveState) > 0) {
                 return PlayerFlowState::Captive;
             }
@@ -340,10 +319,6 @@ namespace TFD::StatusHUD
 
             if (GetGlobalValueInt(gInCombatState) > 0 || liveState == PlayerFlowState::Incombat) {
                 return PlayerFlowState::Incombat;
-            }
-
-            if (GetGlobalValueInt(gVictoryState) >= 2 || liveState == PlayerFlowState::Victory) {
-                return PlayerFlowState::Victory;
             }
 
             // Do not trust raw TFDPreCombatState alone for HUD. The visual Precombat icon
@@ -473,7 +448,6 @@ namespace TFD::StatusHUD
         gCachedLiveState = PlayerFlowState::Neutral;
         gLastIncombatSeen = {};
         gLastPrecombatSeen = {};
-        gLastVictorySeen = {};
         ResolveGlobals();
     }
 

@@ -279,6 +279,8 @@ namespace TFD::Bleedout
 	int GetBleedDialogueRetryCount();
 	void SetBleedDialogueRetryCount(int count);
 	std::vector<std::uint32_t> GetBleedCrowdAssignedIDs();
+	std::vector<std::uint32_t> GetBleedPleasureCrowdSnapshotIDs();
+	void ClearBleedPleasureCrowdSnapshot(const char* reason = nullptr);
 	bool HasBleedCrowdAssignedID(std::uint32_t actorID);
 	void ClearBleedCrowdAssigned();
 	void ClearBleedRejectedSpeakerIds();
@@ -300,6 +302,7 @@ namespace TFD::Bleedout
 	bool BeginAfterPleasure(RE::Actor* actor, const char* reason = nullptr);
 	bool HandleAfterPleasureEnter(RE::Actor* actor, const char* reason = nullptr);
 	bool CompleteAfterPleasure(const char* reason = nullptr);
+	void FinalizePleasureBridgeToInCombat(const char* reason = nullptr);
 	bool IsPleasureCycleDialogueCandidate(RE::Actor* actor, RE::Actor* currentActor = nullptr);
 	bool CompletePleasureCycleChainNeutral(const char* reason = nullptr);
 	bool BeginForPleasureCycleActor(RE::Actor* actor, TFD::InteractionRouter::Action* outAction = nullptr);

@@ -66,6 +66,7 @@ namespace TFD::HostilityController
         bool hadPacifyFaction{ false };
         bool addedPacifyFaction{ false };
         bool stablePacifyInitialized{ false };
+        bool resultDialogueLightHoldActive{ false };
 
         TFD::Tame::TameDisposition disposition{ static_cast<TFD::Tame::TameDisposition>(0) };
         bool temporaryTeammateApplied{ false };
@@ -120,7 +121,8 @@ namespace TFD::HostilityController
         double nowSec,
         bool allowDialogue,
         bool ignoreSpent = false,
-        bool suppressBridgeEvents = false);
+        bool suppressBridgeEvents = false,
+        bool allowPacifiedBridge = false);
 
     std::optional<RE::FormID> BeginCellTruceBurst(
         RE::Actor* player,
@@ -169,6 +171,11 @@ namespace TFD::HostilityController
     Mode GetMode(RE::Actor* actor);
     bool CanOpenDialogue(RE::Actor* actor);
     bool PreserveTruceSessionForFlowHandoff(RE::Actor* primaryTarget, double durationSec, const char* reason = nullptr);
+
+    // R499A: renew an existing InCombat Pleasure handoff without recollecting
+    // actors or mutating combat, alarm, AI package, or dialogue ownership.
+    bool RefreshTruceSessionForFlowHandoff(RE::Actor* sessionActor, double durationSec, const char* reason = nullptr);
+
     bool IsFlowHandoffHoldActive(RE::Actor* actor);
 
     // P5PAY: lightweight in-dialogue passive guard for CK Pay linked topics.
@@ -255,6 +262,7 @@ namespace TFD::HostilityController
 
     void ApplyAggressionClamp(RE::Actor* actor);
     void ClearAggressionClamp();
+    void ClearAggressionClampForSettledHandoff(const char* reason = nullptr);
 
     void TickCaptiveSuppression();
     void ResetCaptiveSuppression();

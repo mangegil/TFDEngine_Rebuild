@@ -1762,6 +1762,9 @@ namespace TFD::InteractionRouter
                 bool succeeded = false;
                 bool requestIssued = false;
                 std::uint32_t attempts = 0;
+                Mode lastSucceededMode = Mode::None;
+                RE::FormID lastSucceededSpeaker = 0;
+                Clock::time_point lastSucceededAt{};
                 Clock::time_point started{};
                 Clock::time_point nextAttempt{};
                 Clock::time_point deadline{};
@@ -1780,14 +1783,12 @@ namespace TFD::InteractionRouter
             RE::TESGlobal* g_inCombatStateGlobal = nullptr;
             RE::TESGlobal* g_captiveStateGlobal = nullptr;
             RE::TESGlobal* g_defeatStateGlobal = nullptr;
-            RE::TESGlobal* g_victoryStateGlobal = nullptr;
             RE::TESGlobal* g_pleasureStateGlobal = nullptr;
             bool g_loggedDialogueStateMissing = false;
             bool g_loggedPreCombatStateMissing = false;
             bool g_loggedInCombatStateMissing = false;
             bool g_loggedCaptiveStateMissing = false;
             bool g_loggedDefeatStateMissing = false;
-            bool g_loggedVictoryStateMissing = false;
             bool g_loggedPleasureStateMissing = false;
             std::unordered_map<RE::FormID, Clock::time_point> g_temporaryDialogueCooldownUntil{};
 
@@ -1909,7 +1910,6 @@ namespace TFD::InteractionRouter
                 int inCombat = 0;
                 int captive = 0;
                 int defeat = 0;
-                int victory = 0;
                 int pleasure = 0;
 
                 switch (mode) {
@@ -1942,11 +1942,33 @@ namespace TFD::InteractionRouter
                     break;
                 }
 
+                // R491A: A ForceGreet/dialogue interaction must not promote or restore
+                // the root combat state.  InCombat-source AfterPleasure is a terminal
+                // pleasure dialogue owned by PleasureRuntime; setting TFDInCombatState=1
+                // here makes HUD/CK conditions flicker Neutral <-> InCombat during the
+                // exact frame the AfterPleasure tree is evaluated, which can close the
+                // menu before the player chooses an outcome.  The combat situation or a
+                // committed dialogue outcome may change root state; opening the greet may
+                // only expose dialogue/pleasure condition state.
+                const auto pleasureSource = TFD::PleasureRuntime::GetSourceContext();
+                if ((mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) &&
+                    pleasureSource == TFD::PleasureRuntime::SourceContext::InCombat) {
+                    inCombat = 0;
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R491A] terminal ForceGreet preserved root state mode={} source=InCombat pre={} in={} captive={} defeat={} pleasure={} reason={}",
+                        ModeName(mode),
+                        preCombat,
+                        inCombat,
+                        captive,
+                        defeat,
+                        pleasure,
+                        reason ? reason : "unknown");
+                }
+
                 SetApproachConditionGlobal(g_preCombatStateGlobal, "TFDPreCombatState", g_loggedPreCombatStateMissing, preCombat);
                 SetApproachConditionGlobal(g_inCombatStateGlobal, "TFDInCombatState", g_loggedInCombatStateMissing, inCombat);
                 SetApproachConditionGlobal(g_captiveStateGlobal, "TFDCaptiveState", g_loggedCaptiveStateMissing, captive);
                 SetApproachConditionGlobal(g_defeatStateGlobal, "TFDDefeatState", g_loggedDefeatStateMissing, defeat);
-                SetApproachConditionGlobal(g_victoryStateGlobal, "TFDVictoryState", g_loggedVictoryStateMissing, victory);
                 SetApproachConditionGlobal(g_pleasureStateGlobal, "TFDPleasureState", g_loggedPleasureStateMissing, pleasure);
 
                 // Approach packages and forced dialogue topics can evaluate before the UI menu opens.
@@ -1954,13 +1976,12 @@ namespace TFD::InteractionRouter
                 SetDialogueStateValue(1);
 
                 spdlog::info(
-                    "[TFD][DialogueOpen][R202B] condition globals synced mode={} pre={} in={} captive={} defeat={} victory={} pleasure={} dialogue=1 pleasureSource={} captiveCtx={} reason={}",
+                    "[TFD][DialogueOpen][R202B] condition globals synced mode={} pre={} in={} captive={} defeat={} pleasure={} dialogue=1 pleasureSource={} captiveCtx={} reason={}",
                     ModeName(mode),
                     preCombat,
                     inCombat,
                     captive,
                     defeat,
-                    victory,
                     pleasure,
                     TFD::PleasureRuntime::GetSourceContextName(),
                     IsCaptivePleasureConditionContext() ? 1 : 0,
@@ -2088,7 +2109,7 @@ namespace TFD::InteractionRouter
                     // response for TFDDialogueInCombatGreet. InCombat truce can
                     // otherwise report SetDialogueWithPlayer(ok=1) without the
                     // Papyrus greet fragment entering, same class of failure as
-                    // Victory-after-PreCombat before R93O.
+                    // the old post-PreCombat hard-open route before R93O.
                     constexpr RE::FormID kInCombatGreetInfoLocalFormID = 0x0006FEA8;
                     constexpr std::string_view kPluginName{ "TFDEngine.esp" };
 
@@ -2863,6 +2884,9 @@ namespace TFD::InteractionRouter
                 g_pending.succeeded = false;
                 g_pending.requestIssued = false;
                 g_pending.attempts = 0;
+                g_pending.lastSucceededMode = Mode::None;
+                g_pending.lastSucceededSpeaker = 0;
+                g_pending.lastSucceededAt = {};
                 g_pending.started = {};
                 g_pending.nextAttempt = {};
                 g_pending.deadline = {};
@@ -2921,6 +2945,17 @@ namespace TFD::InteractionRouter
                 // generic dialogue cooldown; it only waits for the actor to walk
                 // inside the distance window.
                 return mode == Mode::AfterPleasure || mode == Mode::CaptiveMarker;
+            }
+
+            bool IsCommittedTerminalMode(Mode mode)
+            {
+                if (mode == Mode::AfterPleasure) {
+                    return TFD::ForceGreetState::IsAfterPleasureCommitted();
+                }
+                if (mode == Mode::PleasureFailed) {
+                    return TFD::ForceGreetState::IsPleasureFailedCommitted();
+                }
+                return false;
             }
 
             bool ShouldPreservePleasureFailedDrawnPosture(Mode mode, RE::Actor* speaker)
@@ -3052,6 +3087,23 @@ namespace TFD::InteractionRouter
 
                 std::scoped_lock lk(g_pending.lock);
 
+                if ((mode == Mode::AfterPleasure || mode == Mode::PleasureFailed) && IsCommittedTerminalMode(mode)) {
+                    if (g_pending.active && g_pending.mode == mode) {
+                        CancelLocked(mode == Mode::AfterPleasure ?
+                            "after_pleasure_committed_begin_cancel" :
+                            "pleasure_failed_committed_begin_cancel");
+                    }
+                    else {
+                        SyncDialogueStateLocked(IsDialogueOpen());
+                    }
+                    spdlog::info(
+                        "[TFD][DialogueOpen][R477A] terminal begin ignored committed mode={} reason={} speaker={:08X}",
+                        ModeName(mode),
+                        reason ? reason : "unknown",
+                        speaker ? speaker->GetFormID() : 0u);
+                    return;
+                }
+
                 if (speaker && mode == Mode::PleasureFailed && g_pending.active && g_pending.mode == Mode::PleasureFailed && PendingSpeakerFormID() == speaker->GetFormID()) {
                     SyncDialogueStateLocked(IsDialogueOpen());
                     spdlog::info(
@@ -3086,6 +3138,9 @@ namespace TFD::InteractionRouter
                         g_pending.succeeded = false;
                         g_pending.requestIssued = false;
                         g_pending.attempts = 0;
+                        g_pending.lastSucceededMode = Mode::None;
+                        g_pending.lastSucceededSpeaker = 0;
+                        g_pending.lastSucceededAt = {};
                         g_pending.started = now;
                         g_pending.nextAttempt = now + retryDelay;
                         g_pending.deadline = now + kAfterPleasureTimeout + retryDelay;
@@ -3150,6 +3205,9 @@ namespace TFD::InteractionRouter
                 g_pending.succeeded = false;
                 g_pending.requestIssued = false;
                 g_pending.attempts = 0;
+                g_pending.lastSucceededMode = Mode::None;
+                g_pending.lastSucceededSpeaker = 0;
+                g_pending.lastSucceededAt = {};
                 g_pending.started = now;
                 const auto initialDelay = (mode == Mode::Bleedout || mode == Mode::AfterPleasure || mode == Mode::CaptiveMarker) ?
                     std::chrono::milliseconds(0) :
@@ -3261,11 +3319,55 @@ namespace TFD::InteractionRouter
 
         void BeginAfterPleasure(RE::Actor* speaker)
         {
+            // R476A: ESP AfterPleasure greet/outcome conditions now use FGState=1
+            // for the opened dialogue phase.  Native hard-open can evaluate topic
+            // conditions before Papyrus receives the root greet and calls
+            // SetAfterPleasureOpened(), so pre-arm the state before requesting the
+            // topic.  Do not downgrade a committed session.
+            const int state = TFD::ForceGreetState::GetAfterPleasureState();
+            if (state >= 2) {
+                {
+                    std::scoped_lock lk(g_pending.lock);
+                    if (g_pending.active && g_pending.mode == Mode::AfterPleasure) {
+                        CancelLocked("after_pleasure_committed_begin_cancel");
+                    }
+                    else {
+                        SyncDialogueStateLocked(IsDialogueOpen());
+                    }
+                }
+                spdlog::info(
+                    "[TFD][DialogueOpen][R477A] after pleasure begin ignored committed state={} speaker={:08X} reason=before_native_open",
+                    state,
+                    speaker ? speaker->GetFormID() : 0);
+                return;
+            }
+
+            TFD::ForceGreetState::SetAfterPleasureOpened();
+            spdlog::info(
+                "[TFD][DialogueOpen][R476A] after pleasure FGState pre-armed oldState={} speaker={:08X} reason=before_native_open",
+                state,
+                speaker ? speaker->GetFormID() : 0);
+
             BeginCommon(speaker, Mode::AfterPleasure, "after_pleasure");
         }
 
         void BeginPleasureFailed(RE::Actor* speaker)
         {
+            if (TFD::ForceGreetState::IsPleasureFailedCommitted()) {
+                {
+                    std::scoped_lock lk(g_pending.lock);
+                    if (g_pending.active && g_pending.mode == Mode::PleasureFailed) {
+                        CancelLocked("pleasure_failed_committed_begin_cancel");
+                    }
+                    else {
+                        SyncDialogueStateLocked(IsDialogueOpen());
+                    }
+                }
+                spdlog::info(
+                    "[TFD][DialogueOpen][R477A] pleasure failed begin ignored committed speaker={:08X}",
+                    speaker ? speaker->GetFormID() : 0);
+                return;
+            }
             BeginCommon(speaker, Mode::PleasureFailed, "pleasure_failed");
         }
 
@@ -3280,6 +3382,13 @@ namespace TFD::InteractionRouter
             const bool dialogueOpen = IsDialogueOpen();
             SyncDialogueStateLocked(dialogueOpen);
             if (!g_pending.active) {
+                return;
+            }
+
+            if (IsCommittedTerminalMode(g_pending.mode)) {
+                CancelLocked(g_pending.mode == Mode::AfterPleasure ?
+                    "after_pleasure_committed_pending_cancel" :
+                    "pleasure_failed_committed_pending_cancel");
                 return;
             }
 
@@ -3302,6 +3411,9 @@ namespace TFD::InteractionRouter
                 const auto completedMode = g_pending.mode;
                 const auto completedSpeaker = PendingSpeakerFormID();
                 g_pending.succeeded = true;
+                g_pending.lastSucceededMode = completedMode;
+                g_pending.lastSucceededSpeaker = completedSpeaker;
+                g_pending.lastSucceededAt = Clock::now();
                 g_pending.active = false;
                 g_pending.mode = Mode::None;
                 SyncDialogueStateLocked(true);
@@ -3411,6 +3523,25 @@ namespace TFD::InteractionRouter
 
                 if (!rangeReady) {
                     const float dist = captiveMode ? CaptiveApproachDisplayDistance(player, speaker) : std::sqrt(DistanceSquared(player, speaker));
+                    if (bleedoutMode) {
+                        const bool moved = AssistBleedoutApproach(player, speaker, "request_unconfirmed_reapproach");
+                        g_pending.requestIssued = false;
+                        g_pending.quietUntil = {};
+                        g_pending.nextAttempt = now + (moved ? std::chrono::milliseconds(120) : kRetryDelay);
+                        g_pending.lastApproachRefresh = now;
+                        g_pending.lastPackageRefresh = now;
+                        SyncDialogueStateLocked(dialogueOpen);
+                        spdlog::info(
+                            "[TFD][DialogueOpen][R432A] bleedout request not confirmed; reapproach mode={} speaker={:08X} dist={:.1f} max={:.1f} moved={} attempts={} routeConfirmedMayBeFragmentOnly=1",
+                            ModeName(g_pending.mode),
+                            speaker->GetFormID(),
+                            dist,
+                            targetDist,
+                            moved ? 1 : 0,
+                            g_pending.attempts);
+                        return;
+                    }
+
                     g_pending.requestIssued = false;
                     g_pending.quietUntil = {};
                     g_pending.nextAttempt = now + kRetryDelay;
@@ -3702,6 +3833,31 @@ namespace TFD::InteractionRouter
             const bool result = g_pending.succeeded;
             g_pending.succeeded = false;
             return result;
+        }
+
+        bool WasLastSuccess(Mode mode, RE::FormID speaker)
+        {
+            std::scoped_lock lk(g_pending.lock);
+            if (g_pending.lastSucceededMode == Mode::None || g_pending.lastSucceededAt.time_since_epoch().count() == 0) {
+                return false;
+            }
+            const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - g_pending.lastSucceededAt);
+            if (age > std::chrono::milliseconds(10000)) {
+                return false;
+            }
+            return g_pending.lastSucceededMode == mode && (speaker == 0 || g_pending.lastSucceededSpeaker == speaker);
+        }
+
+        Mode GetLastSucceededMode()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            return g_pending.lastSucceededMode;
+        }
+
+        RE::FormID GetLastSucceededSpeaker()
+        {
+            std::scoped_lock lk(g_pending.lock);
+            return g_pending.lastSucceededSpeaker;
         }
 
         Mode GetMode()

@@ -10,14 +10,6 @@ namespace TFD::DefeatRuntimeProviders
         TFD::TeammateManager::RuntimeProviders teammateRuntimeProviders{};
         teammateRuntimeProviders.hasAllyBleedLock = hooks.teammateHasAllyBleedLock;
         teammateRuntimeProviders.isBleedingOutActor = hooks.teammateIsBleedingOutActor;
-        teammateRuntimeProviders.isDialogueCapableDefeatedEnemy = hooks.teammateIsDialogueCapableDefeatedEnemy;
-        teammateRuntimeProviders.getDefeatedEnemyRemainingSeconds = hooks.teammateGetDefeatedEnemyRemainingSeconds;
-        teammateRuntimeProviders.suppressDefeatedReentry = hooks.teammateSuppressDefeatedReentry;
-        teammateRuntimeProviders.releaseBleedLock = hooks.teammateReleaseBleedLock;
-        teammateRuntimeProviders.restoreActorHealthToSafePct = hooks.teammateRestoreActorHealthToSafePct;
-        teammateRuntimeProviders.resolvePendingDefeatedDialogueTarget = hooks.teammateResolvePendingDefeatedDialogueTarget;
-        teammateRuntimeProviders.clearPendingDefeatedDialogueTarget = hooks.teammateClearPendingDefeatedDialogueTarget;
-        teammateRuntimeProviders.setPendingDefeatedDialogueTarget = hooks.teammateSetPendingDefeatedDialogueTarget;
         teammateRuntimeProviders.reviveDownedAlly = hooks.teammateReviveDownedAlly;
         TFD::TeammateManager::InstallRuntimeProviders(std::move(teammateRuntimeProviders));
 

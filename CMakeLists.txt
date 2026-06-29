@@ -33,6 +33,9 @@ add_library(TFDEngine SHARED
     src/TFDSettings.cpp
     src/TFDLocation.cpp
     src/TFDCaptive.cpp
+    src/TFDCaptiveRecaptureRecoveryPulse.cpp
+    src/TFDCaptiveRecaptureRecovery.cpp
+    src/TFDCaptiveRecaptureRecoveryWiring.cpp
     src/TFDRescue.cpp
     src/TFDVictory.cpp
     src/TFDPostDefeatState.cpp
@@ -41,6 +44,15 @@ add_library(TFDEngine SHARED
     src/TFDDefeatLifecycleBootstrap.cpp
     src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
+    src/TFDPlayerDamageGuard.cpp
+    src/TFDPlayerOverkillDamageHook.cpp
+    src/TFDPlayerDownRouter.cpp
+    src/TFDBleedLockState.cpp
+    src/TFDBleedLockRuntime.cpp
+    src/TFDBleedoutDialogueRuntime.cpp
+    src/TFDDialogueLifecycle.cpp
+    src/TFDDefeatRuntimeActions.cpp
+    src/TFDPlayerDownRouterWiring.cpp
     src/TFDPreCombatGreet.cpp
     src/TFDInCombat.cpp
     src/TFDInCombatGreet.cpp

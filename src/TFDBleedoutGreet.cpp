@@ -64,10 +64,17 @@ namespace TFD::BleedoutGreet
 			g_runtime.afterPleasureRetryCount = 0;
 		}
 
-		bool HasNativeBleedoutOpenSucceeded()
+		bool IsDialogueMenuOpen()
 		{
-			return TFD::InteractionRouter::DialogueOpen::DidSucceed() &&
-				TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout;
+			auto* ui = RE::UI::GetSingleton();
+			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+		}
+
+		bool HasNativeBleedoutOpenSucceeded(std::uint32_t speakerFormID = 0)
+		{
+			return TFD::InteractionRouter::DialogueOpen::WasLastSuccess(
+				TFD::InteractionRouter::DialogueOpen::Mode::Bleedout,
+				speakerFormID);
 		}
 
 		HoldDecision EvaluateHoldInternal(bool dialogueOpen, bool pleasureCommitted, bool ostimBridgeBlocking)
@@ -190,14 +197,36 @@ namespace TFD::BleedoutGreet
 	void NotifyFlowGreetConfirmed(RE::Actor* speaker, const char* reason)
 	{
 		const auto speakerFormID = speaker ? speaker->GetFormID() : 0u;
+		const bool nativeMenuOpen = IsDialogueMenuOpen();
+		const bool nativeOpenSucceeded = HasNativeBleedoutOpenSucceeded(speakerFormID);
 		std::scoped_lock lk(g_runtime.lock);
-		g_runtime.sawDialogue = true;
 		g_runtime.flowGreetConfirmed = true;
 		g_runtime.flowGreetSpeakerFormID = speakerFormID;
-		g_runtime.initialHandoffArmed = false;
-		g_runtime.initialHandoffNextRetry = {};
+
+		if (nativeMenuOpen || nativeOpenSucceeded) {
+			g_runtime.sawDialogue = true;
+			g_runtime.initialHandoffArmed = false;
+			g_runtime.initialHandoffNextRetry = {};
+			g_runtime.stickyReopenPending = false;
+			spdlog::info("[TFD][BleedoutGreet][R432A] flow greet confirmed with native menu speaker={:08X} reason={} menuOpen={} nativeSucceeded={}",
+				speakerFormID,
+				reason ? reason : "unknown",
+				nativeMenuOpen ? 1 : 0,
+				nativeOpenSucceeded ? 1 : 0);
+			return;
+		}
+
+		// R432A: CK topic/fragment confirmation is only a route/fragment ack.  It is
+		// not proof that the DialogueMenu actually opened.  Keep the initial handoff
+		// watchdog armed so native DialogueOpen can re-approach/retry instead of
+		// suppressing bleed timeout forever with a false "seen dialogue" state.
+		g_runtime.sawDialogue = false;
+		g_runtime.initialHandoffArmed = true;
+		if (g_runtime.initialHandoffNextRetry.time_since_epoch().count() == 0) {
+			g_runtime.initialHandoffNextRetry = Clock::now() + std::chrono::milliseconds(250);
+		}
 		g_runtime.stickyReopenPending = false;
-		spdlog::info("[TFD][BleedoutGreet][CB07] flow greet confirmed speaker={:08X} reason={}",
+		spdlog::info("[TFD][BleedoutGreet][R432A] flow greet route confirmed without DialogueMenu speaker={:08X} reason={} menuOpen=0 nativeSucceeded=0 watchdogStillArmed=1",
 			speakerFormID,
 			reason ? reason : "unknown");
 	}
@@ -243,16 +272,12 @@ namespace TFD::BleedoutGreet
 		if (!HasBleedoutOwnership() || hasTerminalCommit || dialogueOpen || pleasureBlocking || speakerFormID == 0 || !reopenFn) {
 			return false;
 		}
-		if (HasNativeBleedoutOpenSucceeded()) {
-			spdlog::info("[TFD][BleedoutGreet][CB07] initial handoff retry suppressed reason=native_open_succeeded speaker={:08X}", speakerFormID);
-			return false;
-		}
-
-		if (TFD::InteractionRouter::DialogueOpen::DidSucceed()) {
+		if (HasNativeBleedoutOpenSucceeded(speakerFormID)) {
 			std::scoped_lock lk(g_runtime.lock);
+			g_runtime.sawDialogue = true;
 			g_runtime.initialHandoffArmed = false;
 			g_runtime.initialHandoffNextRetry = {};
-			spdlog::info("[TFD][BleedoutGreet][CB07] initial handoff watchdog suppressed reason=native_dialogue_open_succeeded speaker={:08X}", speakerFormID);
+			spdlog::info("[TFD][BleedoutGreet][R432A] initial handoff retry suppressed reason=native_open_succeeded speaker={:08X}", speakerFormID);
 			return false;
 		}
 
@@ -260,10 +285,10 @@ namespace TFD::BleedoutGreet
 		int retry = 0;
 		{
 			std::scoped_lock lk(g_runtime.lock);
-			if (g_runtime.flowGreetConfirmed || !g_runtime.initialHandoffArmed) {
+			if (!g_runtime.initialHandoffArmed) {
 				return false;
 			}
-			if (g_runtime.initialHandoffRetryCount >= 4) {
+			if (g_runtime.initialHandoffRetryCount >= 6) {
 				return false;
 			}
 			if (g_runtime.initialHandoffNextRetry.time_since_epoch().count() != 0 && now < g_runtime.initialHandoffNextRetry) {

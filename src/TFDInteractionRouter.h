@@ -198,7 +198,10 @@ namespace TFD::InteractionRouter
         bool ForceCloseDialogueMenu(const char* reason = nullptr);
         bool IsActive();
         bool DidSucceed();
+        bool WasLastSuccess(Mode mode, RE::FormID speaker = 0);
         Mode GetMode();
+        Mode GetLastSucceededMode();
+        RE::FormID GetLastSucceededSpeaker();
 
         void ArmTemporaryDialogueCooldown(RE::Actor* speaker, double durationSec, const char* reason = nullptr);
         bool IsTemporaryDialogueCooldownActive(RE::Actor* speaker);

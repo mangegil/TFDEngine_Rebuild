@@ -27,24 +27,24 @@ namespace TFD::FlowController
     enum class RootFlow : std::uint8_t
     {
         None = 0,
-        PreCombat,
-        InCombat,
-        Bleedout,
-        Captive,
-        Victory,
-        Rescue,
-        Recovery,
-        LeftForDead
+        PreCombat = 1,
+        InCombat = 2,
+        Bleedout = 3,
+        Captive = 4,
+        // Value 5 is reserved after removal of the retired manual-interaction root. Keep later values stable.
+        Rescue = 6,
+        Recovery = 7,
+        LeftForDead = 8
     };
 
     enum class ObservedMainState : std::uint8_t
     {
         Neutral = 0,
-        Precombat,
-        Incombat,
-        Victory,
-        Defeat,
-        Captive
+        Precombat = 1,
+        Incombat = 2,
+        // Value 3 is reserved after removal of the retired manual-interaction projection.
+        Defeat = 4,
+        Captive = 5
     };
 
     enum class DecisionGate : std::uint8_t
@@ -67,35 +67,34 @@ namespace TFD::FlowController
     {
         None = 0,
 
-        PreCombatPayFollowup,
-        PreCombatPleasure,
-        PreCombatAfterPleasure,
-        InCombatPayFollowup,
-        InCombatPleasure,
-        InCombatAfterPleasure,
-        BleedoutPleasure,
-        BleedoutAfterPleasure,
-        VictoryPleasure,
-        VictoryAfterPleasure,
+        PreCombatPayFollowup = 1,
+        PreCombatPleasure = 2,
+        PreCombatAfterPleasure = 3,
+        InCombatPayFollowup = 4,
+        InCombatPleasure = 5,
+        InCombatAfterPleasure = 6,
+        BleedoutPleasure = 7,
+        BleedoutAfterPleasure = 8,
+        // Values 9-10 are reserved after removal of retired manual-interaction subflows.
 
         // R223A: PleasureFailed is a terminal dialogue owner separate from
         // AfterPleasure. It must not be counted as an AfterPleasure subflow.
-        PleasureFailedDialogue,
+        PleasureFailedDialogue = 11,
 
-        CaptiveIdle,
-        CaptivePleasure,
-        CaptiveAfterPleasure,
-        WorkForEnemy,
-        EscapeAttempt,
-        EscapeFailed,
-        Recapture,
-        JoinedEnemyIdle,
+        CaptiveIdle = 12,
+        CaptivePleasure = 13,
+        CaptiveAfterPleasure = 14,
+        WorkForEnemy = 15,
+        EscapeAttempt = 16,
+        EscapeFailed = 17,
+        Recapture = 18,
+        JoinedEnemyIdle = 19,
 
         // R206A: Captive/Work PleasureFailed > Fight is not generic InCombat or
-        // generic Bleedout.  It is an escape-break combat overlay that must
+        // generic Bleedout. It is an escape-break combat overlay that must
         // preserve Captive/Work context for the next terminal dialogue.
-        InCombatEscapeBreak,
-        BleedoutEscapeBreak
+        InCombatEscapeBreak = 20,
+        BleedoutEscapeBreak = 21
     };
 
     enum class PreCombatOutcome : std::uint8_t
@@ -140,16 +139,6 @@ namespace TFD::FlowController
         Failed
     };
 
-    enum class VictoryOutcome : std::uint8_t
-    {
-        None = 0,
-        RecruitEnemy,
-        KillEnemy,
-        Pleasure,
-        Cancel,
-        Failed
-    };
-
     enum class CaptiveOutcome : std::uint8_t
     {
         None = 0,
@@ -190,7 +179,7 @@ namespace TFD::FlowController
         DefeatedLivingEnemy = 1u << 7,
         MutualLosHostile = 1u << 8,
         RootInCombat = 1u << 9,
-        RootVictory = 1u << 10,
+        // Bit 10 is reserved after removal of the retired manual-interaction root flag.
         RootPreCombat = 1u << 11
     };
 
@@ -214,7 +203,6 @@ namespace TFD::FlowController
 
         int preCombatGlobal{ 0 };
         int inCombatGlobal{ 0 };
-        int victoryGlobal{ 0 };
         int defeatGlobal{ 0 };
         int captiveGlobal{ 0 };
         int pleasureGlobal{ 0 };
@@ -259,7 +247,6 @@ namespace TFD::FlowController
         std::function<void()> releaseBleedPlayerAggressionTruce;
         std::function<void(const char*)> clearAllBleedLocks;
         std::function<void(RE::Actor*, const char*)> clearBleedBridgeAliases;
-        std::function<void()> clearPendingDialogueTarget;
     };
 
     struct ContinuousRuntimeProviders
@@ -287,6 +274,7 @@ namespace TFD::FlowController
         std::function<void(RE::Actor*, const char*)> removeReleaseFollowGrace;
         std::function<std::uint32_t()> resolveBleedFlowActorFormID;
         std::function<bool()> isBleedStateActive;
+        std::function<void(const char*)> completeBleedPayRelease;
         std::function<void(const char*)> preparePlayerForCaptivePleasureScene;
         std::function<void(const char*)> completeCaptivePleasureHandoff;
         std::function<void(const char*)> preparePlayerForBleedoutPleasureScene;
@@ -364,10 +352,9 @@ namespace TFD::FlowController
         std::function<void(const char*)> clearBridgeAliases;
         std::function<void()> clearCaptiveResidue;
         std::function<void()> clearAllFactions;
-        std::function<void()> recoverVictoryTeammates;
         std::function<void()> resetBleedRuntimeState;
-        std::function<void()> clearPendingDialogueTarget;
         std::function<void(bool)> setPlayerBleedImmune;
+        std::function<bool(const char*)> beginResolvedNoMarkerFallback;
         std::function<void(const char*)> queueNonCaptiveChoice;
         std::function<RE::Actor* ()> resolveObservedDownedFollower;
         std::function<void(RE::Actor*)> armObservedLeftForDeadFallback;
@@ -426,7 +413,6 @@ namespace TFD::FlowController
         bool RequestInCombat(std::uint32_t actorFormID, std::string_view reason);
         bool RequestInCombatEscapeBreak(std::uint32_t actorFormID, std::string_view reason);
         bool RequestCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason);
-        bool RequestVictory(std::uint32_t actorFormID, std::string_view reason);
 
         bool RequestTruceDecision(std::uint32_t actorFormID, std::string_view reason);
         bool RequestPlayerBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
@@ -435,7 +421,6 @@ namespace TFD::FlowController
         bool RequestResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
-        bool RequestResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool RequestResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
@@ -452,7 +437,6 @@ namespace TFD::FlowController
         bool BeginPreCombat(std::uint32_t actorFormID, std::string_view reason);
         bool BeginInCombat(std::uint32_t actorFormID, std::string_view reason);
         bool BeginCaptive(std::uint32_t actorFormID, CaptiveMode mode, std::string_view reason);
-        bool BeginVictory(std::uint32_t actorFormID, std::string_view reason);
 
         bool BeginTruceDecision(std::uint32_t actorFormID, std::string_view reason);
         bool BeginPlayerBleedoutDecision(std::uint32_t actorFormID, std::string_view reason);
@@ -461,7 +445,6 @@ namespace TFD::FlowController
         bool ResolvePreCombatOutcome(PreCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveInCombatOutcome(InCombatOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveBleedoutOutcome(BleedoutOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
-        bool ResolveVictoryOutcome(VictoryOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveCaptiveOutcome(CaptiveOutcome outcome, std::uint32_t actorFormID, std::string_view reason);
         bool ResolveInCombatPleasure(std::uint32_t actorFormID, std::string_view reason);
         bool ResolveInCombatTerminal(std::uint32_t actorFormID, std::string_view reason);
@@ -481,7 +464,6 @@ namespace TFD::FlowController
         bool CanStartPreCombat() const;
         bool CanStartInCombatTruce() const;
         bool CanEnterCaptive() const;
-        bool CanEnterVictory() const;
         bool IsCaptiveContext() const;
         bool IsJoinedEnemyMode() const;
         bool IsBleedDecisionActive() const;
@@ -508,7 +490,6 @@ namespace TFD::FlowController
         static const char* ToString(PreCombatOutcome value);
         static const char* ToString(InCombatOutcome value);
         static const char* ToString(BleedoutOutcome value);
-        static const char* ToString(VictoryOutcome value);
         static const char* ToString(CaptiveOutcome value);
 
     private:

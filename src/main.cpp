@@ -36,6 +36,7 @@
 #include "TFDRecruit.h"
 #include "TFDWorkNative.h"
 #include "TFDForceGreetState.h"
+#include "TFDVictory.h"
 
 #if !defined(TFDEnableSmf)
 #define TFDEnableSmf 1
@@ -102,6 +103,7 @@ static void ResetTransientStateForLoad()
     TFD::BleedoutGreet::Reset();
     TFD::HostilityController::ResetForLoad();
     TFD::CombatBehavior::ResetForLoad();
+    TFD::Victory::ResetForLoad("transient_reset_for_load");
     TFD::DefeatMonitor::ResetForLoad();
     TFD::DefeatMonitor::ResetGrace();
     TFD::FlowController::Controller::GetSingleton().ResetForLoad("transient_reset_for_load");
@@ -116,7 +118,7 @@ static constexpr std::uint32_t kSerializationID = 'TFDE';
 static constexpr std::uint32_t kProgressRecord = 'TDSP';
 static constexpr std::uint32_t kProgressVersion = 3;
 static constexpr std::uint32_t kLocationCacheRecord = 'TDLC';
-static constexpr std::uint32_t kLocationCacheVersion = 1;
+static constexpr std::uint32_t kLocationCacheVersion = 2;
 
 struct SavedProgressRecord
 {
@@ -147,6 +149,7 @@ static void InitOnceAfterLoad()
 
     TFD::Location::Initialize();
     TFD::Actor::Ops::Initialize();
+    TFD::Victory::Install();
     TFD::DefeatMonitor::Install();
     TFD::InCombat::Install();
     TFD::InCombatGreet::Install();
@@ -179,6 +182,7 @@ static void FinalizeLoadAfterWorldReady()
     }
 
     ResetTransientStateForLoad();
+    TFD::Victory::SetLoadTransition(false, "finalize_load_after_world_ready");
     TFD::DefeatMonitor::SetLoadTransition(false);
     TFD::DefeatMonitor::ApplyQueuedProgressState();
     TFD::Recruit::RefreshRuntimeRestoredActorsAfterLoad("finalize_load_after_world_ready");
@@ -235,6 +239,7 @@ static void OnSerializationRevert(SKSE::SerializationInterface*)
     TFD::DefeatMonitor::QueueDefaultProgressState();
     TFD::Location::ClearRescueCache();
     ResetTransientStateForLoad();
+    TFD::Victory::SetLoadTransition(true, "serialization_revert");
     TFD::DefeatMonitor::SetLoadTransition(true);
     gPendingLoadFinalize.store(true, std::memory_order_release);
 }
@@ -314,6 +319,15 @@ public:
             return RE::BSEventNotifyControl::kContinue;
         }
 
+        if (e->menuName == RE::DialogueMenu::MENU_NAME) {
+            TFD::Victory::NotifyDialogueMenuStateChanged(e->opening);
+            TFD::RescueGreet::NotifyDialogueMenuStateChanged(e->opening);
+        }
+
+        if (e->menuName == RE::ContainerMenu::MENU_NAME) {
+            TFD::Victory::NotifyContainerMenuStateChanged(e->opening);
+        }
+
         if (e->menuName == RE::LoadingMenu::MENU_NAME && !e->opening) {
             auto* ui = RE::UI::GetSingleton();
             if (ui && ui->IsMenuOpen(RE::MainMenu::MENU_NAME)) {
@@ -336,6 +350,7 @@ public:
             TFD::Location::ResetAmbientKidnapAvailabilityWatcher();
             TFD::Location::UpdateAmbientKidnapAvailability(true);
             FinalizeLoadAfterWorldReady();
+            TFD::RescueGreet::NotifyWorldReady("loading_menu_closed");
             // R96E: hard guarantee for save-swap cleanup. Some builds already call this
             // inside FinalizeLoadAfterWorldReady(); this direct post-menu pass is harmless
             // when the snapshot queue is empty, and catches cases where finalize was skipped
@@ -402,6 +417,7 @@ extern "C" __declspec(dllexport) bool SKSEAPI SKSEPlugin_Load(const SKSE::LoadIn
 
     if (auto* papyrus = SKSE::GetPapyrusInterface()) {
         papyrus->Register(TFD::Actor::RegisterPapyrus);
+        papyrus->Register(TFD::Victory::RegisterPapyrus);
         papyrus->Register(TFD::CombatBehavior::RegisterPapyrus);
         papyrus->Register(TFD::WorkNative::RegisterPapyrus);
         papyrus->Register(TFD::ForceGreetState::RegisterPapyrus);

@@ -548,12 +548,20 @@ namespace
         bool playerFaction{ false };
     };
 
-    AllianceEnsureResult EnsureRecruitAlliance(RE::Actor* actor, RE::PlayerCharacter* player)
+    AllianceEnsureResult EnsureRecruitAlliance(
+        RE::Actor* actor,
+        RE::PlayerCharacter* player,
+        bool ensureTeammateFaction,
+        bool ensureFollowerAnchorFactions)
     {
         AllianceEnsureResult result{};
 
         if (actor) {
-            if (EnsureFactionActive(actor, "TFDTeammateFaction", "actor")) {
+            // R410A: some flows, specifically Victory Recruit 3D repair, need a
+            // dehostile-only pass before the actor is allowed to enter teammate
+            // aliases/packages. Keep TFDTeammateFaction optional so alias sync does
+            // not pre-fill and evaluate the follower package before the 3D pulse.
+            if (ensureTeammateFaction && EnsureFactionActive(actor, "TFDTeammateFaction", "actor")) {
                 ++result.actorFactions;
             }
             if (EnsureFactionActive(actor, "TFDPacifyFaction", "actor")) {
@@ -566,15 +574,16 @@ namespace
             if (EnsureFactionActive(actor, "TFDPlayerFaction", "actor_player_side")) {
                 ++result.actorFactions;
             }
-            // R80: TFD-converted teammates must get the same follower anchor
-            // factions as vanilla-style followers during native commit, not only
-            // after the Papyrus alias repair arrives. This makes combat assist
-            // state exist before the first threat scan/AI package tick.
-            if (EnsureFactionActive(actor, "CurrentFollowerFaction", "actor_follower_anchor")) {
-                ++result.actorFactions;
-            }
-            if (EnsureFactionActive(actor, "PlayerFollowerFaction", "actor_follower_anchor")) {
-                ++result.actorFactions;
+            // R80/R410A: follower anchor factions are still default-on for normal
+            // recruit commits, but Victory Recruit can defer them until after its
+            // controlled 3D refresh to prevent pre-pulse package snap/marker blink.
+            if (ensureFollowerAnchorFactions) {
+                if (EnsureFactionActive(actor, "CurrentFollowerFaction", "actor_follower_anchor")) {
+                    ++result.actorFactions;
+                }
+                if (EnsureFactionActive(actor, "PlayerFollowerFaction", "actor_follower_anchor")) {
+                    ++result.actorFactions;
+                }
             }
         }
 
@@ -913,12 +922,8 @@ namespace TFD::Recruit
             return "Bleedout";
         case SourceFlow::Captive:
             return "Captive";
-        case SourceFlow::Victory:
-            return "Victory";
         case SourceFlow::Pleasure:
             return "Pleasure";
-        case SourceFlow::Defeated:
-            return "Defeated";
         case SourceFlow::Teammate:
             return "Teammate";
         case SourceFlow::Dialogue:
@@ -1244,7 +1249,11 @@ namespace TFD::Recruit
         const bool settleAlreadyAttempted = HasRecruitSettleBeenAttempted(actorId);
 
         if (options.ensurePacifyAlliance) {
-            const auto alliance = EnsureRecruitAlliance(actor, player);
+            const auto alliance = EnsureRecruitAlliance(
+                actor,
+                player,
+                options.ensureTeammateFaction,
+                options.ensureFollowerAnchorFactions);
             result.ensuredStateFactions = alliance.actorFactions;
             result.playerFactionEnsured = alliance.playerFaction;
         }

@@ -34,6 +34,4 @@ namespace TFD::DefeatMonitor
 	bool IsThresholdDownedActor(RE::Actor* actor);
 	bool IsThresholdCombatTargetValid(RE::Actor* actor);
 
-	void ForceRecoverPlayerAfterCaptiveRecapture(const char* reason = nullptr);
-	void SuppressDefeatedEnemyAutoDeathForActor(RE::Actor* actor, double seconds = 20.0, const char* reason = nullptr);
 }

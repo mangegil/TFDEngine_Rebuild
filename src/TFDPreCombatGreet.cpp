@@ -1867,7 +1867,6 @@ namespace TFD::PreCombatGreet
                 }
 
                 if (snapshot.root == TFD::FlowController::RootFlow::Captive ||
-                    snapshot.root == TFD::FlowController::RootFlow::Victory ||
                     snapshot.terminalResolved ||
                     snapshot.root == TFD::FlowController::RootFlow::None) {
                     return TFD::Tame::ReleaseReason::FlowHandoff;

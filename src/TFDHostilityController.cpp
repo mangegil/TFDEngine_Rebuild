@@ -4,6 +4,7 @@
 #include "TFDTame.h"
 #include "TFDTeammateManager.h"
 #include "TFDRecruit.h"
+#include "TFDVictory.h"
 
 #include "TFDCaptive.h"
 #include "TFDDefeatMonitor.h"
@@ -249,6 +250,39 @@ namespace
                 current);
         }
 
+        bool HasHandoffOwnerMarker(RE::Actor* actor)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            if (actor->IsPlayerTeammate()) {
+                return true;
+            }
+
+            constexpr const char* kOwnerEditorIds[] = {
+                "TFDPreCombatTruceFaction",
+                "TFDInCombatTruceFaction",
+                "TFDBleedOutFaction",
+                "TFDBleedoutFaction",
+                "TFDAfterPleasureFaction",
+                "TFDPleasureFailedFaction",
+                "TFDTeammateFaction",
+                "TFDTemporaryTeammateFaction",
+                "TFDWorkingCaptiveFaction",
+                "TFDSaviorFaction"
+            };
+
+            for (auto* editorId : kOwnerEditorIds) {
+                auto* faction = RE::TESForm::LookupByEditorID<RE::TESFaction>(editorId);
+                if (faction && actor->IsInFaction(faction)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         void Clear()
         {
             std::unordered_map<std::uint32_t, float> snapshot;
@@ -280,6 +314,60 @@ namespace
                     handle,
                     original);
             }
+        }
+
+        void ClearForSettledHandoff(const char* reason)
+        {
+            std::unordered_map<std::uint32_t, float> snapshot;
+            {
+                std::scoped_lock lock(g_lock);
+                snapshot.swap(g_saved);
+            }
+
+            std::uint32_t dropped = 0;
+            std::uint32_t restored = 0;
+            for (auto& entry : snapshot) {
+                const auto handle = entry.first;
+                const auto original = entry.second;
+
+                auto actorRef = RE::Actor::LookupByHandle(handle);
+                auto* actor = actorRef.get();
+                if (!actor) {
+                    continue;
+                }
+
+                if (HasHandoffOwnerMarker(actor)) {
+                    ++dropped;
+                    spdlog::info(
+                        "[TFD][HostilityController][R471A] aggression clamp handoff adopted actor={:08X} handle={} savedAgg={} reason={}",
+                        actor->GetFormID(),
+                        handle,
+                        original,
+                        reason ? reason : "unknown");
+                    continue;
+                }
+
+                auto* avo = actor->AsActorValueOwner();
+                if (!avo) {
+                    continue;
+                }
+
+                avo->ModActorValue(RE::ActorValue::kAggression, original);
+                actor->EvaluatePackage(true, false);
+                ++restored;
+
+                spdlog::info("[TFD][HostilityController] aggression clamp restored actor={:08X} handle={} addBack={} reason={}",
+                    actor->GetFormID(),
+                    handle,
+                    original,
+                    reason ? reason : "settled_handoff_clear");
+            }
+
+            spdlog::info(
+                "[TFD][HostilityController][R471A] aggression clamp settled handoff clear restored={} adopted={} reason={}",
+                restored,
+                dropped,
+                reason ? reason : "unknown");
         }
     }
 
@@ -703,6 +791,11 @@ namespace TFD::HostilityController
     void ClearAggressionClamp()
     {
         AggressionClampInternal::Clear();
+    }
+
+    void ClearAggressionClampForSettledHandoff(const char* reason)
+    {
+        AggressionClampInternal::ClearForSettledHandoff(reason ? reason : "settled_handoff");
     }
 
     void TickCaptiveSuppression()
@@ -1341,7 +1434,56 @@ namespace TFD::HostilityController
                     TFD::Actor::Ops::HasTemporaryFollowLock(actor);
             }
 
-            void Apply(RE::Actor* actor, Entry& entry, const char* reason)
+            bool IsConfirmedPlayerSidePacifyOwner(RE::Actor* actor)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                return actor->IsPlayerTeammate() ||
+                    TFD::TeammateManager::IsActiveFollowerActor(actor) ||
+                    TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+                    TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+                    TFD::Recruit::IsRecruitLike(actor) ||
+                    TFD::Tame::IsCompanion(actor) ||
+                    TFD::Actor::Ops::HasReleaseFollowGrace(actor) ||
+                    TFD::Actor::Ops::HasTemporaryFollowLock(actor);
+            }
+
+            bool ShouldAdoptInheritedPacifyForSession(RE::Actor* actor, const Entry& entry)
+            {
+                if (!actor) {
+                    return false;
+                }
+
+                // R503A: Bleedout -> InCombat Pleasure handoff intentionally preserves
+                // TFDPacifyFaction so the crowd does not wake hostile during the handoff.
+                // When the new InCombat session sees the faction already present, older
+                // code records it as hadPacify=1 / addedPacify=0.  That makes release
+                // unable to remove the inherited TFD-owned pacify, so rejected / orphaned
+                // crowd actors can stay permanently pacified after aliases are cleared.
+                // Adopt only InCombat truce pacify; do not steal Pay, follower, recruit,
+                // teammate, or other explicit passive owners.
+                if (entry.mode != Mode::TruceInCombat) {
+                    return false;
+                }
+
+                if (entry.disposition == TameDisposition::Companion) {
+                    return false;
+                }
+
+                if (PayDialoguePassiveGuardInternal::IsActive(actor)) {
+                    return false;
+                }
+
+                if (IsConfirmedPlayerSidePacifyOwner(actor)) {
+                    return false;
+                }
+
+                return true;
+            }
+
+            void Apply(RE::Actor* actor, Entry& entry, const char* reason, bool allowActorProcessMutation = true)
             {
                 if (!IsActorStillValid(actor) || entry.disposition == TameDisposition::Companion) {
                     return;
@@ -1364,6 +1506,7 @@ namespace TFD::HostilityController
                     originalAggression = entry.originalAggression;
                 }
 
+                bool adoptedInheritedPacify = false;
                 if (!entry.stablePacifyInitialized) {
                     entry.stablePacifyInitialized = true;
                     entry.hadPacifyFaction = pacifyFaction ? actor->IsInFaction(pacifyFaction) : false;
@@ -1371,11 +1514,29 @@ namespace TFD::HostilityController
                         entry.addedPacifyFaction = true;
                         addPacifyFaction = true;
                     }
+                    else if (pacifyFaction && entry.hadPacifyFaction && ShouldAdoptInheritedPacifyForSession(actor, entry)) {
+                        // The faction is already on the actor, so do not add it again.
+                        // Mark it as session-owned so Restore() can remove it when the
+                        // Pleasure/InCombat cycle is truly released.
+                        entry.hadPacifyFaction = false;
+                        entry.addedPacifyFaction = true;
+                        adoptedInheritedPacify = true;
+                    }
                 }
 
                 if (addPacifyFaction && pacifyFaction) {
                     actor->AddToFaction(pacifyFaction, 0);
                     changedFaction = true;
+                }
+
+                if (adoptedInheritedPacify) {
+                    spdlog::info(
+                        "[TFD][HostilityController][R503A] inherited pacify adopted actor={:08X} mode={} session={} primary={:08X} reason={}",
+                        actor->GetFormID(),
+                        ToString(entry.mode),
+                        entry.sessionId,
+                        entry.primaryTargetId,
+                        reason ? reason : "session_suppression");
                 }
 
                 if (avo) {
@@ -1387,22 +1548,25 @@ namespace TFD::HostilityController
                 }
 
                 if (changedFaction || changedAggression) {
-                    if (auto* process = RE::ProcessLists::GetSingleton()) {
-                        process->ClearCachedFactionFightReactions();
+                    if (allowActorProcessMutation) {
+                        if (auto* process = RE::ProcessLists::GetSingleton()) {
+                            process->ClearCachedFactionFightReactions();
+                        }
+                        actor->StopAlarmOnActor();
+                        actor->StopCombat();
+                        // R240A: no forced sheathe in stable session pacify.
+                        actor->EvaluatePackage(false, true);
+                        actor->EvaluatePackage(true, true);
                     }
-                    actor->StopAlarmOnActor();
-                    actor->StopCombat();
-                    // R240A: no forced sheathe in stable session pacify.
-                    actor->EvaluatePackage(false, true);
-                    actor->EvaluatePackage(true, true);
 
                     spdlog::info(
-                        "[TFD][HostilityController][R139] stable session pacify applied actor={:08X} mode={} origAgg={} addedPacify={} changedAgg={} reason={}",
+                        "[TFD][HostilityController][R139] stable session pacify applied actor={:08X} mode={} origAgg={} addedPacify={} changedAgg={} processMutation={} reason={}",
                         actor->GetFormID(),
                         ToString(entry.mode),
                         originalAggression,
                         entry.addedPacifyFaction ? 1 : 0,
                         changedAggression ? 1 : 0,
+                        allowActorProcessMutation ? 1 : 0,
                         reason ? reason : "session_suppression");
                 }
             }
@@ -1710,7 +1874,8 @@ namespace TFD::HostilityController
 
             if (reason == ReleaseReason::DialogueClosed ||
                 reason == ReleaseReason::PlayerArmed ||
-                reason == ReleaseReason::FightChoice) {
+                reason == ReleaseReason::FightChoice ||
+                reason == ReleaseReason::HardFailsafeExpired) {
                 PulseGlobalDetection(ToString(reason));
             }
 
@@ -3326,14 +3491,104 @@ namespace TFD::HostilityController
             return actorIds;
         }
 
+        namespace ResultDialogueHoldInternal
+        {
+            inline RE::TESFaction* g_afterPleasureFaction = nullptr;
+            inline RE::TESFaction* g_pleasureFailedFaction = nullptr;
+            inline bool g_triedResolve = false;
+
+            void ResolveFactions()
+            {
+                if (g_triedResolve) {
+                    return;
+                }
+
+                g_triedResolve = true;
+                g_afterPleasureFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDAfterPleasureFaction");
+                g_pleasureFailedFaction = RE::TESForm::LookupByEditorID<RE::TESFaction>("TFDPleasureFailedFaction");
+
+                if (!g_afterPleasureFaction) {
+                    spdlog::warn("[TFD][HostilityController][R499A] result hold faction missing editorId=TFDAfterPleasureFaction");
+                }
+                if (!g_pleasureFailedFaction) {
+                    spdlog::warn("[TFD][HostilityController][R499A] result hold faction missing editorId=TFDPleasureFailedFaction");
+                }
+            }
+
+            bool HasResultOwnerMarker(RE::Actor* actor)
+            {
+                if (!IsActorStillValid(actor)) {
+                    return false;
+                }
+
+                ResolveFactions();
+                return (g_afterPleasureFaction && actor->IsInFaction(g_afterPleasureFaction)) ||
+                    (g_pleasureFailedFaction && actor->IsInFaction(g_pleasureFailedFaction));
+            }
+
+            bool OwnsSession(RE::Actor* actor, const Entry& entry)
+            {
+                auto sessionIt = g_sessions.find(entry.sessionId);
+                if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
+                    return false;
+                }
+
+                const auto mode = sessionIt->second.primaryMode;
+                if (mode != Mode::TruceInCombat && mode != Mode::BleedoutSuppress) {
+                    return false;
+                }
+
+                if (HasResultOwnerMarker(actor)) {
+                    return true;
+                }
+
+                auto* primary = ResolveActor(sessionIt->second.primaryTargetId);
+                return primary && primary != actor && HasResultOwnerMarker(primary);
+            }
+        }
+
         void ApplySuppression(RE::Actor* actor, Entry& entry, double nowSec)
         {
             if (!IsActorStillValid(actor)) {
                 return;
             }
 
+            const bool resultDialogueLightHold = ResultDialogueHoldInternal::OwnsSession(actor, entry);
+
             if (entry.disposition != TameDisposition::Companion) {
-                StableSessionPacifyInternal::Apply(actor, entry, "session_suppression");
+                StableSessionPacifyInternal::Apply(
+                    actor,
+                    entry,
+                    resultDialogueLightHold ? "r499a_result_dialogue_light_hold" : "session_suppression",
+                    !resultDialogueLightHold);
+            }
+
+            if (resultDialogueLightHold) {
+                if (!entry.resultDialogueLightHoldActive) {
+                    entry.resultDialogueLightHoldActive = true;
+                    spdlog::info(
+                        "[TFD][HostilityController][R499A] result dialogue light hold entered actor={:08X} session={} mode={} policy=pacify_aggression_only",
+                        actor->GetFormID(),
+                        entry.sessionId,
+                        ToString(entry.mode));
+                }
+
+                // Keep session/faction ownership alive, but do not mutate actor process
+                // state while native AfterPleasure/PleasureFailed dialogue owns the actor.
+                entry.lastSuppressionApplySec = nowSec;
+                entry.lastPackageEvalSec = nowSec;
+                return;
+            }
+
+            if (entry.resultDialogueLightHoldActive) {
+                entry.resultDialogueLightHoldActive = false;
+                entry.lastSuppressionApplySec = 0.0;
+                entry.lastPackageEvalSec = 0.0;
+                spdlog::info(
+                    "[TFD][HostilityController][R499A] result dialogue light hold exited actor={:08X} session={} mode={}",
+                    actor->GetFormID(),
+                    entry.sessionId,
+                    ToString(entry.mode));
             }
 
             if (entry.disposition != TameDisposition::Companion && (nowSec - entry.lastSuppressionApplySec) >= kSuppressionApplyIntervalSec) {
@@ -3586,6 +3841,127 @@ namespace TFD::HostilityController
             for (auto actorId : toErase) {
                 g_rehostileRequests.erase(actorId);
             }
+        }
+
+        void QueuePayReleaseWakePulses(RE::FormID actorId, RE::FormID playerId, RE::FormID sessionId, const char* source)
+        {
+            if (actorId == 0 || playerId == 0) {
+                return;
+            }
+
+            std::thread([actorId, playerId, sessionId, sourceText = std::string(source ? source : "pay_release_wake")]() {
+                const std::vector<int> delaysMs{ 50, 450, 1100 };
+
+                for (std::size_t i = 0; i < delaysMs.size(); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(delaysMs[i]));
+
+                    auto* tasks = SKSE::GetTaskInterface();
+                    if (!tasks) {
+                        continue;
+                    }
+
+                    tasks->AddUITask([actorId, playerId, sessionId, sourceText, attempt = i + 1, delayMs = delaysMs[i]]() {
+                        auto* actor = ResolveActor(actorId);
+                        auto* player = ResolveActor(playerId);
+                        if (!IsActorStillValid(actor) || !IsActorStillValid(player)) {
+                            spdlog::info(
+                                "[TFD][HostilityController][R427A] pay release wake skipped actor={:08X} player={:08X} session={} attempt={} delayMs={} reason=invalid",
+                                actorId,
+                                playerId,
+                                sessionId,
+                                static_cast<unsigned int>(attempt),
+                                delayMs);
+                            return;
+                        }
+
+                        if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
+                            spdlog::info(
+                                "[TFD][HostilityController][R427A] pay release wake skipped actor={:08X} player={:08X} session={} attempt={} delayMs={} reason=victory_defeated",
+                                actor->GetFormID(),
+                                player->GetFormID(),
+                                sessionId,
+                                static_cast<unsigned int>(attempt),
+                                delayMs);
+                            return;
+                        }
+
+                        if (TFD::Recruit::IsRecruitLike(actor)) {
+                            spdlog::info(
+                                "[TFD][HostilityController][R427A] pay release wake skipped actor={:08X} player={:08X} session={} attempt={} delayMs={} reason=recruit_like",
+                                actor->GetFormID(),
+                                player->GetFormID(),
+                                sessionId,
+                                static_cast<unsigned int>(attempt),
+                                delayMs);
+                            return;
+                        }
+
+                        auto beforeTargetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                        RE::FormID beforeTargetId = beforeTargetSp ? beforeTargetSp->GetFormID() : 0u;
+                        const bool beforeTargetPlayer = beforeTargetId == player->GetFormID();
+                        const bool beforeInCombat = actor->IsInCombat();
+                        const bool beforeWeaponDrawn = actor->IsWeaponDrawn();
+                        const bool beforeHostile = IsEnemyToPlayer(player, actor);
+
+                        if (!beforeHostile && !beforeInCombat && !beforeTargetPlayer) {
+                            spdlog::info(
+                                "[TFD][HostilityController][R427A] pay release wake skipped actor={:08X} player={:08X} session={} attempt={} delayMs={} source={} reason=no_active_hostility beforeTarget={:08X}",
+                                actor->GetFormID(),
+                                player->GetFormID(),
+                                sessionId,
+                                static_cast<unsigned int>(attempt),
+                                delayMs,
+                                sourceText.c_str(),
+                                beforeTargetId);
+                            return;
+                        }
+
+                        if (auto* process = RE::ProcessLists::GetSingleton()) {
+                            process->runDetection = true;
+                            process->ClearCachedFactionFightReactions();
+                        }
+
+                        const bool satisfied = ForceRehostile(actor, player, ReleaseReason::HardFailsafeExpired, false);
+
+                        // R427A: pay release can leave a hostile actor visually/AI-bound to furniture
+                        // even when radar and current target already point at the player.  ForceRehostile
+                        // may report stable because the target is already player, so send extra non-draw
+                        // AI/combat refresh pulses during this short wake window.  No sheathe/draw, no
+                        // MoveTo, no damage, no disable/enable.
+                        actor->EvaluatePackage(false, true);
+                        actor->EvaluatePackage(true, true);
+                        actor->UpdateCombat();
+                        player->UpdateCombat();
+
+                        auto afterTargetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                        const RE::FormID afterTargetId = afterTargetSp ? afterTargetSp->GetFormID() : 0u;
+                        spdlog::info(
+                            "[TFD][HostilityController][R427A] pay release wake pulse actor={:08X} player={:08X} session={} attempt={} delayMs={} source={} beforeHostile={} beforeInCombat={} beforeTarget={:08X} beforeTargetPlayer={} beforeWeaponDrawn={} satisfied={} afterInCombat={} afterTarget={:08X} afterWeaponDrawn={} noDraw=1 noDamage=1 noDisableEnable=1",
+                            actor->GetFormID(),
+                            player->GetFormID(),
+                            sessionId,
+                            static_cast<unsigned int>(attempt),
+                            delayMs,
+                            sourceText.c_str(),
+                            beforeHostile ? 1 : 0,
+                            beforeInCombat ? 1 : 0,
+                            beforeTargetId,
+                            beforeTargetPlayer ? 1 : 0,
+                            beforeWeaponDrawn ? 1 : 0,
+                            satisfied ? 1 : 0,
+                            actor->IsInCombat() ? 1 : 0,
+                            afterTargetId,
+                            actor->IsWeaponDrawn() ? 1 : 0);
+                        });
+                }
+                }).detach();
+
+            spdlog::info(
+                "[TFD][HostilityController][R427A] queued pay release wake pulses actor={:08X} player={:08X} session={} pulses=3 source={}",
+                actorId,
+                playerId,
+                sessionId,
+                source ? source : "pay_release_wake");
         }
 
         bool AddOrRefreshEntry(
@@ -4658,17 +5034,27 @@ namespace TFD::HostilityController
         double nowSec,
         bool allowDialogue,
         bool ignoreSpent,
-        bool suppressBridgeEvents)
+        bool suppressBridgeEvents,
+        bool allowPacifiedBridge)
     {
         if (allowDialogue && primaryTarget && !IsActorTargetingPlayerSideForTruce(primaryTarget, player)) {
             auto* currentTarget = ResolveCurrentCombatTarget(primaryTarget);
+            if (!allowPacifiedBridge) {
+                spdlog::info(
+                    "[TFD][HostilityController][P8TRUCE] reject dialogue InCombat session actor={:08X} reason=not_targeting_player_side currentTarget={:08X} ignoreSpent={} suppressBridge={} allowPacifiedBridge=0",
+                    primaryTarget->GetFormID(),
+                    currentTarget ? currentTarget->GetFormID() : 0u,
+                    ignoreSpent ? 1 : 0,
+                    suppressBridgeEvents ? 1 : 0);
+                return std::nullopt;
+            }
+
             spdlog::info(
-                "[TFD][HostilityController][P8TRUCE] reject dialogue InCombat session actor={:08X} reason=not_targeting_player_side currentTarget={:08X} ignoreSpent={} suppressBridge={}",
+                "[TFD][HostilityController][R475A] tolerate pacified InCombat cycle speaker actor={:08X} currentTarget={:08X} ignoreSpent={} suppressBridge={} reason=pleasure_cycle_handoff",
                 primaryTarget->GetFormID(),
                 currentTarget ? currentTarget->GetFormID() : 0u,
                 ignoreSpent ? 1 : 0,
                 suppressBridgeEvents ? 1 : 0);
-            return std::nullopt;
         }
 
         if (!allowDialogue && primaryTarget &&
@@ -5109,6 +5495,61 @@ namespace TFD::HostilityController
             refreshed,
             addedInCombatPleasureHold,
             reason ? reason : "unknown");
+
+        return true;
+    }
+
+    bool RefreshTruceSessionForFlowHandoff(RE::Actor* sessionActor, double durationSec, const char* reason)
+    {
+        if (!sessionActor) {
+            return false;
+        }
+
+        const auto actorId = sessionActor->GetFormID();
+        if (actorId == 0) {
+            return false;
+        }
+
+        auto entryIt = g_entries.find(actorId);
+        if (entryIt == g_entries.end() || entryIt->second.mode != Mode::TruceInCombat) {
+            return false;
+        }
+
+        const auto sessionId = entryIt->second.sessionId;
+        auto sessionIt = g_sessions.find(sessionId);
+        if (sessionIt == g_sessions.end() || sessionIt->second.finished) {
+            return false;
+        }
+
+        auto& session = sessionIt->second;
+        if (session.primaryMode != Mode::TruceInCombat || !session.flowHandoffHold) {
+            return false;
+        }
+
+        if (!std::isfinite(durationSec) || durationSec <= 0.0) {
+            durationSec = kFlowHandoffHoldMaxSec;
+        }
+
+        const double nowSec = SuppressionNowSec();
+        const double clampedDuration = std::clamp(durationSec, kFlowHandoffHoldMinSec, kFlowHandoffHoldMaxSec);
+        const double oldUntilSec = session.flowHandoffHoldUntilSec;
+        session.flowHandoffHoldUntilSec = std::max(oldUntilSec, nowSec + clampedDuration);
+        session.pendingReleaseReason = ReleaseReason::FlowHandoff;
+        session.suppressBridgeEvents = true;
+        session.armedSinceSec = 0.0;
+        session.tooFarSinceSec = 0.0;
+        session.tameStartleSinceSec = 0.0;
+        session.invalidSinceSec = 0.0;
+
+        spdlog::info(
+            "TFDHostilityController: [R499A] refreshed truce lifecycle hold session={} actor={:08X} primary={:08X} oldUntil={:.2f} newUntil={:.2f} duration={:.2f}s reason={}",
+            sessionId,
+            actorId,
+            session.primaryTargetId,
+            oldUntilSec,
+            session.flowHandoffHoldUntilSec,
+            clampedDuration,
+            reason ? reason : "incombat_pleasure_lifecycle");
 
         return true;
     }
@@ -5659,6 +6100,14 @@ namespace TFD::HostilityController
         auto* targetActor = targetRef ? targetRef->As<RE::Actor>() : nullptr;
         auto* causeActor = causeRef ? causeRef->As<RE::Actor>() : nullptr;
 
+        // R414A diagnostic only: if this hit belongs to a recently recruited
+        // Victory actor, sample state before/after the player-hit recovery path.
+        // This must not consume the hit or alter in-combat truce handling.
+        TFD::Victory::ObserveRecentRecruitHit(
+            targetActor,
+            causeActor,
+            reason && reason[0] ? reason : "hit_damage_interrupt");
+
         // R99D: hit interrupt must be target-driven, not cause-driven.
         // TESHitEvent can arrive with a valid cause but a null target during AI/package
         // transitions.  Treating that as "speaker/crowd/player was hit" creates false
@@ -5831,6 +6280,8 @@ namespace TFD::HostilityController
         resumeCombatIds.reserve(actorIds.size());
         std::vector<RE::FormID> postInCombatRearmIds;
         postInCombatRearmIds.reserve(actorIds.size());
+        std::vector<RE::FormID> payReleaseWakeIds;
+        payReleaseWakeIds.reserve(actorIds.size());
 
         for (RE::FormID actorId : actorIds) {
             auto it = g_entries.find(actorId);
@@ -5871,6 +6322,28 @@ namespace TFD::HostilityController
                 if (immediateInCombatRehostile) {
                     g_entries.erase(it);
                     it = g_entries.end();
+                }
+
+                const bool shouldWakePayReleaseActor =
+                    releasedEntry.mode == Mode::BleedoutPayReleaseSuppress &&
+                    reason == ReleaseReason::HardFailsafeExpired &&
+                    player &&
+                    !TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor) &&
+                    !TFD::Recruit::IsRecruitLike(actor);
+
+                if (shouldWakePayReleaseActor) {
+                    payReleaseWakeIds.push_back(actorId);
+                    auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
+                    spdlog::info(
+                        "[TFD][HostilityController][R427A] pay release wake armed actor={:08X} player={:08X} session={} target={:08X} hostile={} inCombat={} weaponDrawn={} reason={}",
+                        actor->GetFormID(),
+                        player->GetFormID(),
+                        sessionId,
+                        targetSp ? targetSp->GetFormID() : 0u,
+                        IsEnemyToPlayer(player, actor) ? 1 : 0,
+                        actor->IsInCombat() ? 1 : 0,
+                        actor->IsWeaponDrawn() ? 1 : 0,
+                        ToString(reason));
                 }
 
                 if (shouldRehostileTame) {
@@ -5994,6 +6467,20 @@ namespace TFD::HostilityController
                 ToString(reason),
                 static_cast<unsigned int>(resumeSent),
                 static_cast<unsigned int>(resumeCombatIds.size()));
+        }
+
+        if (!payReleaseWakeIds.empty() && player) {
+            std::sort(payReleaseWakeIds.begin(), payReleaseWakeIds.end());
+            payReleaseWakeIds.erase(std::unique(payReleaseWakeIds.begin(), payReleaseWakeIds.end()), payReleaseWakeIds.end());
+            for (const auto actorId : payReleaseWakeIds) {
+                QueuePayReleaseWakePulses(actorId, player->GetFormID(), sessionId, "pay_release_hard_failsafe_expired");
+            }
+            spdlog::info(
+                "[TFD][HostilityController][R427A] pay release wake scheduled session={} reason={} actors={} mode={}",
+                sessionId,
+                ToString(reason),
+                static_cast<unsigned int>(payReleaseWakeIds.size()),
+                ToString(primaryMode));
         }
 
         spdlog::info(

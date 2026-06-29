@@ -16,14 +16,6 @@ namespace TFD::DefeatRuntimeProviders
     {
         std::function<bool(RE::Actor*)> teammateHasAllyBleedLock;
         std::function<bool(RE::Actor*)> teammateIsBleedingOutActor;
-        std::function<bool(RE::Actor*)> teammateIsDialogueCapableDefeatedEnemy;
-        std::function<double(RE::Actor*)> teammateGetDefeatedEnemyRemainingSeconds;
-        std::function<void(RE::Actor*, double, const char*)> teammateSuppressDefeatedReentry;
-        std::function<void(RE::Actor*, const char*, bool)> teammateReleaseBleedLock;
-        std::function<void(RE::Actor*, float, float, float, float, float, const char*)> teammateRestoreActorHealthToSafePct;
-        std::function<RE::Actor*()> teammateResolvePendingDefeatedDialogueTarget;
-        std::function<void()> teammateClearPendingDefeatedDialogueTarget;
-        std::function<void(RE::Actor*)> teammateSetPendingDefeatedDialogueTarget;
         std::function<bool(RE::Actor*, float)> teammateReviveDownedAlly;
 
         std::function<bool(RE::Actor*, RE::Actor*, const char*)> hostilityStartBleedTruceSessionForSpeaker;

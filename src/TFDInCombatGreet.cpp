@@ -100,6 +100,32 @@ namespace TFD::InCombatGreet
 			return state && state->IsBleedingOut();
 		}
 
+		bool IsBleedoutRecruitBridgeAllowedWhilePlayerBleedout(RE::Actor* speaker, bool allowPacifiedBridge)
+		{
+			if (!allowPacifiedBridge || !speaker) {
+				return false;
+			}
+
+			const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			const bool bleedoutAfterPleasureOwner =
+				snapshot.root == TFD::FlowController::RootFlow::Bleedout &&
+				snapshot.contextRoot == TFD::FlowController::RootFlow::Bleedout &&
+				(snapshot.sub == TFD::FlowController::SubFlow::BleedoutAfterPleasure ||
+					snapshot.sub == TFD::FlowController::SubFlow::BleedoutPleasure);
+
+			if (bleedoutAfterPleasureOwner) {
+				spdlog::info(
+					"[TFD][InCombatGreet][R485A] allow bleedout recruit bridge while player bleedout actor={:08X} root={} ctx={} sub={} primary={:08X}",
+					speaker->GetFormID(),
+					TFD::FlowController::Controller::ToString(snapshot.root),
+					TFD::FlowController::Controller::ToString(snapshot.contextRoot),
+					TFD::FlowController::Controller::ToString(snapshot.sub),
+					snapshot.primaryActorFormID);
+			}
+
+			return bleedoutAfterPleasureOwner;
+		}
+
 		bool IsPleasureRuntimeDialogueSuppressed(RE::Actor* actor, const char* entry, const char* reason)
 		{
 			if (!actor || !TFD::PleasureRuntime::ShouldSuppressTruceDialogue(actor)) {
@@ -359,7 +385,7 @@ namespace TFD::InCombatGreet
 		return true;
 	}
 
-	bool BeginForPleasureCycleActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction)
+	bool BeginForPleasureCycleActor(RE::Actor* speaker, TFD::InteractionRouter::Action* outAction, bool allowPacifiedBridge)
 	{
 		if (IsPleasureRuntimeDialogueSuppressed(speaker, "BeginForPleasureCycleActor", "incombat_pleasure_cycle")) {
 			if (outAction) {
@@ -373,17 +399,34 @@ namespace TFD::InCombatGreet
 			*outAction = TFD::InteractionRouter::Action::None;
 		}
 
-		if (IsPlayerBleedoutInteractionOwned()) {
+		if (IsPlayerBleedoutInteractionOwned() &&
+			!IsBleedoutRecruitBridgeAllowedWhilePlayerBleedout(speaker, allowPacifiedBridge)) {
 			spdlog::info(
-				"[TFD][InCombatGreet][CB05] BeginForPleasureCycleActor blocked actor={:08X} reason=player_bleedout_owned_by_bleedout_route",
-				speaker ? speaker->GetFormID() : 0u);
+				"[TFD][InCombatGreet][CB05] BeginForPleasureCycleActor blocked actor={:08X} reason=player_bleedout_owned_by_bleedout_route allowPacifiedBridge={}",
+				speaker ? speaker->GetFormID() : 0u,
+				allowPacifiedBridge ? 1 : 0);
 			return false;
+		}
+
+		if (TFD::Transition::IsRecoveryActive()) {
+			// R464A: Bleedout -> AfterPleasure Recruit may intentionally bridge into an
+			// InCombat ForceGreet while the old left-for-dead/recovery calm window is still
+			// winding down.  Regular hotkey/open flows should still respect recovery, but
+			// this pleasure-cycle handoff owns the next dialogue.  Abort the stale calm
+			// window before candidate validation so the queued speaker is not rejected as
+			// invalid until the queue expires.
+			TFD::Transition::AbortCalmWindowForCombat(speaker, "incombat_pleasure_cycle_abort_recovery_calm_window");
 		}
 
 		if (!IsCandidate(speaker, player)) {
 			spdlog::info(
-				"[TFD][InCombatGreet][R94B] BeginForPleasureCycleActor blocked actor={:08X} reason=invalid_candidate",
-				speaker ? speaker->GetFormID() : 0u);
+				"[TFD][InCombatGreet][R464A] BeginForPleasureCycleActor blocked actor={:08X} reason=invalid_candidate recoveryActive={} dead={} disabled={} loaded={} playerMatch={}",
+				speaker ? speaker->GetFormID() : 0u,
+				TFD::Transition::IsRecoveryActive() ? 1 : 0,
+				speaker && speaker->IsDead() ? 1 : 0,
+				speaker && speaker->IsDisabled() ? 1 : 0,
+				speaker && speaker->Is3DLoaded() ? 1 : 0,
+				(speaker && player && speaker->GetFormID() == player->GetFormID()) ? 1 : 0);
 			return false;
 		}
 
@@ -401,13 +444,15 @@ namespace TFD::InCombatGreet
 				now,
 				true,
 				true,
-				false);
+				false,
+				allowPacifiedBridge);
 		}
 
 		if (!sessionId || *sessionId == 0) {
 			spdlog::info(
-				"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor blocked actor={:08X} reason=session_failed",
-				speaker ? speaker->GetFormID() : 0u);
+				"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor blocked actor={:08X} reason=session_failed allowPacifiedBridge={}",
+				speaker ? speaker->GetFormID() : 0u,
+				allowPacifiedBridge ? 1 : 0);
 			return false;
 		}
 
@@ -469,10 +514,11 @@ namespace TFD::InCombatGreet
 		}
 
 		spdlog::info(
-			"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor actor={:08X} action=TruceInCombat session={} dialogueRequested=1 promotedExisting={}",
+			"[TFD][InCombatGreet][R94C] BeginForPleasureCycleActor actor={:08X} action=TruceInCombat session={} dialogueRequested=1 promotedExisting={} allowPacifiedBridge={}",
 			speaker->GetFormID(),
 			*sessionId,
-			promotedExistingSession ? 1 : 0);
+			promotedExistingSession ? 1 : 0,
+			allowPacifiedBridge ? 1 : 0);
 		return true;
 	}
 

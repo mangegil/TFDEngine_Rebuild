@@ -14,6 +14,7 @@
 #include "TFDLocation.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDSettings.h"
+#include "TFDTeammateManager.h"
 
 #include <RE/L/LockpickingMenu.h>
 #include <SKSE/SKSE.h>
@@ -112,12 +113,33 @@ namespace TFD::Transition
 			return handlers.isActiveFollowerActor ? handlers.isActiveFollowerActor(actor) : false;
 		}
 
-		static std::vector<RE::Actor*> CollectRegisteredTeammates(const RuntimeHandlers& handlers)
+		static std::vector<RE::Actor*> CollectFallbackTeammates(const RuntimeHandlers& handlers, float radius)
 		{
+			std::vector<RE::Actor*> out;
+			std::unordered_set<RE::FormID> seen;
+
+			auto append = [&](RE::Actor* actor) {
+				if (!actor || actor->IsDisabled()) {
+					return;
+				}
+				const auto id = actor->GetFormID();
+				if (!id || !seen.insert(id).second) {
+					return;
+				}
+				out.push_back(actor);
+			};
+
 			if (handlers.collectRegisteredTeammates) {
-				return handlers.collectRegisteredTeammates();
+				for (auto* actor : handlers.collectRegisteredTeammates()) {
+					append(actor);
+				}
 			}
-			return {};
+
+			for (auto* actor : TFD::TeammateManager::CollectKnownTeammates(radius)) {
+				append(actor);
+			}
+
+			return out;
 		}
 
 
@@ -277,7 +299,7 @@ namespace TFD::Transition
 			float bestStandingDist = std::numeric_limits<float>::max();
 			float bestDownedDist = std::numeric_limits<float>::max();
 
-			for (auto* actor : CollectRegisteredTeammates(handlers)) {
+			for (auto* actor : CollectFallbackTeammates(handlers, radius)) {
 				if (!actor || actor == player) {
 					continue;
 				}
@@ -310,7 +332,7 @@ namespace TFD::Transition
 
 			RE::Actor* best = nullptr;
 			float bestDist = std::numeric_limits<float>::max();
-			for (auto* actor : CollectRegisteredTeammates(handlers)) {
+			for (auto* actor : CollectFallbackTeammates(handlers, radius)) {
 				if (!actor || actor == player || !IsStandingAllyThresholdActor(handlers, actor)) {
 					continue;
 				}
@@ -1074,13 +1096,26 @@ namespace TFD::Transition
 			if (phase == TFD::PleasureRuntime::Phase::PleasureStartPending ||
 				phase == TFD::PleasureRuntime::Phase::PleasureActive ||
 				phase == TFD::PleasureRuntime::Phase::PleasureFailedDialogue) {
+				// R454A: Do not skip the calm window during Bleedout-source
+				// Pleasure. OStim may end/abort if hostile actors leak back into
+				// combat. Also do not call hostile-intrusion abort here; if the
+				// scene ends without climax, PleasureFailed forcegreet owns the next
+				// state until the player explicitly chooses Fight.
+				const float radius = (std::max)(3200.0f, TFD::Settings::GetSweepRadius() + 1200.0f);
+				if (player->IsInCombat()) {
+					player->StopCombat();
+				}
+				player->DrawWeaponMagicHands(false);
+				TFD::HostilityController::StopCombatSweep(radius, false);
+				TFD::HostilityController::ScheduleStopCombatWaves(radius, false, 3, 75);
 				spdlog::info(
-					"[TFD][Transition][R250A] calm window skipped during bleedout-source pleasure source={} phase={} root={} sub={} primary={:08X}",
+					"[TFD][Transition][R454A] calm window maintained during bleedout-source pleasure source={} phase={} root={} sub={} primary={:08X} radius={:.1f}",
 					TFD::PleasureRuntime::GetSourceContextName(),
 					TFD::PleasureRuntime::GetPhaseName(),
 					TFD::FlowController::Controller::ToString(flow.root),
 					TFD::FlowController::Controller::ToString(flow.sub),
-					flow.primaryActorFormID);
+					flow.primaryActorFormID,
+					radius);
 				return;
 			}
 		}

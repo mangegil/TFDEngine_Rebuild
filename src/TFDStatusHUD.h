@@ -7,7 +7,7 @@ namespace TFD::StatusHUD
         Neutral = 0,
         Precombat = 1,
         Incombat = 2,
-        Victory = 3,
+        // Value 3 is reserved after removal of the retired manual-interaction HUD state.
         Defeat = 4,
         Captive = 5
     };

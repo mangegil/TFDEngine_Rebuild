@@ -1,8 +1,8 @@
 #include "TFDRescue.h"
 
 #include "TFDLocation.h"
+#include "TFDRescueGreet.h"
 
-#include <cmath>
 #include <thread>
 
 #include <RE/Skyrim.h>
@@ -109,17 +109,71 @@ namespace TFD::Rescue
 			return outDest != nullptr;
 		}
 
-		static void AssignSaviorIfPresent(const State& state, const Handlers& handlers)
+		static bool IsValidSaviorActor(RE::Actor* actor)
 		{
-			if (!state.follower || !handlers.assignPlayerSavior) {
-				return;
+			return actor && !actor->IsDead() && !actor->IsDisabled() && actor->HasKeywordString("ActorTypeNPC");
+		}
+
+		static RE::Actor* ResolveStateSavior(const State& state)
+		{
+			if (!state.follower) {
+				return nullptr;
 			}
 
 			auto followerSp = RE::Actor::LookupByHandle(state.follower.native_handle());
-			if (auto* follower = followerSp.get()) {
-				handlers.assignPlayerSavior(follower);
-				spdlog::info("[TFD][Rescue] savior assigned {:08X}", follower->GetFormID());
+			auto* follower = followerSp.get();
+			return IsValidSaviorActor(follower) ? follower : nullptr;
+		}
+
+		static RE::Actor* ResolveCachedBedOwnerSavior(RE::BGSLocation* safeLoc, RE::TESObjectREFR* dest)
+		{
+			if (auto* owner = TFD::Location::ResolveApprovedBedOwnerActor(dest)) {
+				if (IsValidSaviorActor(owner)) {
+					return owner;
+				}
 			}
+
+			if (safeLoc) {
+				if (auto* owner = TFD::Location::ResolveBestApprovedBedOwnerActorForLocation(safeLoc)) {
+					if (IsValidSaviorActor(owner)) {
+						return owner;
+					}
+				}
+			}
+
+			return nullptr;
+		}
+
+
+		static void AssignSaviorForRescue(const State& state, RE::BGSLocation* safeLoc, RE::TESObjectREFR* dest)
+		{
+			const char* source = "fallback";
+			RE::Actor* savior = ResolveStateSavior(state);
+			if (savior) {
+				source = "standing_teammate";
+			}
+			else {
+				savior = ResolveCachedBedOwnerSavior(safeLoc, dest);
+				if (savior) {
+					source = "cached_bed_owner";
+				}
+			}
+
+			if (!savior) {
+				spdlog::info("[TFD][Rescue][R36D] no savior armed safeLoc={:08X} dest={:08X}", safeLoc ? safeLoc->GetFormID() : 0u, dest ? dest->GetFormID() : 0u);
+				return;
+			}
+
+			// R36D: do not assign the Savior alias or hard-open dialogue in the
+			// middle of the rescue transition.  Player MoveTo can still be resolving
+			// a LoadingMenu/world-ready edge here.  RescueGreet owns the post-teleport
+			// queue and will assign the Savior bridge only after the world is ready.
+			const bool armed = TFD::RescueGreet::ArmPostTeleportSavior(savior, source, "rescue_post_teleport_r36d");
+			spdlog::info(
+				"[TFD][Rescue][R36D] post-teleport savior arm actor={:08X} source={} armed={}",
+				savior->GetFormID(),
+				source,
+				armed ? 1 : 0);
 		}
 	}
 
@@ -169,7 +223,7 @@ namespace TFD::Rescue
 		if (handlers.finalizePostDefeatRecoveryWindow) {
 			handlers.finalizePostDefeatRecoveryWindow(grace, 1);
 		}
-		AssignSaviorIfPresent(state, handlers);
+		AssignSaviorForRescue(state, safeLoc, dest);
 
 		spdlog::info("[TFD][Rescue] complete reason={} safeLoc={:08X} dest={:08X} branch={}",
 			reason ? reason : "unknown",

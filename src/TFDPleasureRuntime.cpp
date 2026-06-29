@@ -1,5 +1,6 @@
 #include "TFDPleasureRuntime.h"
 #include "TFDFlowController.h"
+#include "TFDForceGreetState.h"
 #include "TFDHostilityController.h"
 #include "TFDInteractionRouter.h"
 #include "TFDPreCombatGreet.h"
@@ -50,6 +51,7 @@ namespace TFD::PleasureRuntime
 			std::uint32_t queuedPreCombatSpeakerFormID{ 0 };
 			std::uint32_t queuedPreCombatConsumedFormID{ 0 };
 			SourceContext queuedPreCombatSource{ SourceContext::None };
+			bool queuedPreCombatBleedoutBridgeToInCombat{ false };
 			double queuedPreCombatNextTrySec{ 0.0 };
 			double queuedPreCombatExpireSec{ 0.0 };
 			unsigned queuedPreCombatAttempts{ 0 };
@@ -70,8 +72,17 @@ namespace TFD::PleasureRuntime
 
 			double scenePassiveHoldNextPulseSec{ 0.0 };
 			unsigned scenePassiveHoldPulseCount{ 0 };
+			double truceFlowHandoffRefreshNextSec{ 0.0 };
 
 			std::vector<std::uint32_t> deferredInCombatRecruitActorIds{};
+
+			// R505A: A Bleedout recruit chain can legitimately continue as InCombat.
+			// In that handoff, HostilityController's live truce list may shrink to
+			// only the current speaker while the Bleedout/Papyrus crowd snapshot
+			// still owns the remaining actors.  Keep this flag until terminal reset
+			// so later InCombat recruit outcomes can fall back to that snapshot
+			// instead of finalizing Neutral while crowd actors still exist.
+			bool inCombatContinuationFromBleedoutSnapshot{ false };
 		};
 
 		// R94H: this runtime may be queried re-entrantly by TeammateManager
@@ -88,6 +99,8 @@ namespace TFD::PleasureRuntime
 
 		constexpr const char* kOStimSceneStartPendingEvent = "TFDOStimSceneStartPending";
 		constexpr const char* kOStimSceneStartedEvent = "TFDOStimSceneStarted";
+		constexpr const char* kOStimSceneSucceededEvent = "TFDOStimSceneSucceeded";
+		// R498A compatibility only. Updated Papyrus sends the explicit success event.
 		constexpr const char* kOStimSceneEndedEvent = "TFDOStimSceneEnded";
 
 		constexpr const char* kAfterPleasureEnterEvent = "TFDAfterPleasureEnter";
@@ -115,6 +128,9 @@ namespace TFD::PleasureRuntime
 		constexpr double kAbortedFlowCompleteDelaySec = 0.05;
 		constexpr double kScenePassiveHoldPendingPulseSec = 0.45;
 		constexpr double kScenePassiveHoldActivePulseSec = 3.50;
+		constexpr double kInCombatTruceRefreshIntervalSec = 20.0;
+		constexpr double kInCombatTruceRefreshDurationSec = 90.0;
+		constexpr double kInCombatTruceRefreshRetrySec = 1.0;
 
 		const char* ToString(Phase value)
 		{
@@ -155,8 +171,6 @@ namespace TFD::PleasureRuntime
 				return "Bleedout";
 			case SourceContext::Captive:
 				return "Captive";
-			case SourceContext::Victory:
-				return "Victory";
 			case SourceContext::Teammate:
 				return "Teammate";
 			case SourceContext::InCombat:
@@ -164,6 +178,15 @@ namespace TFD::PleasureRuntime
 			default:
 				return "Unknown";
 			}
+		}
+
+		bool IsSupportedSourceContext(SourceContext source)
+		{
+			return source == SourceContext::PreCombat ||
+				source == SourceContext::Bleedout ||
+				source == SourceContext::Captive ||
+				source == SourceContext::Teammate ||
+				source == SourceContext::InCombat;
 		}
 
 		SourceContext SourceFromFlowValue(int sourceFlow, SourceContext fallback)
@@ -175,8 +198,6 @@ namespace TFD::PleasureRuntime
 				return SourceContext::Bleedout;
 			case static_cast<int>(SourceContext::Captive):
 				return SourceContext::Captive;
-			case static_cast<int>(SourceContext::Victory):
-				return SourceContext::Victory;
 			case static_cast<int>(SourceContext::Teammate):
 				return SourceContext::Teammate;
 			case static_cast<int>(SourceContext::InCombat):
@@ -219,7 +240,6 @@ namespace TFD::PleasureRuntime
 			case SourceContext::InCombat:
 			case SourceContext::Bleedout:
 			case SourceContext::Captive:
-			case SourceContext::Victory:
 			case SourceContext::Teammate:
 				return true;
 			default:
@@ -409,6 +429,7 @@ namespace TFD::PleasureRuntime
 			std::uint32_t actorFormID{ 0 };
 			std::uint32_t consumedActorFormID{ 0 };
 			SourceContext source{ SourceContext::None };
+			bool bleedoutBridgeToInCombat{ false };
 			unsigned attemptIndex{ 0 };
 			bool valid{ false };
 		};
@@ -446,6 +467,7 @@ namespace TFD::PleasureRuntime
 			g_state.queuedPreCombatSpeakerFormID = 0;
 			g_state.queuedPreCombatConsumedFormID = 0;
 			g_state.queuedPreCombatSource = SourceContext::None;
+			g_state.queuedPreCombatBleedoutBridgeToInCombat = false;
 			g_state.queuedPreCombatNextTrySec = 0.0;
 			g_state.queuedPreCombatExpireSec = 0.0;
 			g_state.queuedPreCombatAttempts = 0;
@@ -605,18 +627,30 @@ namespace TFD::PleasureRuntime
 			g_state.pleasureActiveStartedAtSec = 0.0;
 			g_state.scenePassiveHoldNextPulseSec = 0.0;
 			g_state.scenePassiveHoldPulseCount = 0;
+			g_state.truceFlowHandoffRefreshNextSec = 0.0;
 		}
 
-		void ClearHoldStateLocked()
+		void ClearHoldStateLocked(bool preserveAggressionClampForBridge = false)
 		{
 			if (g_state.holdActive || g_state.passiveLockActive) {
-				TFD::HostilityController::ClearAggressionClamp();
+				if (preserveAggressionClampForBridge) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R471A] aggression clamp clear deferred for bleedout recruit bridge cycle={} source={} queuedNext={:08X} consumed={:08X}",
+						g_state.sessionCycleId,
+						ToString(g_state.source),
+						g_state.queuedPreCombatSpeakerFormID,
+						g_state.queuedPreCombatConsumedFormID);
+				}
+				else {
+					TFD::HostilityController::ClearAggressionClamp();
+				}
 			}
 			g_state.holdActive = false;
 			g_state.passiveLockActive = false;
 			g_state.blocking = false;
 			g_state.scenePassiveHoldNextPulseSec = 0.0;
 			g_state.scenePassiveHoldPulseCount = 0;
+			g_state.truceFlowHandoffRefreshNextSec = 0.0;
 		}
 
 		void ResetStateLocked(std::string_view reason)
@@ -634,6 +668,7 @@ namespace TFD::PleasureRuntime
 			g_state.abortedFlowActorFormID = 0;
 			g_state.abortedFlowCompleteDueSec = 0.0;
 			g_state.deferredInCombatRecruitActorIds.clear();
+			g_state.inCombatContinuationFromBleedoutSnapshot = false;
 
 			ClearSpeakerStateLocked();
 			ClearBridgeStateLocked();
@@ -658,6 +693,7 @@ namespace TFD::PleasureRuntime
 				g_state.pleasureActiveStartedAtSec = 0.0;
 				g_state.scenePassiveHoldNextPulseSec = 0.0;
 				g_state.scenePassiveHoldPulseCount = 0;
+				g_state.truceFlowHandoffRefreshNextSec = 0.0;
 			}
 			else if (next == Phase::PleasureActive) {
 				g_state.pleasureActiveStartedAtSec = NowSec();
@@ -707,6 +743,7 @@ namespace TFD::PleasureRuntime
 			g_state.holdActive = false;
 			g_state.passiveLockActive = false;
 			g_state.blocking = false;
+			g_state.truceFlowHandoffRefreshNextSec = 0.0;
 			ClearQueuedPreCombatCycleLocked("new_cycle");
 			ClearQueuedTerminalNeutralFinalizeLocked("new_cycle");
 
@@ -778,6 +815,7 @@ namespace TFD::PleasureRuntime
 				eventName == kPleasureEndedEvent ||
 				eventName == kOStimSceneStartPendingEvent ||
 				eventName == kOStimSceneStartedEvent ||
+				eventName == kOStimSceneSucceededEvent ||
 				eventName == kOStimSceneEndedEvent ||
 				eventName == kAfterPleasureEnterEvent ||
 				eventName == kAfterPleasureLoopEnterEvent ||
@@ -996,14 +1034,13 @@ namespace TFD::PleasureRuntime
 				reasonText);
 		}
 
-		void PrepareActorForScenePassiveLocked(RE::Actor* actor, std::string_view reason)
+		void PrepareActorForScenePassiveLocked(RE::Actor* actor, std::string_view reason, bool allowPackageEvaluation = true)
 		{
 			if (!actor || actor->IsDead() || actor->IsDisabled()) {
 				return;
 			}
 
 			const std::string reasonText = reason.empty() ? "pleasure_scene_passive_lock" : std::string{ reason };
-
 			TFD::HostilityController::ApplyAggressionClamp(actor);
 			if (auto* process = RE::ProcessLists::GetSingleton()) {
 				const bool oldRunDetection = process->runDetection;
@@ -1014,46 +1051,138 @@ namespace TFD::PleasureRuntime
 			}
 			actor->StopCombat();
 			actor->StopAlarmOnActor();
-			// R240A: no forced sheathe during scene passive lock.
-			actor->EvaluatePackage(true, false);
+			// R498A: Before QuickStart, package evaluation may settle the combat handoff.
+			// Once OStim reports a real scene start, OStim owns actor positioning and
+			// animation; evaluating the package at that point can terminate the scene.
+			if (allowPackageEvaluation) {
+				actor->EvaluatePackage(true, false);
+			}
 			TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 5, 90);
 
 			spdlog::info(
-				"[TFD][PleasureRuntime] scene passive lock actor={:08X} source={} phase={} cycle={} reason={}",
+				"[TFD][PleasureRuntime] scene passive lock actor={:08X} source={} phase={} cycle={} packageEval={} reason={}",
 				actor->GetFormID(),
 				ToString(g_state.source),
 				ToString(g_state.phase),
 				g_state.sessionCycleId,
+				allowPackageEvaluation ? 1 : 0,
 				reasonText);
+		}
+
+		bool IsScenePassiveHoldSource(SourceContext source)
+		{
+			// R454A: Bleedout-source Pleasure must remain pacified until the
+			// PleasureFailed dialogue/outcome decides whether combat resumes.
+			// InCombat uses the same shared lifecycle but owns an existing truce
+			// session that R499A renews until a terminal outcome commits.
+			return source == SourceContext::InCombat || source == SourceContext::Bleedout;
+		}
+
+		bool IsBleedoutSourceClearPhase(Phase phase)
+		{
+			switch (phase) {
+			case Phase::PleasureStartPending:
+			case Phase::PleasureActive:
+			case Phase::PleasureEnding:
+			case Phase::RedoPending:
+			case Phase::Finalizing:
+				return true;
+			default:
+				return false;
+			}
 		}
 
 		bool IsScenePassiveHoldSourceLocked()
 		{
-			// R249A: Bleedout-source Pleasure has already committed its Bleedout
-			// dialogue owner before entering PleasureRuntime.  Keeping it in the
-			// hard passive hold loop can drop the actor out of combat stance while
-			// leaving the weapon in hand, then PleasureFailed -> Fight inherits a
-			// broken animation graph.  Only true InCombat handoffs still need this
-			// repeated native StopCombat/EvaluatePackage pressure while OStim is
-			// starting.
-			return g_state.source == SourceContext::InCombat;
+			return IsScenePassiveHoldSource(g_state.source);
+		}
+
+		bool IsResultDecisionPhaseLocked()
+		{
+			return g_state.phase == Phase::AfterPleasureAwaitQuest ||
+				g_state.phase == Phase::AfterPleasureDialogue ||
+				g_state.phase == Phase::PleasureFailedDialogue;
+		}
+
+		bool IsInCombatTruceLifecyclePhaseLocked()
+		{
+			if (g_state.source != SourceContext::InCombat) {
+				return false;
+			}
+
+			switch (g_state.phase) {
+			case Phase::PleasureStartPending:
+			case Phase::PleasureActive:
+			case Phase::PleasureEnding:
+			case Phase::AfterPleasureAwaitQuest:
+			case Phase::AfterPleasureDialogue:
+			case Phase::PleasureFailedDialogue:
+			case Phase::RedoPending:
+				return true;
+			default:
+				return false;
+			}
+		}
+
+		RE::Actor* ResolveInCombatTruceLifecycleActorLocked()
+		{
+			if (IsResultDecisionPhaseLocked() && g_state.afterPleasureSpeakerFormID != 0) {
+				if (auto* actor = LookupActor(g_state.afterPleasureSpeakerFormID)) {
+					return actor;
+				}
+			}
+			return LookupActor(g_state.pleasureSpeakerFormID);
+		}
+
+		void RefreshInCombatTruceLifecycleHoldLocked(double now)
+		{
+			if (!IsInCombatTruceLifecyclePhaseLocked()) {
+				g_state.truceFlowHandoffRefreshNextSec = 0.0;
+				return;
+			}
+
+			if (g_state.truceFlowHandoffRefreshNextSec > 0.0 && now < g_state.truceFlowHandoffRefreshNextSec) {
+				return;
+			}
+
+			auto* actor = ResolveInCombatTruceLifecycleActorLocked();
+			const bool refreshed = actor && TFD::HostilityController::RefreshTruceSessionForFlowHandoff(
+				actor,
+				kInCombatTruceRefreshDurationSec,
+				"r499a_incombat_pleasure_lifecycle");
+
+			g_state.truceFlowHandoffRefreshNextSec = now +
+				(refreshed ? kInCombatTruceRefreshIntervalSec : kInCombatTruceRefreshRetrySec);
+
+			if (refreshed) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][R499A] InCombat truce lifecycle hold refreshed actor={:08X} phase={} cycle={} next={:.2f}s",
+					actor ? actor->GetFormID() : 0u,
+					ToString(g_state.phase),
+					g_state.sessionCycleId,
+					kInCombatTruceRefreshIntervalSec);
+			}
 		}
 
 		bool ShouldMaintainScenePassiveHoldLocked()
 		{
-			if (!g_state.passiveLockActive || !g_state.holdActive) {
+			if (!g_state.holdActive || !IsScenePassiveHoldSourceLocked()) {
 				return false;
 			}
 
-			if (!IsScenePassiveHoldSourceLocked()) {
+			// Result dialogue is already the owner. Keep only the lightweight
+			// aggression guard even when the old scene passiveLock flag is off.
+			if (IsResultDecisionPhaseLocked()) {
+				return true;
+			}
+
+			if (!g_state.passiveLockActive) {
 				return false;
 			}
 
-			// W33: The aggressive passive hold is only needed while OStim is still
-			// starting. Once OStim reports the scene active, repeated StopCombat /
-			// EvaluatePackage waves can fight OStim's own scene/UI state and add
-			// avoidable pressure during alignment/animation UI updates.
-			return g_state.phase == Phase::PleasureStartPending;
+			return g_state.phase == Phase::PleasureStartPending ||
+				g_state.phase == Phase::PleasureActive ||
+				g_state.phase == Phase::PleasureEnding;
 		}
 
 		void MaintainScenePassiveHoldLocked(double now)
@@ -1066,9 +1195,34 @@ namespace TFD::PleasureRuntime
 				return;
 			}
 
-			auto* actor = LookupActor(g_state.pleasureSpeakerFormID);
+			const bool resultDialogueLightHold = IsResultDecisionPhaseLocked();
+			const auto actorFormID = resultDialogueLightHold && g_state.afterPleasureSpeakerFormID != 0 ?
+				g_state.afterPleasureSpeakerFormID :
+				g_state.pleasureSpeakerFormID;
+			auto* actor = LookupActor(actorFormID);
 			if (!actor || actor->IsDead() || actor->IsDisabled()) {
 				g_state.scenePassiveHoldNextPulseSec = now + kScenePassiveHoldPendingPulseSec;
+				return;
+			}
+
+			if (resultDialogueLightHold) {
+				// Native ForceGreet owns the result dialogue. Do not clear fight
+				// reactions, stop combat/alarm, evaluate packages, or schedule waves
+				// while DialogueMenu is alive. Hooks and the session faction still
+				// block reacquisition; this only keeps aggression clamped.
+				TFD::HostilityController::ApplyAggressionClamp(actor);
+				++g_state.scenePassiveHoldPulseCount;
+				g_state.scenePassiveHoldNextPulseSec = now + kScenePassiveHoldActivePulseSec;
+
+				if (g_state.scenePassiveHoldPulseCount == 1 || (g_state.scenePassiveHoldPulseCount % 4) == 0) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R499A] result dialogue light hold actor={:08X} source={} phase={} cycle={} count={} policy=aggression_only",
+						actor->GetFormID(),
+						ToString(g_state.source),
+						ToString(g_state.phase),
+						g_state.sessionCycleId,
+						g_state.scenePassiveHoldPulseCount);
+				}
 				return;
 			}
 
@@ -1083,10 +1237,16 @@ namespace TFD::PleasureRuntime
 			actor->StopCombat();
 			actor->StopAlarmOnActor();
 			// R240A: Do not force weapon sheathe here. Once combat/alarm/pacify
-			// state is correct, Skyrim will settle the weapon naturally. Forced
-			// sheathe can break the animation graph: idle posture with weapon still
-			// in hand, then hostile actors cannot attack after Fight.
-			actor->EvaluatePackage(false, true);
+			// state is correct, Skyrim will settle the weapon naturally.
+			// R498A: The pending transition performs one deliberate pre-launch
+			// package evaluation before QuickStart. Periodic hold pulses must not repeat
+			// it while the asynchronous player thread is being created or animated.
+			const bool ostimLifecycleOwnsActor =
+				g_state.phase == Phase::PleasureStartPending ||
+				g_state.phase == Phase::PleasureActive;
+			if (!ostimLifecycleOwnsActor) {
+				actor->EvaluatePackage(false, true);
+			}
 
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			if (player) {
@@ -1102,7 +1262,7 @@ namespace TFD::PleasureRuntime
 
 			if (g_state.scenePassiveHoldPulseCount == 1 || (g_state.scenePassiveHoldPulseCount % 4) == 0) {
 				spdlog::info(
-					"[TFD][PleasureRuntime][W33] scene pending passive hold pulse actor={:08X} source={} phase={} cycle={} count={} next={:.2f}s",
+					"[TFD][PleasureRuntime][R454A] scene combat quarantine pulse actor={:08X} source={} phase={} cycle={} count={} next={:.2f}s",
 					actor->GetFormID(),
 					ToString(g_state.source),
 					ToString(g_state.phase),
@@ -1279,6 +1439,60 @@ namespace TFD::PleasureRuntime
 			return nullptr;
 		}
 
+		RE::Actor* SelectNextInCombatBleedoutSnapshotCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
+		{
+			scannedCount = 0;
+
+			const auto snapshotIds = TFD::Bleedout::GetBleedPleasureCrowdSnapshotIDs();
+			if (snapshotIds.empty()) {
+				return nullptr;
+			}
+
+			const auto currentID = currentActor ? currentActor->GetFormID() : RE::FormID{ 0 };
+			const bool currentBelongsToSnapshot = currentID != 0 &&
+				std::find(snapshotIds.begin(), snapshotIds.end(), currentID) != snapshotIds.end();
+			if (!currentBelongsToSnapshot) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][R505A] InCombat Bleedout snapshot fallback skipped current={:08X} snapshot={} reason=current_not_in_snapshot",
+					currentID,
+					static_cast<unsigned int>(snapshotIds.size()));
+				return nullptr;
+			}
+
+			std::vector<RE::Actor*> actors;
+			actors.reserve(snapshotIds.size());
+			for (const auto actorID : snapshotIds) {
+				AppendUniqueCycleActor(actors, RE::TESForm::LookupByID<RE::Actor>(actorID));
+			}
+
+			scannedCount = static_cast<unsigned>(actors.size());
+			for (auto* candidate : actors) {
+				if (IsValidPreCombatCycleCandidate(candidate, currentActor)) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R505A] InCombat Bleedout snapshot fallback selected current={:08X} next={:08X} scanned={} snapshot={}",
+						currentID,
+						candidate->GetFormID(),
+						scannedCount,
+						static_cast<unsigned int>(snapshotIds.size()));
+					return candidate;
+				}
+
+				if (candidate && candidate->GetFormID() != 0) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R505A] InCombat Bleedout snapshot candidate skipped current={:08X} candidate={:08X} reason=invalid_or_recruit_like",
+						currentID,
+						candidate->GetFormID());
+				}
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R505A] InCombat Bleedout snapshot fallback exhausted current={:08X} scanned={} snapshot={}",
+				currentID,
+				scannedCount,
+				static_cast<unsigned int>(snapshotIds.size()));
+			return nullptr;
+		}
+
 		RE::Actor* SelectNextCycleActorForSource(RE::Actor* currentActor, SourceContext source, unsigned& scannedCount)
 		{
 			scannedCount = 0;
@@ -1299,6 +1513,98 @@ namespace TFD::PleasureRuntime
 				}
 			}
 
+			if (source == SourceContext::InCombat && g_state.inCombatContinuationFromBleedoutSnapshot) {
+				unsigned fallbackScanned = 0;
+				auto* fallback = SelectNextInCombatBleedoutSnapshotCycleActor(currentActor, fallbackScanned);
+				if (fallbackScanned > scannedCount) {
+					scannedCount = fallbackScanned;
+				}
+				if (fallback) {
+					return fallback;
+				}
+			}
+
+			return nullptr;
+		}
+
+		RE::Actor* SelectNextBleedoutRecruitBridgeToInCombatActor(RE::Actor* currentActor, unsigned& scannedCount)
+		{
+			scannedCount = 0;
+
+			// R457A: R456A looked only at live native truce pools. In Bleedout ->
+			// Pleasure handoff those pools can already be cleared while the Papyrus
+			// bridge aliases still preserve the original crowd.  Do not re-scan wild
+			// hostility actors here.  Use the Bleedout-owned snapshot captured when the
+			// original Bleedout crowd was primed / when Pleasure was prepared, then fall
+			// back to the old bounded truce pools only if the snapshot is empty.
+			std::vector<RE::Actor*> actors;
+			const auto snapshotIds = TFD::Bleedout::GetBleedPleasureCrowdSnapshotIDs();
+			for (const auto actorID : snapshotIds) {
+				AppendUniqueCycleActor(actors, RE::TESForm::LookupByID<RE::Actor>(actorID));
+			}
+
+			if (!actors.empty()) {
+				scannedCount = static_cast<unsigned>(actors.size());
+				for (auto* candidate : actors) {
+					if (IsValidPreCombatCycleCandidate(candidate, currentActor)) {
+						spdlog::info(
+							"[TFD][PleasureRuntime][R457A] bleedout recruit bridge selected next InCombat speaker current={:08X} next={:08X} scanned={} pool=bleedout_snapshot snapshot={}",
+							currentActor ? currentActor->GetFormID() : 0u,
+							candidate->GetFormID(),
+							scannedCount,
+							static_cast<unsigned int>(snapshotIds.size()));
+						return candidate;
+					}
+
+					if (candidate && candidate->GetFormID() != 0) {
+						spdlog::info(
+							"[TFD][PleasureRuntime][R457A] bleedout recruit bridge snapshot candidate skipped current={:08X} candidate={:08X} snapshot={} reason=invalid_or_recruit_like",
+							currentActor ? currentActor->GetFormID() : 0u,
+							candidate->GetFormID(),
+							static_cast<unsigned int>(snapshotIds.size()));
+					}
+				}
+
+				spdlog::info(
+					"[TFD][PleasureRuntime][R457A] bleedout recruit bridge snapshot exhausted current={:08X} scanned={} snapshot={} reason=no_valid_snapshot_candidate",
+					currentActor ? currentActor->GetFormID() : 0u,
+					scannedCount,
+					static_cast<unsigned int>(snapshotIds.size()));
+			}
+
+			auto liveActors = TFD::HostilityController::CollectDialogueTruceActors(currentActor);
+			const bool usedDialogueList = !liveActors.empty();
+			if (liveActors.empty()) {
+				liveActors = TFD::HostilityController::CollectActiveTruceActors(currentActor);
+			}
+
+			scannedCount = static_cast<unsigned>(liveActors.size());
+			for (auto* candidate : liveActors) {
+				if (IsValidPreCombatCycleCandidate(candidate, currentActor)) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R456A] bleedout recruit bridge selected next InCombat speaker current={:08X} next={:08X} scanned={} pool={}",
+						currentActor ? currentActor->GetFormID() : 0u,
+						candidate->GetFormID(),
+						scannedCount,
+						usedDialogueList ? "dialogue_truce" : "active_truce");
+					return candidate;
+				}
+
+				if (candidate && candidate->GetFormID() != 0) {
+					spdlog::info(
+						"[TFD][PleasureRuntime][R456A] bleedout recruit bridge candidate skipped current={:08X} candidate={:08X} pool={} reason=invalid_or_recruit_like",
+						currentActor ? currentActor->GetFormID() : 0u,
+						candidate->GetFormID(),
+						usedDialogueList ? "dialogue_truce" : "active_truce");
+				}
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R457A] bleedout recruit bridge no InCombat speaker current={:08X} snapshot={} liveScanned={} livePool={}",
+				currentActor ? currentActor->GetFormID() : 0u,
+				static_cast<unsigned int>(snapshotIds.size()),
+				scannedCount,
+				usedDialogueList ? "dialogue_truce" : "active_truce");
 			return nullptr;
 		}
 
@@ -1307,7 +1613,16 @@ namespace TFD::PleasureRuntime
 			return SelectNextCycleActorForSource(currentActor, g_state.source, scannedCount);
 		}
 
-		void QueuePreCombatCycleLocked(RE::Actor* nextActor, RE::Actor* currentActor, unsigned scannedCount, std::string_view reason)
+		RE::Actor* SelectNextRecruitCycleActor(RE::Actor* currentActor, unsigned& scannedCount)
+		{
+			if (g_state.source == SourceContext::Bleedout) {
+				return SelectNextBleedoutRecruitBridgeToInCombatActor(currentActor, scannedCount);
+			}
+
+			return SelectNextPreCombatCycleActor(currentActor, scannedCount);
+		}
+
+		void QueuePreCombatCycleLocked(RE::Actor* nextActor, RE::Actor* currentActor, unsigned scannedCount, std::string_view reason, bool bleedoutBridgeToInCombat = false)
 		{
 			if (!nextActor) {
 				spdlog::info(
@@ -1324,16 +1639,18 @@ namespace TFD::PleasureRuntime
 			g_state.queuedPreCombatSpeakerFormID = nextActor->GetFormID();
 			g_state.queuedPreCombatConsumedFormID = currentActor ? currentActor->GetFormID() : 0;
 			g_state.queuedPreCombatSource = g_state.source;
+			g_state.queuedPreCombatBleedoutBridgeToInCombat = bleedoutBridgeToInCombat;
 			g_state.queuedPreCombatNextTrySec = now + kPreCombatCycleInitialDelaySec;
 			g_state.queuedPreCombatExpireSec = now + kPreCombatCycleExpireSec;
 			g_state.queuedPreCombatAttempts = 0;
 
 			spdlog::info(
-				"[TFD][PleasureRuntime] after pleasure cycle queued current={:08X} next={:08X} scanned={} source={} delay={:.2f}s expire={:.2f}s reason={}",
+				"[TFD][PleasureRuntime] after pleasure cycle queued current={:08X} next={:08X} scanned={} source={} bridgeBleedoutToInCombat={} delay={:.2f}s expire={:.2f}s reason={}",
 				currentActor ? currentActor->GetFormID() : 0u,
 				nextActor->GetFormID(),
 				scannedCount,
 				ToString(g_state.source),
+				bleedoutBridgeToInCombat ? 1 : 0,
 				kPreCombatCycleInitialDelaySec,
 				kPreCombatCycleExpireSec,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
@@ -1347,8 +1664,16 @@ namespace TFD::PleasureRuntime
 			}
 
 			unsigned scannedCount = 0;
-			auto* nextActor = SelectNextPreCombatCycleActor(recruitedActor, scannedCount);
-			QueuePreCombatCycleLocked(nextActor, recruitedActor, scannedCount, "after_pleasure_recruit_cycle");
+			auto* nextActor = SelectNextRecruitCycleActor(recruitedActor, scannedCount);
+
+			QueuePreCombatCycleLocked(
+				nextActor,
+				recruitedActor,
+				scannedCount,
+				g_state.source == SourceContext::Bleedout ?
+					"after_pleasure_recruit_bleedout_bridge_to_incombat_cycle" :
+					"after_pleasure_recruit_cycle",
+				g_state.source == SourceContext::Bleedout && nextActor != nullptr);
 			return nextActor != nullptr;
 		}
 
@@ -1392,6 +1717,7 @@ namespace TFD::PleasureRuntime
 			attempt.actorFormID = g_state.queuedPreCombatSpeakerFormID;
 			attempt.consumedActorFormID = g_state.queuedPreCombatConsumedFormID;
 			attempt.source = g_state.queuedPreCombatSource;
+			attempt.bleedoutBridgeToInCombat = g_state.queuedPreCombatBleedoutBridgeToInCombat;
 			attempt.attemptIndex = g_state.queuedPreCombatAttempts;
 			attempt.valid = true;
 			return attempt;
@@ -1405,6 +1731,14 @@ namespace TFD::PleasureRuntime
 
 			const double now = NowSec();
 			if (success) {
+				if (attempt.source == SourceContext::Bleedout && attempt.bleedoutBridgeToInCombat) {
+					g_state.inCombatContinuationFromBleedoutSnapshot = true;
+					spdlog::info(
+						"[TFD][PleasureRuntime][R505A] InCombat continuation adopted Bleedout snapshot actor={:08X} consumed={:08X} attempt={}",
+						attempt.actorFormID,
+						attempt.consumedActorFormID,
+						attempt.attemptIndex);
+				}
 				ClearQueuedPreCombatCycleLocked("begin_ok");
 				return;
 			}
@@ -1525,6 +1859,7 @@ namespace TFD::PleasureRuntime
 			g_state.redoPending = false;
 			g_state.flowOwnerToken = 0;
 			g_state.pendingChoice = AfterChoice::None;
+			g_state.inCombatContinuationFromBleedoutSnapshot = false;
 			ClearSpeakerStateLocked();
 			ClearBridgeStateLocked();
 
@@ -1568,6 +1903,62 @@ namespace TFD::PleasureRuntime
 			return false;
 		}
 
+		bool ShouldTolerateCombatFlagAtSceneEndLocked(double activeDuration)
+		{
+			// R468A: In combat-owned and bleedout-owned pleasure scenes often still
+			// report vanilla combat flags at OStim end because nearby enemies are
+			// only quarantined, not globally neutralized.  Once OStim has been
+			// established for the minimum active duration, that flag is not an
+			// abort signal.  The next owner must be AfterPleasure, not generic
+			// PleasureFailed/Recovery cleanup.
+			if (activeDuration < kMinimumSceneActiveSec) {
+				return false;
+			}
+
+			return g_state.source == SourceContext::Bleedout ||
+				g_state.source == SourceContext::InCombat;
+		}
+
+		bool IsBleedoutRecruitSettleReason(std::string_view reason)
+		{
+			return reason.find("bleedout") != std::string_view::npos;
+		}
+
+		void StabilizeBleedoutRecruitSettle(RE::Actor* actor, std::string_view reason)
+		{
+			if (!actor || actor->IsDisabled() || actor->IsDead()) {
+				return;
+			}
+
+			auto* player = RE::PlayerCharacter::GetSingleton();
+			auto* process = RE::ProcessLists::GetSingleton();
+			if (process) {
+				process->StopCombatAndAlarmOnActor(actor, false);
+			}
+			actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+			actor->StopCombat();
+			actor->StopAlarmOnActor();
+			actor->SetBeenAttacked(false);
+
+			if (player) {
+				auto* target = player->GetActorRuntimeData().currentCombatTarget.get().get();
+				if (target && target->GetFormID() == actor->GetFormID()) {
+					player->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+				}
+			}
+
+			if (auto* owner = actor->AsActorValueOwner()) {
+				owner->SetActorValue(RE::ActorValue::kAggression, 0.0f);
+				owner->SetActorValue(RE::ActorValue::kConfidence, 1.0f);
+				owner->SetActorValue(RE::ActorValue::kAssistance, 0.0f);
+			}
+
+			spdlog::info(
+				"[TFD][PleasureRuntime][R453A] bleedout recruit settle guard actor={:08X} reason={} policy=no_runtime_profile_no_package_eval_stop_combat",
+				actor->GetFormID(),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
 		double GetActiveSceneDurationLocked()
 		{
 			if (g_state.pleasureActiveStartedAtSec <= 0.0) {
@@ -1589,6 +1980,78 @@ namespace TFD::PleasureRuntime
 				ToString(g_state.source),
 				kAbortedFlowCompleteDelaySec,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
+		}
+
+		bool RouteBleedoutAbortToPleasureFailedLocked(const EventInfo& info, std::string_view eventName)
+		{
+			if (g_state.source != SourceContext::Bleedout) {
+				return false;
+			}
+
+			if (eventName != kPleasureAbortedEvent && eventName != kPleasureFailedEvent) {
+				return false;
+			}
+
+			switch (g_state.phase) {
+			case Phase::PleasureStartPending:
+			case Phase::PleasureActive:
+			case Phase::PleasureEnding:
+			case Phase::RedoPending:
+			case Phase::AfterPleasureAwaitQuest:
+			case Phase::AfterPleasureDialogue:
+				break;
+			case Phase::PleasureFailedDialogue:
+				return true;
+			default:
+				return false;
+			}
+
+			auto* failedActor = ResolveEventOrTrackedActorLocked(info);
+			if (!failedActor || failedActor->IsDead() || failedActor->IsDisabled()) {
+				failedActor = LookupActor(g_state.pleasureSpeakerFormID);
+			}
+
+			if (!failedActor || failedActor->IsDead() || failedActor->IsDisabled()) {
+				spdlog::warn(
+					"[TFD][PleasureRuntime][R461A] bleedout abort failed dialogue rejected invalid actor event={} eventActor={:08X} tracked={:08X} phase={} source={}",
+					std::string(eventName),
+					info.actorFormID,
+					g_state.pleasureSpeakerFormID,
+					ToString(g_state.phase),
+					ToString(g_state.source));
+				return false;
+			}
+
+			const auto failedActorFormID = failedActor->GetFormID();
+			g_state.afterPleasureSpeakerFormID = failedActorFormID;
+			g_state.afterPleasureCommitted = true;
+			g_state.pleasureFailedDialogueActive = true;
+			g_state.pendingChoice = AfterChoice::None;
+			g_state.redoPending = false;
+			g_state.blocking = true;
+			g_state.holdActive = true;
+			g_state.passiveLockActive = false;
+			g_state.afterPleasureDialogueExpireSec = 0.0;
+			PreparePleasureFailedPackageActor(failedActor, "r461_bleedout_abort_to_pleasure_failed");
+			AdvancePhaseLocked(Phase::PleasureFailedDialogue, "r461_bleedout_abort_to_pleasure_failed");
+
+			const std::string failedArg =
+				std::to_string(failedActorFormID) + "|" +
+				std::to_string(static_cast<int>(SourceContext::Bleedout));
+			const bool queued = TFD::FlowController::QueueBridgeModEvent(
+				kPleasureFailedEnterEvent,
+				failedActor,
+				failedArg.c_str(),
+				0.0f);
+
+			spdlog::warn(
+				"[TFD][PleasureRuntime][R461A] bleedout abort routed to PleasureFailed actor={:08X} cycle={} event={} queued={} arg={} policy=no_neutral_abort",
+				failedActorFormID,
+				g_state.sessionCycleId,
+				std::string(eventName),
+				queued ? 1 : 0,
+				failedArg);
+			return true;
 		}
 
 		QueuedAbortedFlowComplete TakeDueAbortedFlowCompleteLocked(double nowSec)
@@ -1675,8 +2138,9 @@ namespace TFD::PleasureRuntime
 			const bool bleedoutSource = g_state.source == SourceContext::Bleedout;
 			const bool deferredChainSource = inCombatSource || bleedoutSource;
 			unsigned preCommitScannedCount = 0;
-			RE::Actor* predictedNextActor = deferredChainSource ? SelectNextPreCombatCycleActor(actor, preCommitScannedCount) : nullptr;
+			RE::Actor* predictedNextActor = deferredChainSource ? SelectNextRecruitCycleActor(actor, preCommitScannedCount) : nullptr;
 			const bool deferredChainWillContinue = deferredChainSource && predictedNextActor != nullptr;
+			const bool bleedoutRecruitSettleGuard = bleedoutSource;
 
 			TFD::Recruit::MarkRecruitCommitPending(
 				actor,
@@ -1691,11 +2155,11 @@ namespace TFD::PleasureRuntime
 				"after_pleasure_recruit_commit";
 			options.quarantineHostileFactions = true;
 			options.clearCombat = true;
-			options.evaluatePackage = !deferredChainWillContinue;
+			options.evaluatePackage = !(deferredChainWillContinue || bleedoutRecruitSettleGuard);
 			options.detailedLog = true;
 			options.throttleObserve = false;
 			options.ensurePacifyAlliance = true;
-			options.applyRuntimeProfile = !deferredChainWillContinue;
+			options.applyRuntimeProfile = !(deferredChainWillContinue || bleedoutRecruitSettleGuard);
 
 			if (deferredChainWillContinue) {
 				spdlog::info(
@@ -1708,16 +2172,39 @@ namespace TFD::PleasureRuntime
 
 			const auto result = TFD::Recruit::CommitRecruit(actor, options);
 			const bool clean = result.attempted && !result.skipped && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
+			const bool bleedoutBridgeClean = bleedoutSource &&
+				result.attempted &&
+				!result.skipped &&
+				result.hostileFactionMatchesAfter == 0 &&
+				TFD::Recruit::IsRecruitLike(actor);
+			const bool chainClean = clean || bleedoutBridgeClean;
+
+			if (bleedoutBridgeClean && !clean) {
+				spdlog::info(
+					"[TFD][PleasureRuntime][R485A] bleedout recruit bridge accepted stale raw hostility actor={:08X} rawAfter={} hostileAfter={} recruitLike=1 predictedNext={:08X} scanned={} policy=queue_handoff_not_neutralize",
+					actorFormID,
+					result.rawHostileAfter ? 1 : 0,
+					result.hostileFactionMatchesAfter,
+					predictedNextActor ? predictedNextActor->GetFormID() : 0u,
+					preCommitScannedCount);
+			}
+
+			if (chainClean && bleedoutRecruitSettleGuard) {
+				StabilizeBleedoutRecruitSettle(actor, "after_pleasure_recruit_bleedout_settle_guard");
+			}
 			bool aliasRegistered = false;
 
 			bool queuedNextCycle = false;
-			if (clean) {
+			if (chainClean) {
 				queuedNextCycle = QueueNextPreCombatCycleIfNeededLocked(actor, true);
-				if ((g_state.source == SourceContext::InCombat || g_state.source == SourceContext::Bleedout) && queuedNextCycle) {
-					DeferInCombatRecruitAliasLocked(actor, g_state.source == SourceContext::Bleedout ? "after_pleasure_recruit_bleedout_chain_active" : "after_pleasure_recruit_chain_active");
-					(void)TFD::HostilityController::DemoteTruceActorForCycleHold(actor, g_state.source == SourceContext::Bleedout ? "after_pleasure_recruit_bleedout_chain_defer" : "after_pleasure_recruit_chain_defer");
-					// R130: Bleedout now follows the same deferred recruit/crowd-cycle pattern as InCombat.
-					// Do not evaluate or register the converted speaker until the next crowd speaker is armed.
+				if ((g_state.source == SourceContext::InCombat || g_state.source == SourceContext::Bleedout) && (queuedNextCycle || bleedoutRecruitSettleGuard)) {
+					const char* deferReason = g_state.source == SourceContext::Bleedout ?
+						(queuedNextCycle ? "after_pleasure_recruit_bleedout_chain_active" : "after_pleasure_recruit_bleedout_settle_no_candidate") :
+						"after_pleasure_recruit_chain_active";
+					DeferInCombatRecruitAliasLocked(actor, deferReason);
+					(void)TFD::HostilityController::DemoteTruceActorForCycleHold(actor, g_state.source == SourceContext::Bleedout ? "after_pleasure_recruit_bleedout_settle_defer" : "after_pleasure_recruit_chain_defer");
+					// R453A: Bleedout recruits must not receive teammate package/runtime aggression
+					// before the next speaker/fallback is stable. Keep them in passive settle hold.
 				}
 				else {
 					aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNow(actor, "after_pleasure_recruit_commit");
@@ -1725,24 +2212,26 @@ namespace TFD::PleasureRuntime
 				}
 			}
 
-			if (clean) {
+			if (chainClean) {
 				spdlog::info(
-					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} rawAfter={} hostileAfter={} aliasRegistered={} reason={}",
+					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} bridgeClean={} rawAfter={} hostileAfter={} aliasRegistered={} queuedNext={} reason={}",
 					actorFormID,
 					g_state.sessionCycleId,
 					ToString(g_state.source),
 					info.sourceFlow,
 					result.attempted ? 1 : 0,
 					result.skipped ? 1 : 0,
-					1,
+					clean ? 1 : 0,
+					bleedoutBridgeClean ? 1 : 0,
 					result.rawHostileAfter ? 1 : 0,
 					result.hostileFactionMatchesAfter,
 					aliasRegistered ? 1 : 0,
+					queuedNextCycle ? 1 : 0,
 					"after_pleasure_recruit_commit");
 			}
 			else {
 				spdlog::warn(
-					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} rawAfter={} hostileAfter={} aliasRegistered={} reason={}",
+					"[TFD][PleasureRuntime] after pleasure recruit commit actor={:08X} cycle={} source={} eventFlow={} attempted={} skipped={} clean={} bridgeClean={} rawAfter={} hostileAfter={} aliasRegistered={} queuedNext={} reason={}",
 					actorFormID,
 					g_state.sessionCycleId,
 					ToString(g_state.source),
@@ -1750,17 +2239,19 @@ namespace TFD::PleasureRuntime
 					result.attempted ? 1 : 0,
 					result.skipped ? 1 : 0,
 					0,
+					0,
 					result.rawHostileAfter ? 1 : 0,
 					result.hostileFactionMatchesAfter,
 					aliasRegistered ? 1 : 0,
+					queuedNextCycle ? 1 : 0,
 					"commit_not_clean_no_alias");
 			}
 
-			if (!clean) {
+			if (!chainClean) {
 				(void)QueueNextPreCombatCycleIfNeededLocked(actor, false);
 			}
 
-			return clean;
+			return chainClean;
 		}
 
 		bool FinalizeConsumedInCombatRecruitForCycle(RE::Actor* consumedActor, RE::Actor* nextActor, std::string_view reason)
@@ -1794,16 +2285,18 @@ namespace TFD::PleasureRuntime
 				TFD::Recruit::SourceFlow::Pleasure,
 				"incombat_consumed_recruit_cycle_finalize_pending");
 
+			const bool bleedoutSettle = IsBleedoutRecruitSettleReason(reason);
+
 			TFD::Recruit::CommitOptions options{};
 			options.sourceFlow = TFD::Recruit::SourceFlow::Pleasure;
-			options.reason = "incombat_consumed_recruit_cycle_finalize";
+			options.reason = bleedoutSettle ? "bleedout_consumed_recruit_cycle_finalize" : "incombat_consumed_recruit_cycle_finalize";
 			options.quarantineHostileFactions = true;
 			options.clearCombat = true;
-			options.evaluatePackage = true;
+			options.evaluatePackage = !bleedoutSettle;
 			options.detailedLog = true;
 			options.throttleObserve = false;
 			options.ensurePacifyAlliance = true;
-			options.applyRuntimeProfile = true;
+			options.applyRuntimeProfile = !bleedoutSettle;
 
 			const auto result = TFD::Recruit::CommitRecruit(consumedActor, options);
 			const bool recruitLikeClean =
@@ -1813,6 +2306,10 @@ namespace TFD::PleasureRuntime
 			const bool settledClean = result.attempted && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
 			const bool finalizeOk = settledClean || recruitLikeClean;
 
+			if (finalizeOk && bleedoutSettle) {
+				StabilizeBleedoutRecruitSettle(consumedActor, reason.empty() ? "bleedout_consumed_recruit_cycle_finalize" : reason);
+			}
+
 			bool truceReleased = false;
 			bool aliasRegistered = false;
 			if (finalizeOk) {
@@ -1820,9 +2317,13 @@ namespace TFD::PleasureRuntime
 					consumedActor,
 					TFD::HostilityController::ReleaseReason::FlowHandoff,
 					"incombat_consumed_recruit_cycle_finalize");
-				aliasRegistered = TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(
-					consumedActor,
-					"incombat_consumed_recruit_cycle_finalize");
+				aliasRegistered = bleedoutSettle ?
+					TFD::TeammateManager::RegisterOrRefreshTeammateNowDeferredPackage(
+						consumedActor,
+						"bleedout_consumed_recruit_cycle_finalize") :
+					TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(
+						consumedActor,
+						"incombat_consumed_recruit_cycle_finalize");
 				TFD::TeammateManager::RefreshRecruitCapacityGlobals("incombat_consumed_recruit_cycle_finalize");
 			}
 
@@ -1849,6 +2350,11 @@ namespace TFD::PleasureRuntime
 				const auto oldPhase = g_state.phase;
 				const auto oldSource = g_state.source;
 				const auto oldCycle = g_state.sessionCycleId;
+				const auto eventSource = SourceFromFlowValue(info.sourceFlow, oldSource);
+				const bool hadBleedoutPleasureOwner =
+					eventSource == SourceContext::Bleedout &&
+					IsBleedoutSourceClearPhase(oldPhase) &&
+					(g_state.active || g_state.blocking || g_state.holdActive || g_state.passiveLockActive);
 				auto* clearActor = ResolveEventOrTrackedActorLocked(info);
 
 				ClearQueuedPreCombatCycleLocked(eventName);
@@ -1859,6 +2365,7 @@ namespace TFD::PleasureRuntime
 				g_state.abortedFlowActorFormID = 0;
 				g_state.abortedFlowCompleteDueSec = 0.0;
 				g_state.afterPleasureCommitted = false;
+				g_state.pleasureFailedDialogueActive = false;
 				g_state.active = false;
 				g_state.blocking = false;
 				g_state.phase = Phase::Closed;
@@ -1868,13 +2375,23 @@ namespace TFD::PleasureRuntime
 				ClearHoldStateLocked();
 				ClearSpeakerStateLocked();
 
+				bool bleedoutNeutralized = false;
+				if (hadBleedoutPleasureOwner) {
+					TFD::ForceGreetState::ResetBleedout();
+					TFD::ForceGreetState::ResetPleasureFailed();
+					TFD::ForceGreetState::ResetAfterPleasure();
+					bleedoutNeutralized = TFD::Bleedout::CompletePleasureCycleChainNeutral("r512a_bleedout_source_pleasure_clear");
+				}
+
 				spdlog::info(
-					"[TFD][PleasureRuntime][W32] clear event accepted event={} actor={:08X} oldPhase={} oldSource={} oldCycle={} reason=papyrus_or_system_clear",
+					"[TFD][PleasureRuntime][W32] clear event accepted event={} actor={:08X} oldPhase={} oldSource={} eventSource={} oldCycle={} bleedoutNeutralized={} reason=papyrus_or_system_clear",
 					std::string{ eventName },
 					clearActor ? clearActor->GetFormID() : info.actorFormID,
 					ToString(oldPhase),
 					ToString(oldSource),
-					oldCycle);
+					ToString(eventSource),
+					oldCycle,
+					bleedoutNeutralized ? 1 : 0);
 				return;
 			}
 
@@ -1893,11 +2410,15 @@ namespace TFD::PleasureRuntime
 						return;
 					}
 
+
 					BeginNewCycleLocked(eventActor, eventSource, eventName);
+					if (eventName == kOStimSceneStartPendingEvent && info.threadID >= 0) {
+						g_state.ostimThreadId = static_cast<std::uint32_t>(info.threadID);
+					}
 					AdvancePhaseLocked(Phase::PleasureStartPending, eventName);
 					g_state.blocking = true;
 					g_state.holdActive = true;
-					if (eventSource == SourceContext::InCombat) {
+					if (IsScenePassiveHoldSource(eventSource)) {
 						g_state.passiveLockActive = true;
 						PrepareActorForScenePassiveLocked(eventActor, "scene_start_pending_passive_lock");
 						SuppressActorDialogueForSceneLocked(eventActor, "scene_start_pending_suppress_dialogue");
@@ -1919,6 +2440,12 @@ namespace TFD::PleasureRuntime
 					return;
 				}
 				if (g_state.phase == Phase::PleasureStartPending) {
+					if (eventName == kOStimSceneStartPendingEvent && info.threadID >= 0) {
+						g_state.ostimThreadId = static_cast<std::uint32_t>(info.threadID);
+						g_state.scenePassiveHoldNextPulseSec = 0.0;
+						LogEventAcceptedLocked(eventName, info, "r498a_quickstart_thread_armed_no_package_eval");
+						return;
+					}
 					LogEventIgnoredLocked(eventName, "already_pending", info);
 					return;
 				}
@@ -1928,12 +2455,20 @@ namespace TFD::PleasureRuntime
 
 			if (eventName == kPleasureStartedEvent || eventName == kOStimSceneStartedEvent) {
 				if (g_state.phase == Phase::PleasureStartPending) {
+					if (info.threadID >= 0) {
+						g_state.ostimThreadId = static_cast<std::uint32_t>(info.threadID);
+					}
 					AdvancePhaseLocked(Phase::PleasureActive, eventName);
 					g_state.holdActive = true;
-					if (g_state.source == SourceContext::InCombat) {
+					if (IsScenePassiveHoldSource(g_state.source)) {
 						g_state.passiveLockActive = true;
-						PrepareActorForScenePassiveLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_passive_lock");
-						SuppressActorDialogueForSceneLocked(info.actor ? info.actor : LookupActor(info.actorFormID), "scene_started_suppress_dialogue");
+						PrepareActorForScenePassiveLocked(
+							info.actor ? info.actor : LookupActor(info.actorFormID),
+							"r498a_scene_started_passive_lock_no_package_eval",
+							false);
+						SuppressActorDialogueForSceneLocked(
+							info.actor ? info.actor : LookupActor(info.actorFormID),
+							"scene_started_suppress_dialogue");
 					}
 					else {
 						g_state.passiveLockActive = false;
@@ -1954,22 +2489,47 @@ namespace TFD::PleasureRuntime
 				return;
 			}
 
-			if (eventName == kPleasureEndedEvent || eventName == kOStimSceneEndedEvent) {
+			if (eventName == kOStimSceneEndedEvent) {
+				// R498A: Generic scene-ended remains a result-neutral compatibility
+				// notification for existing Papyrus listeners. It must never decide
+				// AfterPleasure versus PleasureFailed.
+				spdlog::info(
+					"[TFD][PleasureRuntime][R498A] terminal notification accepted actor={:08X} cycle={} source={} phase={} event={}",
+					info.actorFormID,
+					g_state.sessionCycleId,
+					ToString(g_state.source),
+					ToString(g_state.phase),
+					std::string{ eventName });
+				return;
+			}
+
+			if (eventName == kPleasureEndedEvent ||
+				eventName == kOStimSceneSucceededEvent) {
 				if (g_state.phase == Phase::PleasureActive) {
 					auto* eventActor = ResolveEventOrTrackedActorLocked(info);
 					const double activeDuration = GetActiveSceneDurationLocked();
 					const bool shortScene = activeDuration < kMinimumSceneActiveSec;
 					const bool combatUnsafe = IsSceneCombatUnsafe(eventActor);
+					const bool combatFlagTolerated = combatUnsafe && ShouldTolerateCombatFlagAtSceneEndLocked(activeDuration);
+					const bool authoritativeOStimSuccess = eventName == kOStimSceneSucceededEvent;
 
-					if (shortScene || combatUnsafe) {
+					// R498A: TFDOStimSceneSucceeded is emitted only after Papyrus has
+					// claimed the scene terminal and confirmed the speaker climax. Native
+					// must not reinterpret that result from duration or a late combat flag.
+					// Keep the old safety policy for the unused legacy
+					// TFDPreCombatPleasureEnded route so compatibility behavior does not
+					// silently become more permissive.
+					if (!authoritativeOStimSuccess &&
+						(shortScene || (combatUnsafe && !combatFlagTolerated))) {
 						spdlog::warn(
-							"[TFD][PleasureRuntime] scene end rejected actor={:08X} cycle={} source={} duration={:.2f}s min={:.2f}s combatUnsafe={} reason={} no_afterpleasure=1",
+							"[TFD][PleasureRuntime] legacy scene end rejected actor={:08X} cycle={} source={} duration={:.2f}s min={:.2f}s combatUnsafe={} tolerated={} reason={} no_afterpleasure=1",
 							eventActor ? eventActor->GetFormID() : info.actorFormID,
 							g_state.sessionCycleId,
 							ToString(g_state.source),
 							activeDuration,
 							kMinimumSceneActiveSec,
 							combatUnsafe ? 1 : 0,
+							combatFlagTolerated ? 1 : 0,
 							std::string{ eventName });
 
 						AdvancePhaseLocked(Phase::Finalizing, "scene_rejected_no_afterpleasure");
@@ -1983,22 +2543,76 @@ namespace TFD::PleasureRuntime
 						return;
 					}
 
+					if (authoritativeOStimSuccess && (shortScene || combatUnsafe)) {
+						spdlog::warn(
+							"[TFD][PleasureRuntime][R498A] authoritative OStim success accepted actor={:08X} cycle={} source={} duration={:.2f}s min={:.2f}s combatUnsafe={} event={}",
+							eventActor ? eventActor->GetFormID() : info.actorFormID,
+							g_state.sessionCycleId,
+							ToString(g_state.source),
+							activeDuration,
+							kMinimumSceneActiveSec,
+							combatUnsafe ? 1 : 0,
+							std::string{ eventName });
+					}
+
+					if (authoritativeOStimSuccess && combatUnsafe) {
+						// Preserve the encounter while the authoritative AfterPleasure
+						// result is handed to the quest/dialogue owner.
+						g_state.holdActive = true;
+						g_state.passiveLockActive = true;
+						g_state.scenePassiveHoldNextPulseSec = 0.0;
+						TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 6, 75);
+					}
+					else if (combatFlagTolerated) {
+						// Preserve the baseline tolerance for the legacy result event.
+						g_state.holdActive = true;
+						g_state.passiveLockActive = true;
+						g_state.scenePassiveHoldNextPulseSec = 0.0;
+						TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 6, 75);
+						spdlog::warn(
+							"[TFD][PleasureRuntime][R468A] legacy scene end combat flag tolerated actor={:08X} cycle={} source={} duration={:.2f}s reason={} afterpleasure=1",
+							eventActor ? eventActor->GetFormID() : info.actorFormID,
+							g_state.sessionCycleId,
+							ToString(g_state.source),
+							activeDuration,
+							std::string{ eventName });
+					}
+
 					const auto afterSpeakerFormID = info.actorFormID ? info.actorFormID : g_state.pleasureSpeakerFormID;
 
 					AdvancePhaseLocked(Phase::PleasureEnding, eventName);
 
 					g_state.afterPleasureSpeakerFormID = afterSpeakerFormID;
 					g_state.afterPleasureCommitted = false;
+					g_state.pleasureFailedDialogueActive = false;
 					g_state.pendingChoice = AfterChoice::None;
 					g_state.redoPending = false;
 					g_state.blocking = true;
 
 					if (auto* afterActor = LookupActor(afterSpeakerFormID)) {
-						PrepareAfterPleasurePackageActor(afterActor, "scene_end_await_after_dialogue");
+						if (IsScenePassiveHoldSourceLocked()) {
+							g_state.holdActive = true;
+							g_state.passiveLockActive = true;
+							g_state.scenePassiveHoldNextPulseSec = 0.0;
+							PrepareActorForScenePassiveLocked(afterActor, "r498a_success_afterpleasure_passive_lock");
+							TFD::HostilityController::ScheduleStopCombatWaves(2400.0f, false, 8, 60);
+						}
+						PrepareAfterPleasurePackageActor(afterActor, "r498a_success_await_after_dialogue");
 					}
 
 					AdvancePhaseLocked(Phase::AfterPleasureAwaitQuest, eventName);
-					LogEventAcceptedLocked(eventName, info, "await_after_dialogue_package_owned");
+					LogEventAcceptedLocked(
+						eventName,
+						info,
+						authoritativeOStimSuccess ? "r498a_success_committed" : "r498a_legacy_success_committed");
+					return;
+				}
+				if (g_state.phase == Phase::AfterPleasureAwaitQuest || g_state.phase == Phase::AfterPleasureDialogue) {
+					LogEventIgnoredLocked(eventName, "duplicate_success_result", info);
+					return;
+				}
+				if (g_state.phase == Phase::PleasureFailedDialogue) {
+					LogEventIgnoredLocked(eventName, "stale_success_after_failure_committed", info);
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);
@@ -2006,12 +2620,17 @@ namespace TFD::PleasureRuntime
 			}
 
 			if (eventName == kPleasureFailedEnterEvent) {
+				if (g_state.phase == Phase::AfterPleasureAwaitQuest || g_state.phase == Phase::AfterPleasureDialogue) {
+					LogEventIgnoredLocked(eventName, "stale_failure_after_success_committed", info);
+					return;
+				}
+				if (g_state.phase == Phase::PleasureFailedDialogue) {
+					LogEventIgnoredLocked(eventName, "duplicate_failure_result", info);
+					return;
+				}
 				if (g_state.phase == Phase::PleasureStartPending ||
 					g_state.phase == Phase::PleasureActive ||
-					g_state.phase == Phase::PleasureEnding ||
-					g_state.phase == Phase::AfterPleasureAwaitQuest ||
-					g_state.phase == Phase::AfterPleasureDialogue ||
-					g_state.phase == Phase::PleasureFailedDialogue) {
+					g_state.phase == Phase::PleasureEnding) {
 					auto* failedActor = ResolveEventOrTrackedActorLocked(info);
 					if (!failedActor || failedActor->IsDead() || failedActor->IsDisabled()) {
 						spdlog::warn(
@@ -2038,14 +2657,11 @@ namespace TFD::PleasureRuntime
 					g_state.redoPending = false;
 					g_state.blocking = true;
 					g_state.holdActive = true;
-					// R203A: hold the runtime route, but do not arm the AfterPleasure
-					// passive lock for Pleasure Failed.  The new Aggressor alias/package
-					// owns the forcegreet posture until a terminal choice is selected.
 					g_state.passiveLockActive = false;
 					g_state.afterPleasureDialogueExpireSec = 0.0;
-					PreparePleasureFailedPackageActor(failedActor, "pleasure_failed_dialogue");
+					PreparePleasureFailedPackageActor(failedActor, "r498a_pleasure_failed_committed");
 					AdvancePhaseLocked(Phase::PleasureFailedDialogue, eventName);
-					LogEventAcceptedLocked(eventName, info, "r223a_pleasure_failed_independent_dialogue_open");
+					LogEventAcceptedLocked(eventName, info, "r498a_failure_committed");
 					return;
 				}
 				LogEventIgnoredLocked(eventName, "wrong_phase", info);
@@ -2073,6 +2689,15 @@ namespace TFD::PleasureRuntime
 			}
 
 			if (eventName == kPleasureFailedEvent || eventName == kPleasureAbortedEvent) {
+				if (g_state.phase == Phase::AfterPleasureAwaitQuest || g_state.phase == Phase::AfterPleasureDialogue) {
+					LogEventIgnoredLocked(eventName, "stale_failure_or_abort_after_success_committed", info);
+					return;
+				}
+				if (RouteBleedoutAbortToPleasureFailedLocked(info, eventName)) {
+					LogEventAcceptedLocked(eventName, info, "r461_bleedout_abort_to_pleasure_failed");
+					return;
+				}
+
 				if (g_state.phase == Phase::PleasureStartPending || g_state.phase == Phase::PleasureActive || g_state.phase == Phase::PleasureEnding || g_state.phase == Phase::RedoPending || g_state.phase == Phase::AfterPleasureDialogue || g_state.phase == Phase::PleasureFailedDialogue) {
 					auto* eventActor = ResolveEventOrTrackedActorLocked(info);
 					AdvancePhaseLocked(Phase::Finalizing, eventName);
@@ -2153,8 +2778,8 @@ namespace TFD::PleasureRuntime
 				AdvancePhaseLocked(Phase::Finalizing, eventName);
 				AdvancePhaseLocked(Phase::Closed, eventName);
 
+				auto* terminalActor = ResolveEventOrTrackedActorLocked(info);
 				{
-					auto* terminalActor = ResolveEventOrTrackedActorLocked(info);
 					const bool sourceIsCaptive =
 						g_state.source == SourceContext::Captive ||
 						info.sourceFlow == static_cast<int>(SourceContext::Captive);
@@ -2173,10 +2798,18 @@ namespace TFD::PleasureRuntime
 					}
 				}
 
+				const bool preserveBleedoutRecruitBridgeClamp =
+					choice == AfterChoice::Recruit &&
+					g_state.source == SourceContext::Bleedout &&
+					g_state.queuedPreCombatSpeakerFormID != 0 &&
+					g_state.queuedPreCombatConsumedFormID == (terminalActor ? terminalActor->GetFormID() : info.actorFormID) &&
+					g_state.queuedPreCombatSource == SourceContext::Bleedout &&
+					g_state.queuedPreCombatBleedoutBridgeToInCombat;
+
 				ClearBridgeStateLocked();
-				ClearHoldStateLocked();
+				ClearHoldStateLocked(preserveBleedoutRecruitBridgeClamp);
 				g_state.pendingChoice = AfterChoice::None;
-				LogEventAcceptedLocked(eventName, info, "finalize_close");
+				LogEventAcceptedLocked(eventName, info, preserveBleedoutRecruitBridgeClamp ? "finalize_close_bleedout_bridge_hold_preserved" : "finalize_close");
 				return;
 			}
 		}
@@ -2221,6 +2854,7 @@ namespace TFD::PleasureRuntime
 			}
 
 			const double now = NowSec();
+			RefreshInCombatTruceLifecycleHoldLocked(now);
 			MaintainScenePassiveHoldLocked(now);
 			afterDialogueTimeout = TakeDueAfterPleasureDialogueTimeoutLocked(now);
 			if (!afterDialogueTimeout.valid) {
@@ -2339,6 +2973,7 @@ namespace TFD::PleasureRuntime
 			reason = "actor_already_recruit_like";
 		}
 		else if (attempt.source == SourceContext::Bleedout &&
+			!attempt.bleedoutBridgeToInCombat &&
 			!TFD::Bleedout::IsPleasureCycleDialogueCandidate(actor, LookupActor(attempt.consumedActorFormID))) {
 			terminalFailure = true;
 			reason = "bleedout_candidate_invalid";
@@ -2354,11 +2989,37 @@ namespace TFD::PleasureRuntime
 				}
 				QueueTruceAliasUnassign(consumedActor, attempt.source == SourceContext::Bleedout ? "after_pleasure_cycle_consumed_bleedout_recruit" : "after_pleasure_cycle_consumed_recruit");
 			}
-			QueueTruceAliasPromoteSpeaker(actor, attempt.source == SourceContext::Bleedout ? "after_pleasure_cycle_promote_next_bleedout_speaker" : "after_pleasure_cycle_promote_next_speaker");
+			QueueTruceAliasPromoteSpeaker(
+				actor,
+				attempt.bleedoutBridgeToInCombat ?
+					"after_pleasure_cycle_promote_next_bleedout_bridge_incombat_speaker" :
+					(attempt.source == SourceContext::Bleedout ?
+						"after_pleasure_cycle_promote_next_bleedout_speaker" :
+						"after_pleasure_cycle_promote_next_speaker"));
 
 			if (attempt.source == SourceContext::InCombat) {
+				// R475A: AfterPleasure/InCombat cycle candidates can be pacified by
+				// the same truce quarantine that protects the player during the
+				// external scene. A selected desire/crowd candidate with no current
+				// combat target is still a valid next speaker for this handoff.
 				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_incombat");
-				success = TFD::InCombatGreet::BeginForPleasureCycleActor(actor, &action);
+				success = TFD::InCombatGreet::BeginForPleasureCycleActor(actor, &action, true);
+			}
+			else if (attempt.source == SourceContext::Bleedout && attempt.bleedoutBridgeToInCombat) {
+				// R456A/R471A: The original Bleedout physical/session owner is intentionally
+				// not re-entered after AfterPleasure Recruit.  The next crowd actor continues
+				// as an InCombat ForceGreet.  Do not release the Bleedout quarantine before
+				// BeginForPleasureCycleActor succeeds; otherwise the crowd can reacquire the
+				// player during the 1-2 second bridge delay.
+				// R472A: this bridge is allowed to promote a pacified standing threat.
+				// The actor may no longer target the player because Bleedout quarantine
+				// intentionally stopped combat to protect the downed player.
+				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_bleedout_bridge_incombat");
+				success = TFD::InCombatGreet::BeginForPleasureCycleActor(actor, &action, true);
+				if (success) {
+					TFD::HostilityController::ClearAggressionClampForSettledHandoff("bleedout_recruit_bridge_incombat_settled");
+					TFD::Bleedout::FinalizePleasureBridgeToInCombat("after_pleasure_cycle_next_bleedout_bridge_incombat_settled");
+				}
 			}
 			else if (attempt.source == SourceContext::Bleedout) {
 				completeFlow = TFD::FlowController::Controller::GetSingleton().RequestCompleteAfterPleasure("after_pleasure_cycle_next_bleedout");
@@ -2372,8 +3033,9 @@ namespace TFD::PleasureRuntime
 		}
 
 		spdlog::info(
-			"[TFD][PleasureRuntime][R94B] after pleasure cycle attempt source={} actor={:08X} consumed={:08X} attempt={} ok={} terminal={} completeFlow={} action={} reason={}",
+			"[TFD][PleasureRuntime][R94B] after pleasure cycle attempt source={} bridgeBleedoutToInCombat={} actor={:08X} consumed={:08X} attempt={} ok={} terminal={} completeFlow={} action={} reason={}",
 			ToString(attempt.source),
+			attempt.bleedoutBridgeToInCombat ? 1 : 0,
 			attempt.actorFormID,
 			attempt.consumedActorFormID,
 			attempt.attemptIndex,
@@ -2409,6 +3071,14 @@ namespace TFD::PleasureRuntime
 			spdlog::warn("[TFD][PleasureRuntime] BeginPleasure rejected installed=0");
 			return false;
 		}
+		if (!speaker || !IsSupportedSourceContext(source)) {
+			spdlog::warn(
+				"[TFD][PleasureRuntime][R392A] BeginPleasure rejected actor={:08X} source={} reason={} policy=unsupported_source_no_mutation",
+				speaker ? speaker->GetFormID() : 0u,
+				static_cast<int>(source),
+				reason.empty() ? std::string{ "-" } : std::string{ reason });
+			return false;
+		}
 
 		BeginNewCycleLocked(speaker, source, reason);
 		if (source == SourceContext::InCombat && speaker) {
@@ -2426,15 +3096,16 @@ namespace TFD::PleasureRuntime
 
 			TFD::HostilityController::ScheduleStopCombatWaves(1800.0f, false, 3, 75);
 			spdlog::info(
-				"[TFD][PleasureRuntime][W37] combat hard passive lock actor={:08X} source={} reason={}",
+				"[TFD][PleasureRuntime][R331A] hard passive lock actor={:08X} source={} reason={}",
 				speaker->GetFormID(),
 				ToString(source),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 		else if (source == SourceContext::Bleedout && speaker) {
-			SuppressActorDialogueForSceneLocked(speaker, "r250a_bleedout_begin_pleasure_dialogue_cooldown_only");
+			PrepareActorForScenePassiveLocked(speaker, "r454a_bleedout_begin_pleasure_combat_quarantine");
+			SuppressActorDialogueForSceneLocked(speaker, "r454a_bleedout_begin_pleasure_dialogue_cooldown");
 			spdlog::info(
-				"[TFD][PleasureRuntime][R250A] bleedout source BeginPleasure without hard passive lock actor={:08X} reason={}",
+				"[TFD][PleasureRuntime][R454A] bleedout source BeginPleasure combat quarantine actor={:08X} reason={}",
 				speaker->GetFormID(),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
@@ -2453,7 +3124,7 @@ namespace TFD::PleasureRuntime
 		AdvancePhaseLocked(Phase::PleasureStartPending, reason);
 		g_state.blocking = true;
 		g_state.holdActive = true;
-		g_state.passiveLockActive = source == SourceContext::InCombat;
+		g_state.passiveLockActive = IsScenePassiveHoldSource(source);
 		return true;
 	}
 
@@ -2485,6 +3156,7 @@ namespace TFD::PleasureRuntime
 			g_state.queuedPreCombatSpeakerFormID = nextActor->GetFormID();
 			g_state.queuedPreCombatConsumedFormID = currentActor->GetFormID();
 			g_state.queuedPreCombatSource = source;
+			g_state.queuedPreCombatBleedoutBridgeToInCombat = false;
 			g_state.queuedPreCombatNextTrySec = now + initialDelay;
 			g_state.queuedPreCombatExpireSec = now + kPreCombatCycleExpireSec;
 			g_state.queuedPreCombatAttempts = 0;
@@ -2710,16 +3382,18 @@ namespace TFD::PleasureRuntime
 				TFD::Recruit::SourceFlow::Pleasure,
 				"incombat_deferred_recruit_finalize_pending");
 
+			const bool bleedoutNoCandidateSettle = IsBleedoutRecruitSettleReason(reason) && reason.find("no_candidate") != std::string_view::npos;
+
 			TFD::Recruit::CommitOptions options{};
 			options.sourceFlow = TFD::Recruit::SourceFlow::Pleasure;
-			options.reason = "incombat_deferred_recruit_finalize";
+			options.reason = bleedoutNoCandidateSettle ? "bleedout_deferred_recruit_settle_no_candidate" : "incombat_deferred_recruit_finalize";
 			options.quarantineHostileFactions = true;
 			options.clearCombat = true;
-			options.evaluatePackage = true;
+			options.evaluatePackage = !bleedoutNoCandidateSettle;
 			options.detailedLog = true;
 			options.throttleObserve = false;
 			options.ensurePacifyAlliance = true;
-			options.applyRuntimeProfile = true;
+			options.applyRuntimeProfile = !bleedoutNoCandidateSettle;
 
 			const auto result = TFD::Recruit::CommitRecruit(actor, options);
 			const bool settledClean = result.attempted && !result.rawHostileAfter && result.hostileFactionMatchesAfter == 0;
@@ -2729,6 +3403,10 @@ namespace TFD::PleasureRuntime
 				!TFD::Recruit::HasKnownHostileSourceFaction(actor);
 			const bool clean = settledClean || recruitLikeClean;
 			bool truceReleased = false;
+			if (clean && bleedoutNoCandidateSettle) {
+				StabilizeBleedoutRecruitSettle(actor, reason.empty() ? "bleedout_deferred_recruit_settle_no_candidate" : reason);
+			}
+
 			if (clean) {
 				// R95B/R96D: the actor was kept inside the TruceInCombat session while the
 				// crowd chain continued. Remove it as a FlowHandoff before the final
@@ -2737,15 +3415,17 @@ namespace TFD::PleasureRuntime
 				truceReleased = TFD::HostilityController::ReleaseSingleTruceActorForCycle(
 					actor,
 					TFD::HostilityController::ReleaseReason::FlowHandoff,
-					"incombat_deferred_recruit_finalize");
+					bleedoutNoCandidateSettle ? "bleedout_deferred_recruit_settle_no_candidate" : "incombat_deferred_recruit_finalize");
 			}
-			const bool aliasRegistered = clean && TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(actor, "incombat_deferred_recruit_finalize");
+			const bool aliasRegistered = clean && (bleedoutNoCandidateSettle ?
+				TFD::TeammateManager::RegisterOrRefreshTeammateNowDeferredPackage(actor, "bleedout_deferred_recruit_settle_no_candidate") :
+				TFD::TeammateManager::RegisterOrRefreshTeammateNowImmediatePackage(actor, "incombat_deferred_recruit_finalize"));
 			if (aliasRegistered) {
 				++registered;
 			}
 
 			spdlog::info(
-				"[TFD][PleasureRuntime][R96D] deferred recruit flush actor={:08X} attempted={} skipped={} settledClean={} recruitLikeClean={} clean={} rawAfter={} hostileAfter={} truceReleased={} aliasRegistered={} reason={}",
+				"[TFD][PleasureRuntime][R453A] deferred recruit flush actor={:08X} attempted={} skipped={} settledClean={} recruitLikeClean={} clean={} rawAfter={} hostileAfter={} truceReleased={} aliasRegistered={} bleedoutSettle={} reason={}",
 				actorId,
 				result.attempted ? 1 : 0,
 				result.skipped ? 1 : 0,
@@ -2756,6 +3436,7 @@ namespace TFD::PleasureRuntime
 				result.hostileFactionMatchesAfter,
 				truceReleased ? 1 : 0,
 				aliasRegistered ? 1 : 0,
+				bleedoutNoCandidateSettle ? 1 : 0,
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
 

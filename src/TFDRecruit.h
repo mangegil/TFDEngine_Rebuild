@@ -14,15 +14,15 @@ namespace TFD::Recruit
     enum class SourceFlow : std::uint8_t
     {
         Unknown = 0,
-        PreCombat,
-        InCombat,
-        Bleedout,
-        Captive,
-        Victory,
-        Pleasure,
-        Defeated,
-        Teammate,
-        Dialogue
+        PreCombat = 1,
+        InCombat = 2,
+        Bleedout = 3,
+        Captive = 4,
+        // Values 5 and 7 are intentionally unused. Manual defeated interaction
+        // owns its future recruit handoff outside this generic source enum.
+        Pleasure = 6,
+        Teammate = 8,
+        Dialogue = 9
     };
 
     struct ObserveOptions
@@ -43,6 +43,11 @@ namespace TFD::Recruit
         bool detailedLog{ false };
         bool throttleObserve{ true };
         bool ensurePacifyAlliance{ true };
+        // R410A: Victory Recruit needs a pre-3D-refresh dehostile pass that
+        // removes hostility without entering the teammate alias/package system yet.
+        // Keep these true for normal recruit commits.
+        bool ensureTeammateFaction{ true };
+        bool ensureFollowerAnchorFactions{ true };
         bool applyRuntimeProfile{ true };
     };
 

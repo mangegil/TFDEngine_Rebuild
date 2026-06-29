@@ -19,10 +19,9 @@ namespace TFD::ForceGreetState
             PreCombat = 3,
             InCombat = 4,
             Bleedout = 5,
-            Victory = 6,
-            Teammate = 7,
-            Rescue = 8,
-            Count = 9
+            Teammate = 6,
+            Rescue = 7,
+            Count = 8
         };
 
         struct FlowState
@@ -40,7 +39,6 @@ namespace TFD::ForceGreetState
             FlowState{ "PreCombat", "TFDPreCombatFGState", nullptr, -1 },
             FlowState{ "InCombat", "TFDInCombatFGState", nullptr, -1 },
             FlowState{ "Bleedout", "TFDBleedoutFGState", nullptr, -1 },
-            FlowState{ "Victory", "TFDVictoryFGState", nullptr, -1 },
             FlowState{ "Teammate", "TFDTeammateFGState", nullptr, -1 },
             FlowState{ "Rescue", "TFDRescueFGState", nullptr, -1 }
         };
@@ -168,12 +166,6 @@ namespace TFD::ForceGreetState
         int PapyrusGetBleedoutState(RE::StaticFunctionTag*) { return GetBleedoutState(); }
         bool PapyrusIsBleedoutCommitted(RE::StaticFunctionTag*) { return IsBleedoutCommitted(); }
 
-        bool PapyrusResetVictory(RE::StaticFunctionTag*) { return ResetVictory(); }
-        bool PapyrusSetVictoryOpened(RE::StaticFunctionTag*) { return SetVictoryOpened(); }
-        bool PapyrusSetVictoryCommitted(RE::StaticFunctionTag*) { return SetVictoryCommitted(); }
-        int PapyrusGetVictoryState(RE::StaticFunctionTag*) { return GetVictoryState(); }
-        bool PapyrusIsVictoryCommitted(RE::StaticFunctionTag*) { return IsVictoryCommitted(); }
-
         bool PapyrusResetTeammate(RE::StaticFunctionTag*) { return ResetTeammate(); }
         bool PapyrusSetTeammateOpened(RE::StaticFunctionTag*) { return SetTeammateOpened(); }
         bool PapyrusSetTeammateCommitted(RE::StaticFunctionTag*) { return SetTeammateCommitted(); }
@@ -195,20 +187,19 @@ namespace TFD::ForceGreetState
         Set(Flow::PreCombat, kIdle, a_reason ? a_reason : "reset_all");
         Set(Flow::InCombat, kIdle, a_reason ? a_reason : "reset_all");
         Set(Flow::Bleedout, kIdle, a_reason ? a_reason : "reset_all");
-        Set(Flow::Victory, kIdle, a_reason ? a_reason : "reset_all");
         Set(Flow::Teammate, kIdle, a_reason ? a_reason : "reset_all");
         Set(Flow::Rescue, kIdle, a_reason ? a_reason : "reset_all");
     }
 
     bool ResetAfterPleasure() { return Set(Flow::AfterPleasure, kIdle, "ResetAfterPleasure"); }
-    bool SetAfterPleasureOpened() { return Set(Flow::AfterPleasure, kOpenedNoCommit, "SetAfterPleasureOpened"); }
-    bool SetAfterPleasureCommitted() { return Set(Flow::AfterPleasure, kCommitted, "SetAfterPleasureCommitted"); }
+    bool SetAfterPleasureOpened() { return SetOpenedNoDowngrade(Flow::AfterPleasure, "SetAfterPleasureOpened"); }
+    bool SetAfterPleasureCommitted() { return SetCommittedNoDowngrade(Flow::AfterPleasure, "SetAfterPleasureCommitted"); }
     int GetAfterPleasureState() { return GetValue(Flow::AfterPleasure); }
     bool IsAfterPleasureCommitted() { return GetAfterPleasureState() >= kCommitted; }
 
     bool ResetPleasureFailed() { return Set(Flow::PleasureFailed, kIdle, "ResetPleasureFailed"); }
-    bool SetPleasureFailedOpened() { return Set(Flow::PleasureFailed, kOpenedNoCommit, "SetPleasureFailedOpened"); }
-    bool SetPleasureFailedCommitted() { return Set(Flow::PleasureFailed, kCommitted, "SetPleasureFailedCommitted"); }
+    bool SetPleasureFailedOpened() { return SetOpenedNoDowngrade(Flow::PleasureFailed, "SetPleasureFailedOpened"); }
+    bool SetPleasureFailedCommitted() { return SetCommittedNoDowngrade(Flow::PleasureFailed, "SetPleasureFailedCommitted"); }
     int GetPleasureFailedState() { return GetValue(Flow::PleasureFailed); }
     bool IsPleasureFailedCommitted() { return GetPleasureFailedState() >= kCommitted; }
 
@@ -235,12 +226,6 @@ namespace TFD::ForceGreetState
     bool SetBleedoutCommitted() { return SetCommittedNoDowngrade(Flow::Bleedout, "SetBleedoutCommitted"); }
     int GetBleedoutState() { return GetValue(Flow::Bleedout); }
     bool IsBleedoutCommitted() { return GetBleedoutState() >= kCommitted; }
-
-    bool ResetVictory() { return Set(Flow::Victory, kIdle, "ResetVictory"); }
-    bool SetVictoryOpened() { return SetOpenedNoDowngrade(Flow::Victory, "SetVictoryOpened"); }
-    bool SetVictoryCommitted() { return SetCommittedNoDowngrade(Flow::Victory, "SetVictoryCommitted"); }
-    int GetVictoryState() { return GetValue(Flow::Victory); }
-    bool IsVictoryCommitted() { return GetVictoryState() >= kCommitted; }
 
     bool ResetTeammate() { return Set(Flow::Teammate, kIdle, "ResetTeammate"); }
     bool SetTeammateOpened() { return SetOpenedNoDowngrade(Flow::Teammate, "SetTeammateOpened"); }
@@ -296,12 +281,6 @@ namespace TFD::ForceGreetState
         a_vm->RegisterFunction("GetBleedoutState", "TFDForceGreetStateNative", PapyrusGetBleedoutState);
         a_vm->RegisterFunction("IsBleedoutCommitted", "TFDForceGreetStateNative", PapyrusIsBleedoutCommitted);
 
-        a_vm->RegisterFunction("ResetVictory", "TFDForceGreetStateNative", PapyrusResetVictory);
-        a_vm->RegisterFunction("SetVictoryOpened", "TFDForceGreetStateNative", PapyrusSetVictoryOpened);
-        a_vm->RegisterFunction("SetVictoryCommitted", "TFDForceGreetStateNative", PapyrusSetVictoryCommitted);
-        a_vm->RegisterFunction("GetVictoryState", "TFDForceGreetStateNative", PapyrusGetVictoryState);
-        a_vm->RegisterFunction("IsVictoryCommitted", "TFDForceGreetStateNative", PapyrusIsVictoryCommitted);
-
         a_vm->RegisterFunction("ResetTeammate", "TFDForceGreetStateNative", PapyrusResetTeammate);
         a_vm->RegisterFunction("SetTeammateOpened", "TFDForceGreetStateNative", PapyrusSetTeammateOpened);
         a_vm->RegisterFunction("SetTeammateCommitted", "TFDForceGreetStateNative", PapyrusSetTeammateCommitted);
@@ -314,7 +293,7 @@ namespace TFD::ForceGreetState
         a_vm->RegisterFunction("GetRescueState", "TFDForceGreetStateNative", PapyrusGetRescueState);
         a_vm->RegisterFunction("IsRescueCommitted", "TFDForceGreetStateNative", PapyrusIsRescueCommitted);
 
-        spdlog::info("[TFD][ForceGreetState][R327A] Papyrus natives registered for FGState framework AfterPleasure/PleasureFailed/Captive/PreCombat/InCombat/Bleedout/Victory/Teammate/Rescue");
+        spdlog::info("[TFD][ForceGreetState][R327A] Papyrus natives registered for FGState framework AfterPleasure/PleasureFailed/Captive/PreCombat/InCombat/Bleedout/Teammate/Rescue");
         return true;
     }
 }

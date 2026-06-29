@@ -50,11 +50,7 @@ namespace TFD::ForceGreetState
     int GetBleedoutState();
     bool IsBleedoutCommitted();
 
-    bool ResetVictory();
-    bool SetVictoryOpened();
-    bool SetVictoryCommitted();
-    int GetVictoryState();
-    bool IsVictoryCommitted();
+    // R391B: Victory is manual selected-actor interaction, not ForceGreetState.
 
     bool ResetTeammate();
     bool SetTeammateOpened();

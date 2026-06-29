@@ -12,7 +12,7 @@
 #include "TFDInteractionRouter.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDTransition.h"
-#include "TFDDefeatMonitor.h"
+#include "TFDCaptiveRecaptureRecovery.h"
 #include "TFDForceGreetState.h"
 
 #include <SKSE/SKSE.h>
@@ -2164,7 +2164,7 @@ namespace TFD::Captive
 		const bool hostile = actor && player && actor->IsHostileToActor(player);
 
 		spdlog::info(
-			"[TFD][Captive][CallDiag] reason={} actor={:08X} owner={:08X} ownerMatch={} boss={:08X} movementTarget={} target={:08X} targetIsPlayer={} marker={:08X} globals[captive={} pre={} in={} defeat={} victory={} dialogue={}] actorState[dead={} disabled={} loaded3d={} ai={} combat={} hostile={} weapon={} suppressed={} captiveRole={} canOpenDialogue={}] dist[player={:.1f} target={:.1f}] cell[actor={:08X} player={:08X} sameCell={} sameSpace={}]",
+			"[TFD][Captive][CallDiag] reason={} actor={:08X} owner={:08X} ownerMatch={} boss={:08X} movementTarget={} target={:08X} targetIsPlayer={} marker={:08X} globals[captive={} pre={} in={} defeat={} dialogue={}] actorState[dead={} disabled={} loaded3d={} ai={} combat={} hostile={} weapon={} suppressed={} captiveRole={} canOpenDialogue={}] dist[player={:.1f} target={:.1f}] cell[actor={:08X} player={:08X} sameCell={} sameSpace={}]",
 			reason ? reason : "unknown",
 			actor ? actor->GetFormID() : 0u,
 			RefIDForDiagnostic(ownerRef),
@@ -2178,7 +2178,6 @@ namespace TFD::Captive
 			ReadDiagnosticGlobal("TFDPreCombatState"),
 			ReadDiagnosticGlobal("TFDInCombatState"),
 			ReadDiagnosticGlobal("TFDDefeatState"),
-			ReadDiagnosticGlobal("TFDVictoryState"),
 			ReadDiagnosticGlobal("TFDDialogueState"),
 			(actor && actor->IsDead()) ? 1 : 0,
 			(actor && actor->IsDisabled()) ? 1 : 0,
@@ -4212,7 +4211,7 @@ namespace TFD::Captive
 				nullptr,
 				why,
 				1.0f);
-			TFD::DefeatMonitor::ForceRecoverPlayerAfterCaptiveRecapture(why);
+			TFD::CaptiveRecaptureRecovery::ForceRecoverPlayer(why);
 			g_lastRecaptureCompleted = Now();
 			spdlog::info("[TFD][Captive][R202B] CommitRecapture complete actor={:08X} reason={} clearSystemRoute=1 clearBleedAliases=1 clearCrowdAliases=1 hardCrowdClear=1 recoverPlayer=1", actorFormID, why);
 		}

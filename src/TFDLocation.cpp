@@ -96,7 +96,7 @@ namespace TFD::Location
 			std::uint32_t bedUseSerial{ 0 };
 		};
 
-		static constexpr std::uint32_t kRescueCacheVersion = 1;
+		static constexpr std::uint32_t kRescueCacheVersion = 2;
 		static constexpr float kCheckpointBedScanRadius = 8192.0f;
 
 		using Clock = std::chrono::steady_clock;
@@ -1439,6 +1439,106 @@ namespace TFD::Location
 			return true;
 		}
 
+		static RE::TESNPC* GetBedActorOwner(RE::TESObjectREFR* bedRef)
+		{
+			if (!bedRef) {
+				return nullptr;
+			}
+
+			auto* owner = bedRef->GetOwner();
+			return owner ? owner->As<RE::TESNPC>() : nullptr;
+		}
+
+		static RE::TESFaction* GetBedFactionOwner(RE::TESObjectREFR* bedRef)
+		{
+			if (!bedRef) {
+				return nullptr;
+			}
+
+			auto* owner = bedRef->GetOwner();
+			return owner ? owner->As<RE::TESFaction>() : nullptr;
+		}
+
+		static RE::Actor* ResolveActorReferenceForOwnerNpc(RE::TESNPC* ownerNpc, RE::TESObjectREFR* anchorRef, float radius)
+		{
+			if (!ownerNpc || !anchorRef) {
+				return nullptr;
+			}
+
+			auto* cell = anchorRef->GetParentCell();
+			if (!cell) {
+				return nullptr;
+			}
+
+			const auto origin = anchorRef->GetPosition();
+			const float scanRadius = radius > 0.0f ? radius : kCheckpointBedScanRadius;
+			RE::Actor* best = nullptr;
+			double bestDistSq = std::numeric_limits<double>::max();
+
+			cell->ForEachReferenceInRange(origin, scanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+				auto* actor = candidate ? candidate->As<RE::Actor>() : nullptr;
+				if (!actor || actor->IsDead() || actor->IsDisabled()) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (actor->GetActorBase() != ownerNpc) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				const auto pos = actor->GetPosition();
+				const double dx = static_cast<double>(pos.x - origin.x);
+				const double dy = static_cast<double>(pos.y - origin.y);
+				const double dz = static_cast<double>(pos.z - origin.z);
+				const double distSq = dx * dx + dy * dy + dz * dz;
+				if (!best || distSq < bestDistSq) {
+					best = actor;
+					bestDistSq = distSq;
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+
+			return best;
+		}
+
+		static RE::Actor* ResolveActorReferenceForOwnerFaction(RE::TESFaction* ownerFaction, RE::TESObjectREFR* anchorRef, float radius)
+		{
+			if (!ownerFaction || !anchorRef) {
+				return nullptr;
+			}
+
+			auto* cell = anchorRef->GetParentCell();
+			if (!cell) {
+				return nullptr;
+			}
+
+			const auto origin = anchorRef->GetPosition();
+			const float scanRadius = radius > 0.0f ? radius : kCheckpointBedScanRadius;
+			RE::Actor* best = nullptr;
+			double bestDistSq = std::numeric_limits<double>::max();
+
+			cell->ForEachReferenceInRange(origin, scanRadius, [&](RE::TESObjectREFR* candidate) -> RE::BSContainer::ForEachResult {
+				auto* actor = candidate ? candidate->As<RE::Actor>() : nullptr;
+				if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->HasKeywordString("ActorTypeNPC")) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+				if (actor->GetFactionRank(ownerFaction, false) == -2) {
+					return RE::BSContainer::ForEachResult::kContinue;
+				}
+
+				const auto pos = actor->GetPosition();
+				const double dx = static_cast<double>(pos.x - origin.x);
+				const double dy = static_cast<double>(pos.y - origin.y);
+				const double dz = static_cast<double>(pos.z - origin.z);
+				const double distSq = dx * dx + dy * dy + dz * dz;
+				if (!best || distSq < bestDistSq) {
+					best = actor;
+					bestDistSq = distSq;
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+
+			return best;
+		}
+
 		static RE::TESObjectREFR* ResolveBestCheckpointBed(RE::BGSLocation* safeLoc, RE::TESObjectREFR* preferredMarker, RE::TESObjectREFR* contextRef)
 		{
 			if (!safeLoc) {
@@ -1483,7 +1583,11 @@ namespace TFD::Location
 				const bool hasActorOwner = ownerForm && ownerForm->As<RE::TESNPC>();
 				const bool hasFactionOwner = ownerForm && ownerForm->As<RE::TESFaction>();
 				const bool hasAnyOwner = ownerForm != nullptr;
-				const int tier = hasActorOwner ? 0 : (hasFactionOwner ? 2 : 1);  // faction/no-actor-owner first, actor-owned fallback
+				const bool safeLocIsDwelling = LocationHasKeywordByEditorID(safeLoc, "LocTypeDwelling");
+				const bool safeLocIsInn = LocationHasKeywordByEditorID(safeLoc, "LocTypeInn");
+				const int tier = (safeLocIsDwelling && hasActorOwner) ? 3 :
+					(hasFactionOwner ? 2 :
+						(!hasAnyOwner ? 1 : 0));
 
 				int score = 0;
 				auto* candidateLoc = GetLocationFromRef(candidate);
@@ -1501,13 +1605,16 @@ namespace TFD::Location
 					score += 300;
 				}
 
-				if (hasFactionOwner) {
+				if (hasActorOwner && safeLocIsDwelling) {
+					score += 260;
+				}
+				else if (hasFactionOwner) {
 					score += 180;
 				}
 				else if (!hasAnyOwner) {
 					score += 100;
 				}
-				else if (hasActorOwner) {
+				else if (hasActorOwner && safeLocIsInn) {
 					score -= 300;
 				}
 
@@ -2065,7 +2172,11 @@ namespace TFD::Location
 					"[TFD][Location] Rescan: marker not found (preferInterior={})",
 					preferInterior ? "true" : "false");
 
-				DumpSpecialRefs(playerLoc ? playerLoc : aggressorLoc);
+				auto* debugLoc = playerLoc ? playerLoc : aggressorLoc;
+				spdlog::info(
+					"[TFD][Location] Rescan: specialRefs dump suppressed loc={:08X} size={} reason=marker_not_found",
+					debugLoc ? debugLoc->GetFormID() : 0u,
+					debugLoc ? static_cast<unsigned int>(debugLoc->specialRefs.size()) : 0u);
 
 				g_cachedMarker = {};
 				ClearCaptiveStorageDebugSnapshot(false);
@@ -2597,6 +2708,21 @@ namespace TFD::Location
 		bed.bedRefId = bedRef->GetFormID();
 		bed.cellId = bedRef->GetParentCell() ? bedRef->GetParentCell()->GetFormID() : 0;
 
+		if (auto* owner = bedRef->GetOwner()) {
+			bed.ownerFormId = owner->GetFormID();
+			if (auto* ownerNpc = owner->As<RE::TESNPC>()) {
+				bed.ownerNpcFormId = ownerNpc->GetFormID();
+				bed.ownerKind = 1;
+			}
+			else if (auto* ownerFaction = owner->As<RE::TESFaction>()) {
+				bed.ownerFactionFormId = ownerFaction->GetFormID();
+				bed.ownerKind = 2;
+			}
+			else {
+				bed.ownerKind = 3;
+			}
+		}
+
 		if (const auto it = g_approvedBedByLocation.find(bed.safeLocationId); it != g_approvedBedByLocation.end()) {
 			if (it->second.bedRefId == bed.bedRefId && it->second.cellId == bed.cellId) {
 				return true;
@@ -2608,10 +2734,14 @@ namespace TFD::Location
 		g_approvedBedByLocation[bed.safeLocationId] = bed;
 
 		spdlog::info(
-			"[TFD][Location] RememberApprovedBed loc={:08X} bed={:08X} cell={:08X} serial={}",
+			"[TFD][Location] RememberApprovedBed loc={:08X} bed={:08X} cell={:08X} owner={:08X} ownerNpc={:08X} ownerFaction={:08X} ownerKind={} serial={}",
 			bed.safeLocationId,
 			bed.bedRefId,
 			bed.cellId,
+			bed.ownerFormId,
+			bed.ownerNpcFormId,
+			bed.ownerFactionFormId,
+			bed.ownerKind,
 			bed.useSerial);
 
 		return true;
@@ -2624,6 +2754,62 @@ namespace TFD::Location
 			return false;
 		}
 		return RememberApprovedBed(safeLoc, bedRef);
+	}
+
+	RE::Actor* ResolveApprovedBedOwnerActor(RE::TESObjectREFR* bedRef, float radius)
+	{
+		if (!bedRef) {
+			return nullptr;
+		}
+
+		if (auto* ownerNpc = GetBedActorOwner(bedRef)) {
+			auto* ownerActor = ResolveActorReferenceForOwnerNpc(ownerNpc, bedRef, radius);
+			if (ownerActor) {
+				spdlog::info(
+					"[TFD][Location] ResolveApprovedBedOwnerActor bed={:08X} ownerNpc={:08X} actor={:08X}",
+					bedRef->GetFormID(),
+					ownerNpc->GetFormID(),
+					ownerActor->GetFormID());
+				return ownerActor;
+			}
+			spdlog::info(
+				"[TFD][Location] ResolveApprovedBedOwnerActor miss bed={:08X} ownerNpc={:08X}",
+				bedRef->GetFormID(),
+				ownerNpc->GetFormID());
+		}
+
+		if (auto* ownerFaction = GetBedFactionOwner(bedRef)) {
+			auto* ownerActor = ResolveActorReferenceForOwnerFaction(ownerFaction, bedRef, radius);
+			if (ownerActor) {
+				spdlog::info(
+					"[TFD][Location] ResolveApprovedBedOwnerActor bed={:08X} ownerFaction={:08X} actor={:08X}",
+					bedRef->GetFormID(),
+					ownerFaction->GetFormID(),
+					ownerActor->GetFormID());
+				return ownerActor;
+			}
+			spdlog::info(
+				"[TFD][Location] ResolveApprovedBedOwnerActor miss bed={:08X} ownerFaction={:08X}",
+				bedRef->GetFormID(),
+				ownerFaction->GetFormID());
+		}
+
+		return nullptr;
+	}
+
+	RE::Actor* ResolveBestApprovedBedOwnerActorForLocation(RE::BGSLocation* loc)
+	{
+		ApprovedBed bed{};
+		if (!GetBestApprovedBedForLocation(loc, bed) || bed.bedRefId == 0 || bed.ownerFormId == 0) {
+			return nullptr;
+		}
+
+		auto* bedRef = RE::TESForm::LookupByID<RE::TESObjectREFR>(bed.bedRefId);
+		if (!bedRef) {
+			return nullptr;
+		}
+
+		return ResolveApprovedBedOwnerActor(bedRef, kCheckpointBedScanRadius);
 	}
 
 	bool RefreshPlayerInteriorSafeCheckpoint()

@@ -1,685 +1,3480 @@
 #include "TFDVictory.h"
 
 #include "TFDActor.h"
-#include "TFDHostilityController.h"
+#include "TFDRecruit.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
-#include "TFDTame.h"
 
 #include <RE/Skyrim.h>
+#include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
-#include <cmath>
-#include <cstdint>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace TFD::Victory
 {
     namespace
     {
-        RE::TESGlobal* g_stateGlobal = nullptr;
-        bool g_logged = false;
-        std::chrono::steady_clock::time_point g_observedCombatContextUntil{};
-        std::chrono::steady_clock::time_point g_dialogueReadyHoldUntil{};
-        RE::FormID g_dialogueReadyHoldActorFormID = 0;
+        using Clock = std::chrono::steady_clock;
 
-        static constexpr int kStateNeutral = 0;
-        static constexpr int kStateNo = 1;
-        static constexpr int kStateYes = 2;
-        static constexpr int kObservedCombatContextLingerMs = 2500;
-        static constexpr float kDefeatedDialogueScanRadius = 512.0f;
-        static constexpr float kVictoryObservedScanRadius = 2400.0f;
-        static constexpr float kActorLevelDefeatedScanRadius = 4200.0f;
+        constexpr std::uint8_t kEnemyLockKindValue = 2;
+        constexpr double kEnemyKnockSeconds = 10.0;
+        constexpr double kDefeatedReentrySuppressSeconds = 6.0;
+        constexpr auto kDialogueOpenTimeout = std::chrono::milliseconds(5000);
+        constexpr auto kChoiceCommitGrace = std::chrono::milliseconds(6000);
+        constexpr auto kKillPrimeDelay = std::chrono::milliseconds(100);
+        constexpr auto kKillDamageDelay = std::chrono::milliseconds(450);
+        constexpr auto kKillDeathSettleDelay = std::chrono::milliseconds(300);
+        constexpr auto kKillDeathConfirmDelay = std::chrono::milliseconds(1500);
+        constexpr auto kKillEngineConfirmDelay = std::chrono::milliseconds(1000);
+        constexpr auto kLootDialogueCloseTimeout = std::chrono::milliseconds(10000);
+        constexpr auto kLootInventoryDispatchDelay = std::chrono::milliseconds(100);
+        constexpr auto kLootInventoryDispatchRetryDelay = std::chrono::milliseconds(250);
+        constexpr auto kLootInventoryOpenTimeout = std::chrono::milliseconds(7000);
+        constexpr std::uint8_t kLootInventoryDispatchMaxAttempts = 3;
+        constexpr auto kLootReleasePrepareDelay = std::chrono::milliseconds(100);
+        constexpr auto kLootGraphStepDelay = std::chrono::milliseconds(150);
+        constexpr auto kLootGetUpMinimumSettle = std::chrono::milliseconds(1800);
+        constexpr auto kLootGetUpMaximumSettle = std::chrono::milliseconds(4500);
+        constexpr double kLootReentrySuppressSeconds = 3.0;
+        constexpr float kLootHealthBonusPct = 8.0f;
+        constexpr auto kRecruitDialogueCloseTimeout = std::chrono::milliseconds(10000);
+        constexpr auto kRecruitCommitDelay = std::chrono::milliseconds(350);
+        constexpr auto kRecruitDefeatedClearDelay = std::chrono::milliseconds(250);
+        constexpr auto kRecruitPostClearCommitDelay = std::chrono::milliseconds(0);
+        constexpr auto kRecruitDeferredPackageDelay = std::chrono::milliseconds(1000);
+        constexpr auto kRecruitGraphStepDelay = std::chrono::milliseconds(150);
+        constexpr auto kRecruitBleedoutExitMinimumDelay = std::chrono::milliseconds(900);
+        constexpr auto kRecruitBleedoutExitCheckDelay = std::chrono::milliseconds(250);
+        constexpr auto kRecruitBleedoutExitMaximumWait = std::chrono::milliseconds(4000);
+        constexpr auto kRecruitHitReactStartDelay = std::chrono::milliseconds(150);
+        constexpr auto kRecruitHitReactStopDelay = std::chrono::milliseconds(350);
+        constexpr auto kRecruitHitReactSettleDelay = std::chrono::milliseconds(1200);
+        constexpr auto kRecruitHitReactMaximumSettle = std::chrono::milliseconds(2500);
+        constexpr auto kRecruitHitDiagnosticWindow = std::chrono::seconds(60);
+        constexpr auto kRecruitHitDiagnosticFirstDelay = std::chrono::milliseconds(250);
+        constexpr auto kRecruitHitDiagnosticSecondDelay = std::chrono::milliseconds(1000);
+        constexpr auto kRecruitGetUpMinimumSettle = std::chrono::milliseconds(4500);
+        constexpr auto kRecruitGetUpMaximumSettle = std::chrono::milliseconds(6500);
+        constexpr double kRecruitReentrySuppressSeconds = 12.0;
+        constexpr double kRecruitCommitPendingSeconds = 15.0;
+        constexpr float kRecruitHealthBonusPct = 8.0f;
+        constexpr bool kEnemyDefeatedVisualBleedoutEnabled = true;
+        constexpr bool kEnemySoftEnterHardStateDelayEnabled = true;
+        constexpr auto kEnemySoftEnterHardStateDelay = std::chrono::milliseconds(1500);
+        constexpr auto kEnemyDelayedBleedoutStartSettleDelay = std::chrono::milliseconds(400);
+        constexpr auto kEnemySoftEnterPressureQuietWindow = std::chrono::milliseconds(900);
+        constexpr auto kEnemySoftEnterPressureRetryDelay = std::chrono::milliseconds(500);
+        constexpr auto kEnemySoftEnterPressureMaxExtraDelay = std::chrono::milliseconds(4000);
+        constexpr float kEnemySoftEnterPressureScanRadius = 4096.0f;
+        constexpr RE::FormID kVictoryGreetInfoLocalFormID = 0x00195937;
+        constexpr std::string_view kPluginName{ "TFDEngine.esp" };
 
-        void ResolveGlobal()
+        enum class KillStage : std::uint8_t
         {
-            if (!g_stateGlobal) {
-                g_stateGlobal = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDVictoryState");
-                if (g_stateGlobal && !g_logged) {
-                    g_logged = true;
-                    spdlog::info("[TFD][Victory] TFDVictoryState resolved {:08X}", g_stateGlobal->GetFormID());
+            None = 0,
+            WaitingForDialogueClose,
+            PrimePending,
+            DamagePending,
+            AwaitingDeath,
+            AwaitingEngineDeath
+        };
+
+        enum class LootStage : std::uint8_t
+        {
+            None = 0,
+            WaitingForDialogueClose,
+            InventoryDispatchPending,
+            WaitingForInventoryOpen,
+            InventoryOpen,
+            ReleasePending,
+            BleedoutStopPending,
+            GetUpPending,
+            PackageRefreshPending
+        };
+
+        enum class RecruitStage : std::uint8_t
+        {
+            None = 0,
+            WaitingForDialogueClose,
+            CommitPending,
+            BleedoutStopPending,
+            BleedoutExitPending,
+            HitReactStartPending,
+            HitReactStopPending,
+            GetUpPending,
+            DefeatedClearPending,
+            RecruitCommitPending,
+            PackageRefreshPending
+        };
+
+        struct EnemyEntry
+        {
+            RE::ActorHandle handle{};
+            float thresholdPct{ 0.0f };
+
+            float savedHealRate{ 0.0f };
+            float savedHealRateMult{ 100.0f };
+            float savedCombatHealRateMult{ 1.0f };
+            bool regenOverridden{ false };
+
+            float savedAggression{ 1.0f };
+            bool aggressionOverridden{ false };
+
+            bool managed{ true };
+            bool factionApplied{ false };
+            bool autoDeathIssued{ false };
+            bool fatalDamageApplied{ false };
+            int aliasSlot{ -1 };
+            Clock::time_point deadline{};
+            bool countdownHeld{ false };
+            std::uint32_t heldSessionID{ 0 };
+            bool initialPackageRefreshDone{ false };
+            bool visualBleedoutStarted{ false };
+            bool visualBleedoutStopSent{ false };
+            bool softEnterActive{ false };
+            bool softEnterHardStateApplied{ false };
+            bool softEnterPendingLogged{ false };
+            Clock::time_point softEnterHardStateDue{};
+            Clock::time_point softEnterHardStateMaxDue{};
+            Clock::time_point softEnterLastPressureSeen{};
+            RE::FormID softEnterLastPressureCauseFormID{ 0 };
+            RE::FormID softEnterLastPressureOtherFormID{ 0 };
+            std::uint16_t softEnterPressureHitCount{ 0 };
+            std::uint8_t softEnterPressureDeferrals{ 0 };
+            bool visualBleedoutStartPending{ false };
+            bool visualBleedoutStartDecisionLogged{ false };
+            Clock::time_point visualBleedoutStartDue{};
+        };
+
+        struct LootTransitionState
+        {
+            RE::ActorHandle handle{};
+            bool wasBleedingOut{ false };
+        };
+
+        struct RecruitTransitionState
+        {
+            RE::ActorHandle handle{};
+            bool visualBleedoutOwned{ false };
+            bool bleedoutStopSent{ false };
+            bool bleedoutExitObservedBeforeGetUp{ false };
+            bool actorBleedingBeforeGetUp{ false };
+            bool getUpStartSent{ false };
+            bool hitReactStartSent{ false };
+            bool hitReactFallbackStartSent{ false };
+            bool hitReactStopSent{ false };
+            bool hitReactFallbackStopSent{ false };
+            bool getUpForcedAfterExitTimeout{ false };
+            std::uint16_t bleedoutExitWaitTicks{ 0 };
+            bool defeatedOwnershipClearedBeforeGetUp{ false };
+            bool aliasFactionClearedBeforeGetUp{ false };
+            bool regenRestoredBeforeGetUp{ false };
+            bool passiveHeldThroughGetUp{ false };
+            bool passiveRestoredOnFailure{ false };
+            float savedAggression{ 1.0f };
+            bool aggressionOverridden{ false };
+            bool preGetUpCommitAttempted{ false };
+            bool preGetUpCommitSkipped{ false };
+            bool preGetUpRawHostileBefore{ false };
+            bool preGetUpRawHostileAfter{ false };
+            bool commitAttempted{ false };
+            bool commitSkipped{ false };
+            bool rawHostileAfter{ false };
+            bool teammateRegistered{ false };
+        };
+
+        struct RecruitHitDiagnosticState
+        {
+            RE::ActorHandle handle{};
+            RE::FormID actorFormID{ 0 };
+            RE::FormID causeFormID{ 0 };
+            std::uint32_t recruitSessionID{ 0 };
+            bool active{ false };
+            bool playerHitObserved{ false };
+            bool firstAfterHitLogged{ false };
+            bool secondAfterHitLogged{ false };
+            Clock::time_point armedAt{};
+            Clock::time_point expireAt{};
+            Clock::time_point firstAfterHitDue{};
+            Clock::time_point secondAfterHitDue{};
+            RE::NiPoint3 armPosition{};
+            RE::NiPoint3 hitPosition{};
+        };
+
+        std::atomic_bool g_installed{ false };
+        std::atomic_bool g_running{ false };
+        std::atomic_bool g_loadTransition{ false };
+        std::atomic_flag g_tickPending = ATOMIC_FLAG_INIT;
+        std::thread g_worker{};
+        std::recursive_mutex g_lock;
+        std::unordered_map<RE::FormID, EnemyEntry> g_enemyEntries{};
+        Clock::time_point g_lastLifecycleLog{};
+
+        SessionSnapshot g_session{};
+        Clock::time_point g_sessionOpenDeadline{};
+        Clock::time_point g_choiceCommitDeadline{};
+        Clock::time_point g_killDeadline{};
+        Clock::time_point g_killFinalizeNotBefore{};
+        KillStage g_killStage{ KillStage::None };
+        Clock::time_point g_lootDeadline{};
+        Clock::time_point g_lootFinalizeDeadline{};
+        LootStage g_lootStage{ LootStage::None };
+        LootTransitionState g_lootTransition{};
+        std::uint8_t g_lootInventoryDispatchAttempts{ 0 };
+        Clock::time_point g_recruitDeadline{};
+        Clock::time_point g_recruitFinalizeDeadline{};
+        RecruitStage g_recruitStage{ RecruitStage::None };
+        RecruitTransitionState g_recruitTransition{};
+        RecruitHitDiagnosticState g_recruitHitDiagnostic{};
+        std::uint32_t g_nextSessionID{ 1 };
+        RE::TESGlobal* g_conditionState = nullptr;
+        RE::TESTopicInfo* g_victoryGreetInfo = nullptr;
+
+        Clock::time_point Now()
+        {
+            return Clock::now();
+        }
+
+        std::string ReasonText(std::string_view reason)
+        {
+            return reason.empty() ? std::string{ "-" } : std::string{ reason };
+        }
+
+        const char* ToString(KillStage stage)
+        {
+            switch (stage) {
+            case KillStage::None:
+                return "None";
+            case KillStage::WaitingForDialogueClose:
+                return "WaitingForDialogueClose";
+            case KillStage::PrimePending:
+                return "PrimePending";
+            case KillStage::DamagePending:
+                return "DamagePending";
+            case KillStage::AwaitingDeath:
+                return "AwaitingDeath";
+            case KillStage::AwaitingEngineDeath:
+                return "AwaitingEngineDeath";
+            default:
+                return "Unknown";
+            }
+        }
+
+        const char* ToString(LootStage stage)
+        {
+            switch (stage) {
+            case LootStage::None:
+                return "None";
+            case LootStage::WaitingForDialogueClose:
+                return "WaitingForDialogueClose";
+            case LootStage::InventoryDispatchPending:
+                return "InventoryDispatchPending";
+            case LootStage::WaitingForInventoryOpen:
+                return "WaitingForInventoryOpen";
+            case LootStage::InventoryOpen:
+                return "InventoryOpen";
+            case LootStage::ReleasePending:
+                return "ReleasePending";
+            case LootStage::BleedoutStopPending:
+                return "BleedoutStopPending";
+            case LootStage::GetUpPending:
+                return "GetUpPending";
+            case LootStage::PackageRefreshPending:
+                return "PackageRefreshPending";
+            default:
+                return "Unknown";
+            }
+        }
+
+        const char* ToString(RecruitStage stage)
+        {
+            switch (stage) {
+            case RecruitStage::None:
+                return "None";
+            case RecruitStage::WaitingForDialogueClose:
+                return "WaitingForDialogueClose";
+            case RecruitStage::CommitPending:
+                return "CommitPending";
+            case RecruitStage::BleedoutStopPending:
+                return "BleedoutStopPending";
+            case RecruitStage::BleedoutExitPending:
+                return "BleedoutExitPending";
+            case RecruitStage::HitReactStartPending:
+                return "HitReactStartPending";
+            case RecruitStage::HitReactStopPending:
+                return "HitReactStopPending";
+            case RecruitStage::GetUpPending:
+                return "GetUpPending";
+            case RecruitStage::DefeatedClearPending:
+                return "DefeatedClearPending";
+            case RecruitStage::RecruitCommitPending:
+                return "RecruitCommitPending";
+            case RecruitStage::PackageRefreshPending:
+                return "PackageRefreshPending";
+            default:
+                return "Unknown";
+            }
+        }
+
+        bool PapyrusRequestKill(RE::StaticFunctionTag*, RE::Actor* speaker)
+        {
+            return RequestKill(speaker, "papyrus_victory_kill_fragment");
+        }
+
+        bool PapyrusRequestLoot(RE::StaticFunctionTag*, RE::Actor* speaker)
+        {
+            return RequestLoot(speaker, "papyrus_victory_loot_fragment");
+        }
+
+        bool PapyrusRequestRecruit(RE::StaticFunctionTag*, RE::Actor* speaker)
+        {
+            return RequestRecruit(speaker, "papyrus_victory_recruit_fragment");
+        }
+
+        void SetConditionState(int value)
+        {
+            if (!g_conditionState) {
+                g_conditionState = RE::TESForm::LookupByEditorID<RE::TESGlobal>("TFDVictoryState");
+            }
+            if (g_conditionState) {
+                g_conditionState->value = static_cast<float>(value);
+            }
+        }
+
+        void RefreshConditionStateLocked()
+        {
+            int value = 0;
+            if (g_session.active) {
+                value = 2;
+            }
+            else {
+                for (const auto& [_formID, entry] : g_enemyEntries) {
+                    if (entry.managed) {
+                        value = 1;
+                        break;
+                    }
                 }
             }
+            SetConditionState(value);
         }
 
-        inline std::chrono::steady_clock::time_point Now()
+        float GetActorHealthPct(RE::Actor* actor)
         {
-            return std::chrono::steady_clock::now();
+            if (!actor) {
+                return 0.0f;
+            }
+            const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float hpNow = (std::max)(0.0f, actor->GetActorValue(RE::ActorValue::kHealth));
+            return (hpNow / hpMax) * 100.0f;
         }
 
-        bool HasKeywordByEditorID(RE::Actor* actor, const char* editorID)
+        float DistanceOrZero(const RE::NiPoint3& a, const RE::NiPoint3& b)
         {
-            if (!actor || !editorID || !editorID[0]) {
-                return false;
-            }
-            auto* keyword = RE::TESForm::LookupByEditorID<RE::BGSKeyword>(editorID);
-            return keyword && actor->HasKeyword(keyword);
+            return a.GetDistance(b);
         }
 
-        bool IsHumanoidVictoryActor(RE::Actor* actor)
+        void LogRecruitHitDiagnosticSampleLocked(
+            RE::Actor* actor,
+            RE::Actor* cause,
+            const char* phase,
+            std::string_view reason)
         {
-            return HasKeywordByEditorID(actor, "ActorTypeNPC");
+            const auto reasonText = ReasonText(reason);
+            const auto* actorState = actor ? actor->AsActorState() : nullptr;
+            const bool bleeding = actorState && actorState->IsBleedingOut();
+            const bool dead = actor && actor->IsDead();
+            const bool disabled = actor && actor->IsDisabled();
+            const bool loaded = actor && actor->Is3DLoaded();
+            const bool inCombat = actor && actor->IsInCombat();
+            const bool playerTeammate = actor && actor->IsPlayerTeammate();
+            const bool activeFollower = actor && TFD::TeammateManager::IsActiveFollowerActor(actor);
+            const bool playerSide = actor && TFD::TeammateManager::IsPlayerSideTeammateActor(actor);
+            const bool tfdManaged = actor && TFD::TeammateManager::IsTFDManagedTeammateActor(actor);
+            const bool rawHostile = actor && TFD::Recruit::IsRawHostileToPlayer(actor, RE::PlayerCharacter::GetSingleton());
+            const float hp = actor ? actor->GetActorValue(RE::ActorValue::kHealth) : 0.0f;
+            const float hpPct = actor ? GetActorHealthPct(actor) : 0.0f;
+            const auto pos = actor ? actor->GetPosition() : RE::NiPoint3{};
+            const float distFromArm = actor && g_recruitHitDiagnostic.active ?
+                DistanceOrZero(pos, g_recruitHitDiagnostic.armPosition) :
+                0.0f;
+            const float distFromHit = actor && g_recruitHitDiagnostic.playerHitObserved ?
+                DistanceOrZero(pos, g_recruitHitDiagnostic.hitPosition) :
+                0.0f;
+
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit hit diagnostic sample phase={} actor={:08X} session={} cause={:08X} reason={} dead={} disabled={} loaded={} bleeding={} inCombat={} hp={:.2f} hpPct={:.1f} playerTeammate={} activeFollower={} playerSide={} tfdManaged={} rawHostile={} pos=({:.1f},{:.1f},{:.1f}) distFromArm={:.1f} distFromHit={:.1f} noBehaviorChange=1",
+                phase ? phase : "unknown",
+                actor ? actor->GetFormID() : g_recruitHitDiagnostic.actorFormID,
+                g_recruitHitDiagnostic.recruitSessionID,
+                cause ? cause->GetFormID() : g_recruitHitDiagnostic.causeFormID,
+                reasonText,
+                dead ? 1 : 0,
+                disabled ? 1 : 0,
+                loaded ? 1 : 0,
+                bleeding ? 1 : 0,
+                inCombat ? 1 : 0,
+                hp,
+                hpPct,
+                playerTeammate ? 1 : 0,
+                activeFollower ? 1 : 0,
+                playerSide ? 1 : 0,
+                tfdManaged ? 1 : 0,
+                rawHostile ? 1 : 0,
+                pos.x,
+                pos.y,
+                pos.z,
+                distFromArm,
+                distFromHit);
         }
 
-        bool IsBasicLivingVictoryActor(RE::Actor* actor, RE::Actor* player)
+        void ArmRecruitHitDiagnosticLocked(RE::Actor* actor, std::uint32_t sessionID, std::string_view reason)
         {
-            if (!actor || !player) {
-                return false;
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+                return;
             }
-            if (actor == player) {
-                return false;
-            }
-            if (actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-                return false;
-            }
-            if (actor->GetParentCell() != player->GetParentCell()) {
-                return false;
-            }
-            if (actor->IsPlayerTeammate() || TFD::TeammateManager::IsActiveFollowerActor(actor) || TFD::TeammateManager::IsPlayerSideTeammateActor(actor)) {
-                return false;
-            }
-            if (TFD::Tame::IsCompanion(actor) || TFD::Tame::HasActiveSession(actor)) {
-                return false;
-            }
-            return true;
+
+            const auto now = Now();
+            g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+            g_recruitHitDiagnostic.handle = actor->GetHandle();
+            g_recruitHitDiagnostic.actorFormID = actor->GetFormID();
+            g_recruitHitDiagnostic.recruitSessionID = sessionID;
+            g_recruitHitDiagnostic.active = true;
+            g_recruitHitDiagnostic.armedAt = now;
+            g_recruitHitDiagnostic.expireAt = now + kRecruitHitDiagnosticWindow;
+            g_recruitHitDiagnostic.armPosition = actor->GetPosition();
+
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit hit diagnostic armed actor={:08X} session={} windowMs={} reason={} watch=player_hit_after_recruit noBehaviorChange=1",
+                actor->GetFormID(),
+                sessionID,
+                std::chrono::duration_cast<std::chrono::milliseconds>(kRecruitHitDiagnosticWindow).count(),
+                ReasonText(reason));
+            LogRecruitHitDiagnosticSampleLocked(actor, nullptr, "armed_after_recruit_finalize", reason);
         }
 
-        bool HasLineOfSightToPlayer(RE::Actor* actor, RE::Actor* player)
+        void TickRecruitHitDiagnosticLocked(Clock::time_point now)
         {
-            if (!actor || !player) {
-                return false;
+            if (!g_recruitHitDiagnostic.active) {
+                return;
             }
-            bool hasLOSData = false;
-            return actor->HasLineOfSight(player, hasLOSData);
+
+            auto actorSP = g_recruitHitDiagnostic.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                spdlog::warn(
+                    "[TFD][Victory][R421A] Recruit hit diagnostic stopped actor={:08X} session={} reason=actor_invalid dead={} disabled={} noBehaviorChange=1",
+                    g_recruitHitDiagnostic.actorFormID,
+                    g_recruitHitDiagnostic.recruitSessionID,
+                    actor && actor->IsDead() ? 1 : 0,
+                    actor && actor->IsDisabled() ? 1 : 0);
+                g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+                return;
+            }
+
+            if (g_recruitHitDiagnostic.playerHitObserved) {
+                if (!g_recruitHitDiagnostic.firstAfterHitLogged &&
+                    g_recruitHitDiagnostic.firstAfterHitDue.time_since_epoch().count() != 0 &&
+                    now >= g_recruitHitDiagnostic.firstAfterHitDue) {
+                    g_recruitHitDiagnostic.firstAfterHitLogged = true;
+                    LogRecruitHitDiagnosticSampleLocked(actor, nullptr, "after_player_hit_250ms", "victory_recruit_player_hit_diagnostic");
+                }
+
+                if (!g_recruitHitDiagnostic.secondAfterHitLogged &&
+                    g_recruitHitDiagnostic.secondAfterHitDue.time_since_epoch().count() != 0 &&
+                    now >= g_recruitHitDiagnostic.secondAfterHitDue) {
+                    g_recruitHitDiagnostic.secondAfterHitLogged = true;
+                    LogRecruitHitDiagnosticSampleLocked(actor, nullptr, "after_player_hit_1000ms", "victory_recruit_player_hit_diagnostic");
+                    spdlog::info(
+                        "[TFD][Victory][R421A] Recruit hit diagnostic completed actor={:08X} session={} result=first_player_hit_observed noBehaviorChange=1",
+                        g_recruitHitDiagnostic.actorFormID,
+                        g_recruitHitDiagnostic.recruitSessionID);
+                    g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+                    return;
+                }
+            }
+
+            if (g_recruitHitDiagnostic.expireAt.time_since_epoch().count() != 0 &&
+                now >= g_recruitHitDiagnostic.expireAt) {
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit hit diagnostic expired actor={:08X} session={} playerHitObserved={} windowMs={} noBehaviorChange=1",
+                    g_recruitHitDiagnostic.actorFormID,
+                    g_recruitHitDiagnostic.recruitSessionID,
+                    g_recruitHitDiagnostic.playerHitObserved ? 1 : 0,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(kRecruitHitDiagnosticWindow).count());
+                g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+            }
         }
 
-        bool IsTargetingPlayer(RE::Actor* actor, RE::Actor* player)
-        {
-            if (!actor || !player) {
-                return false;
-            }
-            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
-            auto* target = targetSp.get();
-            if (!target) {
-                return false;
-            }
-            return target == player || target->GetFormID() == player->GetFormID();
-        }
-
-
-        bool IsRelevantLivingEnemyActor(RE::Actor* actor, RE::Actor* player)
-        {
-            if (!IsBasicLivingVictoryActor(actor, player)) {
-                return false;
-            }
-            if (TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
-                return true;
-            }
-            if (TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor)) {
-                return true;
-            }
-            if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
-                return true;
-            }
-
-            auto targetSp = actor->GetActorRuntimeData().currentCombatTarget.get();
-            auto* currentTarget = targetSp.get();
-            if (currentTarget == player) {
-                return true;
-            }
-            if (currentTarget && TFD::TeammateManager::IsActiveFollowerActor(currentTarget)) {
-                return true;
-            }
-            return false;
-        }
-
-        bool IsUsableDefeatedDialogueActor(RE::Actor* actor, RE::Actor* player)
-        {
-            if (!IsBasicLivingVictoryActor(actor, player)) {
-                return false;
-            }
-            if (!TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
-                return false;
-            }
-            if (TFD::Actor::Ops::GetDefeatedEnemyRemainingSeconds(actor) <= 0.0) {
-                return false;
-            }
-            return true;
-        }
-
-        bool IsThresholdDefeatedVictoryActor(RE::Actor* actor, RE::Actor* player, bool allowContextFallback)
-        {
-            if (!IsBasicLivingVictoryActor(actor, player)) {
-                return false;
-            }
-            if (!IsHumanoidVictoryActor(actor)) {
-                return false;
-            }
-            if (!TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct())) {
-                return false;
-            }
-            return allowContextFallback || IsRelevantLivingEnemyActor(actor, player);
-        }
-
-
-        bool IsStandingForVictoryBlock(RE::Actor* actor)
-        {
-            if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
-                return false;
-            }
-            if (actor->GetActorValue(RE::ActorValue::kHealth) <= 0.0f) {
-                return false;
-            }
-
-            // R304A: A TFD-knocked enemy remains alive during its defeated window,
-            // but it is no longer a standing combat blocker.  Treat it as an
-            // individual defeated candidate, not as proof that the encounter is
-            // still unresolved.
-            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
-                return false;
-            }
-            if (TFD::Actor::IsDownByHealthThreshold(actor, TFD::Settings::GetEnemyDownedThresholdPct())) {
-                return false;
-            }
-            return true;
-        }
-
-        bool IsDefeatedVictoryCandidate(RE::Actor* actor, RE::Actor* player, bool allowThresholdFallback)
-        {
-            if (!IsBasicLivingVictoryActor(actor, player)) {
-                return false;
-            }
-            if (TFD::Actor::Ops::IsDialogueCapableDefeatedEnemy(actor)) {
-                return true;
-            }
-            if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
-                return true;
-            }
-            return IsThresholdDefeatedVictoryActor(actor, player, allowThresholdFallback);
-        }
-
-        bool SharesDefeatedEncounterFaction(RE::Actor* actor, const std::vector<RE::Actor*>& defeatedActors)
+        bool IsUsableManualCandidate(RE::Actor* actor)
         {
             if (!actor) {
                 return false;
             }
-            for (auto* defeated : defeatedActors) {
-                if (!defeated || defeated == actor) {
-                    continue;
-                }
-                if (TFD::Actor::SharesAllowedFactionExact(actor, defeated)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        struct CollectiveVictoryEvaluation
-        {
-            bool hasCandidate{ false };
-            bool resolved{ false };
-            bool hasStandingBlocker{ false };
-            RE::FormID candidateFormID{ 0 };
-            RE::FormID blockerFormID{ 0 };
-            std::uint32_t activeCoalitionCount{ 0 };
-            std::uint32_t standingHostileCoalitionCount{ 0 };
-        };
-
-        CollectiveVictoryEvaluation EvaluateCollectiveVictory(
-            float radius,
-            bool activeVictoryContext,
-            RE::Actor* requiredCandidate)
-        {
-            CollectiveVictoryEvaluation result{};
-
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player) {
-                return result;
-            }
-
-            const float scanRadius = (std::max)(radius, kActorLevelDefeatedScanRadius);
-            TFD::Actor::ScanOptions options{};
-            options.radius = scanRadius;
-            options.npcOnly = false;
-            const auto snapshot = TFD::Actor::BuildSnapshot(player, options);
-
-            const auto requiredFormID = requiredCandidate ? requiredCandidate->GetFormID() : 0;
-            std::vector<RE::Actor*> defeatedActors;
-            defeatedActors.reserve(snapshot.actors.size() + (requiredCandidate ? 1u : 0u));
-
-            auto addCandidate = [&](RE::Actor* actor) {
-                if (!actor || actor == player) {
-                    return;
-                }
-                if (!IsDefeatedVictoryCandidate(actor, player, activeVictoryContext)) {
-                    return;
-                }
-                for (auto* existing : defeatedActors) {
-                    if (existing == actor) {
-                        return;
-                    }
-                }
-                defeatedActors.push_back(actor);
-                result.hasCandidate = true;
-                if (result.candidateFormID == 0) {
-                    result.candidateFormID = actor->GetFormID();
-                }
-            };
-
-            if (requiredCandidate) {
-                addCandidate(requiredCandidate);
-            }
-
-            for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor || info.dist > scanRadius) {
-                    continue;
-                }
-                addCandidate(actor);
-            }
-
-            if (requiredFormID != 0) {
-                bool foundRequired = false;
-                for (auto* defeated : defeatedActors) {
-                    if (defeated && defeated->GetFormID() == requiredFormID) {
-                        foundRequired = true;
-                        break;
-                    }
-                }
-                if (!foundRequired) {
-                    result.hasCandidate = false;
-                    result.candidateFormID = 0;
-                    return result;
-                }
-                result.candidateFormID = requiredFormID;
-            }
-
-            if (!result.hasCandidate) {
-                return result;
-            }
-
-            auto isDefeatedActorRef = [&](RE::Actor* actor) {
-                for (auto* defeated : defeatedActors) {
-                    if (defeated == actor) {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            std::vector<std::int32_t> effectiveStandingCoalitions;
-            std::vector<std::int32_t> effectiveHostileCoalitions;
-
-            auto pushUniqueCoalition = [](std::vector<std::int32_t>& values, std::int32_t coalitionID) {
-                if (coalitionID < 0) {
-                    return;
-                }
-                if (std::find(values.begin(), values.end(), coalitionID) == values.end()) {
-                    values.push_back(coalitionID);
-                }
-            };
-
-            auto markBlocker = [&](RE::Actor* actor) {
-                result.hasStandingBlocker = true;
-                if (actor && result.blockerFormID == 0) {
-                    result.blockerFormID = actor->GetFormID();
-                }
-            };
-
-            for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor || info.dist > scanRadius) {
-                    continue;
-                }
-                if (!IsBasicLivingVictoryActor(actor, player)) {
-                    continue;
-                }
-
-                // R304A: actor-level defeated is preserved, but it does not count
-                // as a standing coalition member during the 10s Victory window.
-                if (isDefeatedActorRef(actor)) {
-                    continue;
-                }
-                if (!IsStandingForVictoryBlock(actor)) {
-                    continue;
-                }
-
-                const bool standingEncounterCoalition = info.isBattleParticipant && !info.playerSide;
-                const bool activeEnemy = IsRelevantLivingEnemyActor(actor, player);
-                const bool suppressedByTFD =
-                    TFD::HostilityController::IsSuppressed(actor) ||
-                    TFD::HostilityController::IsActorTemporarilySuppressed(actor);
-                const bool sameDefeatedFaction = SharesDefeatedEncounterFaction(actor, defeatedActors);
-
-                const bool targetingPlayer = IsTargetingPlayer(actor, player);
-                const bool hasPlayerLOS = HasLineOfSightToPlayer(actor, player);
-                const bool activeThreatSignal = targetingPlayer || hasPlayerLOS;
-                const bool enemyIdentity =
-                    actor->IsHostileToActor(player) ||
-                    actor->IsInCombat() ||
-                    activeEnemy ||
-                    suppressedByTFD ||
-                    sameDefeatedFaction ||
-                    standingEncounterCoalition;
-
-                // R306A: Player Victory is blocked by an active threat to the
-                // player, not by every standing faction mate in the cell.  A
-                // standing enemy that is neither targeting the player nor able
-                // to see the player is not an immediate threat and must not
-                // erase the 10s defeated-enemy Victory window.
-                if (enemyIdentity && activeThreatSignal) {
-                    pushUniqueCoalition(effectiveStandingCoalitions, info.coalitionID);
-                    if (!info.playerSide) {
-                        pushUniqueCoalition(effectiveHostileCoalitions, info.coalitionID);
-                    }
-                    markBlocker(actor);
-                }
-            }
-
-            result.activeCoalitionCount = static_cast<std::uint32_t>(effectiveStandingCoalitions.size());
-            result.standingHostileCoalitionCount = static_cast<std::uint32_t>(effectiveHostileCoalitions.size());
-
-            result.resolved = result.hasCandidate && !result.hasStandingBlocker;
-            return result;
-        }
-
-        bool HasActorLevelDefeatedLivingVictoryActor(float radius)
-        {
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player) {
+            if (actor->IsDisabled() || actor->IsDead()) {
                 return false;
             }
-
-            const float scanRadius = (std::max)(radius, kActorLevelDefeatedScanRadius);
-            const auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
-
-            for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor || info.dist > scanRadius) {
-                    continue;
-                }
-                if (!IsBasicLivingVictoryActor(actor, player)) {
-                    continue;
-                }
-                if (TFD::Actor::Ops::IsDefeatedEnemyKnocked(actor)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        bool HasThresholdDefeatedVictoryActor(float radius, bool allowContextFallback)
-        {
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            if (!player) {
-                return false;
-            }
-
-            const float scanRadius = (std::max)(radius, kVictoryObservedScanRadius);
-            const auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
-
-            for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor || info.dist > scanRadius) {
-                    continue;
-                }
-                if (IsThresholdDefeatedVictoryActor(actor, player, allowContextFallback)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        bool IsDialogueReadyHoldActive()
-        {
-            const auto now = Now();
-            if (g_dialogueReadyHoldActorFormID == 0 || now >= g_dialogueReadyHoldUntil) {
-                g_dialogueReadyHoldActorFormID = 0;
-                g_dialogueReadyHoldUntil = {};
-                return false;
-            }
-
-            auto* player = RE::PlayerCharacter::GetSingleton();
-            auto* actor = RE::TESForm::LookupByID<RE::Actor>(g_dialogueReadyHoldActorFormID);
-            if (!IsUsableDefeatedDialogueActor(actor, player)) {
-                spdlog::info(
-                    "[TFD][Victory] dialogue ready hold cleared actor={:08X} reason=actor_not_usable",
-                    g_dialogueReadyHoldActorFormID);
-                g_dialogueReadyHoldActorFormID = 0;
-                g_dialogueReadyHoldUntil = {};
-                return false;
-            }
-
             return true;
         }
 
-        bool HasRelevantLivingEnemyActor(float radius)
+        RE::TESTopicInfo* ResolveVictoryGreetTopicInfo()
         {
+            if (!g_victoryGreetInfo) {
+                if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
+                    g_victoryGreetInfo = dataHandler->LookupForm<RE::TESTopicInfo>(
+                        kVictoryGreetInfoLocalFormID,
+                        kPluginName);
+                }
+
+                if (g_victoryGreetInfo) {
+                    spdlog::info(
+                        "[TFD][Victory][R394A] Victory Greet INFO resolved form={:08X} local={:06X}",
+                        g_victoryGreetInfo->GetFormID(),
+                        kVictoryGreetInfoLocalFormID);
+                }
+                else {
+                    spdlog::warn(
+                        "[TFD][Victory][R394A] Victory Greet INFO missing local={:06X} plugin={}",
+                        kVictoryGreetInfoLocalFormID,
+                        kPluginName);
+                }
+            }
+            return g_victoryGreetInfo;
+        }
+
+        bool IsDialogueMenuOpen()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+        }
+
+        RE::FormID GetOpenLootTargetActorFormID()
+        {
+            auto* ui = RE::UI::GetSingleton();
+            if (!ui || !ui->IsMenuOpen(RE::ContainerMenu::MENU_NAME)) {
+                return 0;
+            }
+
+            auto targetSP = RE::Actor::LookupByHandle(RE::ContainerMenu::GetTargetRefHandle());
+            auto* target = targetSP.get();
+            return target ? target->GetFormID() : 0;
+        }
+
+        bool IsSelectedLootContainerOpen(RE::FormID expectedActorFormID)
+        {
+            return expectedActorFormID != 0 &&
+                   GetOpenLootTargetActorFormID() == expectedActorFormID;
+        }
+
+        std::uint32_t NextSessionIDLocked()
+        {
+            auto value = g_nextSessionID++;
+            if (value == 0) {
+                value = g_nextSessionID++;
+            }
+            return value;
+        }
+
+        struct ThreatGateResult
+        {
+            bool blocked{ false };
+            RE::FormID actorFormID{ 0 };
+            float distance{ 0.0f };
+        };
+
+        ThreatGateResult FindBlockingPlayerThreat(RE::Actor* selectedActor)
+        {
+            ThreatGateResult result{};
             auto* player = RE::PlayerCharacter::GetSingleton();
             if (!player) {
+                result.blocked = true;
+                return result;
+            }
+
+            std::unordered_set<RE::FormID> defeatedIDs{};
+            {
+                std::scoped_lock lk(g_lock);
+                defeatedIDs.reserve(g_enemyEntries.size());
+                for (const auto& [formID, _entry] : g_enemyEntries) {
+                    defeatedIDs.insert(formID);
+                }
+            }
+
+            TFD::Actor::ScanOptions options{};
+            options.radius = (std::max)(128.0f, TFD::Settings::GetSweepRadius());
+            options.npcOnly = false;
+            const auto snapshot = TFD::Actor::BuildSnapshot(player, options);
+            const auto playerFormID = player->GetFormID();
+
+            float bestDistance = options.radius + 1.0f;
+            for (const auto& info : snapshot.actors) {
+                auto* actor = info.get();
+                if (!actor || actor == player || actor == selectedActor || actor->IsDead() || actor->IsDisabled()) {
+                    continue;
+                }
+                if (defeatedIDs.contains(actor->GetFormID())) {
+                    continue;
+                }
+                if (!info.standing || !info.inCombat || info.playerSide) {
+                    continue;
+                }
+
+                bool targetsPlayer = info.currentTargetFormID == playerFormID;
+                if (!targetsPlayer) {
+                    auto targetSP = actor->GetActorRuntimeData().currentCombatTarget.get();
+                    targetsPlayer = targetSP.get() == player;
+                }
+                if (!targetsPlayer) {
+                    continue;
+                }
+
+                if (info.dist < bestDistance) {
+                    bestDistance = info.dist;
+                    result.blocked = true;
+                    result.actorFormID = actor->GetFormID();
+                    result.distance = info.dist;
+                }
+            }
+            return result;
+        }
+
+        bool ReleaseEntryByIDLocked(RE::FormID formID, std::string_view reason, bool playGetUp);
+
+        void ClearLootTransitionLocked(std::string_view reason)
+        {
+            if (g_lootStage != LootStage::None) {
+                spdlog::info(
+                    "[TFD][Victory][R396B] Loot transition cleared actor={:08X} stage={} reason={}",
+                    g_session.selectedActorFormID,
+                    ToString(g_lootStage),
+                    ReasonText(reason));
+            }
+            g_lootTransition = LootTransitionState{};
+            g_lootInventoryDispatchAttempts = 0;
+            g_lootDeadline = {};
+            g_lootFinalizeDeadline = {};
+            g_lootStage = LootStage::None;
+        }
+
+        void ClearRecruitTransitionLocked(std::string_view reason)
+        {
+            if (g_recruitStage != RecruitStage::None) {
+                spdlog::info(
+                    "[TFD][Victory][R400D] Recruit transition cleared actor={:08X} stage={} reason={}",
+                    g_session.selectedActorFormID,
+                    ToString(g_recruitStage),
+                    ReasonText(reason));
+            }
+            g_recruitTransition = RecruitTransitionState{};
+            g_recruitDeadline = {};
+            g_recruitFinalizeDeadline = {};
+            g_recruitStage = RecruitStage::None;
+        }
+
+        void ResetSessionLocked(std::string_view reason, bool restartCountdown)
+        {
+            const auto previous = g_session;
+            const auto now = Now();
+
+            if (previous.active && previous.selectedActorFormID != 0) {
+                if (auto it = g_enemyEntries.find(previous.selectedActorFormID); it != g_enemyEntries.end()) {
+                    auto& entry = it->second;
+                    if (entry.countdownHeld &&
+                        (entry.heldSessionID == 0 || entry.heldSessionID == previous.sessionID)) {
+                        entry.countdownHeld = false;
+                        entry.heldSessionID = 0;
+                        entry.autoDeathIssued = false;
+                        entry.fatalDamageApplied = false;
+                        if (restartCountdown) {
+                            entry.deadline = now + std::chrono::milliseconds(
+                                static_cast<int>(kEnemyKnockSeconds * 1000.0));
+                        }
+                    }
+                }
+            }
+
+            g_session = SessionSnapshot{};
+            g_sessionOpenDeadline = {};
+            g_choiceCommitDeadline = {};
+            g_killDeadline = {};
+            g_killFinalizeNotBefore = {};
+            g_killStage = KillStage::None;
+            ClearLootTransitionLocked(reason);
+            ClearRecruitTransitionLocked(reason);
+            RefreshConditionStateLocked();
+
+            if (previous.active || previous.selectedActorFormID != 0) {
+                spdlog::info(
+                    "[TFD][Victory][R394A] session closed actor={:08X} session={} phase={} countdownRestart={} reason={}",
+                    previous.selectedActorFormID,
+                    previous.sessionID,
+                    ToString(previous.phase),
+                    restartCountdown ? kEnemyKnockSeconds : 0.0,
+                    ReasonText(reason));
+            }
+        }
+
+        void ArmCommittedKillLocked(Clock::time_point now, std::string_view reason)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::KillCommitted ||
+                g_session.selectedActorFormID == 0) {
+                return;
+            }
+
+            if (g_killStage != KillStage::WaitingForDialogueClose &&
+                g_killStage != KillStage::None) {
+                return;
+            }
+
+            g_killStage = KillStage::PrimePending;
+            g_killDeadline = now + kKillPrimeDelay;
+            spdlog::info(
+                "[TFD][Victory][R395B] Kill execution armed actor={:08X} session={} stage={} reason={} dialogueOpen={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_killStage),
+                ReasonText(reason),
+                IsDialogueMenuOpen() ? 1 : 0);
+        }
+
+        void TickCommittedKillLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::KillCommitted ||
+                g_session.selectedActorFormID == 0) {
+                return;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+            auto it = g_enemyEntries.find(actorFormID);
+            if (it == g_enemyEntries.end() || !it->second.managed) {
+                spdlog::error(
+                    "[TFD][Victory][R395B] Kill execution lost defeated entry actor={:08X} session={} action=close_session",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("kill_entry_missing", false);
+                return;
+            }
+
+            auto actorSP = it->second.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled()) {
+                spdlog::error(
+                    "[TFD][Victory][R395B] Kill execution invalid actor={:08X} session={} action=release_entry",
+                    actorFormID,
+                    sessionID);
+                (void)ReleaseEntryByIDLocked(actorFormID, "victory_kill_invalid_actor", false);
+                return;
+            }
+
+            if (actor->IsDead()) {
+                if (g_killFinalizeNotBefore.time_since_epoch().count() != 0 &&
+                    now < g_killFinalizeNotBefore) {
+                    return;
+                }
+
+                const auto completedStage = g_killStage;
+                const bool released = ReleaseEntryByIDLocked(actorFormID, "victory_kill_confirmed", false);
+                spdlog::info(
+                    "[TFD][Victory][R395B] Kill finalized actor={:08X} session={} dead=1 releasedManaged={} aliasFactionCleared={} stage={} no_getup=1",
+                    actorFormID,
+                    sessionID,
+                    released ? 1 : 0,
+                    released ? 1 : 0,
+                    ToString(completedStage));
+                return;
+            }
+
+            if (g_killStage == KillStage::WaitingForDialogueClose) {
+                if (!IsDialogueMenuOpen()) {
+                    ArmCommittedKillLocked(now, "dialogue_already_closed");
+                }
+                return;
+            }
+
+            if (g_killStage == KillStage::PrimePending) {
+                if (g_killDeadline.time_since_epoch().count() == 0 || now < g_killDeadline) {
+                    return;
+                }
+
+                // Release the talking state before death. This is not a Get Up path.
+                // It mirrors the confirmed auto-death staging instead of killing the
+                // actor synchronously from inside the TopicInfo fragment.
+                actor->SetDialogueWithPlayer(false, false, nullptr);
+                if (it->second.visualBleedoutStarted && !it->second.visualBleedoutStopSent) {
+                    actor->NotifyAnimationGraph("BleedoutStop");
+                    it->second.visualBleedoutStopSent = true;
+                }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+
+                g_killStage = KillStage::DamagePending;
+                g_killDeadline = now + kKillDamageDelay;
+                spdlog::info(
+                    "[TFD][Victory][R395B] Kill death stage primed actor={:08X} session={} stage={} no_getup=1",
+                    actorFormID,
+                    sessionID,
+                    ToString(g_killStage));
+                return;
+            }
+
+            if (g_killStage == KillStage::DamagePending) {
+                if (g_killDeadline.time_since_epoch().count() == 0 || now < g_killDeadline) {
+                    return;
+                }
+
+                const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+                const float fatalDamage = (std::max)(25.0f, hpNow + 5000.0f);
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    -fatalDamage);
+
+                g_killStage = KillStage::AwaitingDeath;
+                g_killFinalizeNotBefore = now + kKillDeathSettleDelay;
+                g_killDeadline = now + kKillDeathConfirmDelay;
+                spdlog::info(
+                    "[TFD][Victory][R395B] Kill fatal damage applied actor={:08X} session={} hpBefore={:.2f} damage={:.2f} stage={}",
+                    actorFormID,
+                    sessionID,
+                    hpNow,
+                    fatalDamage,
+                    ToString(g_killStage));
+                return;
+            }
+
+            if (g_killStage == KillStage::AwaitingDeath) {
+                if (g_killDeadline.time_since_epoch().count() == 0 || now < g_killDeadline) {
+                    return;
+                }
+
+                // The normal fatal-damage path should already have killed the
+                // actor. If it did not, use the engine's non-instant kill path so
+                // the death graph still gets a chance to run. Never use
+                // KillImmediate for a committed Victory choice.
+                const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+                const float fatalDamage = (std::max)(25.0f, hpNow + 5000.0f);
+                actor->KillImpl(RE::PlayerCharacter::GetSingleton(), fatalDamage, true, false);
+                g_killStage = KillStage::AwaitingEngineDeath;
+                g_killFinalizeNotBefore = now + kKillDeathSettleDelay;
+                g_killDeadline = now + kKillEngineConfirmDelay;
+                spdlog::warn(
+                    "[TFD][Victory][R395B] Kill engine fallback actor={:08X} session={} damage={:.2f} ragdollInstant=0 stage={}",
+                    actorFormID,
+                    sessionID,
+                    fatalDamage,
+                    ToString(g_killStage));
+                return;
+            }
+
+            if (g_killStage == KillStage::AwaitingEngineDeath &&
+                g_killDeadline.time_since_epoch().count() != 0 &&
+                now >= g_killDeadline) {
+                if (actor->IsDead()) {
+                    return;
+                }
+
+                spdlog::error(
+                    "[TFD][Victory][R395B] Kill failed after engine fallback actor={:08X} session={} action=cancel_restart_countdown no_kill_immediate=1",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("kill_failed_after_engine_fallback", true);
+            }
+        }
+
+        void ApplyRegenOverride(RE::Actor* actor, EnemyEntry& entry)
+        {
+            auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+            if (!avo) {
+                return;
+            }
+
+            if (!entry.regenOverridden) {
+                entry.savedHealRate = avo->GetActorValue(RE::ActorValue::kHealRate);
+                entry.savedHealRateMult = avo->GetActorValue(RE::ActorValue::kHealRateMult);
+                entry.savedCombatHealRateMult = avo->GetActorValue(RE::ActorValue::kCombatHealthRegenMultiply);
+                entry.regenOverridden = true;
+            }
+
+            avo->SetActorValue(RE::ActorValue::kHealRate, 0.0f);
+            avo->SetActorValue(RE::ActorValue::kHealRateMult, 0.0f);
+            avo->SetActorValue(RE::ActorValue::kCombatHealthRegenMultiply, 0.0f);
+        }
+
+        void RestoreRegenOverride(RE::Actor* actor, const EnemyEntry& entry)
+        {
+            if (!entry.regenOverridden) {
+                return;
+            }
+
+            auto* avo = actor ? actor->AsActorValueOwner() : nullptr;
+            if (!avo) {
+                return;
+            }
+
+            avo->SetActorValue(RE::ActorValue::kHealRate, entry.savedHealRate);
+            avo->SetActorValue(RE::ActorValue::kHealRateMult, entry.savedHealRateMult);
+            avo->SetActorValue(RE::ActorValue::kCombatHealthRegenMultiply, entry.savedCombatHealRateMult);
+        }
+
+        bool DispatchLootInventoryOpen(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
                 return false;
             }
 
-            const float scanRadius = (std::max)(radius, kVictoryObservedScanRadius);
-            const auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
+            auto* vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+            if (!vm) {
+                return false;
+            }
+
+            auto* policy = vm->GetObjectHandlePolicy();
+            if (!policy) {
+                return false;
+            }
+
+            const auto handle = policy->GetHandleForObject(actor->GetFormType(), actor);
+            if (handle == policy->EmptyHandle()) {
+                return false;
+            }
+
+            RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback{};
+            auto* args = RE::MakeFunctionArguments(true);
+            return vm->DispatchMethodCall(handle, "Actor", "OpenInventory", args, callback);
+        }
+
+        float RestoreLootReleaseHealth(RE::Actor* actor, float thresholdPct)
+        {
+            if (!actor) {
+                return 0.0f;
+            }
+
+            const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+            const float safePct = std::clamp((thresholdPct + kLootHealthBonusPct) / 100.0f, 0.25f, 0.99f);
+            const float target = (std::max)(25.0f, hpMax * safePct);
+            if (hpBefore + 0.001f < target) {
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    target - hpBefore);
+            }
+            return actor->GetActorValue(RE::ActorValue::kHealth);
+        }
+
+        bool BeginLootReleaseLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::LootCommitted ||
+                g_session.selectedActorFormID == 0 ||
+                g_lootStage != LootStage::ReleasePending) {
+                return false;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+            auto it = g_enemyEntries.find(actorFormID);
+            if (it == g_enemyEntries.end() || !it->second.managed) {
+                spdlog::error(
+                    "[TFD][Victory][R396B] Loot release lost defeated entry actor={:08X} session={} action=close_session",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("loot_entry_missing", false);
+                return false;
+            }
+
+            auto& entry = it->second;
+            auto actorSP = entry.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R396B] Loot release invalid actor={:08X} session={} dead={} action=release_without_getup",
+                    actorFormID,
+                    sessionID,
+                    actor && actor->IsDead() ? 1 : 0);
+                (void)ReleaseEntryByIDLocked(actorFormID, "victory_loot_invalid_actor", false);
+                return false;
+            }
+
+            const bool wasBleedingOut = entry.visualBleedoutStarted && !entry.visualBleedoutStopSent;
+            const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+            const float hpAfter = RestoreLootReleaseHealth(actor, entry.thresholdPct);
+
+            TFD::Actor::Ops::SuppressDefeatedEnemyReentry(
+                actor,
+                kLootReentrySuppressSeconds,
+                "victory_loot_controlled_release");
+
+            // Keep the defeated registry/faction and passive aggression owned until
+            // the one-shot Get Up has settled. This follows the outcome contract:
+            // Get Up first, then leave the alias/faction and become free to attack.
+            entry.countdownHeld = true;
+            entry.heldSessionID = sessionID;
+            g_lootTransition.handle = entry.handle;
+            g_lootTransition.wasBleedingOut = wasBleedingOut;
+
+            actor->SetDialogueWithPlayer(false, false, nullptr);
+            g_lootStage = LootStage::BleedoutStopPending;
+            g_lootDeadline = now + kLootReleasePrepareDelay;
+
+            spdlog::info(
+                "[TFD][Victory][R399A] Loot defeated visual release armed actor={:08X} session={} aliasFactionHeld=1 hpBefore={:.2f} hpAfter={:.2f} threshold={:.1f} visualBleedoutOwned={} passiveHeldUntilRelease=1 stage={}",
+                actorFormID,
+                sessionID,
+                hpBefore,
+                hpAfter,
+                entry.thresholdPct,
+                wasBleedingOut ? 1 : 0,
+                ToString(g_lootStage));
+            return true;
+        }
+
+        void TickCommittedLootLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::LootCommitted ||
+                g_session.selectedActorFormID == 0) {
+                return;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+
+            if (g_lootStage == LootStage::WaitingForDialogueClose) {
+                if (!IsDialogueMenuOpen()) {
+                    g_lootStage = LootStage::InventoryDispatchPending;
+                    g_lootInventoryDispatchAttempts = 0;
+                    g_lootDeadline = now + kLootInventoryDispatchDelay;
+                    spdlog::info(
+                        "[TFD][Victory][R396B] Loot dialogue closed actor={:08X} session={} stage={} nativeDispatchDelayMs={}",
+                        actorFormID,
+                        sessionID,
+                        ToString(g_lootStage),
+                        kLootInventoryDispatchDelay.count());
+                    return;
+                }
+
+                if (g_lootDeadline.time_since_epoch().count() != 0 && now >= g_lootDeadline) {
+                    spdlog::warn(
+                        "[TFD][Victory][R396B] Loot cancelled actor={:08X} session={} gate=dialogue_close_timeout countdownRestart=10",
+                        actorFormID,
+                        sessionID);
+                    ResetSessionLocked("loot_dialogue_close_timeout", true);
+                }
+                return;
+            }
+
+            if (g_lootStage == LootStage::InventoryDispatchPending) {
+                if (g_lootDeadline.time_since_epoch().count() != 0 && now < g_lootDeadline) {
+                    return;
+                }
+
+                auto entryIt = g_enemyEntries.find(actorFormID);
+                if (entryIt == g_enemyEntries.end() || !entryIt->second.managed) {
+                    spdlog::warn(
+                        "[TFD][Victory][R396B] Loot inventory dispatch cancelled actor={:08X} session={} gate=missing_defeated_entry countdownRestart=10",
+                        actorFormID,
+                        sessionID);
+                    ResetSessionLocked("loot_inventory_dispatch_missing_entry", true);
+                    return;
+                }
+
+                auto actorSP = entryIt->second.handle.get();
+                auto* actor = actorSP.get();
+                if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                    spdlog::warn(
+                        "[TFD][Victory][R396B] Loot inventory dispatch cancelled actor={:08X} session={} gate=invalid_defeated_actor countdownRestart=10",
+                        actorFormID,
+                        sessionID);
+                    ResetSessionLocked("loot_inventory_dispatch_invalid_actor", true);
+                    return;
+                }
+
+                ++g_lootInventoryDispatchAttempts;
+                g_lootStage = LootStage::WaitingForInventoryOpen;
+                g_lootDeadline = now + kLootInventoryOpenTimeout;
+                const bool dispatched = DispatchLootInventoryOpen(actor);
+                if (dispatched || g_lootStage == LootStage::InventoryOpen) {
+                    spdlog::info(
+                        "[TFD][Victory][R396B] Loot inventory native dispatch actor={:08X} session={} attempt={} dispatched={} stage={} method=Actor.OpenInventory forceOpen=1",
+                        actorFormID,
+                        sessionID,
+                        static_cast<unsigned>(g_lootInventoryDispatchAttempts),
+                        dispatched ? 1 : 0,
+                        ToString(g_lootStage));
+                    return;
+                }
+
+                if (g_lootInventoryDispatchAttempts < kLootInventoryDispatchMaxAttempts) {
+                    g_lootStage = LootStage::InventoryDispatchPending;
+                    g_lootDeadline = now + kLootInventoryDispatchRetryDelay;
+                    spdlog::warn(
+                        "[TFD][Victory][R396B] Loot inventory native dispatch retry actor={:08X} session={} attempt={} maxAttempts={} retryDelayMs={}",
+                        actorFormID,
+                        sessionID,
+                        static_cast<unsigned>(g_lootInventoryDispatchAttempts),
+                        static_cast<unsigned>(kLootInventoryDispatchMaxAttempts),
+                        kLootInventoryDispatchRetryDelay.count());
+                    return;
+                }
+
+                spdlog::error(
+                    "[TFD][Victory][R396B] Loot inventory native dispatch failed actor={:08X} session={} attempts={} action=cancel_and_restart_countdown",
+                    actorFormID,
+                    sessionID,
+                    static_cast<unsigned>(g_lootInventoryDispatchAttempts));
+                ResetSessionLocked("loot_inventory_native_dispatch_failed", true);
+                return;
+            }
+
+            if (g_lootStage == LootStage::WaitingForInventoryOpen) {
+                if (IsSelectedLootContainerOpen(actorFormID)) {
+                    g_lootStage = LootStage::InventoryOpen;
+                    g_lootDeadline = {};
+                    spdlog::info(
+                        "[TFD][Victory][R396B] Loot inventory open confirmed by native poll actor={:08X} session={} stage={} target={:08X}",
+                        actorFormID,
+                        sessionID,
+                        ToString(g_lootStage),
+                        GetOpenLootTargetActorFormID());
+                    return;
+                }
+
+                if (g_lootDeadline.time_since_epoch().count() != 0 && now >= g_lootDeadline) {
+                    spdlog::warn(
+                        "[TFD][Victory][R396B] Loot cancelled actor={:08X} session={} gate=inventory_open_timeout currentTarget={:08X} countdownRestart=10",
+                        actorFormID,
+                        sessionID,
+                        GetOpenLootTargetActorFormID());
+                    ResetSessionLocked("loot_inventory_open_timeout", true);
+                }
+                return;
+            }
+
+            if (g_lootStage == LootStage::InventoryOpen) {
+                return;
+            }
+
+            if (g_lootDeadline.time_since_epoch().count() != 0 && now < g_lootDeadline) {
+                return;
+            }
+
+            if (g_lootStage == LootStage::ReleasePending) {
+                (void)BeginLootReleaseLocked(now);
+                return;
+            }
+
+            auto actorSP = g_lootTransition.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R396B] Loot transition actor lost actor={:08X} session={} stage={} action=close_session",
+                    actorFormID,
+                    sessionID,
+                    ToString(g_lootStage));
+                ResetSessionLocked("loot_transition_actor_lost", false);
+                return;
+            }
+
+            if (g_lootStage == LootStage::BleedoutStopPending) {
+                if (g_lootTransition.wasBleedingOut) {
+                    actor->NotifyAnimationGraph("BleedoutStop");
+                    if (auto entryIt = g_enemyEntries.find(actorFormID); entryIt != g_enemyEntries.end()) {
+                        entryIt->second.visualBleedoutStopSent = true;
+                    }
+                }
+                g_lootStage = LootStage::GetUpPending;
+                g_lootDeadline = now + kLootGraphStepDelay;
+                spdlog::info(
+                    "[TFD][Victory][R399A] Loot graph release prepared actor={:08X} session={} BleedoutStopSent={} visualOwned={} stage={}",
+                    actorFormID,
+                    sessionID,
+                    g_lootTransition.wasBleedingOut ? 1 : 0,
+                    g_lootTransition.wasBleedingOut ? 1 : 0,
+                    ToString(g_lootStage));
+                return;
+            }
+
+            if (g_lootStage == LootStage::GetUpPending) {
+                actor->NotifyAnimationGraph("GetUpStart");
+                g_lootStage = LootStage::PackageRefreshPending;
+                g_lootDeadline = now + kLootGetUpMinimumSettle;
+                g_lootFinalizeDeadline = now + kLootGetUpMaximumSettle;
+                spdlog::info(
+                    "[TFD][Victory][R399A] Loot controlled Get Up sent actor={:08X} session={} GetUpStartCount=1 minSettleMs={} maxSettleMs={} QueueNiNodeUpdate=0 repeatedEvaluatePackage=0 stage={}",
+                    actorFormID,
+                    sessionID,
+                    kLootGetUpMinimumSettle.count(),
+                    kLootGetUpMaximumSettle.count(),
+                    ToString(g_lootStage));
+                return;
+            }
+
+            if (g_lootStage == LootStage::PackageRefreshPending) {
+                const auto* actorState = actor->AsActorState();
+                const bool stillBleedingOut = actorState && actorState->IsBleedingOut();
+                if (stillBleedingOut &&
+                    g_lootFinalizeDeadline.time_since_epoch().count() != 0 &&
+                    now < g_lootFinalizeDeadline) {
+                    return;
+                }
+
+                auto entryIt = g_enemyEntries.find(actorFormID);
+                if (entryIt == g_enemyEntries.end()) {
+                    spdlog::error(
+                        "[TFD][Victory][R396B] Loot finalization lost defeated entry actor={:08X} session={} action=close_session",
+                        actorFormID,
+                        sessionID);
+                    ResetSessionLocked("loot_finalize_entry_missing", false);
+                    return;
+                }
+
+                auto entry = entryIt->second;
+                g_enemyEntries.erase(entryIt);
+                RestoreRegenOverride(actor, entry);
+                TFD::Actor::Ops::ClearDefeatedEnemyState(
+                    actor,
+                    entry.aliasSlot,
+                    entry.factionApplied,
+                    entry.managed,
+                    entry.autoDeathIssued,
+                    entry.fatalDamageApplied,
+                    entry.deadline,
+                    entry.savedAggression,
+                    entry.aggressionOverridden,
+                    "victory_loot_complete");
+
+                // One package evaluation after Get Up and after alias/faction/passive
+                // cleanup. No graph retry, node rebuild, ragdoll repair, or loop.
+                actor->EvaluatePackage(false, true);
+
+                const bool hostileToPlayer = [&]() {
+                    auto* player = RE::PlayerCharacter::GetSingleton();
+                    return player && actor->IsHostileToActor(player);
+                }();
+
+                g_lootTransition = LootTransitionState{};
+                g_lootStage = LootStage::None;
+                g_lootDeadline = {};
+                g_lootFinalizeDeadline = {};
+
+                spdlog::info(
+                    "[TFD][Victory][R399A] Loot finalized actor={:08X} session={} visualReleaseSettled=1 releasedManaged=1 aliasFactionCleared=1 passiveRestored=1 GetUpStartCount=1 packageEvaluateCount=1 stillBleedingOut={} mayAttackPlayer={} no_queue_node_update=1",
+                    actorFormID,
+                    sessionID,
+                    stillBleedingOut ? 1 : 0,
+                    hostileToPlayer ? 1 : 0);
+                ResetSessionLocked("victory_loot_complete", false);
+            }
+        }
+
+        float RestoreRecruitReleaseHealth(RE::Actor* actor, float thresholdPct)
+        {
+            if (!actor) {
+                return 0.0f;
+            }
+
+            const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+            const float safePct = std::clamp((thresholdPct + kRecruitHealthBonusPct) / 100.0f, 0.25f, 0.99f);
+            const float target = (std::max)(25.0f, hpMax * safePct);
+            if (hpBefore + 0.001f < target) {
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    target - hpBefore);
+            }
+            return actor->GetActorValue(RE::ActorValue::kHealth);
+        }
+
+        bool CommitRecruitAfterVisualReleaseLocked(Clock::time_point now);
+
+        bool BeginRecruitCommitLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::RecruitCommitted ||
+                g_session.selectedActorFormID == 0 ||
+                g_recruitStage != RecruitStage::CommitPending) {
+                return false;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+            auto entryIt = g_enemyEntries.find(actorFormID);
+            if (entryIt == g_enemyEntries.end() || !entryIt->second.managed) {
+                spdlog::error(
+                    "[TFD][Victory][R400D] Recruit prepare lost defeated entry actor={:08X} session={} action=close_session",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("recruit_entry_missing", false);
+                return false;
+            }
+
+            auto& entry = entryIt->second;
+            auto actorSP = entry.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R400D] Recruit prepare invalid actor={:08X} session={} dead={} action=cancel_restart_countdown",
+                    actorFormID,
+                    sessionID,
+                    actor && actor->IsDead() ? 1 : 0);
+                ResetSessionLocked("recruit_invalid_actor", true);
+                return false;
+            }
+
+            if (TFD::TeammateManager::GetRecruitSlotsFree() == 0) {
+                spdlog::warn(
+                    "[TFD][Victory][R400D] Recruit prepare rejected actor={:08X} session={} gate=no_recruit_slot countdownRestart=10",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("recruit_no_slot", true);
+                return false;
+            }
+
+            const bool visualBleedoutOwned = entry.visualBleedoutStarted && !entry.visualBleedoutStopSent;
+            const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+            const float hpAfter = RestoreRecruitReleaseHealth(actor, entry.thresholdPct);
+
+            TFD::Actor::Ops::SuppressDefeatedEnemyReentry(
+                actor,
+                kRecruitReentrySuppressSeconds,
+                "victory_recruit_visual_release_hold_defeated");
+
+            actor->SetDialogueWithPlayer(false, false, nullptr);
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+            }
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->StopCombatAndAlarmOnActor(actor, false);
+            }
+
+            // R402A: do not let the actor enter the GetUp graph while still
+            // raw-hostile. Keep defeated visual ownership through BleedoutStop/GetUp,
+            // but install the recruit faction/runtime profile before the graph release.
+            // Teammate alias/package work is still deferred until after visual settle.
+            g_recruitTransition.handle = actor->GetHandle();
+            g_recruitTransition.visualBleedoutOwned = visualBleedoutOwned;
+            g_recruitTransition.bleedoutStopSent = false;
+            g_recruitTransition.bleedoutExitObservedBeforeGetUp = false;
+            g_recruitTransition.actorBleedingBeforeGetUp = false;
+            g_recruitTransition.getUpStartSent = false;
+            g_recruitTransition.hitReactStartSent = false;
+            g_recruitTransition.hitReactFallbackStartSent = false;
+            g_recruitTransition.hitReactStopSent = false;
+            g_recruitTransition.hitReactFallbackStopSent = false;
+            g_recruitTransition.getUpForcedAfterExitTimeout = false;
+            g_recruitTransition.bleedoutExitWaitTicks = 0;
+            g_recruitTransition.defeatedOwnershipClearedBeforeGetUp = false;
+            g_recruitTransition.aliasFactionClearedBeforeGetUp = false;
+            g_recruitTransition.regenRestoredBeforeGetUp = false;
+            g_recruitTransition.passiveHeldThroughGetUp = entry.aggressionOverridden;
+            g_recruitTransition.passiveRestoredOnFailure = false;
+            g_recruitTransition.savedAggression = entry.savedAggression;
+            g_recruitTransition.aggressionOverridden = entry.aggressionOverridden;
+            g_recruitTransition.preGetUpCommitAttempted = false;
+            g_recruitTransition.preGetUpCommitSkipped = false;
+            g_recruitTransition.preGetUpRawHostileBefore = true;
+            g_recruitTransition.preGetUpRawHostileAfter = true;
+            g_recruitTransition.commitAttempted = false;
+            g_recruitTransition.commitSkipped = false;
+            g_recruitTransition.rawHostileAfter = true;
+            g_recruitTransition.teammateRegistered = false;
+
+            TFD::Recruit::MarkRecruitCommitPending(
+                actor,
+                kRecruitCommitPendingSeconds,
+                TFD::Recruit::SourceFlow::Dialogue,
+                "victory_recruit_pre_getup_dehostile");
+
+            TFD::Recruit::CommitOptions preOptions{};
+            preOptions.sourceFlow = TFD::Recruit::SourceFlow::Dialogue;
+            preOptions.reason = "victory_recruit_pre_getup_dehostile";
+            preOptions.quarantineHostileFactions = true;
+            preOptions.clearCombat = true;
+            preOptions.evaluatePackage = false;
+            preOptions.detailedLog = true;
+            preOptions.throttleObserve = false;
+            preOptions.ensurePacifyAlliance = true;
+            preOptions.applyRuntimeProfile = true;
+
+            auto preCommit = TFD::Recruit::CommitRecruit(actor, preOptions);
+            if (preCommit.rawHostileAfter && preCommit.attempted && !preCommit.skipped) {
+                TFD::Recruit::MarkRecruitCommitPending(
+                    actor,
+                    kRecruitCommitPendingSeconds,
+                    TFD::Recruit::SourceFlow::Dialogue,
+                    "victory_recruit_pre_getup_dehostile_retry");
+                preOptions.reason = "victory_recruit_pre_getup_dehostile_retry";
+                preCommit = TFD::Recruit::CommitRecruit(actor, preOptions);
+            }
+
+            g_recruitTransition.preGetUpCommitAttempted = preCommit.attempted;
+            g_recruitTransition.preGetUpCommitSkipped = preCommit.skipped;
+            g_recruitTransition.preGetUpRawHostileBefore = preCommit.rawHostileBefore;
+            g_recruitTransition.preGetUpRawHostileAfter = preCommit.rawHostileAfter;
+
+            if (!preCommit.attempted || (preCommit.skipped && preCommit.rawHostileAfter)) {
+                TFD::Recruit::ClearRecruitCommitPending(actor, "victory_recruit_pre_getup_dehostile_failed");
+                spdlog::warn(
+                    "[TFD][Victory][R421A] Recruit pre-GetUp dehostile failed actor={:08X} session={} attempted={} skipped={} rawBefore={} rawAfter={} hostileAfter={} action=restart_countdown_no_graph_release",
+                    actorFormID,
+                    sessionID,
+                    preCommit.attempted ? 1 : 0,
+                    preCommit.skipped ? 1 : 0,
+                    preCommit.rawHostileBefore ? 1 : 0,
+                    preCommit.rawHostileAfter ? 1 : 0,
+                    preCommit.hostileFactionMatchesAfter);
+                ResetSessionLocked("recruit_pre_getup_dehostile_failed", true);
+                return false;
+            }
+
+            if (!visualBleedoutOwned) {
+                g_recruitStage = RecruitStage::DefeatedClearPending;
+                g_recruitDeadline = now + kRecruitDefeatedClearDelay;
+                g_recruitFinalizeDeadline = now + kRecruitGetUpMaximumSettle;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit package-hold visual release skipped actor={:08X} session={} hpBefore={:.2f} hpAfter={:.2f} visualBleedoutOwned=0 noBleedoutStop=1 noFlinch=1 noGetUpStart=1 visualReleaseSkipped=1 aliasFactionHeld=1 defeatedEntryHeld=1 passiveHeldThroughPackageHold={} preCommitAttempted={} preCommitSkipped={} rawBefore={} rawAfter={} hostileAfter={} teammateCommitBeforeClear=1 teammatePackageDeferred=1 evaluateDuringPrepare=0 defeatedClearDelayMs={} stage={}",
+                    actorFormID,
+                    sessionID,
+                    hpBefore,
+                    hpAfter,
+                    g_recruitTransition.passiveHeldThroughGetUp ? 1 : 0,
+                    preCommit.attempted ? 1 : 0,
+                    preCommit.skipped ? 1 : 0,
+                    preCommit.rawHostileBefore ? 1 : 0,
+                    preCommit.rawHostileAfter ? 1 : 0,
+                    preCommit.hostileFactionMatchesAfter,
+                    kRecruitDefeatedClearDelay.count(),
+                    ToString(g_recruitStage));
+                return true;
+            }
+
+            g_recruitStage = RecruitStage::BleedoutStopPending;
+            g_recruitDeadline = now + kRecruitGraphStepDelay;
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit pre-GetUp dehostile armed actor={:08X} session={} hpBefore={:.2f} hpAfter={:.2f} visualBleedoutOwned={} aliasFactionHeld=1 defeatedEntryHeld=1 passiveHeldThroughGetUp={} preCommitAttempted={} preCommitSkipped={} rawBefore={} rawAfter={} hostileAfter={} teammateCommitBeforeBleedoutStop=1 teammatePackageDeferred=1 evaluateDuringPrepare=0 graphStepDelayMs={} bleedoutExitMinDelayMs={} bleedoutExitMaxWaitMs={} noDisableEnable=1 flinchRefresh=0 bleedoutStopOnlyExit=1 stage={}",
+                actorFormID,
+                sessionID,
+                hpBefore,
+                hpAfter,
+                visualBleedoutOwned ? 1 : 0,
+                g_recruitTransition.passiveHeldThroughGetUp ? 1 : 0,
+                preCommit.attempted ? 1 : 0,
+                preCommit.skipped ? 1 : 0,
+                preCommit.rawHostileBefore ? 1 : 0,
+                preCommit.rawHostileAfter ? 1 : 0,
+                preCommit.hostileFactionMatchesAfter,
+                kRecruitGraphStepDelay.count(),
+                kRecruitBleedoutExitMinimumDelay.count(),
+                kRecruitBleedoutExitMaximumWait.count(),
+                ToString(g_recruitStage));
+            return true;
+        }
+
+        bool ClearRecruitDefeatedOwnershipAfterGetUpLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::RecruitCommitted ||
+                g_session.selectedActorFormID == 0 ||
+                g_recruitStage != RecruitStage::DefeatedClearPending) {
+                return false;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+            auto entryIt = g_enemyEntries.find(actorFormID);
+            if (entryIt == g_enemyEntries.end() || !entryIt->second.managed) {
+                spdlog::error(
+                    "[TFD][Victory][R421A] Recruit post-flinch-refresh ownership clear lost defeated entry actor={:08X} session={} action=close_session",
+                    actorFormID,
+                    sessionID);
+                ResetSessionLocked("recruit_post_hit_refresh_entry_missing", false);
+                return false;
+            }
+
+            auto entry = entryIt->second;
+            auto actorSP = entry.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R421A] Recruit post-flinch-refresh ownership clear invalid actor={:08X} session={} dead={} action=close_session",
+                    actorFormID,
+                    sessionID,
+                    actor && actor->IsDead() ? 1 : 0);
+                ResetSessionLocked("recruit_post_hit_refresh_clear_invalid_actor", false);
+                return false;
+            }
+
+            g_enemyEntries.erase(entryIt);
+            RestoreRegenOverride(actor, entry);
+            TFD::Actor::Ops::ClearDefeatedEnemyMirror(
+                actor,
+                entry.aliasSlot,
+                entry.factionApplied,
+                "victory_recruit_post_hit_refresh_visual_clear");
+
+            // R402A: the actor was already dehostiled before GetUpStart.
+            // Mark a short pending window again so the post-flinch-refresh settle commit can
+            // safely re-apply the recruit runtime profile after defeated ownership is gone.
+            TFD::Recruit::MarkRecruitCommitPending(
+                actor,
+                kRecruitCommitPendingSeconds,
+                TFD::Recruit::SourceFlow::Dialogue,
+                "victory_recruit_post_hit_refresh_settle_after_pre_hit_refresh_commit");
+
+            g_recruitTransition.defeatedOwnershipClearedBeforeGetUp = false;
+            g_recruitTransition.aliasFactionClearedBeforeGetUp = false;
+            g_recruitTransition.regenRestoredBeforeGetUp = false;
+            g_recruitTransition.savedAggression = entry.savedAggression;
+            g_recruitTransition.aggressionOverridden = entry.aggressionOverridden;
+            g_recruitTransition.passiveHeldThroughGetUp = entry.aggressionOverridden;
+
+            g_recruitStage = RecruitStage::RecruitCommitPending;
+            g_recruitDeadline = now + kRecruitPostClearCommitDelay;
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit defeated ownership cleared after OHAF-style Flinch refresh actor={:08X} session={} defeatedEntryRemoved=1 aliasFactionCleared=1 regenRestored={} passiveHeldThroughGetUp={} teammateCommitBeforeFlinch=1 postFlinchRefreshSettleCommit=1 postClearDelayMs={} atomicCommit=1 stage={}",
+                actorFormID,
+                sessionID,
+                entry.regenOverridden ? 1 : 0,
+                entry.aggressionOverridden ? 1 : 0,
+                kRecruitPostClearCommitDelay.count(),
+                ToString(g_recruitStage));
+
+            // R402A: no defeated-clear -> recruit-commit gap, and the first
+            // dehostile commit already happened before BleedoutStop/GetUpStart.
+            // This second commit is a post-flinch-refresh settle pass after defeated faction/alias clear.
+            return CommitRecruitAfterVisualReleaseLocked(now);
+        }
+
+        bool CommitRecruitAfterVisualReleaseLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::RecruitCommitted ||
+                g_session.selectedActorFormID == 0 ||
+                g_recruitStage != RecruitStage::RecruitCommitPending) {
+                return false;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+            auto actorSP = g_recruitTransition.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R421A] Recruit post-flinch-refresh settle commit invalid actor={:08X} session={} dead={} action=close_session",
+                    actorFormID,
+                    sessionID,
+                    actor && actor->IsDead() ? 1 : 0);
+                ResetSessionLocked("recruit_post_hit_refresh_settle_invalid_actor", false);
+                return false;
+            }
+
+            TFD::Recruit::CommitOptions options{};
+            options.sourceFlow = TFD::Recruit::SourceFlow::Dialogue;
+            options.reason = "victory_recruit_post_hit_refresh_settle_after_pre_hit_refresh_commit";
+            options.quarantineHostileFactions = true;
+            options.clearCombat = true;
+            options.evaluatePackage = false;
+            options.detailedLog = true;
+            options.throttleObserve = false;
+            options.ensurePacifyAlliance = true;
+            options.applyRuntimeProfile = true;
+
+            const auto commit = TFD::Recruit::CommitRecruit(actor, options);
+            g_recruitTransition.commitAttempted = commit.attempted;
+            g_recruitTransition.commitSkipped = commit.skipped;
+            g_recruitTransition.rawHostileAfter = commit.rawHostileAfter;
+
+            const bool playerSideAfterSettle = TFD::TeammateManager::IsPlayerSideTeammateActor(actor);
+            const bool settledAfterGetUp =
+                commit.attempted &&
+                !commit.rawHostileAfter &&
+                commit.hostileFactionMatchesAfter == 0 &&
+                (playerSideAfterSettle || !commit.skipped);
+
+            if (!settledAfterGetUp) {
+                TFD::Recruit::ClearRecruitCommitPending(actor, "victory_recruit_post_hit_refresh_settle_failed");
+                actor->EvaluatePackage(false, true);
+                spdlog::warn(
+                    "[TFD][Victory][R421A] Recruit post-flinch-refresh settle commit failed actor={:08X} session={} attempted={} skipped={} rawAfter={} hostileAfter={} playerSideAfter={} action=close_session",
+                    actorFormID,
+                    sessionID,
+                    commit.attempted ? 1 : 0,
+                    commit.skipped ? 1 : 0,
+                    commit.rawHostileAfter ? 1 : 0,
+                    commit.hostileFactionMatchesAfter,
+                    playerSideAfterSettle ? 1 : 0);
+                ResetSessionLocked("recruit_post_hit_refresh_settle_failed", false);
+                return false;
+            }
+
+            g_recruitStage = RecruitStage::PackageRefreshPending;
+            g_recruitDeadline = now + kRecruitDeferredPackageDelay;
+            g_recruitFinalizeDeadline = now + kRecruitGetUpMaximumSettle;
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit post-flinch-refresh settle commit completed actor={:08X} session={} removedHostileFactions={} ensuredState={} playerFaction={} runtimeProfile={} rawAfter={} skipped={} playerSideAfter={} preGetUpRawAfter={} deferredPackageDelayMs={} evalDuringCommit=0 stage={}",
+                actorFormID,
+                sessionID,
+                commit.removedHostileFactions,
+                commit.ensuredStateFactions,
+                commit.playerFactionEnsured ? 1 : 0,
+                commit.runtimeProfileApplied ? 1 : 0,
+                commit.rawHostileAfter ? 1 : 0,
+                commit.skipped ? 1 : 0,
+                playerSideAfterSettle ? 1 : 0,
+                g_recruitTransition.preGetUpRawHostileAfter ? 1 : 0,
+                kRecruitDeferredPackageDelay.count(),
+                ToString(g_recruitStage));
+            return true;
+        }
+
+        void TickCommittedRecruitLocked(Clock::time_point now)
+        {
+            if (!g_session.active ||
+                g_session.phase != SessionPhase::RecruitCommitted ||
+                g_session.selectedActorFormID == 0) {
+                return;
+            }
+
+            const auto actorFormID = g_session.selectedActorFormID;
+            const auto sessionID = g_session.sessionID;
+
+            if (g_recruitStage == RecruitStage::WaitingForDialogueClose) {
+                if (!IsDialogueMenuOpen()) {
+                    g_recruitStage = RecruitStage::CommitPending;
+                    g_recruitDeadline = now + kRecruitCommitDelay;
+                    spdlog::info(
+                        "[TFD][Victory][R421A] Recruit dialogue close observed before delayed BleedoutStop release actor={:08X} session={} stage={} postDialogueCommitDelayMs={} deferBleedoutStopUntilDialogueClose=1",
+                        actorFormID,
+                        sessionID,
+                        ToString(g_recruitStage),
+                        kRecruitCommitDelay.count());
+                    return;
+                }
+
+                if (g_recruitDeadline.time_since_epoch().count() != 0 && now >= g_recruitDeadline) {
+                    spdlog::warn(
+                        "[TFD][Victory][R421A] Recruit cancelled actor={:08X} session={} gate=dialogue_close_timeout countdownRestart=10 deferBleedoutStopUntilDialogueClose=1",
+                        actorFormID,
+                        sessionID);
+                    ResetSessionLocked("recruit_dialogue_close_timeout", true);
+                }
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::CommitPending) {
+                if (g_recruitDeadline.time_since_epoch().count() != 0 && now < g_recruitDeadline) {
+                    return;
+                }
+                (void)BeginRecruitCommitLocked(now);
+                return;
+            }
+
+            auto actorSP = g_recruitTransition.handle.get();
+            auto* actor = actorSP.get();
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                spdlog::warn(
+                    "[TFD][Victory][R400D] Recruit transition actor lost actor={:08X} session={} stage={} action=close_session",
+                    actorFormID,
+                    sessionID,
+                    ToString(g_recruitStage));
+                ResetSessionLocked("recruit_transition_actor_lost", false);
+                return;
+            }
+
+            if (g_recruitDeadline.time_since_epoch().count() != 0 && now < g_recruitDeadline) {
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::BleedoutStopPending) {
+                bool bleedoutStopSent = false;
+                if (g_recruitTransition.visualBleedoutOwned) {
+                    bleedoutStopSent = actor->NotifyAnimationGraph("BleedoutStop");
+                    if (auto entryIt = g_enemyEntries.find(actorFormID); entryIt != g_enemyEntries.end()) {
+                        entryIt->second.visualBleedoutStopSent = bleedoutStopSent;
+                    }
+                }
+
+                g_recruitTransition.bleedoutStopSent = bleedoutStopSent;
+                g_recruitStage = RecruitStage::BleedoutExitPending;
+                g_recruitDeadline = now + (g_recruitTransition.visualBleedoutOwned ?
+                    kRecruitBleedoutExitMinimumDelay :
+                    kRecruitGraphStepDelay);
+                g_recruitFinalizeDeadline = now + kRecruitBleedoutExitMaximumWait;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit graph step BleedoutStop actor={:08X} session={} visualBleedoutOwned={} BleedoutStopSent={} minExitDelayMs={} maxExitWaitMs={} stage={}",
+                    actorFormID,
+                    sessionID,
+                    g_recruitTransition.visualBleedoutOwned ? 1 : 0,
+                    bleedoutStopSent ? 1 : 0,
+                    (g_recruitTransition.visualBleedoutOwned ? kRecruitBleedoutExitMinimumDelay : kRecruitGraphStepDelay).count(),
+                    kRecruitBleedoutExitMaximumWait.count(),
+                    ToString(g_recruitStage));
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::BleedoutExitPending) {
+                const auto* actorState = actor->AsActorState();
+                const bool stillBleedingOut = actorState && actorState->IsBleedingOut();
+                const bool exitTimedOut =
+                    g_recruitFinalizeDeadline.time_since_epoch().count() != 0 &&
+                    now >= g_recruitFinalizeDeadline;
+
+                if (stillBleedingOut && !exitTimedOut) {
+                    ++g_recruitTransition.bleedoutExitWaitTicks;
+                    g_recruitDeadline = now + kRecruitBleedoutExitCheckDelay;
+                    spdlog::info(
+                        "[TFD][Victory][R421A] Recruit waiting bleedout exit actor={:08X} session={} stillBleedingOut=1 waitTick={} nextCheckMs={} maxExitWaitMs={} stage={}",
+                        actorFormID,
+                        sessionID,
+                        static_cast<unsigned>(g_recruitTransition.bleedoutExitWaitTicks),
+                        kRecruitBleedoutExitCheckDelay.count(),
+                        kRecruitBleedoutExitMaximumWait.count(),
+                        ToString(g_recruitStage));
+                    return;
+                }
+
+                g_recruitTransition.bleedoutExitObservedBeforeGetUp = !stillBleedingOut;
+                g_recruitTransition.actorBleedingBeforeGetUp = stillBleedingOut;
+                g_recruitTransition.getUpForcedAfterExitTimeout = stillBleedingOut && exitTimedOut;
+                g_recruitTransition.hitReactStartSent = false;
+                g_recruitTransition.hitReactFallbackStartSent = false;
+                g_recruitTransition.hitReactStopSent = false;
+                g_recruitTransition.hitReactFallbackStopSent = false;
+                g_recruitStage = RecruitStage::DefeatedClearPending;
+                g_recruitDeadline = now + kRecruitDefeatedClearDelay;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit bleedout exit window completed actor={:08X} session={} exitObserved={} actorBleedingBeforeClear={} forcedAfterExitTimeout={} waitTicks={} nextClearDelayMs={} stage={} noGetUpStart=1 noDisableEnable=1 noFlinch=1 bleedoutStopOnlyExit=1",
+                    actorFormID,
+                    sessionID,
+                    g_recruitTransition.bleedoutExitObservedBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.actorBleedingBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.getUpForcedAfterExitTimeout ? 1 : 0,
+                    static_cast<unsigned>(g_recruitTransition.bleedoutExitWaitTicks),
+                    kRecruitDefeatedClearDelay.count(),
+                    ToString(g_recruitStage));
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::HitReactStartPending) {
+                const auto* actorState = actor->AsActorState();
+                const bool stillBleedingOut = actorState && actorState->IsBleedingOut();
+
+                // R421A: Maxsu OHAF config for humanoid defaultmale/defaultfemale uses
+                // AnimationEventName=Flinch and GraphVariableFloatName=blendFlinch.
+                // Send the same graph event directly instead of the generic
+                // staggerStart/staggerStop pair used by R413/R415.
+                const bool flinchSent = actor->NotifyAnimationGraph("Flinch");
+
+                g_recruitTransition.actorBleedingBeforeGetUp = stillBleedingOut;
+                g_recruitTransition.getUpStartSent = false;
+                g_recruitTransition.hitReactStartSent = flinchSent;
+                g_recruitTransition.hitReactFallbackStartSent = false;
+                g_recruitStage = RecruitStage::HitReactStopPending;
+                g_recruitDeadline = now + kRecruitHitReactStopDelay;
+                g_recruitFinalizeDeadline = now + kRecruitHitReactMaximumSettle;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit OHAF-style Flinch graph refresh sent actor={:08X} session={} flinchSent={} actorBleedingBeforeFlinch={} exitObservedBeforeFlinch={} forcedAfterExitTimeout={} settleGateDelayMs={} maxSettleMs={} graphEvent=Flinch noDamage=1 noDisableEnable=1 noStaggerStart=1 stage={}",
+                    actorFormID,
+                    sessionID,
+                    flinchSent ? 1 : 0,
+                    stillBleedingOut ? 1 : 0,
+                    g_recruitTransition.bleedoutExitObservedBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.getUpForcedAfterExitTimeout ? 1 : 0,
+                    kRecruitHitReactStopDelay.count(),
+                    kRecruitHitReactMaximumSettle.count(),
+                    ToString(g_recruitStage));
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::HitReactStopPending) {
+                // R421A: Flinch is a one-shot OHAF-style graph event. Do not send
+                // staggerStop/recoilStop here, because the original OHAF path only
+                // sends the configured event once on TESHitEvent.
+                g_recruitTransition.hitReactStopSent = false;
+                g_recruitTransition.hitReactFallbackStopSent = false;
+                g_recruitStage = RecruitStage::DefeatedClearPending;
+                g_recruitDeadline = now + kRecruitHitReactSettleDelay;
+                g_recruitFinalizeDeadline = now + kRecruitHitReactMaximumSettle;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit OHAF-style Flinch graph refresh settle actor={:08X} session={} flinchSent={} settleDelayMs={} maxSettleMs={} graphEvent=Flinch noDamage=1 noDisableEnable=1 noStopEvent=1 stage={}",
+                    actorFormID,
+                    sessionID,
+                    g_recruitTransition.hitReactStartSent ? 1 : 0,
+                    kRecruitHitReactSettleDelay.count(),
+                    kRecruitHitReactMaximumSettle.count(),
+                    ToString(g_recruitStage));
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::GetUpPending) {
+                const auto* actorState = actor->AsActorState();
+                const bool stillBleedingOut = actorState && actorState->IsBleedingOut();
+                const bool getUpStartSent = actor->NotifyAnimationGraph("GetUpStart");
+                g_recruitTransition.actorBleedingBeforeGetUp = stillBleedingOut;
+                g_recruitTransition.getUpStartSent = getUpStartSent;
+                g_recruitStage = RecruitStage::DefeatedClearPending;
+                g_recruitDeadline = now + kRecruitGetUpMinimumSettle;
+                g_recruitFinalizeDeadline = now + kRecruitGetUpMaximumSettle;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit controlled Get Up sent after bleedout exit actor={:08X} session={} GetUpStartSent={} actorBleedingBeforeGetUp={} exitObservedBeforeGetUp={} forcedAfterExitTimeout={} bleedoutExitWaitTicks={} minSettleMs={} maxSettleMs={} preCommitAttempted={} preRawAfter={} QueueNiNodeUpdate=0 repeatedEvaluatePackage=0 stage={}",
+                    actorFormID,
+                    sessionID,
+                    getUpStartSent ? 1 : 0,
+                    stillBleedingOut ? 1 : 0,
+                    g_recruitTransition.bleedoutExitObservedBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.getUpForcedAfterExitTimeout ? 1 : 0,
+                    static_cast<unsigned>(g_recruitTransition.bleedoutExitWaitTicks),
+                    kRecruitGetUpMinimumSettle.count(),
+                    kRecruitGetUpMaximumSettle.count(),
+                    g_recruitTransition.preGetUpCommitAttempted ? 1 : 0,
+                    g_recruitTransition.preGetUpRawHostileAfter ? 1 : 0,
+                    ToString(g_recruitStage));
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::DefeatedClearPending) {
+                if (g_recruitDeadline.time_since_epoch().count() != 0 && now < g_recruitDeadline) {
+                    return;
+                }
+                (void)ClearRecruitDefeatedOwnershipAfterGetUpLocked(now);
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::RecruitCommitPending) {
+                if (g_recruitDeadline.time_since_epoch().count() != 0 && now < g_recruitDeadline) {
+                    return;
+                }
+                (void)CommitRecruitAfterVisualReleaseLocked(now);
+                return;
+            }
+
+            if (g_recruitStage == RecruitStage::PackageRefreshPending) {
+                if (g_recruitDeadline.time_since_epoch().count() != 0 && now < g_recruitDeadline) {
+                    return;
+                }
+
+                const auto* actorState = actor->AsActorState();
+                const bool stillBleedingOut = actorState && actorState->IsBleedingOut();
+                const bool registered = TFD::TeammateManager::RegisterOrRefreshTeammateNowDeferredPackage(
+                    actor,
+                    "victory_recruit_finalize_deferred_package");
+                g_recruitTransition.teammateRegistered = registered;
+
+                bool evaluatedPackage = false;
+                if (registered && actor->Is3DLoaded()) {
+                    actor->EvaluatePackage(false, true);
+                    evaluatedPackage = true;
+                }
+
+                TFD::TeammateManager::QueueHumanoidTeammateCatchupAfterLoad("victory_recruit_postload_visual_repair");
+
+                const bool playerSide = TFD::TeammateManager::IsPlayerSideTeammateActor(actor);
+                const bool tfdManaged = TFD::TeammateManager::IsTFDManagedTeammateActor(actor);
+                const bool rawHostile = TFD::Recruit::IsRawHostileToPlayer(actor, RE::PlayerCharacter::GetSingleton());
+
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit finalized actor={:08X} session={} teammateRegistered={} playerSide={} tfdManaged={} rawHostile={} stillBleedingOut={} bleedoutStopSent={} bleedoutExitObservedBeforeGetUp={} actorBleedingBeforeGetUp={} getUpStartSent={} forcedAfterExitTimeout={} bleedoutExitWaitTicks={} preGetUpCommitAttempted={} preGetUpCommitSkipped={} preGetUpRawBefore={} preGetUpRawAfter={} postFlinchRefreshCommitAttempted={} postFlinchRefreshCommitSkipped={} rawHostileAfterPostCommit={} defeatedOwnershipClearedAfterGetUp={} aliasFactionClearedAfterGetUp={} passiveHeldThroughGetUp={} packageEvaluateCount={} no_queue_node_update=1 teammateCommitBeforeGetUp=1 teammatePackageAfterVisualSettle=1 postLoadRepairQueued=1 flinchSent={} hitReactFallbackStartSent={} hitReactStopSent={} hitReactFallbackStopSent={} noGetUpStart=1 noDisableEnable=1 bleedoutStopOnlyExit=1",
+                    actorFormID,
+                    sessionID,
+                    registered ? 1 : 0,
+                    playerSide ? 1 : 0,
+                    tfdManaged ? 1 : 0,
+                    rawHostile ? 1 : 0,
+                    stillBleedingOut ? 1 : 0,
+                    g_recruitTransition.bleedoutStopSent ? 1 : 0,
+                    g_recruitTransition.bleedoutExitObservedBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.actorBleedingBeforeGetUp ? 1 : 0,
+                    g_recruitTransition.getUpStartSent ? 1 : 0,
+                    g_recruitTransition.getUpForcedAfterExitTimeout ? 1 : 0,
+                    static_cast<unsigned>(g_recruitTransition.bleedoutExitWaitTicks),
+                    g_recruitTransition.preGetUpCommitAttempted ? 1 : 0,
+                    g_recruitTransition.preGetUpCommitSkipped ? 1 : 0,
+                    g_recruitTransition.preGetUpRawHostileBefore ? 1 : 0,
+                    g_recruitTransition.preGetUpRawHostileAfter ? 1 : 0,
+                    g_recruitTransition.commitAttempted ? 1 : 0,
+                    g_recruitTransition.commitSkipped ? 1 : 0,
+                    g_recruitTransition.rawHostileAfter ? 1 : 0,
+                    g_recruitTransition.defeatedOwnershipClearedBeforeGetUp ? 0 : 1,
+                    g_recruitTransition.aliasFactionClearedBeforeGetUp ? 0 : 1,
+                    g_recruitTransition.passiveHeldThroughGetUp ? 1 : 0,
+                    evaluatedPackage ? 1 : 0,
+                    g_recruitTransition.hitReactStartSent ? 1 : 0,
+                    g_recruitTransition.hitReactFallbackStartSent ? 1 : 0,
+                    g_recruitTransition.hitReactStopSent ? 1 : 0,
+                    g_recruitTransition.hitReactFallbackStopSent ? 1 : 0);
+
+                ArmRecruitHitDiagnosticLocked(actor, sessionID, "victory_recruit_finalized");
+
+                TFD::Recruit::ClearRecruitCommitPending(actor, "victory_recruit_finalized");
+                ClearRecruitTransitionLocked("victory_recruit_complete");
+                ResetSessionLocked("victory_recruit_complete", false);
+            }
+        }
+
+        RE::Actor* ResolveCurrentCombatTarget(RE::Actor* actor)
+        {
+            if (!actor) {
+                return nullptr;
+            }
+            auto sp = actor->GetActorRuntimeData().currentCombatTarget.get();
+            return sp.get();
+        }
+
+        bool IsSoftEnterPressureActor(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            auto it = g_enemyEntries.find(actor->GetFormID());
+            return it != g_enemyEntries.end() &&
+                it->second.managed &&
+                it->second.softEnterActive &&
+                !it->second.softEnterHardStateApplied;
+        }
+
+        void RecordSoftEnterPressureLocked(
+            RE::FormID softActorFormID,
+            RE::FormID causeFormID,
+            RE::FormID otherFormID,
+            std::string_view reason,
+            const char* source)
+        {
+            auto it = g_enemyEntries.find(softActorFormID);
+            if (it == g_enemyEntries.end()) {
+                return;
+            }
+
+            auto& entry = it->second;
+            if (!entry.managed || !entry.softEnterActive || entry.softEnterHardStateApplied) {
+                return;
+            }
+
+            entry.softEnterLastPressureSeen = Now();
+            entry.softEnterLastPressureCauseFormID = causeFormID;
+            entry.softEnterLastPressureOtherFormID = otherFormID;
+            if (entry.softEnterPressureHitCount < 0xFFFFu) {
+                ++entry.softEnterPressureHitCount;
+            }
+
+            spdlog::info(
+                "[TFD][Victory][R421A] enemy soft defeated enter pressure recorded actor={:08X} cause={:08X} other={:08X} source={} reason={} hitCount={} quietWindowMs={} hardeningWillWait=1 teammateCausedEdgeGuard=1",
+                softActorFormID,
+                causeFormID,
+                otherFormID,
+                source ? source : "unknown",
+                ReasonText(reason),
+                static_cast<unsigned>(entry.softEnterPressureHitCount),
+                kEnemySoftEnterPressureQuietWindow.count());
+        }
+
+        struct SoftEnterPressureProbe
+        {
+            bool active{ false };
+            bool targetInCombat{ false };
+            bool targetWeaponDrawn{ false };
+            bool targetHasPlayerSideTarget{ false };
+            bool playerSideAttackerFound{ false };
+            bool stopIssued{ false };
+            std::uint32_t playerSideAttackerCount{ 0 };
+            RE::FormID firstAttackerFormID{ 0 };
+            RE::FormID targetTargetFormID{ 0 };
+        };
+
+        SoftEnterPressureProbe ProbeSoftEnterPressureLocked(RE::Actor* actor)
+        {
+            SoftEnterPressureProbe result{};
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return result;
+            }
+
+            result.targetInCombat = actor->IsInCombat();
+            result.targetWeaponDrawn = actor->IsWeaponDrawn();
+
+            auto* currentTarget = ResolveCurrentCombatTarget(actor);
+            result.targetTargetFormID = currentTarget ? currentTarget->GetFormID() : 0u;
+            result.targetHasPlayerSideTarget = currentTarget &&
+                !currentTarget->IsDead() &&
+                !currentTarget->IsDisabled() &&
+                TFD::TeammateManager::IsPlayerSideTeammateActor(currentTarget);
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            TFD::Actor::ScanOptions options{};
+            options.radius = (std::max)(kEnemySoftEnterPressureScanRadius, TFD::Settings::GetSweepRadius());
+            options.npcOnly = false;
+            const auto snapshot = TFD::Actor::BuildSnapshot(player, options);
+            const auto actorFormID = actor->GetFormID();
 
             for (const auto& info : snapshot.actors) {
-                auto* actor = info.get();
-                if (!actor || info.dist > scanRadius) {
+                auto* teammate = info.get();
+                if (!teammate || teammate == actor || teammate == player || teammate->IsDead() || teammate->IsDisabled()) {
                     continue;
                 }
-                if (IsRelevantLivingEnemyActor(actor, player)) {
-                    return true;
+                if (!info.playerSide || !info.standing) {
+                    continue;
+                }
+
+                bool targetsSoftActor = info.currentTargetFormID == actorFormID;
+                if (!targetsSoftActor) {
+                    targetsSoftActor = info.getCurrentTarget() == actor;
+                }
+                if (!targetsSoftActor) {
+                    continue;
+                }
+
+                result.active = true;
+                result.playerSideAttackerFound = true;
+                ++result.playerSideAttackerCount;
+                if (result.firstAttackerFormID == 0) {
+                    result.firstAttackerFormID = teammate->GetFormID();
+                }
+
+                // Local suppression only: stop a converted teammate from continuing
+                // to land extra hits on an actor that is already pending Victory defeated hardening.
+                teammate->StopCombat();
+                teammate->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                result.stopIssued = true;
+            }
+
+            if (result.targetHasPlayerSideTarget) {
+                result.active = true;
+                actor->StopCombat();
+                actor->GetActorRuntimeData().currentCombatTarget = RE::ActorHandle{};
+                result.stopIssued = true;
+            }
+
+            return result;
+        }
+
+        void MaintainEnemyState(RE::Actor* actor, EnemyEntry& entry, bool initialEntry)
+        {
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                return;
+            }
+
+            if (kEnemySoftEnterHardStateDelayEnabled &&
+                entry.softEnterActive &&
+                !entry.softEnterHardStateApplied) {
+                const auto now = Now();
+                if (entry.softEnterHardStateDue.time_since_epoch().count() != 0 &&
+                    now < entry.softEnterHardStateDue) {
+                    if (initialEntry || !entry.softEnterPendingLogged) {
+                        entry.softEnterPendingLogged = true;
+                        spdlog::info(
+                            "[TFD][Victory][R421A] enemy soft defeated enter pending actor={:08X} hpPct={:.1f} threshold={:.1f} delayMs={} hardStopCombat=0 hardMirror=0 hardEvaluate=0 delayedBleedoutStart=1 softEnter=1",
+                            actor->GetFormID(),
+                            GetActorHealthPct(actor),
+                            entry.thresholdPct,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                kEnemySoftEnterHardStateDelay)
+                                .count());
+                    }
+                    return;
+                }
+
+                const auto pressure = ProbeSoftEnterPressureLocked(actor);
+                const bool hasRecentPressure = entry.softEnterLastPressureSeen.time_since_epoch().count() != 0 &&
+                    now < entry.softEnterLastPressureSeen + kEnemySoftEnterPressureQuietWindow;
+                const bool canDeferPressure = entry.softEnterHardStateMaxDue.time_since_epoch().count() == 0 ||
+                    now < entry.softEnterHardStateMaxDue;
+
+                if ((pressure.active || hasRecentPressure) && canDeferPressure) {
+                    if (entry.softEnterPressureDeferrals < 0xFFu) {
+                        ++entry.softEnterPressureDeferrals;
+                    }
+                    const auto quietRemainingMs = hasRecentPressure ?
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            (entry.softEnterLastPressureSeen + kEnemySoftEnterPressureQuietWindow) - now)
+                            .count() :
+                        0LL;
+                    entry.softEnterHardStateDue = now + kEnemySoftEnterPressureRetryDelay;
+                    spdlog::info(
+                        "[TFD][Victory][R421A] enemy soft defeated hardening deferred actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} actorWeaponDrawn={} activePressure={} recentPressure={} quietRemainingMs={} playerSideAttackers={} firstAttacker={:08X} targetTarget={:08X} stopIssued={} pressureHits={} deferrals={} retryDelayMs={} maxExtraDelayMs={} delayedBleedoutStartWaits=1 teammateCausedEdgeGuard=1",
+                        actor->GetFormID(),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        actor->IsInCombat() ? 1 : 0,
+                        actor->IsWeaponDrawn() ? 1 : 0,
+                        pressure.active ? 1 : 0,
+                        hasRecentPressure ? 1 : 0,
+                        quietRemainingMs,
+                        pressure.playerSideAttackerCount,
+                        pressure.firstAttackerFormID,
+                        pressure.targetTargetFormID,
+                        pressure.stopIssued ? 1 : 0,
+                        static_cast<unsigned>(entry.softEnterPressureHitCount),
+                        static_cast<unsigned>(entry.softEnterPressureDeferrals),
+                        kEnemySoftEnterPressureRetryDelay.count(),
+                        kEnemySoftEnterPressureMaxExtraDelay.count());
+                    return;
+                }
+
+                if ((pressure.active || hasRecentPressure) && !canDeferPressure) {
+                    spdlog::warn(
+                        "[TFD][Victory][R421A] enemy soft defeated hardening pressure timeout actor={:08X} hpPct={:.1f} threshold={:.1f} activePressure={} recentPressure={} pressureHits={} deferrals={} action=force_hardening delayedBleedoutStartMayProceed=1",
+                        actor->GetFormID(),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        pressure.active ? 1 : 0,
+                        hasRecentPressure ? 1 : 0,
+                        static_cast<unsigned>(entry.softEnterPressureHitCount),
+                        static_cast<unsigned>(entry.softEnterPressureDeferrals));
+                }
+
+                entry.softEnterHardStateApplied = true;
+                if (kEnemyDefeatedVisualBleedoutEnabled &&
+                    !entry.visualBleedoutStarted &&
+                    !entry.visualBleedoutStartPending &&
+                    !entry.visualBleedoutStartDecisionLogged) {
+                    entry.visualBleedoutStartPending = true;
+                    entry.visualBleedoutStartDue = now + kEnemyDelayedBleedoutStartSettleDelay;
+                }
+                spdlog::info(
+                    "[TFD][Victory][R421A] enemy soft defeated enter hardening actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} hardStopCombat=1 hardMirror=1 hardEvaluate=1 delayedBleedoutStartArmed={} delayedBleedoutStartDelayMs={} softEnter=1",
+                    actor->GetFormID(),
+                    GetActorHealthPct(actor),
+                    entry.thresholdPct,
+                    actor->IsInCombat() ? 1 : 0,
+                    entry.visualBleedoutStartPending ? 1 : 0,
+                    kEnemyDelayedBleedoutStartSettleDelay.count());
+            }
+
+            ApplyRegenOverride(actor, entry);
+            TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
+            TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.aliasSlot, entry.factionApplied);
+
+            if (actor->IsInCombat()) {
+                actor->StopCombat();
+            }
+            if (auto* process = RE::ProcessLists::GetSingleton()) {
+                process->StopCombatAndAlarmOnActor(actor, false);
+            }
+
+            // R421A: vanilla BleedoutStart is allowed again, but only after
+            // the successful R418/R419 soft-enter delay and a small post-hardening
+            // settle window. Do not fire it at the exact HP-threshold frame.
+            if (entry.softEnterHardStateApplied && !entry.visualBleedoutStartDecisionLogged) {
+                if (kEnemyDefeatedVisualBleedoutEnabled) {
+                    if (!entry.visualBleedoutStartPending) {
+                        entry.visualBleedoutStartPending = true;
+                        entry.visualBleedoutStartDue = Now() + kEnemyDelayedBleedoutStartSettleDelay;
+                        spdlog::info(
+                            "[TFD][Victory][R421A] defeated visual delayed BleedoutStart armed actor={:08X} delayMs={} softEnterApplied=1 packageHold=1",
+                            actor->GetFormID(),
+                            kEnemyDelayedBleedoutStartSettleDelay.count());
+                    }
+
+                    const auto now = Now();
+                    if (entry.visualBleedoutStartDue.time_since_epoch().count() == 0 ||
+                        now >= entry.visualBleedoutStartDue) {
+                        const bool sent = actor->NotifyAnimationGraph("BleedoutStart");
+                        entry.visualBleedoutStarted = sent;
+                        entry.visualBleedoutStopSent = false;
+                        entry.visualBleedoutStartPending = false;
+                        entry.visualBleedoutStartDecisionLogged = true;
+                        spdlog::info(
+                            "[TFD][Victory][R421A] defeated visual delayed BleedoutStart sent actor={:08X} sent={} oneShot=1 reassert=0 queueNode=0 afterSoftHardening=1 delayMs={} packageHold=1",
+                            actor->GetFormID(),
+                            sent ? 1 : 0,
+                            kEnemyDelayedBleedoutStartSettleDelay.count());
+                    }
+                }
+                else {
+                    entry.visualBleedoutStarted = false;
+                    entry.visualBleedoutStopSent = false;
+                    entry.visualBleedoutStartPending = false;
+                    entry.visualBleedoutStartDecisionLogged = true;
+                    spdlog::info(
+                        "[TFD][Victory][R421A] defeated visual BleedoutStart skipped actor={:08X} packageHold=1 expectedPackage=TFDDefeatedEnemyPackage victoryStateGate=>=1 noPseudoBleedout=1",
+                        actor->GetFormID());
                 }
             }
 
+            if (initialEntry && !entry.initialPackageRefreshDone) {
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                entry.initialPackageRefreshDone = true;
+            }
+        }
+
+        bool TryGetDefeatedEnemyStateHook(
+            RE::Actor* actor,
+            std::uint8_t* lockKindValue,
+            bool* defeatedManaged,
+            Clock::time_point* deadline)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            std::scoped_lock lk(g_lock);
+            const auto it = g_enemyEntries.find(actor->GetFormID());
+            if (it == g_enemyEntries.end()) {
+                return false;
+            }
+
+            if (lockKindValue) {
+                *lockKindValue = kEnemyLockKindValue;
+            }
+            if (defeatedManaged) {
+                *defeatedManaged = it->second.managed;
+            }
+            if (deadline) {
+                *deadline = it->second.deadline;
+            }
+            return true;
+        }
+
+        bool ReleaseEntryByIDLocked(RE::FormID formID, std::string_view reason, bool playGetUp)
+        {
+            const auto it = g_enemyEntries.find(formID);
+            if (it == g_enemyEntries.end()) {
+                return false;
+            }
+
+            if (g_session.active && g_session.selectedActorFormID == formID) {
+                ResetSessionLocked("selected_enemy_released", false);
+            }
+
+            auto entry = it->second;
+            g_enemyEntries.erase(it);
+
+            auto actorSP = entry.handle.get();
+            auto* actor = actorSP.get();
+            const auto reasonText = ReasonText(reason);
+
+            RestoreRegenOverride(actor, entry);
+
+            if (actor && reasonText.find("recruit") != std::string::npos) {
+                TFD::Actor::Ops::SuppressDefeatedEnemyReentry(
+                    actor,
+                    kDefeatedReentrySuppressSeconds,
+                    reasonText.c_str());
+            }
+
+            TFD::Actor::Ops::ClearDefeatedEnemyState(
+                actor,
+                entry.aliasSlot,
+                entry.factionApplied,
+                entry.managed,
+                entry.autoDeathIssued,
+                entry.fatalDamageApplied,
+                entry.deadline,
+                entry.savedAggression,
+                entry.aggressionOverridden,
+                reasonText.c_str());
+
+            if (playGetUp && actor && !actor->IsDead() && !actor->IsDisabled()) {
+                // R394A preserves the confirmed no-fake-bleedout baseline. Generic
+                // release only refreshes the package; outcome-specific physical
+                // Get Up will be reconstructed later behind one Victory transition.
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+            }
+
+            RefreshConditionStateLocked();
+
+            spdlog::info(
+                "[TFD][Victory][R394A] defeated enemy released actor={:08X} reason={} packageRefresh={}",
+                formID,
+                reasonText,
+                playGetUp ? 1 : 0);
+            return true;
+        }
+
+        void ClearAllEnemyEntriesLocked(std::string_view reason)
+        {
+            const auto reasonText = ReasonText(reason);
+            ResetSessionLocked(reasonText, false);
+            std::vector<RE::FormID> ids{};
+            ids.reserve(g_enemyEntries.size());
+            for (const auto& [formID, _entry] : g_enemyEntries) {
+                ids.push_back(formID);
+            }
+            for (const auto formID : ids) {
+                (void)ReleaseEntryByIDLocked(formID, reasonText, false);
+            }
+            g_enemyEntries.clear();
+            g_lastLifecycleLog = {};
+            g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+            TFD::Actor::Ops::ClearAllDefeatedEnemyMirrors(reasonText.c_str());
+            RefreshConditionStateLocked();
+        }
+
+        void WorkerLoop()
+        {
+            while (g_running.load(std::memory_order_acquire)) {
+                if (!g_tickPending.test_and_set(std::memory_order_acq_rel)) {
+                    if (auto* task = SKSE::GetTaskInterface()) {
+                        task->AddTask([]() {
+                            struct TickGuard
+                            {
+                                ~TickGuard()
+                                {
+                                    g_tickPending.clear(std::memory_order_release);
+                                }
+                            } guard;
+                            Tick();
+                        });
+                    }
+                    else {
+                        g_tickPending.clear(std::memory_order_release);
+                    }
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+    }
+
+    const char* ToString(SessionPhase phase)
+    {
+        switch (phase) {
+        case SessionPhase::Empty:
+            return "Empty";
+        case SessionPhase::OpeningDialogue:
+            return "OpeningDialogue";
+        case SessionPhase::DialogueOpen:
+            return "DialogueOpen";
+        case SessionPhase::AwaitingChoiceCommit:
+            return "AwaitingChoiceCommit";
+        case SessionPhase::KillCommitted:
+            return "KillCommitted";
+        case SessionPhase::LootCommitted:
+            return "LootCommitted";
+        case SessionPhase::RecruitCommitted:
+            return "RecruitCommitted";
+        default:
+            return "Unknown";
+        }
+    }
+
+    bool RegisterPapyrus(RE::BSScript::IVirtualMachine* a_vm)
+    {
+        if (!a_vm) {
             return false;
         }
+
+        a_vm->RegisterFunction("RequestKill", "TFDVictoryNative", PapyrusRequestKill);
+        a_vm->RegisterFunction("RequestLoot", "TFDVictoryNative", PapyrusRequestLoot);
+        a_vm->RegisterFunction("RequestRecruit", "TFDVictoryNative", PapyrusRequestRecruit);
+        spdlog::info("[TFD][Victory][R400D] Papyrus native registered functions=RequestKill,RequestLoot,RequestRecruit owner=TFDVictory");
+        return true;
     }
 
-    void SetStateValue(int value)
+    void Install()
     {
-        ResolveGlobal();
-        if (!g_stateGlobal) {
+        if (g_installed.exchange(true, std::memory_order_acq_rel)) {
             return;
         }
 
-        if (value < kStateNeutral || value > kStateYes) {
-            spdlog::warn("[TFD][Victory] rejected invalid state value={}", value);
-            return;
+        g_loadTransition.store(false, std::memory_order_release);
+        g_running.store(true, std::memory_order_release);
+        {
+            std::scoped_lock lk(g_lock);
+            ClearAllEnemyEntriesLocked("install");
+            g_nextSessionID = 1;
+            g_victoryGreetInfo = nullptr;
+            SetConditionState(0);
         }
 
-        const float desired = static_cast<float>(value);
-        if (g_stateGlobal->value != desired) {
-            const int previous = static_cast<int>(std::lround(g_stateGlobal->value));
-            g_stateGlobal->value = desired;
-            spdlog::info("[TFD][Victory] state set previous={} value={}", previous, value);
-        }
-    }
-
-    int GetStateValue()
-    {
-        ResolveGlobal();
-        return g_stateGlobal ? static_cast<int>(std::lround(g_stateGlobal->value)) : kStateNeutral;
-    }
-
-    bool IsActive()
-    {
-        return GetStateValue() != kStateNeutral;
-    }
-
-    void ResetObservedContext()
-    {
-        g_observedCombatContextUntil = {};
-    }
-
-    void ArmDialogueReadyHold(RE::Actor* actor, double seconds, const char* reason)
-    {
-        if (!actor || seconds <= 0.0) {
-            return;
-        }
-
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!IsUsableDefeatedDialogueActor(actor, player)) {
-            return;
-        }
-
-        const auto duration = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(seconds));
-        g_dialogueReadyHoldActorFormID = actor->GetFormID();
-        g_dialogueReadyHoldUntil = Now() + duration;
+        TFD::Actor::Ops::InstallDefeatedEnemyStateHooks(
+            TFD::Actor::Ops::DefeatedEnemyStateHooks{ &TryGetDefeatedEnemyStateHook });
+        g_worker = std::thread([]() { WorkerLoop(); });
 
         spdlog::info(
-            "[TFD][Victory] dialogue ready hold armed actor={:08X} seconds={:.2f} reason={}",
-            actor->GetFormID(),
-            seconds,
-            reason ? reason : "unknown");
+            "[TFD][Victory][R421A] enemy defeat owner installed policy=threshold_notify registry_countdown_autodeath_owner selected_actor_session_greet_cancel_kill_staged_death loot_native_inventory_dispatch_container_observer_controlled_release recruit_pre_getup_dehostile_defeated_clear_teammate_handoff package_hold_defeated_delayed_bleedoutstart delayed_bleedoutstart no_reassert no_forcegreet no_generic_flow no_node_rebuild recruit_hit_diagnostic_passthrough soft_defeated_enter_R421A teammate_pressure_quiet_window");
     }
 
-    RE::Actor* FindDialogueCapableDefeatedEnemy(float radius)
+    void Shutdown()
     {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!player) {
-            return nullptr;
-        }
-
-        const float scanRadius = (std::max)(radius, kDefeatedDialogueScanRadius);
-        const auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
-
-        RE::Actor* best = nullptr;
-        float bestDist = scanRadius + 1.0f;
-
-        for (const auto& info : snapshot.actors) {
-            auto* actor = info.get();
-            if (!IsUsableDefeatedDialogueActor(actor, player)) {
-                continue;
-            }
-            if (info.dist > scanRadius) {
-                continue;
-            }
-            if (info.dist < bestDist) {
-                bestDist = info.dist;
-                best = actor;
-            }
-        }
-
-        return best;
-    }
-
-    bool HasDialogueCapableDefeatedEnemy(float radius)
-    {
-        return FindDialogueCapableDefeatedEnemy(radius) != nullptr;
-    }
-
-    void MarkDefeatedDialogueAvailable(RE::Actor* actor)
-    {
-        auto* player = RE::PlayerCharacter::GetSingleton();
-        if (!IsUsableDefeatedDialogueActor(actor, player)) {
+        if (!g_installed.exchange(false, std::memory_order_acq_rel)) {
             return;
         }
-        if (CanAdvertiseVictoryNow(actor, "mark_defeated_dialogue_available")) {
-            SetStateValue(kStateYes);
+
+        g_running.store(false, std::memory_order_release);
+        if (g_worker.joinable()) {
+            g_worker.join();
+        }
+        g_tickPending.clear(std::memory_order_release);
+        TFD::Actor::Ops::InstallDefeatedEnemyStateHooks(TFD::Actor::Ops::DefeatedEnemyStateHooks{});
+        {
+            std::scoped_lock lk(g_lock);
+            ClearAllEnemyEntriesLocked("shutdown");
+            SetConditionState(0);
+        }
+        spdlog::info("[TFD][Victory][R394A] enemy defeat owner shutdown");
+    }
+
+    bool NotifyEnemyBelowThreshold(RE::Actor* actor, float thresholdPct, std::string_view reason)
+    {
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire) ||
+            !actor || actor->IsDisabled() || actor->IsDead()) {
+            return false;
+        }
+
+        const float clampedThreshold = std::clamp(thresholdPct, 2.0f, 95.0f);
+        if (GetActorHealthPct(actor) > clampedThreshold) {
+            return false;
+        }
+
+        std::scoped_lock lk(g_lock);
+        const auto formID = actor->GetFormID();
+        if (auto it = g_enemyEntries.find(formID); it != g_enemyEntries.end()) {
+            it->second.thresholdPct = clampedThreshold;
+            MaintainEnemyState(actor, it->second, false);
+            RefreshConditionStateLocked();
+            return true;
+        }
+
+        if (!TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor)) {
+            return false;
+        }
+
+        EnemyEntry entry{};
+        entry.handle = actor->GetHandle();
+        entry.thresholdPct = clampedThreshold;
+        entry.deadline = Now() + std::chrono::milliseconds(
+            static_cast<int>(kEnemyKnockSeconds * 1000.0));
+
+        auto [it, inserted] = g_enemyEntries.emplace(formID, std::move(entry));
+        if (!inserted) {
+            return false;
+        }
+
+        if (kEnemySoftEnterHardStateDelayEnabled) {
+            it->second.softEnterActive = true;
+            it->second.softEnterHardStateApplied = false;
+            it->second.softEnterPendingLogged = false;
+            const auto softEnterNow = Now();
+            it->second.softEnterHardStateDue = softEnterNow + kEnemySoftEnterHardStateDelay;
+            it->second.softEnterHardStateMaxDue = it->second.softEnterHardStateDue + kEnemySoftEnterPressureMaxExtraDelay;
+            it->second.softEnterLastPressureSeen = Clock::time_point{};
+            it->second.softEnterLastPressureCauseFormID = 0;
+            it->second.softEnterLastPressureOtherFormID = 0;
+            it->second.softEnterPressureHitCount = 0;
+            it->second.softEnterPressureDeferrals = 0;
+        }
+
+        MaintainEnemyState(actor, it->second, true);
+        RefreshConditionStateLocked();
+        spdlog::info(
+            "[TFD][Victory][R421A] enemy threshold committed actor={:08X} hpPct={:.1f} threshold={:.1f} countdown={:.1f} reason={} victoryState=1 softEnterDelay=1 hardStateDelayMs={} initialStopCombat=0 initialMirror=0 initialEvaluate=0 delayedBleedoutStart=1",
+            formID,
+            GetActorHealthPct(actor),
+            clampedThreshold,
+            kEnemyKnockSeconds,
+            ReasonText(reason),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                kEnemySoftEnterHardStateDelay)
+                .count());
+        return true;
+    }
+
+    void Tick()
+    {
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::scoped_lock lk(g_lock);
+        const auto now = Now();
+        TickRecruitHitDiagnosticLocked(now);
+
+        if (g_session.active &&
+            g_session.phase == SessionPhase::OpeningDialogue &&
+            g_sessionOpenDeadline.time_since_epoch().count() != 0 &&
+            now >= g_sessionOpenDeadline) {
+            ResetSessionLocked("dialogue_open_timeout", true);
+        }
+
+        if (g_session.active &&
+            g_session.phase == SessionPhase::AwaitingChoiceCommit &&
+            g_choiceCommitDeadline.time_since_epoch().count() != 0 &&
+            now >= g_choiceCommitDeadline) {
+            ResetSessionLocked("dialogue_closed_without_committed_outcome", true);
+        }
+
+        TickCommittedKillLocked(now);
+        TickCommittedLootLocked(now);
+        TickCommittedRecruitLocked(now);
+
+        std::vector<std::tuple<RE::FormID, std::string, bool>> releases{};
+        bool servicedAny = false;
+
+        for (auto& [formID, entry] : g_enemyEntries) {
+            servicedAny = true;
+            auto actorSP = entry.handle.get();
+            auto* actor = actorSP.get();
+
+            const bool ownedKillEntry =
+                g_session.active &&
+                g_session.phase == SessionPhase::KillCommitted &&
+                g_session.selectedActorFormID == formID;
+            const bool ownedLootEntry =
+                g_session.active &&
+                g_session.phase == SessionPhase::LootCommitted &&
+                g_session.selectedActorFormID == formID;
+            const bool ownedRecruitEntry =
+                g_session.active &&
+                g_session.phase == SessionPhase::RecruitCommitted &&
+                g_session.selectedActorFormID == formID;
+            if (ownedKillEntry || ownedLootEntry || ownedRecruitEntry) {
+                // Outcome-specific ticks are the only owners while a selected actor
+                // is committed. Generic countdown/dead cleanup must not race them.
+                continue;
+            }
+
+            if (!actor || actor->IsDisabled()) {
+                releases.emplace_back(formID, "invalid", false);
+                continue;
+            }
+            if (actor->IsDead()) {
+                releases.emplace_back(formID, "dead", false);
+                continue;
+            }
+
+            MaintainEnemyState(actor, entry, false);
+
+            if (entry.countdownHeld) {
+                const bool validHold =
+                    g_session.active &&
+                    g_session.sessionID == entry.heldSessionID &&
+                    g_session.selectedActorFormID == formID;
+                if (validHold) {
+                    continue;
+                }
+
+                spdlog::warn(
+                    "[TFD][Victory][R394A] stale countdown hold released actor={:08X} heldSession={} activeSession={}",
+                    formID,
+                    entry.heldSessionID,
+                    g_session.sessionID);
+                entry.countdownHeld = false;
+                entry.heldSessionID = 0;
+                entry.autoDeathIssued = false;
+                entry.fatalDamageApplied = false;
+                entry.deadline = now + std::chrono::milliseconds(
+                    static_cast<int>(kEnemyKnockSeconds * 1000.0));
+            }
+
+            if (entry.deadline.time_since_epoch().count() == 0 || now < entry.deadline) {
+                continue;
+            }
+
+            if (!entry.autoDeathIssued) {
+                if (actor->IsEssential() || actor->IsProtected()) {
+                    spdlog::warn(
+                        "[TFD][Victory][R394A] auto-death skipped actor={:08X} reason=protected_or_essential",
+                        formID);
+                    releases.emplace_back(formID, "timeout_skip_kill", true);
+                    continue;
+                }
+
+                entry.autoDeathIssued = true;
+                entry.fatalDamageApplied = false;
+                entry.deadline = now + std::chrono::milliseconds(450);
+
+                // Auto-death exits the optional one-shot defeated visual before
+                // fatal damage. This is not a Get Up path and does not reopen any
+                // dialogue or generic flow.
+                if (entry.visualBleedoutStarted && !entry.visualBleedoutStopSent) {
+                    actor->NotifyAnimationGraph("BleedoutStop");
+                    entry.visualBleedoutStopSent = true;
+                }
+                actor->EvaluatePackage(false, true);
+                actor->EvaluatePackage(true, true);
+                spdlog::info(
+                    "[TFD][Victory][R399A] auto-death queued actor={:08X} visualStopSent={}",
+                    formID,
+                    entry.visualBleedoutStopSent ? 1 : 0);
+                continue;
+            }
+
+            if (!entry.fatalDamageApplied) {
+                if (actor->IsDead()) {
+                    releases.emplace_back(formID, "timeout_dead", false);
+                    continue;
+                }
+
+                const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+                const float fatalDamage = (std::max)(25.0f, hpNow + 5000.0f);
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    -fatalDamage);
+                entry.fatalDamageApplied = true;
+                entry.deadline = now + std::chrono::milliseconds(1500);
+                spdlog::info(
+                    "[TFD][Victory][R394A] auto-death damage actor={:08X} hpBefore={:.2f} damage={:.2f}",
+                    formID,
+                    hpNow,
+                    fatalDamage);
+                continue;
+            }
+
+            if (actor->IsDead()) {
+                releases.emplace_back(formID, "timeout_dead", false);
+                continue;
+            }
+
+            // Keep the confirmed baseline's final fallback grace: the entry's
+            // post-damage deadline must be at least 1.5 seconds old.
+            if ((now - entry.deadline) >= std::chrono::milliseconds(1500)) {
+                spdlog::warn(
+                    "[TFD][Victory][R394A] auto-death fallback kill actor={:08X}",
+                    formID);
+                actor->KillImmediate();
+                releases.emplace_back(formID, "timeout_dead_fallback", false);
+            }
+        }
+
+        for (const auto& [formID, reason, playGetUp] : releases) {
+            (void)ReleaseEntryByIDLocked(formID, reason, playGetUp);
+        }
+
+        if (servicedAny &&
+            (g_lastLifecycleLog.time_since_epoch().count() == 0 ||
+                (now - g_lastLifecycleLog) >= std::chrono::milliseconds(1500))) {
+            g_lastLifecycleLog = now;
+            spdlog::info(
+                "[TFD][Victory][R394A] enemy defeat lifecycle serviced active={}",
+                static_cast<unsigned>(g_enemyEntries.size()));
+        }
+    }
+
+    bool ReleaseManagedEnemy(RE::Actor* actor, std::string_view reason, bool playGetUp)
+    {
+        if (!actor) {
+            return false;
+        }
+        std::scoped_lock lk(g_lock);
+        return ReleaseEntryByIDLocked(actor->GetFormID(), reason, playGetUp);
+    }
+
+    void SuppressAutoDeathForExternalFight(RE::Actor* actor, double seconds, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!actor || actor->IsDisabled() || actor->IsDead()) {
+            spdlog::warn(
+                "[TFD][Victory][R394A] external fight release skipped actor={:08X} reason={} invalid=1",
+                actor ? actor->GetFormID() : 0u,
+                reasonText);
+            return;
+        }
+
+        const double safeSeconds = (std::max)(2.0, seconds);
+        TFD::Actor::Ops::SuppressDefeatedEnemyReentry(actor, safeSeconds, reasonText.c_str());
+        const bool released = ReleaseManagedEnemy(actor, reason, true);
+
+        // This preserves the already-stable external PleasureFailed -> Fight
+        // behavior. The reconstructed Victory outcomes will not use this path.
+        actor->NotifyAnimationGraph("BleedoutStop");
+        actor->NotifyAnimationGraph("GetUpStart");
+        actor->EvaluatePackage(false, true);
+        actor->EvaluatePackage(true, true);
+
+        spdlog::info(
+            "[TFD][Victory][R394A] external fight release actor={:08X} seconds={:.1f} releasedManaged={} reason={}",
+            actor->GetFormID(),
+            safeSeconds,
+            released ? 1 : 0,
+            reasonText);
+    }
+
+    void RestoreActorHealthToSafePct(
+        RE::Actor* actor,
+        float thresholdPct,
+        float bonusPct,
+        float minSafePct,
+        float maxSafePct,
+        float minAbsHp,
+        std::string_view reason)
+    {
+        if (!actor || actor->IsDead() || actor->IsDisabled()) {
+            return;
+        }
+
+        const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+        const float hpNow = actor->GetActorValue(RE::ActorValue::kHealth);
+        auto pctToUnit = [](float value) { return value > 1.0f ? (value / 100.0f) : value; };
+        const float threshold = std::clamp(pctToUnit(thresholdPct), 0.05f, 0.95f);
+        const float bonus = std::clamp(pctToUnit(bonusPct), 0.0f, 0.95f);
+        const float minSafe = std::clamp(pctToUnit(minSafePct), 0.05f, 1.0f);
+        const float maxSafe = std::clamp(pctToUnit(maxSafePct), minSafe, 1.0f);
+        const float safePct = std::clamp(threshold + bonus, minSafe, maxSafe);
+        const float target = (std::max)(minAbsHp, hpMax * safePct);
+
+        if (hpNow + 0.001f < target) {
+            actor->RestoreActorValue(
+                RE::ACTOR_VALUE_MODIFIER::kDamage,
+                RE::ActorValue::kHealth,
+                target - hpNow);
+            spdlog::info(
+                "[TFD][Victory][R394A] recover actor hp actor={:08X} reason={} from={:.2f} to={:.2f} thresholdPct={:.1f}",
+                actor->GetFormID(),
+                ReasonText(reason),
+                hpNow,
+                target,
+                thresholdPct);
+        }
+    }
+
+    void ResetForLoad(std::string_view reason)
+    {
+        std::scoped_lock lk(g_lock);
+        ClearAllEnemyEntriesLocked(reason.empty() ? std::string_view{ "reset_for_load" } : reason);
+        SetConditionState(0);
+        spdlog::info(
+            "[TFD][Victory][R394A] reset for load reason={}",
+            ReasonText(reason));
+    }
+
+    void SetLoadTransition(bool active, std::string_view reason)
+    {
+        g_loadTransition.store(active, std::memory_order_release);
+        if (active) {
+            ResetForLoad(reason.empty() ? std::string_view{ "load_transition" } : reason);
+        }
+        spdlog::info(
+            "[TFD][Victory][R394A] load transition active={} reason={}",
+            active ? 1 : 0,
+            ReasonText(reason));
+    }
+
+    bool BeginManualInteraction(RE::Actor* selectedActor, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!IsUsableManualCandidate(selectedActor)) {
+            spdlog::info(
+                "[TFD][Victory][R394A] manual interaction rejected actor={:08X} reason={} gate=invalid_actor",
+                selectedActor ? selectedActor->GetFormID() : 0u,
+                reasonText);
+            return false;
+        }
+
+        const auto actorFormID = selectedActor->GetFormID();
+        {
+            std::scoped_lock lk(g_lock);
+            const auto it = g_enemyEntries.find(actorFormID);
+            if (it == g_enemyEntries.end() || !it->second.managed) {
+                spdlog::info(
+                    "[TFD][Victory][R394A] manual interaction rejected actor={:08X} reason={} gate=not_managed",
+                    actorFormID,
+                    reasonText);
+                return false;
+            }
+
+            if (g_session.active) {
+                spdlog::info(
+                    "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=session_busy activeActor={:08X} session={} phase={}",
+                    actorFormID,
+                    reasonText,
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_session.phase));
+                return true;
+            }
+
+            if (it->second.autoDeathIssued || it->second.fatalDamageApplied) {
+                spdlog::info(
+                    "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=auto_death_committed",
+                    actorFormID,
+                    reasonText);
+                return true;
+            }
+        }
+
+        if (IsDialogueMenuOpen()) {
+            spdlog::info(
+                "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=dialogue_menu_busy",
+                actorFormID,
+                reasonText);
+            return true;
+        }
+
+        const auto threat = FindBlockingPlayerThreat(selectedActor);
+        if (threat.blocked) {
+            spdlog::info(
+                "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=standing_enemy_targets_player threat={:08X} distance={:.1f}",
+                actorFormID,
+                reasonText,
+                threat.actorFormID,
+                threat.distance);
+            return true;
+        }
+
+        std::uint32_t sessionID = 0;
+        {
+            std::scoped_lock lk(g_lock);
+            auto it = g_enemyEntries.find(actorFormID);
+            if (it == g_enemyEntries.end() || !it->second.managed ||
+                it->second.autoDeathIssued || it->second.fatalDamageApplied) {
+                spdlog::info(
+                    "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=state_changed_before_commit",
+                    actorFormID,
+                    reasonText);
+                return true;
+            }
+            if (g_session.active) {
+                return true;
+            }
+
+            sessionID = NextSessionIDLocked();
+            auto& entry = it->second;
+            entry.deadline = Now() + std::chrono::milliseconds(
+                static_cast<int>(kEnemyKnockSeconds * 1000.0));
+            entry.countdownHeld = true;
+            entry.heldSessionID = sessionID;
+            entry.autoDeathIssued = false;
+            entry.fatalDamageApplied = false;
+            MaintainEnemyState(selectedActor, entry, false);
+
+            g_session.active = true;
+            g_session.sessionID = sessionID;
+            g_session.selectedActorFormID = actorFormID;
+            g_session.phase = SessionPhase::OpeningDialogue;
+            g_sessionOpenDeadline = Now() + kDialogueOpenTimeout;
+            g_choiceCommitDeadline = {};
+            g_killDeadline = {};
+            g_killFinalizeNotBefore = {};
+            g_killStage = KillStage::None;
+            SetConditionState(2);
+
+            spdlog::info(
+                "[TFD][Victory][R394A] session begin actor={:08X} session={} phase={} countdownReset={:.1f} countdownHeld=1 state=2 reason={}",
+                actorFormID,
+                sessionID,
+                ToString(g_session.phase),
+                kEnemyKnockSeconds,
+                reasonText);
+        }
+
+        selectedActor->AllowPCDialogue(true);
+        auto* greetInfo = ResolveVictoryGreetTopicInfo();
+        const bool opened = greetInfo && selectedActor->SetDialogueWithPlayer(true, true, greetInfo);
+
+        {
+            std::scoped_lock lk(g_lock);
+            if (g_session.active &&
+                g_session.sessionID == sessionID &&
+                g_session.selectedActorFormID == actorFormID) {
+                if (!opened) {
+                    spdlog::warn(
+                        "[TFD][Victory][R394A] greet open failed actor={:08X} session={} topicInfo={:08X} action=cancel_restart_countdown",
+                        actorFormID,
+                        sessionID,
+                        greetInfo ? greetInfo->GetFormID() : 0u);
+                    ResetSessionLocked("greet_open_failed", true);
+                }
+                else {
+                    if (IsDialogueMenuOpen() && g_session.phase == SessionPhase::OpeningDialogue) {
+                        g_session.phase = SessionPhase::DialogueOpen;
+                        g_sessionOpenDeadline = {};
+                    }
+                    spdlog::info(
+                        "[TFD][Victory][R394A] greet open result actor={:08X} session={} opened=1 topicInfo={:08X} phase={} no_getup=1",
+                        actorFormID,
+                        sessionID,
+                        greetInfo->GetFormID(),
+                        ToString(g_session.phase));
+                }
+            }
+        }
+
+        return true;
+    }
+
+    void NotifyDialogueMenuStateChanged(bool opening)
+    {
+        std::scoped_lock lk(g_lock);
+        if (!g_session.active) {
+            return;
+        }
+
+        if (opening) {
+            if (g_session.phase == SessionPhase::OpeningDialogue) {
+                g_session.phase = SessionPhase::DialogueOpen;
+                g_sessionOpenDeadline = {};
+                spdlog::info(
+                    "[TFD][Victory][R394A] dialogue menu opened actor={:08X} session={} phase={}",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_session.phase));
+            }
+            return;
+        }
+
+        if (g_session.phase == SessionPhase::DialogueOpen) {
+            // TopicInfo end fragments may run several seconds after DialogueMenu
+            // emits its close event. Keep ownership for a bounded commit window so
+            // a chosen outcome is not mistaken for Cancel. If no outcome arrives,
+            // Tick() performs the normal cancel and restarts the ten-second count.
+            g_session.phase = SessionPhase::AwaitingChoiceCommit;
+            g_sessionOpenDeadline = {};
+            g_choiceCommitDeadline = Now() + kChoiceCommitGrace;
+            spdlog::info(
+                "[TFD][Victory][R396B] dialogue closed awaiting choice actor={:08X} session={} phase={} graceMs={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                kChoiceCommitGrace.count());
+        }
+        else if (g_session.phase == SessionPhase::AwaitingChoiceCommit) {
+            spdlog::info(
+                "[TFD][Victory][R395B] duplicate dialogue close ignored actor={:08X} session={} phase={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase));
+        }
+        else if (g_session.phase == SessionPhase::KillCommitted) {
+            ArmCommittedKillLocked(Now(), "dialogue_menu_closed_after_kill_commit");
+        }
+        else if (g_session.phase == SessionPhase::LootCommitted) {
+            if (g_lootStage == LootStage::WaitingForDialogueClose) {
+                g_lootStage = LootStage::InventoryDispatchPending;
+                g_lootInventoryDispatchAttempts = 0;
+                g_lootDeadline = Now() + kLootInventoryDispatchDelay;
+                spdlog::info(
+                    "[TFD][Victory][R396B] Loot dialogue close observed actor={:08X} session={} stage={} nativeDispatchDelayMs={}",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_lootStage),
+                    kLootInventoryDispatchDelay.count());
+            }
+            else {
+                spdlog::info(
+                    "[TFD][Victory][R396B] Loot dialogue close ignored actor={:08X} session={} stage={} reason=already_advanced",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_lootStage));
+            }
+        }
+        else if (g_session.phase == SessionPhase::RecruitCommitted) {
+            if (g_recruitStage == RecruitStage::WaitingForDialogueClose) {
+                g_recruitStage = RecruitStage::CommitPending;
+                g_recruitDeadline = Now() + kRecruitCommitDelay;
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit dialogue close observed before delayed BleedoutStop release actor={:08X} session={} stage={} postDialogueCommitDelayMs={} deferBleedoutStopUntilDialogueClose=1",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_recruitStage),
+                    kRecruitCommitDelay.count());
+            }
+            else {
+                spdlog::info(
+                    "[TFD][Victory][R421A] Recruit dialogue close ignored actor={:08X} session={} stage={} reason=already_advanced",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_recruitStage));
+            }
         }
         else {
-            SetStateValue(kStateNo);
-        }
-    }
-
-    bool CanAdvertiseVictoryNow(RE::Actor* requiredCandidate, const char* reason)
-    {
-        const auto evaluation = EvaluateCollectiveVictory(
-            kActorLevelDefeatedScanRadius,
-            true,
-            requiredCandidate);
-
-        if (reason && !evaluation.resolved) {
             spdlog::info(
-                "[TFD][Victory][R306A] blocked Player Victory by active threat reason={} candidate={:08X} required={:08X} blocker={:08X} hasCandidate={} threatBlocker={} activeThreatCoalitions={} hostileThreatCoalitions={}",
-                reason,
-                evaluation.candidateFormID,
-                requiredCandidate ? requiredCandidate->GetFormID() : 0u,
-                evaluation.blockerFormID,
-                evaluation.hasCandidate ? 1 : 0,
-                evaluation.hasStandingBlocker ? 1 : 0,
-                evaluation.activeCoalitionCount,
-                evaluation.standingHostileCoalitionCount);
+                "[TFD][Victory][R394A] dialogue close ignored actor={:08X} session={} phase={} reason=awaiting_owned_open",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase));
         }
-
-        return evaluation.resolved;
     }
 
-    int ComputeObservedState(const ObservedContext& context)
+    void NotifyContainerMenuStateChanged(bool opening)
     {
-        // 0 = Neutral: no living enemy remains relevant to the player.
-        // 1 = No: at least one active threat still targets or sees the player.
-        // 2 = Yes: at least one enemy is defeated and no active player threat remains.
-        if (!context.hasPlayer) {
-            ResetObservedContext();
-            return kStateNeutral;
+        std::scoped_lock lk(g_lock);
+        if (!g_session.active || g_session.phase != SessionPhase::LootCommitted) {
+            return;
         }
 
-        if (context.playerDown) {
-            ResetObservedContext();
-            return kStateNeutral;
+        if (opening) {
+            const auto targetFormID = GetOpenLootTargetActorFormID();
+            if ((g_lootStage == LootStage::InventoryDispatchPending ||
+                    g_lootStage == LootStage::WaitingForInventoryOpen) &&
+                targetFormID == g_session.selectedActorFormID) {
+                g_lootStage = LootStage::InventoryOpen;
+                g_lootDeadline = {};
+                spdlog::info(
+                    "[TFD][Victory][R396B] Loot inventory opened actor={:08X} session={} stage={} target={:08X} countdownHeld=1",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_lootStage),
+                    targetFormID);
+            }
+            else {
+                spdlog::info(
+                    "[TFD][Victory][R396B] ContainerMenu open ignored actor={:08X} session={} stage={} target={:08X} reason=not_selected_loot_target",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_lootStage),
+                    targetFormID);
+            }
+            return;
+        }
+
+        if (g_lootStage == LootStage::InventoryOpen) {
+            g_lootStage = LootStage::ReleasePending;
+            g_lootDeadline = Now() + kLootReleasePrepareDelay;
+            spdlog::info(
+                "[TFD][Victory][R396B] Loot inventory closed actor={:08X} session={} stage={} releaseDelayMs={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_lootStage),
+                kLootReleasePrepareDelay.count());
+        }
+        else {
+            spdlog::info(
+                "[TFD][Victory][R396B] Loot inventory close ignored actor={:08X} session={} stage={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_lootStage));
+        }
+    }
+
+    bool RequestKill(RE::Actor* speaker, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire) ||
+            !speaker || speaker->IsDisabled() || speaker->IsDead()) {
+            spdlog::warn(
+                "[TFD][Victory][R395B] Kill rejected actor={:08X} gate=invalid_runtime reason={}",
+                speaker ? speaker->GetFormID() : 0u,
+                reasonText);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::scoped_lock lk(g_lock);
+        const bool commitPhase =
+            g_session.phase == SessionPhase::DialogueOpen ||
+            g_session.phase == SessionPhase::AwaitingChoiceCommit;
+        if (!g_session.active ||
+            g_session.selectedActorFormID != actorFormID ||
+            !commitPhase) {
+            spdlog::warn(
+                "[TFD][Victory][R395B] Kill rejected actor={:08X} gate=session_mismatch active={} selected={:08X} session={} phase={} reason={}",
+                actorFormID,
+                g_session.active ? 1 : 0,
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                reasonText);
+            return false;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        if (it == g_enemyEntries.end() ||
+            !it->second.managed ||
+            it->second.autoDeathIssued ||
+            it->second.fatalDamageApplied) {
+            spdlog::warn(
+                "[TFD][Victory][R395B] Kill rejected actor={:08X} gate=defeated_entry_invalid session={} reason={}",
+                actorFormID,
+                g_session.sessionID,
+                reasonText);
+            return false;
+        }
+
+        if (speaker->IsEssential() || speaker->IsProtected()) {
+            spdlog::warn(
+                "[TFD][Victory][R395B] Kill rejected actor={:08X} gate=protected_or_essential session={} reason={}",
+                actorFormID,
+                g_session.sessionID,
+                reasonText);
+            return false;
+        }
+
+        const auto sessionID = g_session.sessionID;
+        const auto requestPhase = g_session.phase;
+        const bool dialogueOpen = IsDialogueMenuOpen();
+        g_session.phase = SessionPhase::KillCommitted;
+        g_sessionOpenDeadline = {};
+        g_choiceCommitDeadline = {};
+        g_killFinalizeNotBefore = {};
+        SetConditionState(1);
+
+        // Keep the selected actor and countdown owned until death is confirmed on
+        // a later Tick. No synchronous KillImmediate is allowed inside the fragment.
+        it->second.countdownHeld = true;
+        it->second.heldSessionID = sessionID;
+        it->second.autoDeathIssued = false;
+        it->second.fatalDamageApplied = false;
+
+        ClearRecruitTransitionLocked("kill_commit_prepare");
+        g_killStage = dialogueOpen ?
+            KillStage::WaitingForDialogueClose :
+            KillStage::PrimePending;
+        g_killDeadline = dialogueOpen ?
+            Clock::time_point{} :
+            Now() + kKillPrimeDelay;
+
+        spdlog::info(
+            "[TFD][Victory][R395B] Kill commit accepted actor={:08X} session={} phase={} requestPhase={} dialogueOpen={} killStage={} reason={} no_getup=1",
+            actorFormID,
+            sessionID,
+            ToString(g_session.phase),
+            ToString(requestPhase),
+            dialogueOpen ? 1 : 0,
+            ToString(g_killStage),
+            reasonText);
+        return true;
+    }
+
+    bool RequestLoot(RE::Actor* speaker, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire) ||
+            !speaker || speaker->IsDisabled() || speaker->IsDead()) {
+            spdlog::warn(
+                "[TFD][Victory][R396B] Loot rejected actor={:08X} gate=invalid_runtime reason={}",
+                speaker ? speaker->GetFormID() : 0u,
+                reasonText);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::scoped_lock lk(g_lock);
+        const bool commitPhase =
+            g_session.phase == SessionPhase::DialogueOpen ||
+            g_session.phase == SessionPhase::AwaitingChoiceCommit;
+        if (!g_session.active ||
+            g_session.selectedActorFormID != actorFormID ||
+            !commitPhase) {
+            spdlog::warn(
+                "[TFD][Victory][R396B] Loot rejected actor={:08X} gate=session_mismatch active={} selected={:08X} session={} phase={} reason={}",
+                actorFormID,
+                g_session.active ? 1 : 0,
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                reasonText);
+            return false;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        if (it == g_enemyEntries.end() ||
+            !it->second.managed ||
+            it->second.autoDeathIssued ||
+            it->second.fatalDamageApplied) {
+            spdlog::warn(
+                "[TFD][Victory][R396B] Loot rejected actor={:08X} gate=defeated_entry_invalid session={} reason={}",
+                actorFormID,
+                g_session.sessionID,
+                reasonText);
+            return false;
+        }
+
+        const auto sessionID = g_session.sessionID;
+        const auto requestPhase = g_session.phase;
+        const bool dialogueOpen = IsDialogueMenuOpen();
+        const auto now = Now();
+
+        g_session.phase = SessionPhase::LootCommitted;
+        g_sessionOpenDeadline = {};
+        g_choiceCommitDeadline = {};
+        g_killDeadline = {};
+        g_killFinalizeNotBefore = {};
+        g_killStage = KillStage::None;
+        ClearLootTransitionLocked("loot_commit_prepare");
+        ClearRecruitTransitionLocked("loot_commit_prepare");
+        SetConditionState(1);
+
+        it->second.countdownHeld = true;
+        it->second.heldSessionID = sessionID;
+        it->second.autoDeathIssued = false;
+        it->second.fatalDamageApplied = false;
+
+        g_lootStage = dialogueOpen ?
+            LootStage::WaitingForDialogueClose :
+            LootStage::InventoryDispatchPending;
+        g_lootInventoryDispatchAttempts = 0;
+        g_lootDeadline = now + (dialogueOpen ?
+            kLootDialogueCloseTimeout :
+            kLootInventoryDispatchDelay);
+
+        spdlog::info(
+            "[TFD][Victory][R396B] Loot commit accepted actor={:08X} session={} phase={} requestPhase={} dialogueOpen={} lootStage={} reason={} countdownHeld=1 inventoryOwner=TFDVictory nativeMethod=Actor.OpenInventory fragment=request_only completionOwner=TFDVictory",
+            actorFormID,
+            sessionID,
+            ToString(g_session.phase),
+            ToString(requestPhase),
+            dialogueOpen ? 1 : 0,
+            ToString(g_lootStage),
+            reasonText);
+        return true;
+    }
+
+    bool RequestRecruit(RE::Actor* speaker, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire) ||
+            !speaker || speaker->IsDisabled() || speaker->IsDead()) {
+            spdlog::warn(
+                "[TFD][Victory][R400D] Recruit rejected actor={:08X} gate=invalid_runtime reason={}",
+                speaker ? speaker->GetFormID() : 0u,
+                reasonText);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::scoped_lock lk(g_lock);
+        const bool commitPhase =
+            g_session.phase == SessionPhase::DialogueOpen ||
+            g_session.phase == SessionPhase::AwaitingChoiceCommit;
+        if (!g_session.active ||
+            g_session.selectedActorFormID != actorFormID ||
+            !commitPhase) {
+            spdlog::warn(
+                "[TFD][Victory][R400D] Recruit rejected actor={:08X} gate=session_mismatch active={} selected={:08X} session={} phase={} reason={}",
+                actorFormID,
+                g_session.active ? 1 : 0,
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                reasonText);
+            return false;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        if (it == g_enemyEntries.end() ||
+            !it->second.managed ||
+            it->second.autoDeathIssued ||
+            it->second.fatalDamageApplied) {
+            spdlog::warn(
+                "[TFD][Victory][R400D] Recruit rejected actor={:08X} gate=defeated_entry_invalid session={} reason={}",
+                actorFormID,
+                g_session.sessionID,
+                reasonText);
+            return false;
+        }
+
+        if (TFD::TeammateManager::GetRecruitSlotsFree() == 0) {
+            spdlog::warn(
+                "[TFD][Victory][R400D] Recruit rejected actor={:08X} gate=no_recruit_slot session={} reason={}",
+                actorFormID,
+                g_session.sessionID,
+                reasonText);
+            return false;
+        }
+
+        const auto sessionID = g_session.sessionID;
+        const auto requestPhase = g_session.phase;
+        const bool dialogueOpen = IsDialogueMenuOpen();
+        const auto now = Now();
+
+        g_session.phase = SessionPhase::RecruitCommitted;
+        g_sessionOpenDeadline = {};
+        g_choiceCommitDeadline = {};
+        g_killDeadline = {};
+        g_killFinalizeNotBefore = {};
+        g_killStage = KillStage::None;
+        ClearLootTransitionLocked("recruit_commit_prepare");
+        ClearRecruitTransitionLocked("recruit_commit_prepare");
+        SetConditionState(1);
+
+        it->second.countdownHeld = true;
+        it->second.heldSessionID = sessionID;
+        it->second.autoDeathIssued = false;
+        it->second.fatalDamageApplied = false;
+
+        // R421A: delayed vanilla bleedout visual is owned by the soft-enter state.
+        // The option fragment only commits the choice; the visual release waits
+        // for DialogueMenu/MenuTopicManager to close before sending BleedoutStop.
+        const bool waitForDialogueClose = dialogueOpen;
+        if (waitForDialogueClose) {
+            g_recruitStage = RecruitStage::WaitingForDialogueClose;
+            g_recruitDeadline = now + kRecruitDialogueCloseTimeout;
+        }
+        else {
+            g_recruitStage = RecruitStage::CommitPending;
+            g_recruitDeadline = now + kRecruitCommitDelay;
+        }
+
+        spdlog::info(
+            "[TFD][Victory][R421A] Recruit commit accepted actor={:08X} session={} phase={} requestPhase={} dialogueOpen={} recruitStage={} reason={} countdownHeld=1 fragment=request_only owner=TFDVictory deferBleedoutStopUntilDialogueClose={} immediateCommit={} commitDelayMs={} dialogueCloseTimeoutMs={}",
+            actorFormID,
+            sessionID,
+            ToString(g_session.phase),
+            ToString(requestPhase),
+            dialogueOpen ? 1 : 0,
+            ToString(g_recruitStage),
+            reasonText,
+            waitForDialogueClose ? 1 : 0,
+            waitForDialogueClose ? 0 : 1,
+            kRecruitCommitDelay.count(),
+            kRecruitDialogueCloseTimeout.count());
+        return true;
+    }
+
+    void ObserveRecentRecruitHit(RE::Actor* target, RE::Actor* cause, std::string_view reason)
+    {
+        std::scoped_lock lk(g_lock);
+
+        // R421A: the same hit sink is also used as a lightweight pressure sensor
+        // for enemies that have entered soft Victory defeated state but are not
+        // hardened yet. This catches the teammate-caused edge where real hit
+        // traffic continues during the soft-enter window.
+        const bool targetIsSoft = IsSoftEnterPressureActor(target);
+        const bool causeIsSoft = IsSoftEnterPressureActor(cause);
+        const bool causeIsPlayerSide = cause && TFD::TeammateManager::IsPlayerSideTeammateActor(cause);
+        const bool targetIsPlayerSide = target && TFD::TeammateManager::IsPlayerSideTeammateActor(target);
+
+        if (targetIsSoft && causeIsPlayerSide) {
+            RecordSoftEnterPressureLocked(
+                target->GetFormID(),
+                cause ? cause->GetFormID() : 0u,
+                cause ? cause->GetFormID() : 0u,
+                reason,
+                "hit_target_soft_cause_player_side");
+        }
+        if (causeIsSoft && (targetIsPlayerSide || !target)) {
+            RecordSoftEnterPressureLocked(
+                cause->GetFormID(),
+                cause->GetFormID(),
+                target ? target->GetFormID() : 0u,
+                reason,
+                target ? "hit_cause_soft_target_player_side" : "hit_cause_soft_target_unknown");
+        }
+
+        if (!target) {
+            return;
+        }
+
+        if (!g_recruitHitDiagnostic.active ||
+            g_recruitHitDiagnostic.actorFormID == 0 ||
+            target->GetFormID() != g_recruitHitDiagnostic.actorFormID) {
+            return;
         }
 
         const auto now = Now();
-        const int previousState = GetStateValue();
-        const bool lingerActive =
-            g_observedCombatContextUntil != std::chrono::steady_clock::time_point{} &&
-            now < g_observedCombatContextUntil;
-
-        if (IsDialogueReadyHoldActive()) {
-            const auto heldVictory = EvaluateCollectiveVictory(
-                kActorLevelDefeatedScanRadius,
-                true,
-                RE::TESForm::LookupByID<RE::Actor>(g_dialogueReadyHoldActorFormID));
-            return heldVictory.resolved ? kStateYes : kStateNo;
+        if (g_recruitHitDiagnostic.expireAt.time_since_epoch().count() != 0 &&
+            now >= g_recruitHitDiagnostic.expireAt) {
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit hit diagnostic ignored expired actor={:08X} session={} reason={} noBehaviorChange=1",
+                g_recruitHitDiagnostic.actorFormID,
+                g_recruitHitDiagnostic.recruitSessionID,
+                ReasonText(reason));
+            g_recruitHitDiagnostic = RecruitHitDiagnosticState{};
+            return;
         }
 
-        // R304A: Evaluate defeated candidates before the broad combat-context
-        // "hasEnemies" hold.  A TFD-knocked enemy is still alive for the 10s
-        // interaction window, so stale combat/enemy flags must not hide a valid
-        // last-man-standing Victory.
-        const bool activeVictoryContext = context.combatContext || lingerActive || previousState == kStateYes;
-
-        const auto collectiveVictory = EvaluateCollectiveVictory(
-            kActorLevelDefeatedScanRadius,
-            activeVictoryContext,
-            nullptr);
-        if (collectiveVictory.resolved) {
-            return kStateYes;
-        }
-        if (collectiveVictory.hasCandidate && collectiveVictory.hasStandingBlocker) {
-            if (context.combatContext) {
-                g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
-            }
-            return kStateNo;
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        const bool causeIsPlayer =
+            cause && player && cause->GetFormID() == player->GetFormID();
+        if (!causeIsPlayer) {
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit hit diagnostic observed non-player hit actor={:08X} session={} cause={:08X} reason={} ignored=1 noBehaviorChange=1",
+                target->GetFormID(),
+                g_recruitHitDiagnostic.recruitSessionID,
+                cause ? cause->GetFormID() : 0u,
+                ReasonText(reason));
+            return;
         }
 
-        if (context.hasEnemies && context.combatContext) {
-            g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
-            return kStateNo;
+        if (g_recruitHitDiagnostic.playerHitObserved) {
+            spdlog::info(
+                "[TFD][Victory][R421A] Recruit hit diagnostic duplicate player hit actor={:08X} session={} cause={:08X} reason={} ignored=1 noBehaviorChange=1",
+                target->GetFormID(),
+                g_recruitHitDiagnostic.recruitSessionID,
+                cause->GetFormID(),
+                ReasonText(reason));
+            return;
         }
 
-        // Standing observed enemies without combat proof are precombat/threat data,
-        // not a committed combat-resolution context.  Do not advertise VictoryState=1
-        // just because an actor can see or warn the player.
+        g_recruitHitDiagnostic.playerHitObserved = true;
+        g_recruitHitDiagnostic.causeFormID = cause->GetFormID();
+        g_recruitHitDiagnostic.hitPosition = target->GetPosition();
+        g_recruitHitDiagnostic.firstAfterHitDue = now + kRecruitHitDiagnosticFirstDelay;
+        g_recruitHitDiagnostic.secondAfterHitDue = now + kRecruitHitDiagnosticSecondDelay;
 
-        if (context.combatContext && HasRelevantLivingEnemyActor(kVictoryObservedScanRadius)) {
-            g_observedCombatContextUntil = now + std::chrono::milliseconds(kObservedCombatContextLingerMs);
-            return kStateNo;
-        }
-
-        ResetObservedContext();
-        return kStateNeutral;
+        spdlog::info(
+            "[TFD][Victory][R421A] Recruit hit diagnostic player hit observed actor={:08X} session={} cause={:08X} firstDelayMs={} secondDelayMs={} reason={} noBehaviorChange=1",
+            target->GetFormID(),
+            g_recruitHitDiagnostic.recruitSessionID,
+            cause->GetFormID(),
+            kRecruitHitDiagnosticFirstDelay.count(),
+            kRecruitHitDiagnosticSecondDelay.count(),
+            ReasonText(reason));
+        LogRecruitHitDiagnosticSampleLocked(target, cause, "hit_event_immediate", reason);
     }
 
-    void RefreshObservedState(const ObservedContext& context)
+    bool IsCombatBehaviorSuppressedActor(RE::Actor* actor)
     {
-        SetStateValue(ComputeObservedState(context));
+        if (!actor) {
+            return false;
+        }
+
+        const auto actorFormID = actor->GetFormID();
+        if (actorFormID == 0) {
+            return false;
+        }
+
+        std::scoped_lock lk(g_lock);
+        if (g_session.active && g_session.selectedActorFormID == actorFormID) {
+            return true;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        return it != g_enemyEntries.end() &&
+            it->second.managed &&
+            !it->second.autoDeathIssued &&
+            !it->second.fatalDamageApplied;
+    }
+
+    bool IsCombatBehaviorSuppressed()
+    {
+        std::scoped_lock lk(g_lock);
+        if (g_session.active) {
+            return true;
+        }
+
+        for (const auto& [_formID, entry] : g_enemyEntries) {
+            if (entry.managed &&
+                !entry.autoDeathIssued &&
+                !entry.fatalDamageApplied) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void ResetSession(std::string_view reason)
+    {
+        std::scoped_lock lk(g_lock);
+        ResetSessionLocked(reason, true);
+    }
+
+    bool IsSessionActive()
+    {
+        std::scoped_lock lk(g_lock);
+        return g_session.active;
+    }
+
+    SessionSnapshot GetSessionSnapshot()
+    {
+        std::scoped_lock lk(g_lock);
+        return g_session;
     }
 }

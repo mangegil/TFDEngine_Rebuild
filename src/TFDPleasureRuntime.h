@@ -24,12 +24,12 @@ namespace TFD::PleasureRuntime
 	enum class SourceContext : std::uint8_t
 	{
 		None = 0,
-		PreCombat,
-		Bleedout,
-		Captive,
-		Victory,
-		Teammate,
-		InCombat
+		PreCombat = 1,
+		Bleedout = 2,
+		Captive = 3,
+		// Value 4 is intentionally unused; manual defeated interaction is not a generic source.
+		Teammate = 5,
+		InCombat = 6
 	};
 
 	enum class AfterChoice : std::uint8_t
