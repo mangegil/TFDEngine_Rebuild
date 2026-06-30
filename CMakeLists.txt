@@ -33,6 +33,7 @@ add_library(TFDEngine SHARED
     src/TFDSettings.cpp
     src/TFDLocation.cpp
     src/TFDCaptive.cpp
+    src/TFDDefeatCaptiveTickWiring.cpp
     src/TFDCaptiveRecaptureRecoveryPulse.cpp
     src/TFDCaptiveRecaptureRecovery.cpp
     src/TFDCaptiveRecaptureRecoveryWiring.cpp
@@ -40,15 +41,29 @@ add_library(TFDEngine SHARED
     src/TFDVictory.cpp
     src/TFDPostDefeatState.cpp
     src/TFDDefeatBridge.cpp
+    src/TFDDefeatBattleObserveState.cpp
+    src/TFDDefeatBleedoutRuntimeTimer.cpp
+    src/TFDDefeatAggressorResolver.cpp
     src/TFDDefeatRuntimeProviders.cpp
+    src/TFDDefeatRuntimeProviderWiring.cpp
+    src/TFDDefeatLifecycleBootstrapWiring.cpp
+    src/TFDDefeatBleedoutLifecycleWiring.cpp
+    src/TFDDefeatFlowLifecycleWiring.cpp
     src/TFDDefeatLifecycleBootstrap.cpp
     src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
     src/TFDPlayerDamageGuard.cpp
     src/TFDPlayerOverkillDamageHook.cpp
     src/TFDPlayerDownRouter.cpp
+    src/TFDPlayerDownRouterPendingWiring.cpp
+    src/TFDPlayerDownRouterOutcomeWiring.cpp
+    src/TFDPlayerThresholdOutcomeWiring.cpp
     src/TFDBleedLockState.cpp
     src/TFDBleedLockRuntime.cpp
+    src/TFDDefeatBleedLockWiring.cpp
+    src/TFDDefeatTerminalLockout.cpp
+    src/TFDDefeatStickyReopenGrace.cpp
+    src/TFDDefeatFlowRefresh.cpp
     src/TFDBleedoutDialogueRuntime.cpp
     src/TFDDialogueLifecycle.cpp
     src/TFDDefeatRuntimeActions.cpp
