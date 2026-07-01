@@ -1,6 +1,7 @@
 #include "TFDVictory.h"
 
 #include "TFDActor.h"
+#include "TFDFlowController.h"
 #include "TFDRecruit.h"
 #include "TFDSettings.h"
 #include "TFDTeammateManager.h"
@@ -72,7 +73,7 @@ namespace TFD::Victory
         constexpr bool kEnemyDefeatedVisualBleedoutEnabled = true;
         constexpr bool kEnemySoftEnterHardStateDelayEnabled = true;
         constexpr auto kEnemySoftEnterHardStateDelay = std::chrono::milliseconds(1500);
-        constexpr auto kEnemyDelayedBleedoutStartSettleDelay = std::chrono::milliseconds(400);
+        constexpr auto kEnemyDelayedBleedoutStartSettleDelay = std::chrono::milliseconds(1500);
         constexpr auto kEnemySoftEnterPressureQuietWindow = std::chrono::milliseconds(900);
         constexpr auto kEnemySoftEnterPressureRetryDelay = std::chrono::milliseconds(500);
         constexpr auto kEnemySoftEnterPressureMaxExtraDelay = std::chrono::milliseconds(4000);
@@ -1995,6 +1996,81 @@ namespace TFD::Victory
             RE::FormID targetTargetFormID{ 0 };
         };
 
+        struct VictoryEntryContextGate
+        {
+            bool allowed{ true };
+            TFD::FlowController::RootFlow root{ TFD::FlowController::RootFlow::None };
+            TFD::FlowController::RootFlow contextRoot{ TFD::FlowController::RootFlow::None };
+            TFD::FlowController::DecisionGate gate{ TFD::FlowController::DecisionGate::None };
+            TFD::FlowController::SubFlow sub{ TFD::FlowController::SubFlow::None };
+            bool terminalResolved{ false };
+            const char* reason{ "allowed" };
+        };
+
+        bool IsVictoryEntryBlockedRoot(TFD::FlowController::RootFlow root)
+        {
+            using TFD::FlowController::RootFlow;
+            switch (root) {
+            case RootFlow::Bleedout:
+            case RootFlow::Captive:
+            case RootFlow::Rescue:
+            case RootFlow::Recovery:
+            case RootFlow::LeftForDead:
+                return true;
+            default:
+                return false;
+            }
+        }
+
+        VictoryEntryContextGate BuildVictoryEntryContextGate()
+        {
+            VictoryEntryContextGate gate{};
+            const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+            gate.root = snapshot.root;
+            gate.contextRoot = snapshot.contextRoot;
+            gate.gate = snapshot.gate;
+            gate.sub = snapshot.sub;
+            gate.terminalResolved = snapshot.terminalResolved;
+
+            if (IsVictoryEntryBlockedRoot(snapshot.root)) {
+                gate.allowed = false;
+                gate.reason = "blocked_root";
+                return gate;
+            }
+            if (IsVictoryEntryBlockedRoot(snapshot.contextRoot)) {
+                gate.allowed = false;
+                gate.reason = "blocked_context_root";
+                return gate;
+            }
+            if (snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout ||
+                snapshot.gate == TFD::FlowController::DecisionGate::EnemyBleedout) {
+                gate.allowed = false;
+                gate.reason = "bleed_decision_gate";
+                return gate;
+            }
+            if (snapshot.terminalResolved && snapshot.root != TFD::FlowController::RootFlow::None) {
+                gate.allowed = false;
+                gate.reason = "terminal_resolved_root";
+                return gate;
+            }
+            return gate;
+        }
+
+        const char* RootName(TFD::FlowController::RootFlow root)
+        {
+            return TFD::FlowController::Controller::ToString(root);
+        }
+
+        const char* DecisionGateName(TFD::FlowController::DecisionGate gate)
+        {
+            return TFD::FlowController::Controller::ToString(gate);
+        }
+
+        const char* SubFlowName(TFD::FlowController::SubFlow sub)
+        {
+            return TFD::FlowController::Controller::ToString(sub);
+        }
+
         SoftEnterPressureProbe ProbeSoftEnterPressureLocked(RE::Actor* actor)
         {
             SoftEnterPressureProbe result{};
@@ -2165,8 +2241,8 @@ namespace TFD::Victory
             }
 
             // R421A: vanilla BleedoutStart is allowed again, but only after
-            // the successful R418/R419 soft-enter delay and a small post-hardening
-            // settle window. Do not fire it at the exact HP-threshold frame.
+            // the successful R418/R419 soft-enter delay and a post-hardening
+            // alias/package settle window. Do not fire it close to Enemy alias fill / package evaluation.
             if (entry.softEnterHardStateApplied && !entry.visualBleedoutStartDecisionLogged) {
                 if (kEnemyDefeatedVisualBleedoutEnabled) {
                     if (!entry.visualBleedoutStartPending) {
@@ -2396,7 +2472,7 @@ namespace TFD::Victory
         g_worker = std::thread([]() { WorkerLoop(); });
 
         spdlog::info(
-            "[TFD][Victory][R421A] enemy defeat owner installed policy=threshold_notify registry_countdown_autodeath_owner selected_actor_session_greet_cancel_kill_staged_death loot_native_inventory_dispatch_container_observer_controlled_release recruit_pre_getup_dehostile_defeated_clear_teammate_handoff package_hold_defeated_delayed_bleedoutstart delayed_bleedoutstart no_reassert no_forcegreet no_generic_flow no_node_rebuild recruit_hit_diagnostic_passthrough soft_defeated_enter_R421A teammate_pressure_quiet_window");
+            "[TFD][Victory][R421A] enemy defeat owner installed policy=threshold_notify registry_countdown_autodeath_owner selected_actor_session_greet_cancel_kill_staged_death loot_native_inventory_dispatch_container_observer_controlled_release recruit_pre_getup_dehostile_defeated_clear_teammate_handoff package_hold_defeated_delayed_bleedoutstart delayed_bleedoutstart no_reassert no_forcegreet no_generic_flow no_node_rebuild recruit_hit_diagnostic_passthrough soft_defeated_enter_R421A teammate_pressure_quiet_window victory_context_guard_P32B");
     }
 
     void Shutdown()
@@ -2433,13 +2509,42 @@ namespace TFD::Victory
             return false;
         }
 
+        const auto contextGate = BuildVictoryEntryContextGate();
         std::scoped_lock lk(g_lock);
         const auto formID = actor->GetFormID();
         if (auto it = g_enemyEntries.find(formID); it != g_enemyEntries.end()) {
             it->second.thresholdPct = clampedThreshold;
+            if (!contextGate.allowed) {
+                spdlog::info(
+                    "[TFD][Victory][P32B] existing enemy threshold ignored and released actor={:08X} reason={} root={} context={} gate={} sub={} terminal={} noHardening=1 noBleedoutStart=1",
+                    formID,
+                    contextGate.reason,
+                    RootName(contextGate.root),
+                    RootName(contextGate.contextRoot),
+                    DecisionGateName(contextGate.gate),
+                    SubFlowName(contextGate.sub),
+                    contextGate.terminalResolved ? 1 : 0);
+                (void)ReleaseEntryByIDLocked(formID, contextGate.reason, false);
+                return false;
+            }
             MaintainEnemyState(actor, it->second, false);
             RefreshConditionStateLocked();
             return true;
+        }
+
+        if (!contextGate.allowed) {
+            spdlog::info(
+                "[TFD][Victory][P32B] enemy threshold ignored actor={:08X} hpPct={:.1f} threshold={:.1f} reason={} root={} context={} gate={} sub={} terminal={} noEntry=1 noHardening=1 noBleedoutStart=1",
+                formID,
+                GetActorHealthPct(actor),
+                clampedThreshold,
+                contextGate.reason,
+                RootName(contextGate.root),
+                RootName(contextGate.contextRoot),
+                DecisionGateName(contextGate.gate),
+                SubFlowName(contextGate.sub),
+                contextGate.terminalResolved ? 1 : 0);
+            return false;
         }
 
         if (!TFD::Actor::Ops::IsDefeatedEnemyCandidate(actor)) {
@@ -2494,6 +2599,7 @@ namespace TFD::Victory
             return;
         }
 
+        const auto contextGate = BuildVictoryEntryContextGate();
         std::scoped_lock lk(g_lock);
         const auto now = Now();
         TickRecruitHitDiagnosticLocked(now);
@@ -2548,6 +2654,24 @@ namespace TFD::Victory
             }
             if (actor->IsDead()) {
                 releases.emplace_back(formID, "dead", false);
+                continue;
+            }
+
+            if (!contextGate.allowed) {
+                spdlog::info(
+                    "[TFD][Victory][P32B] enemy defeated visual entry cancelled actor={:08X} reason={} root={} context={} gate={} sub={} terminal={} softActive={} hardApplied={} bleedStartPending={} bleedStarted={} noHardening=1 noBleedoutStart=1",
+                    formID,
+                    contextGate.reason,
+                    RootName(contextGate.root),
+                    RootName(contextGate.contextRoot),
+                    DecisionGateName(contextGate.gate),
+                    SubFlowName(contextGate.sub),
+                    contextGate.terminalResolved ? 1 : 0,
+                    entry.softEnterActive ? 1 : 0,
+                    entry.softEnterHardStateApplied ? 1 : 0,
+                    entry.visualBleedoutStartPending ? 1 : 0,
+                    entry.visualBleedoutStarted ? 1 : 0);
+                releases.emplace_back(formID, contextGate.reason, false);
                 continue;
             }
 

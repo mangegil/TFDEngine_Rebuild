@@ -43,16 +43,25 @@ add_library(TFDEngine SHARED
     src/TFDDefeatBridge.cpp
     src/TFDDefeatBattleObserveState.cpp
     src/TFDDefeatBleedoutRuntimeTimer.cpp
+    src/TFDDefeatBleedRuntimeState.cpp
     src/TFDDefeatAggressorResolver.cpp
     src/TFDDefeatRuntimeProviders.cpp
     src/TFDDefeatRuntimeProviderWiring.cpp
     src/TFDDefeatLifecycleBootstrapWiring.cpp
     src/TFDDefeatBleedoutLifecycleWiring.cpp
+    src/TFDDefeatBleedoutDialogueWiring.cpp
     src/TFDDefeatFlowLifecycleWiring.cpp
+    src/TFDDefeatTransitionWiring.cpp
     src/TFDDefeatLifecycleBootstrap.cpp
     src/TFDActor.cpp
     src/TFDDefeatMonitor.cpp
+    src/TFDDefeatActorQueries.cpp
+    src/TFDDefeatEventBridge.cpp
+    src/TFDDefeatBleedRuntimeResetWiring.cpp
+    src/TFDDefeatSaveLoadBridge.cpp
+    src/TFDDefeatThresholdSensor.cpp
     src/TFDPlayerDamageGuard.cpp
+    src/TFDPlayerBleedImmunityGuard.cpp
     src/TFDPlayerOverkillDamageHook.cpp
     src/TFDPlayerDownRouter.cpp
     src/TFDPlayerDownRouterPendingWiring.cpp
@@ -61,8 +70,12 @@ add_library(TFDEngine SHARED
     src/TFDBleedLockState.cpp
     src/TFDBleedLockRuntime.cpp
     src/TFDDefeatBleedLockWiring.cpp
+    src/TFDDefeatBleedHealthGuard.cpp
+    src/TFDDefeatBleedoutTickWiring.cpp
+    src/TFDDefeatMonitorBootstrapWiring.cpp
     src/TFDDefeatTerminalLockout.cpp
     src/TFDDefeatStickyReopenGrace.cpp
+    src/TFDDefeatReleaseGrace.cpp
     src/TFDDefeatFlowRefresh.cpp
     src/TFDBleedoutDialogueRuntime.cpp
     src/TFDDialogueLifecycle.cpp
