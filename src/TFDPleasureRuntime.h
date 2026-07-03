@@ -29,7 +29,9 @@ namespace TFD::PleasureRuntime
 		Captive = 3,
 		// Value 4 is intentionally unused; manual defeated interaction is not a generic source.
 		Teammate = 5,
-		InCombat = 6
+		InCombat = 6,
+		// P45A: Victory Pleasure is a native Victory-owned OStim bridge, not a Teammate source.
+		Victory = 7
 	};
 
 	enum class AfterChoice : std::uint8_t

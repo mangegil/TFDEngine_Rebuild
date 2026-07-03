@@ -9,10 +9,22 @@ namespace TFD::PlayerDownRouter
 	namespace
 	{
 		PendingOverkillRoute g_pendingOverkillRoute{};
+		static constexpr auto kPendingOverkillRouteMaxAge = std::chrono::milliseconds(5000);
 
 		static std::chrono::steady_clock::time_point Now()
 		{
 			return std::chrono::steady_clock::now();
+		}
+
+		bool IsUsablePendingAttacker(RE::Actor* attacker, const PendingRouteHandlers& handlers)
+		{
+			if (!attacker || attacker->IsDead() || attacker->IsDisabled()) {
+				return false;
+			}
+			if (handlers.isObserverAlly && handlers.isObserverAlly(attacker)) {
+				return false;
+			}
+			return true;
 		}
 	}
 
@@ -237,9 +249,32 @@ namespace TFD::PlayerDownRouter
 
 		const auto pending = g_pendingOverkillRoute;
 		const auto now = Now();
-		const auto queuedAgeMs = pending.queuedAt.time_since_epoch().count() != 0 ?
-			std::chrono::duration_cast<std::chrono::milliseconds>(now - pending.queuedAt).count() : 0LL;
+		const auto queuedAge = pending.queuedAt.time_since_epoch().count() != 0 ?
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - pending.queuedAt) :
+			std::chrono::milliseconds(0);
+		const auto queuedAgeMs = queuedAge.count();
 		const float thresholdPct = std::clamp(pending.thresholdPct, 2.0f, 95.0f);
+
+		auto attackerSp = RE::Actor::LookupByHandle(pending.attacker.native_handle());
+		auto* attacker = attackerSp.get();
+		const bool attackerCanOwnPendingRoute = IsUsablePendingAttacker(attacker, handlers);
+		const bool hasBleedOwner = handlers.hasPlayerBleedOwner && handlers.hasPlayerBleedOwner();
+		const bool bleedDecisionActive = handlers.isBleedDecisionActive && handlers.isBleedDecisionActive();
+		const bool playerDead = player->IsDead(false);
+		if (queuedAge >= kPendingOverkillRouteMaxAge && !hasBleedOwner && !bleedDecisionActive && !playerDead) {
+			spdlog::warn(
+				"[TFD][PlayerDownRouter][P32C] stale overkill route expired attacker={:08X} ageMs={} threshold={:.1f} blocked={:.2f} clamped={:.2f}",
+				attacker ? attacker->GetFormID() : 0u,
+				static_cast<long long>(queuedAgeMs),
+				thresholdPct,
+				pending.blockedDamage,
+				pending.clampedDamage);
+			if (handlers.setPlayerBleedImmune) {
+				handlers.setPlayerBleedImmune(false);
+			}
+			ClearPendingOverkillRoute("stale_expired");
+			return false;
+		}
 
 		if (handlers.setPlayerBleedImmune) {
 			handlers.setPlayerBleedImmune(true);
@@ -253,13 +288,11 @@ namespace TFD::PlayerDownRouter
 			handlers.clampHealth(player, safeFloorHp);
 		}
 
-		auto attackerSp = RE::Actor::LookupByHandle(pending.attacker.native_handle());
-		auto* attacker = attackerSp.get();
-		if (attacker && handlers.isObserverAlly && !handlers.isObserverAlly(attacker) && handlers.rememberAggressor) {
+		if (attackerCanOwnPendingRoute && handlers.rememberAggressor) {
 			handlers.rememberAggressor(attacker);
 		}
 
-		if (handlers.hasPlayerBleedOwner && handlers.hasPlayerBleedOwner()) {
+		if (hasBleedOwner) {
 			spdlog::info(
 				"[TFD][PlayerDownRouter][R21] overkill route consumed by existing bleed owner attacker={:08X} ageMs={} hpPct={:.1f}",
 				attacker ? attacker->GetFormID() : 0u,
@@ -274,7 +307,7 @@ namespace TFD::PlayerDownRouter
 		}
 
 		const float hpPct = handlers.getHealthPct ? handlers.getHealthPct(player) : -1.0f;
-		if (handlers.isBleedDecisionActive && handlers.isBleedDecisionActive()) {
+		if (bleedDecisionActive) {
 			spdlog::info(
 				"[TFD][PlayerDownRouter][R21] overkill route already active attacker={:08X} ageMs={} hpPct={:.1f} threshold={:.1f}",
 				attacker ? attacker->GetFormID() : 0u,
@@ -289,7 +322,16 @@ namespace TFD::PlayerDownRouter
 		if (handlers.scanThresholdOutcome) {
 			scan = handlers.scanThresholdOutcome(player);
 		}
-		if (!scan.initialAggressor && attacker && (!handlers.isObserverAlly || !handlers.isObserverAlly(attacker))) {
+		const auto scannedAggressorFormID = scan.initialAggressor ? scan.initialAggressor->GetFormID() : 0u;
+		if (attackerCanOwnPendingRoute) {
+			if (scan.initialAggressor != attacker) {
+				spdlog::warn(
+					"[TFD][PlayerDownRouter][P32R] pending attacker overrides threshold scan aggressor attacker={:08X} old={:08X} ageMs={} hpPct={:.1f}",
+					attacker->GetFormID(),
+					scannedAggressorFormID,
+					static_cast<long long>(queuedAgeMs),
+					hpPct);
+			}
 			scan.initialAggressor = attacker;
 		}
 		const bool immediateThreat =
@@ -301,6 +343,17 @@ namespace TFD::PlayerDownRouter
 		bool dispatched = false;
 		if (immediateThreat) {
 			auto classification = ClassifyThresholdOutcome(scan);
+			if (attackerCanOwnPendingRoute) {
+				classification.rememberedAggressor = attacker;
+				spdlog::info(
+					"[TFD][PlayerDownRouter][P32R] pending overkill dispatch preferred attacker={:08X} standingFollowers={} unresolvedBattle={} hostileStanding={} ageMs={} hpPct={:.1f}",
+					attacker->GetFormID(),
+					static_cast<unsigned int>(scan.standingFollowers.size()),
+					scan.unresolvedBattle ? 1 : 0,
+					scan.hostileCoalitionStanding ? 1 : 0,
+					static_cast<long long>(queuedAgeMs),
+					hpPct);
+			}
 			dispatched = DispatchThresholdOutcome(player, scan, classification, handlers.dispatch);
 		}
 

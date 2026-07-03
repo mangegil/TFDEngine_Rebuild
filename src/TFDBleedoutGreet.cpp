@@ -200,15 +200,15 @@ namespace TFD::BleedoutGreet
 		const bool nativeMenuOpen = IsDialogueMenuOpen();
 		const bool nativeOpenSucceeded = HasNativeBleedoutOpenSucceeded(speakerFormID);
 		std::scoped_lock lk(g_runtime.lock);
-		g_runtime.flowGreetConfirmed = true;
 		g_runtime.flowGreetSpeakerFormID = speakerFormID;
 
 		if (nativeMenuOpen || nativeOpenSucceeded) {
+			g_runtime.flowGreetConfirmed = true;
 			g_runtime.sawDialogue = true;
 			g_runtime.initialHandoffArmed = false;
 			g_runtime.initialHandoffNextRetry = {};
 			g_runtime.stickyReopenPending = false;
-			spdlog::info("[TFD][BleedoutGreet][R432A] flow greet confirmed with native menu speaker={:08X} reason={} menuOpen={} nativeSucceeded={}",
+			spdlog::info("[TFD][BleedoutGreet][P32Q] flow greet confirmed with native menu speaker={:08X} reason={} menuOpen={} nativeSucceeded={}",
 				speakerFormID,
 				reason ? reason : "unknown",
 				nativeMenuOpen ? 1 : 0,
@@ -216,17 +216,18 @@ namespace TFD::BleedoutGreet
 			return;
 		}
 
-		// R432A: CK topic/fragment confirmation is only a route/fragment ack.  It is
-		// not proof that the DialogueMenu actually opened.  Keep the initial handoff
-		// watchdog armed so native DialogueOpen can re-approach/retry instead of
-		// suppressing bleed timeout forever with a false "seen dialogue" state.
+		// P32Q: CK topic/fragment confirmation is only a route/fragment ack. It is
+		// not proof that the DialogueMenu actually opened. Do not expose this as a
+		// confirmed greet to timeout/hold logic; keep the initial handoff watchdog
+		// armed so native DialogueOpen can re-approach/retry.
+		g_runtime.flowGreetConfirmed = false;
 		g_runtime.sawDialogue = false;
 		g_runtime.initialHandoffArmed = true;
 		if (g_runtime.initialHandoffNextRetry.time_since_epoch().count() == 0) {
 			g_runtime.initialHandoffNextRetry = Clock::now() + std::chrono::milliseconds(250);
 		}
 		g_runtime.stickyReopenPending = false;
-		spdlog::info("[TFD][BleedoutGreet][R432A] flow greet route confirmed without DialogueMenu speaker={:08X} reason={} menuOpen=0 nativeSucceeded=0 watchdogStillArmed=1",
+		spdlog::info("[TFD][BleedoutGreet][P32Q] flow greet route ack without DialogueMenu kept unconfirmed speaker={:08X} reason={} menuOpen=0 nativeSucceeded=0 watchdogStillArmed=1",
 			speakerFormID,
 			reason ? reason : "unknown");
 	}
@@ -377,9 +378,9 @@ namespace TFD::BleedoutGreet
 		if (!HasStickyReopenPending() || hasTerminalCommit || dialogueOpen || pleasureBlocking) {
 			return false;
 		}
-		if (HasNativeBleedoutOpenSucceeded()) {
+		if (HasNativeBleedoutOpenSucceeded() && !HasSeenDialogue()) {
 			MarkStickyReopenPending(false, "cb07_native_open_succeeded");
-			spdlog::info("[TFD][BleedoutGreet][CB07] sticky watchdog suppressed reason=native_open_succeeded speaker={:08X}", speakerFormID);
+			spdlog::info("[TFD][BleedoutGreet][P32I] sticky watchdog suppressed reason=native_open_succeeded_without_seen_dialogue speaker={:08X}", speakerFormID);
 			return false;
 		}
 		if (!IsRetryDue(now)) {

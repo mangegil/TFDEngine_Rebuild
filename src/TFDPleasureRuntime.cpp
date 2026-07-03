@@ -175,6 +175,8 @@ namespace TFD::PleasureRuntime
 				return "Teammate";
 			case SourceContext::InCombat:
 				return "InCombat";
+			case SourceContext::Victory:
+				return "Victory";
 			default:
 				return "Unknown";
 			}
@@ -186,7 +188,8 @@ namespace TFD::PleasureRuntime
 				source == SourceContext::Bleedout ||
 				source == SourceContext::Captive ||
 				source == SourceContext::Teammate ||
-				source == SourceContext::InCombat;
+				source == SourceContext::InCombat ||
+				source == SourceContext::Victory;
 		}
 
 		SourceContext SourceFromFlowValue(int sourceFlow, SourceContext fallback)
@@ -202,6 +205,8 @@ namespace TFD::PleasureRuntime
 				return SourceContext::Teammate;
 			case static_cast<int>(SourceContext::InCombat):
 				return SourceContext::InCombat;
+			case static_cast<int>(SourceContext::Victory):
+				return SourceContext::Victory;
 			default:
 				return fallback;
 			}
@@ -241,6 +246,7 @@ namespace TFD::PleasureRuntime
 			case SourceContext::Bleedout:
 			case SourceContext::Captive:
 			case SourceContext::Teammate:
+			case SourceContext::Victory:
 				return true;
 			default:
 				return false;
@@ -2774,6 +2780,13 @@ namespace TFD::PleasureRuntime
 					(void)CommitAfterPleasureRecruitLocked(info);
 				}
 
+				// P33J: An explicit AfterPleasure terminal choice owns the terminal cleanup.
+				// Recruit can queue a terminal-neutral fallback while probing for the next
+				// cycle speaker.  If the player has already committed an AfterPleasure
+				// choice, that fallback must not fire a few ticks later and finalize the
+				// same Bleedout/AfterPleasure chain a second time.
+				ClearQueuedTerminalNeutralFinalizeLocked(eventName);
+
 				g_state.redoPending = false;
 				AdvancePhaseLocked(Phase::Finalizing, eventName);
 				AdvancePhaseLocked(Phase::Closed, eventName);
@@ -3109,7 +3122,7 @@ namespace TFD::PleasureRuntime
 				speaker->GetFormID(),
 				reason.empty() ? std::string{ "-" } : std::string{ reason });
 		}
-		else if ((source == SourceContext::PreCombat || source == SourceContext::Captive) && speaker) {
+		else if ((source == SourceContext::PreCombat || source == SourceContext::Captive || source == SourceContext::Victory) && speaker) {
 			if (source == SourceContext::Captive) {
 				TFD::HostilityController::TickCaptiveSuppression();
 			}

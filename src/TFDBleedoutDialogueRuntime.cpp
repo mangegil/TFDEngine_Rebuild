@@ -53,9 +53,6 @@ namespace TFD::BleedoutDialogueRuntime
 			if (!handlers.isCaptiveSupportedAggressor || !handlers.isCaptiveSupportedAggressor(actor)) {
 				return false;
 			}
-			if (!handlers.isStandingEnemyThresholdActor || !handlers.isStandingEnemyThresholdActor(actor)) {
-				return false;
-			}
 			if (!handlers.isBleedSpaceCompatible || !handlers.isBleedSpaceCompatible(actor, player)) {
 				return false;
 			}
@@ -69,24 +66,26 @@ namespace TFD::BleedoutDialogueRuntime
 			}
 
 			auto* currentTarget = handlers.resolveCurrentCombatTarget ? handlers.resolveCurrentCombatTarget(actor) : nullptr;
-			if (currentTarget == player) {
+			const bool targetsPlayer = currentTarget == player;
+			const bool targetsFollower = currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget);
+			const bool preferredActor = preferred && actor == preferred;
+			const bool rememberedActor = handlers.resolveLastAggressor && handlers.resolveLastAggressor() == actor;
+			const bool engaged = targetsPlayer || targetsFollower || actor->IsHostileToActor(player) || actor->IsInCombat() || preferredActor || rememberedActor;
+			if (!engaged) {
+				return false;
+			}
+
+			const bool standing = handlers.isStandingEnemyThresholdActor && handlers.isStandingEnemyThresholdActor(actor);
+			if (standing) {
 				return true;
 			}
-			if (currentTarget && handlers.isActiveFollowerActor && handlers.isActiveFollowerActor(currentTarget)) {
-				return true;
-			}
-			if (actor->IsHostileToActor(player) || actor->IsInCombat()) {
-				return true;
-			}
-			if (preferred && actor == preferred) {
-				return true;
-			}
-			if (handlers.resolveLastAggressor) {
-				if (auto* last = handlers.resolveLastAggressor(); last == actor) {
-					return true;
-				}
-			}
-			return false;
+
+			// P32Q: During Captive Escape killmove-veto, the actual attacker can be
+			// below the normal enemy defeat threshold while still actively executing
+			// the hit that downed the player. Allow that preferred/remembered attacker
+			// if it is directly targeting the player, instead of replacing it with a
+			// random coalition speaker nearby.
+			return targetsPlayer && (preferredActor || rememberedActor);
 		};
 
 		float preferredDist = -1.0f;
@@ -97,29 +96,6 @@ namespace TFD::BleedoutDialogueRuntime
 		}
 
 		auto snapshot = TFD::Actor::BuildSnapshot(scanRadius, false);
-		if (preferred) {
-			if (const auto* preferredInfo = TFD::Actor::FindActorInfo(snapshot, preferred); preferredInfo && preferredInfo->coalitionID >= 0) {
-				if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, preferredInfo->coalitionID)) {
-					float coalitionDist = -1.0f;
-					if (isCandidate(coalitionSpeaker, &coalitionDist)) {
-						spdlog::info("[TFD][BleedoutDialogueRuntime][R24] bleed speaker preferred coalition actor={:08X} dist={:.1f}",
-							coalitionSpeaker->GetFormID(), coalitionDist);
-						return coalitionSpeaker;
-					}
-				}
-			}
-		}
-
-		if (snapshot.winningCoalitionCandidateID >= 0) {
-			if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, snapshot.winningCoalitionCandidateID)) {
-				float coalitionDist = -1.0f;
-				if (isCandidate(coalitionSpeaker, &coalitionDist)) {
-					spdlog::info("[TFD][BleedoutDialogueRuntime][R24] bleed speaker winning coalition actor={:08X} dist={:.1f}",
-						coalitionSpeaker->GetFormID(), coalitionDist);
-					return coalitionSpeaker;
-				}
-			}
-		}
 
 		RE::Actor* best = nullptr;
 		float bestScore = std::numeric_limits<float>::max();
@@ -155,9 +131,39 @@ namespace TFD::BleedoutDialogueRuntime
 			}
 		}
 
-		spdlog::info("[TFD][BleedoutDialogueRuntime][R24] bleed speaker scan radius={:.1f} best={:08X} score={:.1f}",
-			scanRadius, best ? best->GetFormID() : 0u, best ? bestScore : 0.0f);
-		return best;
+		if (best) {
+			spdlog::info("[TFD][BleedoutDialogueRuntime][P32Q] bleed speaker scan radius={:.1f} best={:08X} score={:.1f}",
+				scanRadius, best->GetFormID(), bestScore);
+			return best;
+		}
+
+		if (preferred) {
+			if (const auto* preferredInfo = TFD::Actor::FindActorInfo(snapshot, preferred); preferredInfo && preferredInfo->coalitionID >= 0) {
+				if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, preferredInfo->coalitionID)) {
+					float coalitionDist = -1.0f;
+					if (isCandidate(coalitionSpeaker, &coalitionDist)) {
+						spdlog::info("[TFD][BleedoutDialogueRuntime][P32Q] bleed speaker preferred coalition fallback actor={:08X} dist={:.1f}",
+							coalitionSpeaker->GetFormID(), coalitionDist);
+						return coalitionSpeaker;
+					}
+				}
+			}
+		}
+
+		if (snapshot.winningCoalitionCandidateID >= 0) {
+			if (auto* coalitionSpeaker = TFD::Actor::ResolveSpeakerCandidate(snapshot, snapshot.winningCoalitionCandidateID)) {
+				float coalitionDist = -1.0f;
+				if (isCandidate(coalitionSpeaker, &coalitionDist)) {
+					spdlog::info("[TFD][BleedoutDialogueRuntime][P32Q] bleed speaker winning coalition fallback actor={:08X} dist={:.1f}",
+						coalitionSpeaker->GetFormID(), coalitionDist);
+					return coalitionSpeaker;
+				}
+			}
+		}
+
+		spdlog::info("[TFD][BleedoutDialogueRuntime][P32Q] bleed speaker scan radius={:.1f} best=00000000 score=0.0",
+			scanRadius);
+		return nullptr;
 	}
 
 	bool IsReasonableSpeaker(RE::Actor* actor, RE::Actor* player, float maxDist, float* outDistance, const Context& context)

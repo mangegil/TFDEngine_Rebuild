@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cstdint>
 #include <mutex>
 #include <utility>
 
+#include <SKSE/SKSE.h>
 #include <spdlog/spdlog.h>
 
 #include "TFDPlayerDamageGuard.h"
@@ -246,6 +249,187 @@ namespace TFD::PlayerOverkillDamageHook
 
 			return true;
 		}
+
+
+		union ConditionParam
+		{
+			char c;
+			std::int32_t i;
+			float f;
+			RE::TESForm* form;
+		};
+
+		static bool ShouldAttackKill(RE::Actor* attacker, RE::Actor* victim)
+		{
+			if (!attacker || !victim) {
+				return false;
+			}
+
+			static RE::TESConditionItem cond;
+			static std::once_flag flag;
+			std::call_once(flag, [&]() {
+				cond.data.functionData.function = RE::FUNCTION_DATA::FunctionID::kShouldAttackKill;
+				cond.data.flags.opCode = RE::CONDITION_ITEM_DATA::OpCode::kEqualTo;
+				cond.data.comparisonValue.f = 1.0f;
+			});
+
+			ConditionParam param{};
+			param.form = const_cast<RE::TESObjectREFR*>(victim->As<RE::TESObjectREFR>());
+			cond.data.functionData.params[0] = std::bit_cast<void*>(param);
+
+			RE::ConditionCheckParams params(
+				const_cast<RE::TESObjectREFR*>(attacker->As<RE::TESObjectREFR>()),
+				const_cast<RE::TESObjectREFR*>(victim->As<RE::TESObjectREFR>()));
+			return cond(params);
+		}
+
+		static bool IsPotentialKaputtPlayerExecution(RE::Actor* player)
+		{
+			if (!player) {
+				return false;
+			}
+			auto* state = player->AsActorState();
+			if (!state) {
+				return false;
+			}
+			if (state->IsBleedingOut()) {
+				return true;
+			}
+			const auto knockState = state->GetKnockState();
+			return knockState == RE::KNOCK_STATE_ENUM::kGetUp || knockState == RE::KNOCK_STATE_ENUM::kQueued;
+		}
+
+		static bool QueueActionKillmoveDeniedRoute(const Context& context, RE::Actor* player, RE::Actor* attacker, const char* reason)
+		{
+			if (!player || player->IsDisabled()) {
+				return false;
+			}
+
+			const float thresholdPct = context.getDefeatThresholdPct ?
+				std::clamp(context.getDefeatThresholdPct(), 2.0f, 95.0f) :
+				std::clamp(TFD::Settings::GetDefeatThresholdPct(), 2.0f, 95.0f);
+			const float hpNow = (std::max)(0.0f, player->GetActorValue(RE::ActorValue::kHealth));
+			const float safeFloorHp = HasRealBleedOwner(context) ?
+				ResolveBleedRuntimeSafeHealth(context, player, thresholdPct) :
+				ResolveSafeFloorHealth(player, thresholdPct);
+
+			if (context.setPlayerBleedImmune) {
+				context.setPlayerBleedImmune(true);
+			}
+			SetKillmoveGuard(true, reason && reason[0] ? reason : "p32f_action_killmove_veto", std::chrono::milliseconds(4500));
+			TFD::PlayerDamageGuard::SetHardImmunity(player, true, reason && reason[0] ? reason : "p32f_action_killmove_veto");
+			player->GetActorRuntimeData().boolFlags.reset(RE::Actor::BOOL_FLAGS::kIsInKillMove);
+			if (player->IsDead(false)) {
+				player->Resurrect(false, true);
+			}
+			if (context.clampHealth) {
+				context.clampHealth(player, safeFloorHp);
+			}
+
+			if (attacker && attacker != player && !IsObserverAlly(context, attacker)) {
+				TFD::PlayerDamageGuard::NoteAttacker(attacker);
+				if (context.rememberAggressor) {
+					context.rememberAggressor(attacker);
+				}
+				if (context.noteEnemyTargetingPlayer) {
+					context.noteEnemyTargetingPlayer(attacker);
+				}
+			}
+
+			const bool pendingOverkill = context.hasPendingOverkillRoute ? context.hasPendingOverkillRoute() : TFD::PlayerDownRouter::HasPendingOverkillRoute();
+			if (!pendingOverkill && !HasRealBleedOwner(context)) {
+				TFD::PlayerDownRouter::QueueOverkillRoute(
+					attacker,
+					thresholdPct,
+					hpNow,
+					0.0f,
+					0.0f,
+					0.0f,
+					safeFloorHp,
+					reason && reason[0] ? reason : "p32f_action_killmove_veto");
+			}
+
+			return true;
+		}
+
+		static bool TryVetoPlayerKillmoveAction(RE::TESActionData* actionData, const char* source)
+		{
+			if (!actionData || !actionData->source || !HasContext()) {
+				return false;
+			}
+
+			auto* attacker = actionData->source->As<RE::Actor>();
+			if (!attacker || attacker->IsPlayerRef() || attacker->IsDead() || attacker->IsDisabled()) {
+				return false;
+			}
+
+			const auto context = ResolveContext();
+			auto* player = context.getPlayer ? context.getPlayer() : RE::PlayerCharacter::GetSingleton();
+			if (!player || player->IsDisabled()) {
+				return false;
+			}
+			if (IsObserverAlly(context, attacker)) {
+				return false;
+			}
+
+			auto victimHandle = attacker->GetActorRuntimeData().currentCombatTarget;
+			auto victimPtr = victimHandle.get();
+			auto* victim = victimPtr.get();
+			if (victim != player) {
+				return false;
+			}
+
+			const bool shouldKill = ShouldAttackKill(attacker, player);
+			const bool kaputtExecutionCandidate = IsPotentialKaputtPlayerExecution(player);
+			if (!shouldKill && !kaputtExecutionCandidate) {
+				return false;
+			}
+
+			QueueActionKillmoveDeniedRoute(context, player, attacker, shouldKill ? "p32f_action_should_attack_kill_veto" : "p32f_action_kaputt_execution_veto");
+			spdlog::warn(
+				"[TFD][PlayerKillmove][P32F] action killmove veto source={} attacker={:08X} victim={:08X} shouldAttackKill={} kaputtExecCandidate={} pending={} bleedLock={} bleedState={}",
+				source && source[0] ? source : "unknown",
+				attacker->GetFormID(),
+				player->GetFormID(),
+				shouldKill ? 1 : 0,
+				kaputtExecutionCandidate ? 1 : 0,
+				(context.hasPendingOverkillRoute ? context.hasPendingOverkillRoute() : TFD::PlayerDownRouter::HasPendingOverkillRoute()) ? 1 : 0,
+				HasPlayerBleedLock(context) ? 1 : 0,
+				IsInBleedState(context) ? 1 : 0);
+			return true;
+		}
+
+		class AttackActionKillmoveVetoHook
+		{
+		public:
+			static void Install()
+			{
+				if (g_installed.exchange(true, std::memory_order_acq_rel)) {
+					return;
+				}
+
+#if defined(SKYRIM_SUPPORT_AE)
+				REL::Relocation<std::uintptr_t> attackAction{ REL::ID(49170), 0x435 };
+#else
+				REL::Relocation<std::uintptr_t> attackAction{ REL::ID(48139), 0x4D7 };
+#endif
+				auto& trampoline = SKSE::GetTrampoline();
+				_AttackAction = trampoline.write_call<5>(attackAction.address(), AttackAction);
+				spdlog::info("[TFD][PlayerKillmove][P32F] AttackAction killmove veto hook installed id=48139 offset=0x4D7 mode=block_npc_player_killmove_and_kaputt");
+			}
+
+		private:
+			static bool AttackAction(RE::TESActionData* actionData)
+			{
+				if (TryVetoPlayerKillmoveAction(actionData, "AttackAction")) {
+					return false;
+				}
+				return _AttackAction(actionData);
+			}
+
+			static inline std::atomic_bool g_installed{ false };
+			static inline REL::Relocation<decltype(AttackAction)> _AttackAction;
+		};
 
 		class CheckClampDamageModifierHook
 		{
@@ -694,5 +878,6 @@ namespace TFD::PlayerOverkillDamageHook
 	void Install()
 	{
 		CheckClampDamageModifierHook::Install();
+		AttackActionKillmoveVetoHook::Install();
 	}
 }

@@ -15,7 +15,8 @@ namespace TFD::Victory
         AwaitingChoiceCommit,
         KillCommitted,
         LootCommitted,
-        RecruitCommitted
+        RecruitCommitted,
+        PleasureCommitted
     };
 
     struct SessionSnapshot
@@ -77,6 +78,13 @@ namespace TFD::Victory
     // and session finalization.
     bool RequestRecruit(RE::Actor* speaker, std::string_view reason);
 
+    // P33O: Terminal Victory Pleasure outcome. Papyrus requests the commit,
+    // starts OStim through SystemEvent/PleasureQuest, then reports whether the
+    // handoff was accepted so Victory can release or restart the defeated entry.
+    bool RequestPleasure(RE::Actor* speaker, std::string_view reason);
+    bool CompletePleasureHandoff(RE::Actor* speaker, bool started, std::string_view reason);
+    bool CompletePleasureScene(RE::Actor* speaker, bool sceneSucceeded, std::string_view reason);
+
     // R414A diagnostic-only hook. Called from the global hit sink after Victory
     // Recruit finalizes so player-hit visual recovery can be sampled without
     // changing behavior.
@@ -87,6 +95,11 @@ namespace TFD::Victory
     // Papyrus StartCombat storms against pending/defeated Victory targets.
     bool IsCombatBehaviorSuppressed();
     bool IsCombatBehaviorSuppressedActor(RE::Actor* actor);
+
+    // P33M: true while a nearby Victory enemy is committed but still in
+    // visual-entry / pre-hardening. BattleObserve must hold Rescue until this
+    // phase settles so the enemy does not look standing while Rescue teleports.
+    RE::FormID FindPendingEnemyVisualEntry(RE::Actor* observer, float radius);
 
     // Public reset is a non-terminal cancel: selected actor remains defeated and
     // its ten-second countdown restarts from the beginning.

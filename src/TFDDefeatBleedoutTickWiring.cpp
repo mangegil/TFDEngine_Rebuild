@@ -16,6 +16,7 @@
 #include "TFDDefeatRuntimeActions.h"
 #include "TFDDefeatStickyReopenGrace.h"
 #include "TFDDialogueLifecycle.h"
+#include "TFDForceGreetState.h"
 #include "TFDPlayerBleedImmunityGuard.h"
 #include "TFDPleasureRuntime.h"
 #include "TFDSettings.h"
@@ -105,22 +106,85 @@ namespace TFD::DefeatBleedoutTickWiring
 		}
 
 		const bool bleedDialogueSeen = TFD::BleedoutGreet::HasSeenDialogue();
-		const bool bleedTerminalCommit = TFD::Bleedout::HasTerminalCommit();
+		const bool bleedFgStateCommitted = TFD::ForceGreetState::IsBleedoutCommitted();
+		const bool bleedTerminalCommit = TFD::Bleedout::HasTerminalCommit() || bleedFgStateCommitted;
 		const bool bleedPleasureBlocking = TFD::PleasureRuntime::IsBlocking();
 		const bool bleedCaptiveOutcome = TFD::Bleedout::GetDialogueOutcome() == BleedDialogueOutcome::Captive;
+		const auto bleedSpeakerID = TFD::Bleedout::GetBleedSpeakerID();
+		const bool bleedDialogueJustClosed = bleedDialogueSeen && TFD::DialogueLifecycle::WasDialogueOpen() && !dOpen;
+
+		if (!bleedDialogueJustClosed && TFD::BleedoutGreet::TryStickyWatchdog(
+				bleedTerminalCommit,
+				dOpen,
+				bleedPleasureBlocking,
+				bleedSpeakerID,
+				Now(),
+				[](const char* reopenReason) -> bool {
+					(void)reopenReason;
+					return TFD::Bleedout::DefeatGlue::BeginDialogueHotkey();
+				})) {
+			TFD::DialogueLifecycle::SetDialogueOpenObserved(false);
+			TFD::DefeatBleedoutRuntimeTimer::SetCountdownDirty();
+			spdlog::info("[TFD][Defeat][P32L] bleed sticky watchdog reopened speaker={:08X}", bleedSpeakerID);
+			return true;
+		}
+
 		if (bleedDialogueSeen && TFD::DialogueLifecycle::WasDialogueOpen() && !dOpen) {
 			TFD::DialogueLifecycle::SetDialogueOpenObserved(false);
 			TFD::DefeatBleedoutRuntimeTimer::SetCountdownDirty();
-			TFD::DefeatStickyReopenGrace::Clear("r470a_monitor_only_dialogue_closed");
-			TFD::BleedoutGreet::MarkStickyReopenPending(false, "r470a_monitor_only_dialogue_closed");
+			TFD::DefeatStickyReopenGrace::Clear("p32k_dialogue_closed_native_owned");
 			spdlog::info(
-				"[TFD][Defeat][R470A] bleed dialogue closed observed monitor-only terminal={} pleasureBlocking={} captiveOutcome={} speaker={:08X}",
+				"[TFD][Defeat][P32L] bleed dialogue closed observed terminal={} fgStateCommitted={} pleasureBlocking={} captiveOutcome={} speaker={:08X}",
 				bleedTerminalCommit ? 1 : 0,
+				bleedFgStateCommitted ? 1 : 0,
 				bleedPleasureBlocking ? 1 : 0,
 				bleedCaptiveOutcome ? 1 : 0,
-				TFD::Bleedout::GetBleedSpeakerID());
+				bleedSpeakerID);
 
-			if (bleedTerminalCommit || bleedPleasureBlocking || bleedCaptiveOutcome) {
+			if (TFD::BleedoutGreet::HandleDialogueClosedFlow(
+					TFD::BleedoutGreet::DialogueClosedContext{
+						bleedDialogueSeen,
+						true,
+						bleedTerminalCommit,
+						bleedPleasureBlocking,
+						bleedCaptiveOutcome },
+					player,
+					bleedSpeakerID,
+					TFD::BleedoutGreet::DialogueClosedHandlers{
+						[&]() {
+							TFD::BleedoutGreet::MarkStickyReopenPending(false, "p32i_terminal_commit_close");
+							spdlog::info("[TFD][Defeat][P32L] bleed dialogue close ignored reopen reason=terminal_commit speaker={:08X}", bleedSpeakerID);
+						},
+						[&]() {
+							TFD::BleedoutGreet::MarkStickyReopenPending(false, "p32i_pleasure_blocking_close");
+							spdlog::info("[TFD][Defeat][P32L] bleed dialogue close held by pleasure bridge speaker={:08X}", bleedSpeakerID);
+						},
+						[&]() {
+							TFD::BleedoutGreet::MarkStickyReopenPending(false, "p32i_captive_outcome_close");
+							spdlog::info("[TFD][Defeat][P32L] bleed dialogue close ignored reopen reason=captive_outcome speaker={:08X}", bleedSpeakerID);
+						},
+						[&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
+							// P32L: do not hard-open on the same tick as DialogueMenu close.
+							// Papyrus choice fragments can submit a terminal outcome in the same frame/second
+							// after the menu closes.  Immediate reopen caused a visible post-commit reopen
+							// before mod_event_captive/mod_event_pleasure had reached native.  Keep the
+							// sticky reopen armed, but let the watchdog retry after a short grace; if a
+							// terminal outcome arrives first it will clear sticky pending and no reopen occurs.
+							TFD::BleedoutGreet::NoteStickyRetry(Now() + std::chrono::milliseconds(900), "p32k_close_no_commit_grace");
+							spdlog::info(
+								"[TFD][Defeat][P32L] bleed dialogue closed no commit -> sticky reopen armed after close-edge grace speaker={:08X} dist={:.1f}",
+								probe.speakerFormID,
+								probe.distance);
+						},
+						[&](const TFD::BleedoutGreet::StickyReopenProbe& probe) {
+							TFD::BleedoutGreet::MarkStickyReopenPending(false, "p32i_sticky_reopen_unavailable");
+							spdlog::info(
+								"[TFD][Defeat][P32L] bleed dialogue closed no commit -> sticky reopen unavailable speaker={:08X} loaded={} dead={} dist={:.1f}",
+								probe.speakerFormID,
+								probe.loaded ? 1 : 0,
+								probe.dead ? 1 : 0,
+								probe.distance);
+						} })) {
 				return true;
 			}
 		}

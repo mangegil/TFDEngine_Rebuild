@@ -33,6 +33,19 @@ namespace TFD::Victory
         constexpr double kDefeatedReentrySuppressSeconds = 6.0;
         constexpr auto kDialogueOpenTimeout = std::chrono::milliseconds(5000);
         constexpr auto kChoiceCommitGrace = std::chrono::milliseconds(6000);
+        constexpr auto kPleasureDialogueCloseGuard = std::chrono::milliseconds(25000);
+        constexpr auto kPleasureDialogueCloseRetryDelay = std::chrono::milliseconds(150);
+        constexpr auto kPleasureReturnDelayedBleedoutStartDelay = std::chrono::milliseconds(3600);
+        constexpr auto kPleasureReturnVisualGraphSafeInitialDelay = kPleasureReturnDelayedBleedoutStartDelay;
+        constexpr auto kPleasureReturnBleedoutReassertInitialDelay = kPleasureReturnDelayedBleedoutStartDelay;
+        constexpr auto kPleasureReturnBleedoutReassertInterval = std::chrono::milliseconds(450);
+        constexpr auto kPleasureReturnBleedoutReassertStopBeforeTimeout = std::chrono::milliseconds(250);
+        constexpr std::uint8_t kPleasureReturnBleedoutReassertMaxAttempts = 40;
+        constexpr std::uint8_t kPleasureReturnBleedoutDialogueStopMinAttempts = 3;
+        constexpr float kPleasureReturnBleedoutHealthBufferPct = 2.0f;
+        constexpr float kPleasureReturnBleedoutMinPct = 5.0f;
+        constexpr float kPleasureReturnBleedoutMaxPct = 35.0f;
+        constexpr float kPleasureReturnBleedoutMinAbsHp = 1.0f;
         constexpr auto kKillPrimeDelay = std::chrono::milliseconds(100);
         constexpr auto kKillDamageDelay = std::chrono::milliseconds(450);
         constexpr auto kKillDeathSettleDelay = std::chrono::milliseconds(300);
@@ -72,11 +85,18 @@ namespace TFD::Victory
         constexpr float kRecruitHealthBonusPct = 8.0f;
         constexpr bool kEnemyDefeatedVisualBleedoutEnabled = true;
         constexpr bool kEnemySoftEnterHardStateDelayEnabled = true;
-        constexpr auto kEnemySoftEnterHardStateDelay = std::chrono::milliseconds(1500);
-        constexpr auto kEnemyDelayedBleedoutStartSettleDelay = std::chrono::milliseconds(1500);
+        constexpr auto kEnemySoftEnterHardStateDelay = std::chrono::milliseconds(900);
+        constexpr auto kEnemyVisualGraphSafeInitialDelay = std::chrono::milliseconds(320);
+        constexpr auto kEnemyVisualGraphSafeQuietWindow = std::chrono::milliseconds(350);
+        constexpr auto kEnemyVisualGraphSafeRetryDelay = std::chrono::milliseconds(120);
+        constexpr auto kEnemyVisualGraphSafeMaxDelay = std::chrono::milliseconds(950);
+        constexpr auto kEnemyVisualFirstHardeningSettleDelay = std::chrono::milliseconds(450);
+        constexpr auto kEnemyVisualFirstRetryDelay = std::chrono::milliseconds(250);
+        constexpr std::uint8_t kEnemyVisualFirstMaxAttempts = 2;
         constexpr auto kEnemySoftEnterPressureQuietWindow = std::chrono::milliseconds(900);
         constexpr auto kEnemySoftEnterPressureRetryDelay = std::chrono::milliseconds(500);
         constexpr auto kEnemySoftEnterPressureMaxExtraDelay = std::chrono::milliseconds(4000);
+        constexpr auto kEnemyNpcCombatHardeningSettleDelay = std::chrono::milliseconds(2200);
         constexpr float kEnemySoftEnterPressureScanRadius = 4096.0f;
         constexpr RE::FormID kVictoryGreetInfoLocalFormID = 0x00195937;
         constexpr std::string_view kPluginName{ "TFDEngine.esp" };
@@ -141,6 +161,7 @@ namespace TFD::Victory
             bool countdownHeld{ false };
             std::uint32_t heldSessionID{ 0 };
             bool initialPackageRefreshDone{ false };
+            bool packageRefreshAfterHardeningPending{ false };
             bool visualBleedoutStarted{ false };
             bool visualBleedoutStopSent{ false };
             bool softEnterActive{ false };
@@ -153,9 +174,23 @@ namespace TFD::Victory
             RE::FormID softEnterLastPressureOtherFormID{ 0 };
             std::uint16_t softEnterPressureHitCount{ 0 };
             std::uint8_t softEnterPressureDeferrals{ 0 };
+            bool npcCombatDefeat{ false };
+            bool npcCombatHardeningSettleLogged{ false };
+            bool pleasureReturnVisualHoldActive{ false };
+            bool pleasureReturnVisualHoldLogged{ false };
+            bool pleasureReturnReassertActive{ false };
+            bool pleasureReturnPackageHoldActive{ false };
+            std::uint8_t pleasureReturnReassertAttempts{ 0 };
+            Clock::time_point pleasureReturnReassertNextDue{};
+            Clock::time_point pleasureReturnReassertUntil{};
             bool visualBleedoutStartPending{ false };
             bool visualBleedoutStartDecisionLogged{ false };
+            std::uint8_t visualBleedoutStartAttempts{ 0 };
+            std::uint8_t visualBleedoutGraphSafeDeferrals{ 0 };
             Clock::time_point visualBleedoutStartDue{};
+            Clock::time_point visualBleedoutStartMaxDue{};
+            Clock::time_point visualBleedoutGraphSafeLastHoldLog{};
+            RE::FormID visualBleedoutLastUnsafeTargetFormID{ 0 };
         };
 
         struct LootTransitionState
@@ -241,6 +276,10 @@ namespace TFD::Victory
         std::uint32_t g_nextSessionID{ 1 };
         RE::TESGlobal* g_conditionState = nullptr;
         RE::TESTopicInfo* g_victoryGreetInfo = nullptr;
+        Clock::time_point g_pleasureDialogueCloseGuardUntil{};
+        Clock::time_point g_pleasureDialogueCloseLastQueued{};
+        std::uint32_t g_pleasureDialogueCloseGuardSessionID{ 0 };
+        RE::ActorHandle g_pleasureDialogueCloseGuardHandle{};
 
         Clock::time_point Now()
         {
@@ -341,6 +380,21 @@ namespace TFD::Victory
         bool PapyrusRequestRecruit(RE::StaticFunctionTag*, RE::Actor* speaker)
         {
             return RequestRecruit(speaker, "papyrus_victory_recruit_fragment");
+        }
+
+        bool PapyrusRequestPleasure(RE::StaticFunctionTag*, RE::Actor* speaker)
+        {
+            return RequestPleasure(speaker, "papyrus_victory_pleasure_fragment");
+        }
+
+        bool PapyrusCompletePleasureHandoff(RE::StaticFunctionTag*, RE::Actor* speaker, bool started)
+        {
+            return CompletePleasureHandoff(speaker, started, started ? "papyrus_victory_pleasure_started" : "papyrus_victory_pleasure_start_failed");
+        }
+
+        bool PapyrusCompletePleasureScene(RE::StaticFunctionTag*, RE::Actor* speaker, bool sceneSucceeded)
+        {
+            return CompletePleasureScene(speaker, sceneSucceeded, sceneSucceeded ? "papyrus_victory_pleasure_scene_succeeded" : "papyrus_victory_pleasure_scene_failed");
         }
 
         void SetConditionState(int value)
@@ -560,6 +614,116 @@ namespace TFD::Victory
             return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
         }
 
+        bool QueueDialogueMenuHide(bool requestedSyncProcess)
+        {
+            auto* queue = RE::UIMessageQueue::GetSingleton();
+            auto* strings = RE::InterfaceStrings::GetSingleton();
+            if (!queue || !strings) {
+                return false;
+            }
+
+            // P36A: do not call UIMessageQueue::ProcessCommands from the Victory
+            // dialogue fragment path.  Crash logs 202/203 both die in HUD/crosshair
+            // update immediately after the synchronous dialogue hide on cycle two.
+            // Queue the hide and let the normal UI pump process it safely.
+            (void)requestedSyncProcess;
+            queue->AddMessage(strings->dialogueMenu, RE::UI_MESSAGE_TYPE::kHide, nullptr);
+            return true;
+        }
+
+        bool CloseVictoryDialogueMenu(RE::Actor* actor, std::string_view reason, bool processNow)
+        {
+            const bool wasOpen = IsDialogueMenuOpen();
+            if (actor && !actor->IsDisabled() && !actor->IsDead()) {
+                actor->SetDialogueWithPlayer(false, false, nullptr);
+                actor->AllowPCDialogue(false);
+            }
+
+            const bool hideQueued = QueueDialogueMenuHide(processNow);
+            spdlog::info(
+                "[TFD][Victory][P36A] Victory dialogue close requested actor={:08X} reason={} wasOpen={} hideQueued={} requestedProcessNow={} processedNow=0 pcDialogueDisabled=1",
+                actor ? actor->GetFormID() : 0u,
+                ReasonText(reason),
+                wasOpen ? 1 : 0,
+                hideQueued ? 1 : 0,
+                processNow ? 1 : 0);
+            return wasOpen || hideQueued;
+        }
+
+        void ClearPleasureDialogueCloseGuardLocked(std::string_view reason)
+        {
+            if (g_pleasureDialogueCloseGuardSessionID != 0) {
+                spdlog::info(
+                    "[TFD][Victory][P36A] Pleasure dialogue close guard cleared session={} reason={}",
+                    g_pleasureDialogueCloseGuardSessionID,
+                    ReasonText(reason));
+            }
+            g_pleasureDialogueCloseGuardUntil = {};
+            g_pleasureDialogueCloseLastQueued = {};
+            g_pleasureDialogueCloseGuardSessionID = 0;
+            g_pleasureDialogueCloseGuardHandle = RE::ActorHandle{};
+        }
+
+        void ArmPleasureDialogueCloseGuardLocked(RE::Actor* actor, std::uint32_t sessionID, Clock::time_point now, std::string_view reason)
+        {
+            if (!actor || sessionID == 0) {
+                return;
+            }
+
+            g_pleasureDialogueCloseGuardUntil = now + kPleasureDialogueCloseGuard;
+            g_pleasureDialogueCloseLastQueued = {};
+            g_pleasureDialogueCloseGuardSessionID = sessionID;
+            g_pleasureDialogueCloseGuardHandle = actor->GetHandle();
+            spdlog::info(
+                "[TFD][Victory][P36A] Pleasure dialogue close guard armed actor={:08X} session={} durationMs={} reason={}",
+                actor->GetFormID(),
+                sessionID,
+                kPleasureDialogueCloseGuard.count(),
+                ReasonText(reason));
+        }
+
+        void MaintainPleasureDialogueCloseGuardLocked(Clock::time_point now)
+        {
+            if (g_pleasureDialogueCloseGuardSessionID == 0) {
+                return;
+            }
+
+            const bool valid =
+                g_session.active &&
+                g_session.sessionID == g_pleasureDialogueCloseGuardSessionID &&
+                g_session.phase == SessionPhase::PleasureCommitted &&
+                now < g_pleasureDialogueCloseGuardUntil;
+
+            if (!valid) {
+                ClearPleasureDialogueCloseGuardLocked("guard_not_valid");
+                return;
+            }
+
+            if (!IsDialogueMenuOpen()) {
+                return;
+            }
+
+            if (g_pleasureDialogueCloseLastQueued.time_since_epoch().count() != 0 &&
+                now < g_pleasureDialogueCloseLastQueued + kPleasureDialogueCloseRetryDelay) {
+                return;
+            }
+
+            g_pleasureDialogueCloseLastQueued = now;
+            auto actorSP = g_pleasureDialogueCloseGuardHandle.get();
+            auto* actor = actorSP.get();
+            if (actor && !actor->IsDisabled() && !actor->IsDead()) {
+                actor->SetDialogueWithPlayer(false, false, nullptr);
+                actor->AllowPCDialogue(false);
+            }
+            const bool hideQueued = QueueDialogueMenuHide(false);
+            spdlog::info(
+                "[TFD][Victory][P36A] Pleasure dialogue reopen suppressed actor={:08X} session={} hideQueued={} retryMs={} pcDialogueDisabled=1",
+                actor ? actor->GetFormID() : g_session.selectedActorFormID,
+                g_session.sessionID,
+                hideQueued ? 1 : 0,
+                kPleasureDialogueCloseRetryDelay.count());
+        }
+
         RE::FormID GetOpenLootTargetActorFormID()
         {
             auto* ui = RE::UI::GetSingleton();
@@ -704,6 +868,8 @@ namespace TFD::Victory
                     }
                 }
             }
+
+            ClearPleasureDialogueCloseGuardLocked(reason);
 
             g_session = SessionSnapshot{};
             g_sessionOpenDeadline = {};
@@ -974,6 +1140,49 @@ namespace TFD::Victory
                     target - hpBefore);
             }
             return actor->GetActorValue(RE::ActorValue::kHealth);
+        }
+
+        float SetPleasureReturnBleedoutHealth(RE::Actor* actor, float thresholdPct, std::string_view reason)
+        {
+            if (!actor) {
+                return 0.0f;
+            }
+
+            const float hpMax = (std::max)(1.0f, actor->GetPermanentActorValue(RE::ActorValue::kHealth));
+            const float hpBefore = actor->GetActorValue(RE::ActorValue::kHealth);
+            const float targetPct = std::clamp(
+                (thresholdPct - kPleasureReturnBleedoutHealthBufferPct) / 100.0f,
+                kPleasureReturnBleedoutMinPct / 100.0f,
+                kPleasureReturnBleedoutMaxPct / 100.0f);
+            const float target = std::clamp(
+                hpMax * targetPct,
+                kPleasureReturnBleedoutMinAbsHp,
+                (std::max)(kPleasureReturnBleedoutMinAbsHp, hpMax * 0.95f));
+
+            if (hpBefore > target + 0.001f) {
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    -(hpBefore - target));
+            }
+            else if (hpBefore + 0.001f < target) {
+                actor->RestoreActorValue(
+                    RE::ACTOR_VALUE_MODIFIER::kDamage,
+                    RE::ActorValue::kHealth,
+                    target - hpBefore);
+            }
+
+            const float hpAfter = actor->GetActorValue(RE::ActorValue::kHealth);
+            spdlog::info(
+                "[TFD][Victory][P34B] Pleasure return bleedout health actor={:08X} reason={} hpBefore={:.2f} hpAfter={:.2f} hpMax={:.2f} thresholdPct={:.1f} targetPct={:.1f}",
+                actor->GetFormID(),
+                ReasonText(reason),
+                hpBefore,
+                hpAfter,
+                hpMax,
+                thresholdPct,
+                targetPct * 100.0f);
+            return hpAfter;
         }
 
         bool BeginLootReleaseLocked(Clock::time_point now)
@@ -1936,6 +2145,29 @@ namespace TFD::Victory
             return sp.get();
         }
 
+        bool HasNonPlayerCombatTarget(RE::Actor* actor)
+        {
+            if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+
+            auto* target = ResolveCurrentCombatTarget(actor);
+            if (!target || target->IsDead() || target->IsDisabled()) {
+                return false;
+            }
+
+            auto* player = RE::PlayerCharacter::GetSingleton();
+            if (target == player) {
+                return false;
+            }
+
+            if (TFD::TeammateManager::IsPlayerSideTeammateActor(target)) {
+                return false;
+            }
+
+            return actor->IsInCombat() || actor->IsWeaponDrawn();
+        }
+
         bool IsSoftEnterPressureActor(RE::Actor* actor)
         {
             if (!actor || actor->IsDead() || actor->IsDisabled()) {
@@ -1989,6 +2221,7 @@ namespace TFD::Victory
             bool targetInCombat{ false };
             bool targetWeaponDrawn{ false };
             bool targetHasPlayerSideTarget{ false };
+            bool targetHasNonPlayerCombatTarget{ false };
             bool playerSideAttackerFound{ false };
             bool stopIssued{ false };
             std::uint32_t playerSideAttackerCount{ 0 };
@@ -2087,6 +2320,7 @@ namespace TFD::Victory
                 !currentTarget->IsDead() &&
                 !currentTarget->IsDisabled() &&
                 TFD::TeammateManager::IsPlayerSideTeammateActor(currentTarget);
+            result.targetHasNonPlayerCombatTarget = HasNonPlayerCombatTarget(actor);
 
             auto* player = RE::PlayerCharacter::GetSingleton();
             TFD::Actor::ScanOptions options{};
@@ -2136,6 +2370,300 @@ namespace TFD::Victory
             return result;
         }
 
+        bool IsVisualGraphUnsafeForBleedoutStartLocked(RE::Actor* actor, EnemyEntry& entry, Clock::time_point now, RE::FormID& targetFormID, std::int64_t& quietRemainingMs, const char*& reason)
+        {
+            targetFormID = 0u;
+            quietRemainingMs = 0;
+            reason = "safe";
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                reason = "invalid_actor";
+                return false;
+            }
+
+            if (entry.softEnterLastPressureSeen.time_since_epoch().count() != 0) {
+                const auto quietUntil = entry.softEnterLastPressureSeen + kEnemyVisualGraphSafeQuietWindow;
+                if (now < quietUntil) {
+                    quietRemainingMs = std::chrono::duration_cast<std::chrono::milliseconds>(quietUntil - now).count();
+                    reason = "recent_hit_pressure";
+                    return true;
+                }
+            }
+
+            auto* currentTarget = ResolveCurrentCombatTarget(actor);
+            if (currentTarget && !currentTarget->IsDead() && !currentTarget->IsDisabled()) {
+                targetFormID = currentTarget->GetFormID();
+                const bool targetsPlayer = currentTarget == RE::PlayerCharacter::GetSingleton();
+                const bool targetsPlayerSide = targetsPlayer || TFD::TeammateManager::IsPlayerSideTeammateActor(currentTarget);
+                if (!targetsPlayerSide && actor->IsInCombat() && actor->IsWeaponDrawn()) {
+                    entry.npcCombatDefeat = true;
+                }
+                if (targetsPlayerSide && actor->IsInCombat() && actor->IsWeaponDrawn()) {
+                    reason = targetsPlayer ? "combat_weapon_player_target" : "combat_weapon_player_side_target";
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        bool MaintainVisualFirstBleedoutStartLocked(RE::Actor* actor, EnemyEntry& entry, Clock::time_point now)
+        {
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                return false;
+            }
+
+            if (!entry.visualBleedoutStartDecisionLogged) {
+                if (kEnemyDefeatedVisualBleedoutEnabled) {
+                    if (entry.visualBleedoutStartDue.time_since_epoch().count() != 0 &&
+                        now < entry.visualBleedoutStartDue) {
+                        if (entry.visualBleedoutGraphSafeLastHoldLog.time_since_epoch().count() == 0 ||
+                            now >= entry.visualBleedoutGraphSafeLastHoldLog + std::chrono::milliseconds(350)) {
+                            entry.visualBleedoutGraphSafeLastHoldLog = now;
+                            spdlog::info(
+                                "[TFD][Victory][P33N] enemy visual graph-safe held actor={:08X} hpPct={:.1f} threshold={:.1f} reason=initial_settle remainingMs={} actorInCombat={} actorWeaponDrawn={} hardeningDelayed=1 softEnter=1 graphSafe=1",
+                                actor->GetFormID(),
+                                GetActorHealthPct(actor),
+                                entry.thresholdPct,
+                                std::chrono::duration_cast<std::chrono::milliseconds>(entry.visualBleedoutStartDue - now).count(),
+                                actor->IsInCombat() ? 1 : 0,
+                                actor->IsWeaponDrawn() ? 1 : 0);
+                        }
+                        return true;
+                    }
+
+                    RE::FormID unsafeTargetFormID = 0u;
+                    std::int64_t quietRemainingMs = 0;
+                    const char* unsafeReason = "safe";
+                    const bool unsafe = IsVisualGraphUnsafeForBleedoutStartLocked(actor, entry, now, unsafeTargetFormID, quietRemainingMs, unsafeReason);
+                    const bool canHoldForGraph = entry.visualBleedoutStartMaxDue.time_since_epoch().count() == 0 ||
+                        now < entry.visualBleedoutStartMaxDue;
+                    if (unsafe && canHoldForGraph) {
+                        if (entry.visualBleedoutGraphSafeDeferrals < 0xFFu) {
+                            ++entry.visualBleedoutGraphSafeDeferrals;
+                        }
+                        entry.visualBleedoutLastUnsafeTargetFormID = unsafeTargetFormID;
+                        entry.visualBleedoutStartDue = now + kEnemyVisualGraphSafeRetryDelay;
+                        if (entry.visualBleedoutGraphSafeLastHoldLog.time_since_epoch().count() == 0 ||
+                            now >= entry.visualBleedoutGraphSafeLastHoldLog + std::chrono::milliseconds(350)) {
+                            entry.visualBleedoutGraphSafeLastHoldLog = now;
+                            spdlog::info(
+                                "[TFD][Victory][P33N] enemy visual graph-safe held actor={:08X} hpPct={:.1f} threshold={:.1f} reason={} unsafeTarget={:08X} quietRemainingMs={} deferrals={} retryDelayMs={} maxDelayMs={} actorInCombat={} actorWeaponDrawn={} hardeningDelayed=1 softEnter=1 graphSafe=1",
+                                actor->GetFormID(),
+                                GetActorHealthPct(actor),
+                                entry.thresholdPct,
+                                unsafeReason,
+                                unsafeTargetFormID,
+                                quietRemainingMs,
+                                static_cast<unsigned>(entry.visualBleedoutGraphSafeDeferrals),
+                                kEnemyVisualGraphSafeRetryDelay.count(),
+                                kEnemyVisualGraphSafeMaxDelay.count(),
+                                actor->IsInCombat() ? 1 : 0,
+                                actor->IsWeaponDrawn() ? 1 : 0);
+                        }
+                        return true;
+                    }
+
+                    if (unsafe && !canHoldForGraph) {
+                        spdlog::warn(
+                            "[TFD][Victory][P33N] enemy visual graph-safe timeout actor={:08X} hpPct={:.1f} threshold={:.1f} reason={} unsafeTarget={:08X} deferrals={} action=send_bleedoutstart hardeningDelayed=1 softEnter=1 graphSafe=1",
+                            actor->GetFormID(),
+                            GetActorHealthPct(actor),
+                            entry.thresholdPct,
+                            unsafeReason,
+                            unsafeTargetFormID,
+                            static_cast<unsigned>(entry.visualBleedoutGraphSafeDeferrals));
+                    }
+
+                    if (entry.visualBleedoutStartAttempts < 0xFFu) {
+                        ++entry.visualBleedoutStartAttempts;
+                    }
+                    const bool sent = actor->NotifyAnimationGraph("BleedoutStart");
+                    entry.visualBleedoutStarted = sent;
+                    entry.visualBleedoutStopSent = false;
+
+                    if (!sent && entry.visualBleedoutStartAttempts < kEnemyVisualFirstMaxAttempts) {
+                        entry.visualBleedoutStartPending = true;
+                        entry.visualBleedoutStartDue = now + kEnemyVisualFirstRetryDelay;
+                        spdlog::info(
+                            "[TFD][Victory][P33N] enemy graph-safe BleedoutStart retry armed actor={:08X} attempt={} hpPct={:.1f} threshold={:.1f} actorInCombat={} actorWeaponDrawn={} retryDelayMs={} hardeningDelayed=1 softEnter=1 graphSafe=1",
+                            actor->GetFormID(),
+                            static_cast<unsigned>(entry.visualBleedoutStartAttempts),
+                            GetActorHealthPct(actor),
+                            entry.thresholdPct,
+                            actor->IsInCombat() ? 1 : 0,
+                            actor->IsWeaponDrawn() ? 1 : 0,
+                            kEnemyVisualFirstRetryDelay.count());
+                        return true;
+                    }
+
+                    entry.visualBleedoutStartDecisionLogged = true;
+                    entry.visualBleedoutStartPending = true;
+                    entry.visualBleedoutStartDue = now + kEnemyVisualFirstHardeningSettleDelay;
+                    if (entry.npcCombatDefeat) {
+                        const auto npcSettleDue = now + kEnemyNpcCombatHardeningSettleDelay;
+                        if (entry.softEnterHardStateDue.time_since_epoch().count() == 0 ||
+                            entry.softEnterHardStateDue < npcSettleDue) {
+                            entry.softEnterHardStateDue = npcSettleDue;
+                        }
+                        if (entry.softEnterHardStateMaxDue.time_since_epoch().count() == 0 ||
+                            entry.softEnterHardStateMaxDue < npcSettleDue + kEnemySoftEnterPressureMaxExtraDelay) {
+                            entry.softEnterHardStateMaxDue = npcSettleDue + kEnemySoftEnterPressureMaxExtraDelay;
+                        }
+                    }
+                    spdlog::info(
+                        "[TFD][Victory][P33N] enemy graph-safe BleedoutStart decided actor={:08X} sent={} attempts={} hpPct={:.1f} threshold={:.1f} actorInCombat={} actorWeaponDrawn={} graphDeferrals={} lastUnsafeTarget={:08X} hardeningDelayed=1 visualSettleMs={} softHardeningDelayMs={} softEnter=1 graphSafe=1",
+                        actor->GetFormID(),
+                        sent ? 1 : 0,
+                        static_cast<unsigned>(entry.visualBleedoutStartAttempts),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        actor->IsInCombat() ? 1 : 0,
+                        actor->IsWeaponDrawn() ? 1 : 0,
+                        static_cast<unsigned>(entry.visualBleedoutGraphSafeDeferrals),
+                        entry.visualBleedoutLastUnsafeTargetFormID,
+                        kEnemyVisualFirstHardeningSettleDelay.count(),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(kEnemySoftEnterHardStateDelay).count());
+                    return true;
+                }
+
+                entry.visualBleedoutStarted = false;
+                entry.visualBleedoutStopSent = false;
+                entry.visualBleedoutStartPending = false;
+                entry.visualBleedoutStartDecisionLogged = true;
+                entry.visualBleedoutStartDue = {};
+                spdlog::info(
+                    "[TFD][Victory][P33N] enemy graph-safe BleedoutStart skipped actor={:08X} reason=disabled hardeningContinues=1 softEnter=1 graphSafe=1",
+                    actor->GetFormID());
+                return false;
+            }
+
+            if (entry.visualBleedoutStartPending) {
+                if (entry.visualBleedoutStartDue.time_since_epoch().count() != 0 &&
+                    now < entry.visualBleedoutStartDue) {
+                    return true;
+                }
+                entry.visualBleedoutStartPending = false;
+                entry.visualBleedoutStartDue = {};
+            }
+
+            return false;
+        }
+
+        void ClearPleasureReturnReassertLocked(EnemyEntry& entry)
+        {
+            entry.pleasureReturnReassertActive = false;
+            entry.pleasureReturnReassertAttempts = 0;
+            entry.pleasureReturnReassertNextDue = {};
+            entry.pleasureReturnReassertUntil = {};
+        }
+
+        bool MaintainPleasureReturnBleedoutReassertLocked(RE::Actor* actor, EnemyEntry& entry, Clock::time_point now)
+        {
+            if (!entry.pleasureReturnReassertActive) {
+                return entry.pleasureReturnPackageHoldActive;
+            }
+
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                ClearPleasureReturnReassertLocked(entry);
+                entry.pleasureReturnPackageHoldActive = false;
+                return false;
+            }
+
+            if (entry.deadline.time_since_epoch().count() != 0) {
+                auto until = entry.deadline;
+                if (until > now + kPleasureReturnBleedoutReassertStopBeforeTimeout) {
+                    until -= kPleasureReturnBleedoutReassertStopBeforeTimeout;
+                }
+                if (entry.pleasureReturnReassertUntil.time_since_epoch().count() == 0 ||
+                    entry.pleasureReturnReassertUntil < until) {
+                    entry.pleasureReturnReassertUntil = until;
+                }
+            }
+
+            if (entry.pleasureReturnReassertNextDue.time_since_epoch().count() == 0) {
+                entry.pleasureReturnReassertNextDue = now + kPleasureReturnBleedoutReassertInitialDelay;
+            }
+
+            const bool beforeUntil = entry.pleasureReturnReassertUntil.time_since_epoch().count() == 0 ||
+                now <= entry.pleasureReturnReassertUntil;
+            const bool canAttempt = entry.pleasureReturnReassertAttempts < kPleasureReturnBleedoutReassertMaxAttempts;
+
+            if (beforeUntil && canAttempt) {
+                if (now >= entry.pleasureReturnReassertNextDue) {
+                    if (entry.pleasureReturnReassertAttempts < 0xFFu) {
+                        ++entry.pleasureReturnReassertAttempts;
+                    }
+                    const auto attemptNo = entry.pleasureReturnReassertAttempts;
+                    const bool sent = actor->NotifyAnimationGraph("BleedoutStart");
+                    entry.visualBleedoutStarted = entry.visualBleedoutStarted || sent;
+                    entry.visualBleedoutStopSent = false;
+                    // P55A: sent=1 only means the animation event was accepted by the graph.
+                    // P54A proved that accepted events can still be swallowed by late OStim/XPMSE/OSED
+                    // cleanup. Keep pulsing through the post-OStim burst window instead of stopping
+                    // after the first accepted event.
+                    entry.pleasureReturnReassertNextDue = now + kPleasureReturnBleedoutReassertInterval;
+
+                    const auto remainingMs = entry.pleasureReturnReassertUntil.time_since_epoch().count() != 0 &&
+                        entry.pleasureReturnReassertUntil > now ?
+                        std::chrono::duration_cast<std::chrono::milliseconds>(entry.pleasureReturnReassertUntil - now).count() :
+                        0LL;
+                    spdlog::info(
+                        "[TFD][Victory][P56A] Pleasure return delayed BleedoutStart burst actor={:08X} sent={} attempt={} maxAttempts={} hpPct={:.1f} threshold={:.1f} remainingMs={} delayedBurstStartMs={} packageHeld=1 mirrorHeld=1 evaluateHeld=1 continueAfterSuccess=1 sentIsNotVisualProof=1",
+                        actor->GetFormID(),
+                        sent ? 1 : 0,
+                        static_cast<unsigned>(attemptNo),
+                        static_cast<unsigned>(kPleasureReturnBleedoutReassertMaxAttempts),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        remainingMs,
+                        kPleasureReturnDelayedBleedoutStartDelay.count());
+                }
+                return true;
+            }
+
+            // P56A: even after delayed BleedoutStart burst attempts are accepted, exhausted,
+            // or manually stopped by a new player action, keep the defeated mirror/package and
+            // EvaluatePackage held. Native Victory owns manual dialogue and timeout from
+            // g_enemyEntries; the defeated package is not needed during this post-OStim grace
+            // and can pull the actor standing.
+            return entry.pleasureReturnPackageHoldActive || entry.pleasureReturnReassertActive;
+        }
+
+        bool StopPleasureReturnBurstForPlayerActionLocked(
+            RE::Actor* actor,
+            EnemyEntry& entry,
+            std::string_view reason,
+            bool forceStop)
+        {
+            if (!entry.pleasureReturnReassertActive) {
+                return false;
+            }
+
+            const auto* actorState = actor ? actor->AsActorState() : nullptr;
+            const bool actorBleeding = actorState && actorState->IsBleedingOut();
+            const auto attempts = entry.pleasureReturnReassertAttempts;
+            if (!forceStop && !actorBleeding && attempts < kPleasureReturnBleedoutDialogueStopMinAttempts) {
+                return false;
+            }
+
+            ClearPleasureReturnReassertLocked(entry);
+            entry.pleasureReturnVisualHoldActive = false;
+            entry.pleasureReturnVisualHoldLogged = false;
+            entry.pleasureReturnPackageHoldActive = true;
+            entry.initialPackageRefreshDone = false;
+            entry.packageRefreshAfterHardeningPending = true;
+
+            spdlog::info(
+                "[TFD][Victory][P56A] Pleasure return delayed burst stopped for player action actor={:08X} reason={} forceStop={} attempts={} actorBleeding={} visualStarted={} packageHeld=1 mirrorHeld=1 evaluateHeld=1",
+                actor ? actor->GetFormID() : 0u,
+                ReasonText(reason),
+                forceStop ? 1 : 0,
+                static_cast<unsigned>(attempts),
+                actorBleeding ? 1 : 0,
+                entry.visualBleedoutStarted ? 1 : 0);
+            return true;
+        }
+
         void MaintainEnemyState(RE::Actor* actor, EnemyEntry& entry, bool initialEntry)
         {
             if (!actor || actor->IsDisabled() || actor->IsDead()) {
@@ -2146,18 +2674,58 @@ namespace TFD::Victory
                 entry.softEnterActive &&
                 !entry.softEnterHardStateApplied) {
                 const auto now = Now();
+
+                // P33N: normal enemy defeat captures immediately, then sends BleedoutStart at the first graph-safe quiet edge.
+                // P55A: Victory Pleasure return is different. OStim/body graph cleanup can accept the first
+                // BleedoutStart too early, causing the actor to collapse, blink standing, then collapse again.
+                // Suppress that immediate visual pass and let the delayed post-OStim BleedoutStart below become
+                // the official return visual.
+                const bool pleasureReturnDelayedOfficialBleedout =
+                    entry.pleasureReturnReassertActive ||
+                    entry.pleasureReturnVisualHoldActive ||
+                    entry.pleasureReturnPackageHoldActive;
+                if (pleasureReturnDelayedOfficialBleedout && !entry.visualBleedoutStartDecisionLogged) {
+                    entry.visualBleedoutStartPending = false;
+                    entry.visualBleedoutStartDecisionLogged = true;
+                    entry.visualBleedoutStartAttempts = 0;
+                    entry.visualBleedoutGraphSafeDeferrals = 0;
+                    entry.visualBleedoutStartDue = {};
+                    entry.visualBleedoutStartMaxDue = {};
+                    entry.visualBleedoutGraphSafeLastHoldLog = Clock::time_point{};
+                    entry.visualBleedoutLastUnsafeTargetFormID = 0;
+                    spdlog::info(
+                        "[TFD][Victory][P56A] Pleasure return immediate BleedoutStart suppressed actor={:08X} hpPct={:.1f} threshold={:.1f} delayedBurstStartMs={} hardStopCombat=0 hardMirror=0 hardEvaluate=0 reason=post_ostim_cleanup_window",
+                        actor->GetFormID(),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        kPleasureReturnDelayedBleedoutStartDelay.count());
+                }
+                if (!pleasureReturnDelayedOfficialBleedout && MaintainVisualFirstBleedoutStartLocked(actor, entry, now)) {
+                    return;
+                }
+
                 if (entry.softEnterHardStateDue.time_since_epoch().count() != 0 &&
                     now < entry.softEnterHardStateDue) {
                     if (initialEntry || !entry.softEnterPendingLogged) {
                         entry.softEnterPendingLogged = true;
                         spdlog::info(
-                            "[TFD][Victory][R421A] enemy soft defeated enter pending actor={:08X} hpPct={:.1f} threshold={:.1f} delayMs={} hardStopCombat=0 hardMirror=0 hardEvaluate=0 delayedBleedoutStart=1 softEnter=1",
+                            "[TFD][Victory][P33N] enemy hardening pending after graph-safe visual actor={:08X} hpPct={:.1f} threshold={:.1f} delayMs={} hardStopCombat=0 hardMirror=0 hardEvaluate=0 graphSafe=1 softEnter=1",
                             actor->GetFormID(),
                             GetActorHealthPct(actor),
                             entry.thresholdPct,
                             std::chrono::duration_cast<std::chrono::milliseconds>(
-                                kEnemySoftEnterHardStateDelay)
+                                entry.softEnterHardStateDue - now)
                                 .count());
+                    }
+                    if (entry.npcCombatDefeat && !entry.npcCombatHardeningSettleLogged) {
+                        entry.npcCombatHardeningSettleLogged = true;
+                        spdlog::info(
+                            "[TFD][Victory][P50A] NPC-caused defeated hardening delayed actor={:08X} hpPct={:.1f} threshold={:.1f} remainingMs={} target={:08X} aliasMirrorDelayed=1 packageHeld=1 reason=npc_combat_bleedout_settle",
+                            actor->GetFormID(),
+                            GetActorHealthPct(actor),
+                            entry.thresholdPct,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(entry.softEnterHardStateDue - now).count(),
+                            ResolveCurrentCombatTarget(actor) ? ResolveCurrentCombatTarget(actor)->GetFormID() : 0u);
                     }
                     return;
                 }
@@ -2165,6 +2733,26 @@ namespace TFD::Victory
                 const auto pressure = ProbeSoftEnterPressureLocked(actor);
                 const bool hasRecentPressure = entry.softEnterLastPressureSeen.time_since_epoch().count() != 0 &&
                     now < entry.softEnterLastPressureSeen + kEnemySoftEnterPressureQuietWindow;
+                if (pressure.targetHasNonPlayerCombatTarget ||
+                    (hasRecentPressure && actor->IsInCombat() && !pressure.targetHasPlayerSideTarget)) {
+                    entry.npcCombatDefeat = true;
+                }
+                if (entry.npcCombatDefeat && !entry.npcCombatHardeningSettleLogged) {
+                    entry.npcCombatHardeningSettleLogged = true;
+                    entry.softEnterHardStateDue = now + kEnemyNpcCombatHardeningSettleDelay;
+                    if (entry.softEnterHardStateMaxDue.time_since_epoch().count() == 0 ||
+                        entry.softEnterHardStateMaxDue < entry.softEnterHardStateDue + kEnemySoftEnterPressureMaxExtraDelay) {
+                        entry.softEnterHardStateMaxDue = entry.softEnterHardStateDue + kEnemySoftEnterPressureMaxExtraDelay;
+                    }
+                    spdlog::info(
+                        "[TFD][Victory][P50A] NPC-caused defeated hardening delayed actor={:08X} hpPct={:.1f} threshold={:.1f} remainingMs={} target={:08X} aliasMirrorDelayed=1 packageHeld=1 reason=npc_combat_late_pressure",
+                        actor->GetFormID(),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        kEnemyNpcCombatHardeningSettleDelay.count(),
+                        pressure.targetTargetFormID);
+                    return;
+                }
                 const bool canDeferPressure = entry.softEnterHardStateMaxDue.time_since_epoch().count() == 0 ||
                     now < entry.softEnterHardStateMaxDue;
 
@@ -2179,7 +2767,7 @@ namespace TFD::Victory
                         0LL;
                     entry.softEnterHardStateDue = now + kEnemySoftEnterPressureRetryDelay;
                     spdlog::info(
-                        "[TFD][Victory][R421A] enemy soft defeated hardening deferred actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} actorWeaponDrawn={} activePressure={} recentPressure={} quietRemainingMs={} playerSideAttackers={} firstAttacker={:08X} targetTarget={:08X} stopIssued={} pressureHits={} deferrals={} retryDelayMs={} maxExtraDelayMs={} delayedBleedoutStartWaits=1 teammateCausedEdgeGuard=1",
+                        "[TFD][Victory][P33N] enemy hardening deferred after graph-safe visual actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} actorWeaponDrawn={} activePressure={} recentPressure={} quietRemainingMs={} playerSideAttackers={} firstAttacker={:08X} targetTarget={:08X} stopIssued={} pressureHits={} deferrals={} retryDelayMs={} maxExtraDelayMs={} graphSafe=1 teammateCausedEdgeGuard=1 npcCombatDefeat={}",
                         actor->GetFormID(),
                         GetActorHealthPct(actor),
                         entry.thresholdPct,
@@ -2195,13 +2783,14 @@ namespace TFD::Victory
                         static_cast<unsigned>(entry.softEnterPressureHitCount),
                         static_cast<unsigned>(entry.softEnterPressureDeferrals),
                         kEnemySoftEnterPressureRetryDelay.count(),
-                        kEnemySoftEnterPressureMaxExtraDelay.count());
+                        kEnemySoftEnterPressureMaxExtraDelay.count(),
+                        entry.npcCombatDefeat ? 1 : 0);
                     return;
                 }
 
                 if ((pressure.active || hasRecentPressure) && !canDeferPressure) {
                     spdlog::warn(
-                        "[TFD][Victory][R421A] enemy soft defeated hardening pressure timeout actor={:08X} hpPct={:.1f} threshold={:.1f} activePressure={} recentPressure={} pressureHits={} deferrals={} action=force_hardening delayedBleedoutStartMayProceed=1",
+                        "[TFD][Victory][P33N] enemy hardening pressure timeout actor={:08X} hpPct={:.1f} threshold={:.1f} activePressure={} recentPressure={} pressureHits={} deferrals={} action=force_hardening graphSafe=1",
                         actor->GetFormID(),
                         GetActorHealthPct(actor),
                         entry.thresholdPct,
@@ -2211,27 +2800,86 @@ namespace TFD::Victory
                         static_cast<unsigned>(entry.softEnterPressureDeferrals));
                 }
 
-                entry.softEnterHardStateApplied = true;
-                if (kEnemyDefeatedVisualBleedoutEnabled &&
-                    !entry.visualBleedoutStarted &&
-                    !entry.visualBleedoutStartPending &&
-                    !entry.visualBleedoutStartDecisionLogged) {
-                    entry.visualBleedoutStartPending = true;
-                    entry.visualBleedoutStartDue = now + kEnemyDelayedBleedoutStartSettleDelay;
+                // P33N: the graph-safe visual decision/pending settle is handled before
+                // soft delay and pressure gates above. Hardening reaches this point only
+                // after the visual attempt has either settled or fallen back.
+
+                if (entry.pleasureReturnVisualHoldActive) {
+                    entry.pleasureReturnVisualHoldActive = false;
+                    entry.pleasureReturnVisualHoldLogged = false;
+                    entry.initialPackageRefreshDone = false;
+                    entry.packageRefreshAfterHardeningPending = true;
+                    entry.pleasureReturnPackageHoldActive = true;
+                    if (!entry.pleasureReturnReassertActive) {
+                        entry.pleasureReturnReassertActive = true;
+                        entry.pleasureReturnReassertAttempts = 0;
+                        entry.pleasureReturnReassertNextDue = now + kPleasureReturnBleedoutReassertInitialDelay;
+                        entry.pleasureReturnReassertUntil = entry.deadline.time_since_epoch().count() != 0 ?
+                            entry.deadline - kPleasureReturnBleedoutReassertStopBeforeTimeout :
+                            now + std::chrono::milliseconds(static_cast<int>(kEnemyKnockSeconds * 1000.0));
+                    }
+                    spdlog::info(
+                        "[TFD][Victory][P56A] Pleasure return visual hold converted to delayed official bleedout actor={:08X} hpPct={:.1f} threshold={:.1f} aliasSlot={} factionApplied={} visualStarted={} delayedBurstStartMs={} retryIntervalMs={} maxAttempts={} packageHeld=1 mirrorHeld=1 evaluateHeld=1 reason=timed_second_stage",
+                        actor->GetFormID(),
+                        GetActorHealthPct(actor),
+                        entry.thresholdPct,
+                        entry.aliasSlot,
+                        entry.factionApplied ? 1 : 0,
+                        entry.visualBleedoutStarted ? 1 : 0,
+                        kPleasureReturnDelayedBleedoutStartDelay.count(),
+                        kPleasureReturnBleedoutReassertInterval.count(),
+                        static_cast<unsigned>(kPleasureReturnBleedoutReassertMaxAttempts));
                 }
+
+                const bool pleasureReturnPackageHold =
+                    entry.pleasureReturnReassertActive || entry.pleasureReturnPackageHoldActive;
+                entry.softEnterHardStateApplied = true;
                 spdlog::info(
-                    "[TFD][Victory][R421A] enemy soft defeated enter hardening actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} hardStopCombat=1 hardMirror=1 hardEvaluate=1 delayedBleedoutStartArmed={} delayedBleedoutStartDelayMs={} softEnter=1",
+                    "[TFD][Victory][P33N] enemy graph-safe visual hardening actor={:08X} hpPct={:.1f} threshold={:.1f} actorInCombat={} hardStopCombat=1 hardMirror={} hardEvaluate={} visualStarted={} visualSettleMs={} softEnter=1 npcCombatDefeat={} pleasureReturnReassert={}",
                     actor->GetFormID(),
                     GetActorHealthPct(actor),
                     entry.thresholdPct,
                     actor->IsInCombat() ? 1 : 0,
-                    entry.visualBleedoutStartPending ? 1 : 0,
-                    kEnemyDelayedBleedoutStartSettleDelay.count());
+                    pleasureReturnPackageHold ? 0 : 1,
+                    pleasureReturnPackageHold ? 0 : 1,
+                    entry.visualBleedoutStarted ? 1 : 0,
+                    kEnemyVisualFirstHardeningSettleDelay.count(),
+                    entry.npcCombatDefeat ? 1 : 0,
+                    pleasureReturnPackageHold ? 1 : 0);
             }
 
             ApplyRegenOverride(actor, entry);
             TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(actor, entry.savedAggression, entry.aggressionOverridden);
-            TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.aliasSlot, entry.factionApplied);
+
+            if (entry.pleasureReturnVisualHoldActive) {
+                entry.pleasureReturnVisualHoldActive = false;
+                entry.pleasureReturnVisualHoldLogged = false;
+                if (!entry.pleasureReturnReassertActive) {
+                    entry.pleasureReturnReassertActive = true;
+                    entry.pleasureReturnReassertAttempts = 0;
+                    entry.pleasureReturnReassertNextDue = Now() + kPleasureReturnBleedoutReassertInitialDelay;
+                    entry.pleasureReturnReassertUntil = entry.deadline.time_since_epoch().count() != 0 ?
+                        entry.deadline - kPleasureReturnBleedoutReassertStopBeforeTimeout :
+                        Now() + std::chrono::milliseconds(static_cast<int>(kEnemyKnockSeconds * 1000.0));
+                }
+                entry.initialPackageRefreshDone = false;
+                entry.packageRefreshAfterHardeningPending = true;
+                entry.pleasureReturnPackageHoldActive = true;
+                spdlog::warn(
+                    "[TFD][Victory][P56A] Pleasure return visual hold fallback converted to delayed official bleedout actor={:08X} hpPct={:.1f} threshold={:.1f} aliasSlot={} factionApplied={} visualStarted={} packageHeld=1 mirrorHeld=1 evaluateHeld=1 reason=hardening_already_applied",
+                    actor->GetFormID(),
+                    GetActorHealthPct(actor),
+                    entry.thresholdPct,
+                    entry.aliasSlot,
+                    entry.factionApplied ? 1 : 0,
+                    entry.visualBleedoutStarted ? 1 : 0);
+            }
+
+            const bool pleasureReturnPackageHold = MaintainPleasureReturnBleedoutReassertLocked(actor, entry, Now());
+
+            if (!pleasureReturnPackageHold) {
+                TFD::Actor::Ops::SyncDefeatedEnemyMirror(actor, entry.aliasSlot, entry.factionApplied);
+            }
 
             if (actor->IsInCombat()) {
                 actor->StopCombat();
@@ -2240,51 +2888,83 @@ namespace TFD::Victory
                 process->StopCombatAndAlarmOnActor(actor, false);
             }
 
-            // R421A: vanilla BleedoutStart is allowed again, but only after
-            // the successful R418/R419 soft-enter delay and a post-hardening
-            // alias/package settle window. Do not fire it close to Enemy alias fill / package evaluation.
-            if (entry.softEnterHardStateApplied && !entry.visualBleedoutStartDecisionLogged) {
-                if (kEnemyDefeatedVisualBleedoutEnabled) {
-                    if (!entry.visualBleedoutStartPending) {
-                        entry.visualBleedoutStartPending = true;
-                        entry.visualBleedoutStartDue = Now() + kEnemyDelayedBleedoutStartSettleDelay;
-                        spdlog::info(
-                            "[TFD][Victory][R421A] defeated visual delayed BleedoutStart armed actor={:08X} delayMs={} softEnterApplied=1 packageHold=1",
-                            actor->GetFormID(),
-                            kEnemyDelayedBleedoutStartSettleDelay.count());
-                    }
+            // P33N: BleedoutStart is attempted at the first graph-safe quiet edge before Enemy alias/package hardening.
+            // P55A: after OStim return, keep alias/package EvaluatePackage held while BleedoutStart is reasserted
+            // through the post-OStim graph cleanup window. Native Victory state stays active, so manual greet
+            // and timeout still work without relying on the defeated package as the visual owner.
 
-                    const auto now = Now();
-                    if (entry.visualBleedoutStartDue.time_since_epoch().count() == 0 ||
-                        now >= entry.visualBleedoutStartDue) {
-                        const bool sent = actor->NotifyAnimationGraph("BleedoutStart");
-                        entry.visualBleedoutStarted = sent;
-                        entry.visualBleedoutStopSent = false;
-                        entry.visualBleedoutStartPending = false;
-                        entry.visualBleedoutStartDecisionLogged = true;
-                        spdlog::info(
-                            "[TFD][Victory][R421A] defeated visual delayed BleedoutStart sent actor={:08X} sent={} oneShot=1 reassert=0 queueNode=0 afterSoftHardening=1 delayMs={} packageHold=1",
-                            actor->GetFormID(),
-                            sent ? 1 : 0,
-                            kEnemyDelayedBleedoutStartSettleDelay.count());
-                    }
-                }
-                else {
-                    entry.visualBleedoutStarted = false;
-                    entry.visualBleedoutStopSent = false;
-                    entry.visualBleedoutStartPending = false;
-                    entry.visualBleedoutStartDecisionLogged = true;
-                    spdlog::info(
-                        "[TFD][Victory][R421A] defeated visual BleedoutStart skipped actor={:08X} packageHold=1 expectedPackage=TFDDefeatedEnemyPackage victoryStateGate=>=1 noPseudoBleedout=1",
-                        actor->GetFormID());
-                }
-            }
-
-            if (initialEntry && !entry.initialPackageRefreshDone) {
+            if (!pleasureReturnPackageHold && (initialEntry || entry.packageRefreshAfterHardeningPending) && !entry.initialPackageRefreshDone) {
                 actor->EvaluatePackage(false, true);
                 actor->EvaluatePackage(true, true);
                 entry.initialPackageRefreshDone = true;
+                entry.packageRefreshAfterHardeningPending = false;
             }
+        }
+
+        void ArmPleasureReturnBleedoutLocked(RE::Actor* actor, EnemyEntry& entry, Clock::time_point now, std::string_view reason)
+        {
+            if (!actor || actor->IsDisabled() || actor->IsDead()) {
+                return;
+            }
+
+            (void)SetPleasureReturnBleedoutHealth(actor, entry.thresholdPct, reason);
+
+            // P55A: post-OStim return must not send BleedoutStart immediately. P53A proved
+            // that the first accepted event can be swallowed or collapse-blink the actor, and only
+            // the later event around the post-OStim cleanup window settles. Keep the native Victory
+            // entry as the owner, delay the BleedoutStart burst, and keep mirror/package
+            // EvaluatePackage deferred through the grace window.
+
+            entry.deadline = now + kPleasureReturnDelayedBleedoutStartDelay + std::chrono::milliseconds(
+                static_cast<int>(kEnemyKnockSeconds * 1000.0));
+            entry.autoDeathIssued = false;
+            entry.fatalDamageApplied = false;
+
+            entry.softEnterActive = true;
+            entry.softEnterHardStateApplied = false;
+            entry.softEnterPendingLogged = false;
+            entry.softEnterHardStateDue = now + kEnemySoftEnterHardStateDelay;
+            entry.softEnterHardStateMaxDue = entry.softEnterHardStateDue + kEnemySoftEnterPressureMaxExtraDelay;
+            entry.softEnterLastPressureSeen = Clock::time_point{};
+            entry.softEnterLastPressureCauseFormID = 0;
+            entry.softEnterLastPressureOtherFormID = 0;
+            entry.softEnterPressureHitCount = 0;
+            entry.softEnterPressureDeferrals = 0;
+            entry.npcCombatDefeat = false;
+            entry.npcCombatHardeningSettleLogged = false;
+            entry.pleasureReturnVisualHoldActive = true;
+            entry.pleasureReturnVisualHoldLogged = false;
+            entry.pleasureReturnReassertActive = true;
+            entry.pleasureReturnPackageHoldActive = true;
+            entry.pleasureReturnReassertAttempts = 0;
+            entry.pleasureReturnReassertNextDue = now + kPleasureReturnBleedoutReassertInitialDelay;
+            entry.pleasureReturnReassertUntil = entry.deadline.time_since_epoch().count() != 0 ?
+                entry.deadline - kPleasureReturnBleedoutReassertStopBeforeTimeout :
+                now + std::chrono::milliseconds(static_cast<int>(kEnemyKnockSeconds * 1000.0));
+            entry.visualBleedoutStarted = false;
+            entry.visualBleedoutStopSent = false;
+            entry.visualBleedoutStartPending = false;
+            entry.visualBleedoutStartDecisionLogged = false;
+            entry.visualBleedoutStartAttempts = 0;
+            entry.visualBleedoutGraphSafeDeferrals = 0;
+            entry.visualBleedoutStartDue = {};
+            entry.visualBleedoutStartMaxDue = {};
+            entry.visualBleedoutGraphSafeLastHoldLog = Clock::time_point{};
+            entry.visualBleedoutLastUnsafeTargetFormID = 0;
+            entry.initialPackageRefreshDone = false;
+            entry.packageRefreshAfterHardeningPending = true;
+
+            spdlog::info(
+                "[TFD][Victory][P56A] Pleasure return-to-bleedout armed actor={:08X} reason={} graceAfterDelayedBurstStart={:.1f} immediateVisualSuppressed=1 delayedBurstStartMs={} totalDeadlineDelayMs={} graphSafeMaxDelayMs={} hardStateDelayMs={} retryIntervalMs={} retryMaxAttempts={} lowHealthRearmed=1 mirrorDeferredThroughGrace=1 packageDeferredThroughGrace=1 evaluateDeferredThroughGrace=1",
+                actor->GetFormID(),
+                ReasonText(reason),
+                kEnemyKnockSeconds,
+                kPleasureReturnDelayedBleedoutStartDelay.count(),
+                (kPleasureReturnDelayedBleedoutStartDelay + std::chrono::milliseconds(static_cast<int>(kEnemyKnockSeconds * 1000.0))).count(),
+                kEnemyVisualGraphSafeMaxDelay.count(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(kEnemySoftEnterHardStateDelay).count(),
+                kPleasureReturnBleedoutReassertInterval.count(),
+                static_cast<unsigned>(kPleasureReturnBleedoutReassertMaxAttempts));
         }
 
         bool TryGetDefeatedEnemyStateHook(
@@ -2433,6 +3113,8 @@ namespace TFD::Victory
             return "LootCommitted";
         case SessionPhase::RecruitCommitted:
             return "RecruitCommitted";
+        case SessionPhase::PleasureCommitted:
+            return "PleasureCommitted";
         default:
             return "Unknown";
         }
@@ -2447,7 +3129,10 @@ namespace TFD::Victory
         a_vm->RegisterFunction("RequestKill", "TFDVictoryNative", PapyrusRequestKill);
         a_vm->RegisterFunction("RequestLoot", "TFDVictoryNative", PapyrusRequestLoot);
         a_vm->RegisterFunction("RequestRecruit", "TFDVictoryNative", PapyrusRequestRecruit);
-        spdlog::info("[TFD][Victory][R400D] Papyrus native registered functions=RequestKill,RequestLoot,RequestRecruit owner=TFDVictory");
+        a_vm->RegisterFunction("RequestPleasure", "TFDVictoryNative", PapyrusRequestPleasure);
+        a_vm->RegisterFunction("CompletePleasureHandoff", "TFDVictoryNative", PapyrusCompletePleasureHandoff);
+        a_vm->RegisterFunction("CompletePleasureScene", "TFDVictoryNative", PapyrusCompletePleasureScene);
+        spdlog::info("[TFD][Victory][P33P] Papyrus native registered functions=RequestKill,RequestLoot,RequestRecruit,RequestPleasure,CompletePleasureHandoff,CompletePleasureScene owner=TFDVictory");
         return true;
     }
 
@@ -2472,7 +3157,7 @@ namespace TFD::Victory
         g_worker = std::thread([]() { WorkerLoop(); });
 
         spdlog::info(
-            "[TFD][Victory][R421A] enemy defeat owner installed policy=threshold_notify registry_countdown_autodeath_owner selected_actor_session_greet_cancel_kill_staged_death loot_native_inventory_dispatch_container_observer_controlled_release recruit_pre_getup_dehostile_defeated_clear_teammate_handoff package_hold_defeated_delayed_bleedoutstart delayed_bleedoutstart no_reassert no_forcegreet no_generic_flow no_node_rebuild recruit_hit_diagnostic_passthrough soft_defeated_enter_R421A teammate_pressure_quiet_window victory_context_guard_P32B");
+            "[TFD][Victory][R421A] enemy defeat owner installed policy=threshold_notify registry_countdown_autodeath_owner selected_actor_session_greet_cancel_kill_staged_death loot_native_inventory_dispatch_container_observer_controlled_release recruit_pre_getup_dehostile_defeated_clear_teammate_handoff package_hold_defeated_delayed_bleedoutstart delayed_bleedoutstart no_reassert no_forcegreet no_generic_flow no_node_rebuild recruit_hit_diagnostic_passthrough soft_defeated_enter_R421A teammate_pressure_quiet_window victory_context_guard_P32B victory_pleasure_dialogue_async_close_guard_P36A pleasure_return_low_health_bleedout_P34B pleasure_return_delayed_burst_P56A npc_combat_defeat_hardening_settle_P50A");
     }
 
     void Shutdown()
@@ -2514,6 +3199,9 @@ namespace TFD::Victory
         const auto formID = actor->GetFormID();
         if (auto it = g_enemyEntries.find(formID); it != g_enemyEntries.end()) {
             it->second.thresholdPct = clampedThreshold;
+            if (HasNonPlayerCombatTarget(actor)) {
+                it->second.npcCombatDefeat = true;
+            }
             if (!contextGate.allowed) {
                 spdlog::info(
                     "[TFD][Victory][P32B] existing enemy threshold ignored and released actor={:08X} reason={} root={} context={} gate={} sub={} terminal={} noHardening=1 noBleedoutStart=1",
@@ -2554,6 +3242,8 @@ namespace TFD::Victory
         EnemyEntry entry{};
         entry.handle = actor->GetHandle();
         entry.thresholdPct = clampedThreshold;
+        entry.npcCombatDefeat = HasNonPlayerCombatTarget(actor);
+        entry.npcCombatHardeningSettleLogged = false;
         entry.deadline = Now() + std::chrono::milliseconds(
             static_cast<int>(kEnemyKnockSeconds * 1000.0));
 
@@ -2574,17 +3264,26 @@ namespace TFD::Victory
             it->second.softEnterLastPressureOtherFormID = 0;
             it->second.softEnterPressureHitCount = 0;
             it->second.softEnterPressureDeferrals = 0;
+            it->second.visualBleedoutStartAttempts = 0;
+            it->second.visualBleedoutGraphSafeDeferrals = 0;
+            it->second.visualBleedoutStartPending = true;
+            it->second.visualBleedoutStartDue = softEnterNow + kEnemyVisualGraphSafeInitialDelay;
+            it->second.visualBleedoutStartMaxDue = softEnterNow + kEnemyVisualGraphSafeMaxDelay;
+            it->second.visualBleedoutGraphSafeLastHoldLog = Clock::time_point{};
+            it->second.visualBleedoutLastUnsafeTargetFormID = 0;
         }
 
         MaintainEnemyState(actor, it->second, true);
         RefreshConditionStateLocked();
         spdlog::info(
-            "[TFD][Victory][R421A] enemy threshold committed actor={:08X} hpPct={:.1f} threshold={:.1f} countdown={:.1f} reason={} victoryState=1 softEnterDelay=1 hardStateDelayMs={} initialStopCombat=0 initialMirror=0 initialEvaluate=0 delayedBleedoutStart=1",
+            "[TFD][Victory][P33N] enemy threshold committed actor={:08X} hpPct={:.1f} threshold={:.1f} countdown={:.1f} reason={} victoryState=1 visualStartDelayMs={} graphSafeMaxDelayMs={} hardStateDelayMs={} initialStopCombat=0 initialMirror=0 initialEvaluate=0 graphSafeBleedoutStart=1 graphSafe=1",
             formID,
             GetActorHealthPct(actor),
             clampedThreshold,
             kEnemyKnockSeconds,
             ReasonText(reason),
+            kEnemyVisualGraphSafeInitialDelay.count(),
+            kEnemyVisualGraphSafeMaxDelay.count(),
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 kEnemySoftEnterHardStateDelay)
                 .count());
@@ -2603,6 +3302,7 @@ namespace TFD::Victory
         std::scoped_lock lk(g_lock);
         const auto now = Now();
         TickRecruitHitDiagnosticLocked(now);
+        MaintainPleasureDialogueCloseGuardLocked(now);
 
         if (g_session.active &&
             g_session.phase == SessionPhase::OpeningDialogue &&
@@ -2642,7 +3342,11 @@ namespace TFD::Victory
                 g_session.active &&
                 g_session.phase == SessionPhase::RecruitCommitted &&
                 g_session.selectedActorFormID == formID;
-            if (ownedKillEntry || ownedLootEntry || ownedRecruitEntry) {
+            const bool ownedPleasureEntry =
+                g_session.active &&
+                g_session.phase == SessionPhase::PleasureCommitted &&
+                g_session.selectedActorFormID == formID;
+            if (ownedKillEntry || ownedLootEntry || ownedRecruitEntry || ownedPleasureEntry) {
                 // Outcome-specific ticks are the only owners while a selected actor
                 // is committed. Generic countdown/dead cleanup must not race them.
                 continue;
@@ -2917,6 +3621,19 @@ namespace TFD::Victory
                 return true;
             }
 
+            if (it->second.softEnterActive && !it->second.softEnterHardStateApplied) {
+                spdlog::info(
+                    "[TFD][Victory][P33K] manual interaction consumed actor={:08X} reason={} gate=visual_entry_pending softActive={} hardApplied={} visualPending={} visualStarted={} visualDecision={} noDialogueBeforeVisualSettle=1",
+                    actorFormID,
+                    reasonText,
+                    it->second.softEnterActive ? 1 : 0,
+                    it->second.softEnterHardStateApplied ? 1 : 0,
+                    it->second.visualBleedoutStartPending ? 1 : 0,
+                    it->second.visualBleedoutStarted ? 1 : 0,
+                    it->second.visualBleedoutStartDecisionLogged ? 1 : 0);
+                return true;
+            }
+
             if (it->second.autoDeathIssued || it->second.fatalDamageApplied) {
                 spdlog::info(
                     "[TFD][Victory][R394A] manual interaction consumed actor={:08X} reason={} gate=auto_death_committed",
@@ -2960,6 +3677,27 @@ namespace TFD::Victory
             if (g_session.active) {
                 return true;
             }
+            if (it->second.softEnterActive && !it->second.softEnterHardStateApplied) {
+                spdlog::info(
+                    "[TFD][Victory][P33K] manual interaction consumed actor={:08X} reason={} gate=visual_entry_pending_after_recheck softActive={} hardApplied={} visualPending={} visualStarted={} visualDecision={} noDialogueBeforeVisualSettle=1",
+                    actorFormID,
+                    reasonText,
+                    it->second.softEnterActive ? 1 : 0,
+                    it->second.softEnterHardStateApplied ? 1 : 0,
+                    it->second.visualBleedoutStartPending ? 1 : 0,
+                    it->second.visualBleedoutStarted ? 1 : 0,
+                    it->second.visualBleedoutStartDecisionLogged ? 1 : 0);
+                return true;
+            }
+            if (it->second.pleasureReturnReassertActive && !it->second.visualBleedoutStarted) {
+                spdlog::info(
+                    "[TFD][Victory][P56A] manual interaction consumed actor={:08X} reason={} gate=pleasure_return_delayed_bleedout_pending visualStarted=0 attempts={} delayedBurstStartMs={} noDialogueBeforeVisualSettle=1",
+                    actorFormID,
+                    reasonText,
+                    static_cast<unsigned>(it->second.pleasureReturnReassertAttempts),
+                    kPleasureReturnDelayedBleedoutStartDelay.count());
+                return true;
+            }
 
             sessionID = NextSessionIDLocked();
             auto& entry = it->second;
@@ -2969,6 +3707,28 @@ namespace TFD::Victory
             entry.heldSessionID = sessionID;
             entry.autoDeathIssued = false;
             entry.fatalDamageApplied = false;
+            if (entry.pleasureReturnVisualHoldActive) {
+                entry.pleasureReturnVisualHoldActive = false;
+                entry.pleasureReturnVisualHoldLogged = false;
+                if (!entry.pleasureReturnReassertActive) {
+                    entry.pleasureReturnReassertActive = true;
+                    entry.pleasureReturnReassertAttempts = 0;
+                    entry.pleasureReturnReassertNextDue = Now() + kPleasureReturnBleedoutReassertInitialDelay;
+                    entry.pleasureReturnReassertUntil = entry.deadline.time_since_epoch().count() != 0 ?
+                        entry.deadline - kPleasureReturnBleedoutReassertStopBeforeTimeout :
+                        Now() + std::chrono::milliseconds(static_cast<int>(kEnemyKnockSeconds * 1000.0));
+                }
+                entry.initialPackageRefreshDone = false;
+                entry.packageRefreshAfterHardeningPending = true;
+                entry.pleasureReturnPackageHoldActive = true;
+                spdlog::info(
+                    "[TFD][Victory][P56A] Pleasure return delayed visual hold released for manual dialogue actor={:08X} reason={} aliasSlot={} factionApplied={} reassertActive={} packageHeld=1 mirrorHeld=1 evaluateHeld=1",
+                    actorFormID,
+                    reasonText,
+                    entry.aliasSlot,
+                    entry.factionApplied ? 1 : 0,
+                    entry.pleasureReturnReassertActive ? 1 : 0);
+            }
             MaintainEnemyState(selectedActor, entry, false);
 
             g_session.active = true;
@@ -3013,6 +3773,13 @@ namespace TFD::Victory
                         g_session.phase = SessionPhase::DialogueOpen;
                         g_sessionOpenDeadline = {};
                     }
+                    if (auto it = g_enemyEntries.find(actorFormID); it != g_enemyEntries.end()) {
+                        (void)StopPleasureReturnBurstForPlayerActionLocked(
+                            selectedActor,
+                            it->second,
+                            "manual_dialogue_opened",
+                            false);
+                    }
                     spdlog::info(
                         "[TFD][Victory][R394A] greet open result actor={:08X} session={} opened=1 topicInfo={:08X} phase={} no_getup=1",
                         actorFormID,
@@ -3037,11 +3804,27 @@ namespace TFD::Victory
             if (g_session.phase == SessionPhase::OpeningDialogue) {
                 g_session.phase = SessionPhase::DialogueOpen;
                 g_sessionOpenDeadline = {};
+                if (auto it = g_enemyEntries.find(g_session.selectedActorFormID); it != g_enemyEntries.end()) {
+                    auto actorSP = it->second.handle.get();
+                    (void)StopPleasureReturnBurstForPlayerActionLocked(
+                        actorSP.get(),
+                        it->second,
+                        "dialogue_menu_opened",
+                        false);
+                }
                 spdlog::info(
                     "[TFD][Victory][R394A] dialogue menu opened actor={:08X} session={} phase={}",
                     g_session.selectedActorFormID,
                     g_session.sessionID,
                     ToString(g_session.phase));
+            }
+            else if (g_session.phase == SessionPhase::PleasureCommitted) {
+                MaintainPleasureDialogueCloseGuardLocked(Now());
+                spdlog::info(
+                    "[TFD][Victory][P36A] dialogue menu opening suppressed during PleasureCommitted actor={:08X} session={} closeGuardSession={}",
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    g_pleasureDialogueCloseGuardSessionID);
             }
             return;
         }
@@ -3109,6 +3892,13 @@ namespace TFD::Victory
                     g_session.sessionID,
                     ToString(g_recruitStage));
             }
+        }
+        else if (g_session.phase == SessionPhase::PleasureCommitted) {
+            spdlog::info(
+                "[TFD][Victory][P33O] Pleasure dialogue close ignored while handoff pending actor={:08X} session={} phase={}",
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase));
         }
         else {
             spdlog::info(
@@ -3225,6 +4015,8 @@ namespace TFD::Victory
             return false;
         }
 
+        StopPleasureReturnBurstForPlayerActionLocked(speaker, it->second, "kill_commit", true);
+
         const auto sessionID = g_session.sessionID;
         const auto requestPhase = g_session.phase;
         const bool dialogueOpen = IsDialogueMenuOpen();
@@ -3306,6 +4098,8 @@ namespace TFD::Victory
                 reasonText);
             return false;
         }
+
+        StopPleasureReturnBurstForPlayerActionLocked(speaker, it->second, "loot_commit", true);
 
         const auto sessionID = g_session.sessionID;
         const auto requestPhase = g_session.phase;
@@ -3402,6 +4196,8 @@ namespace TFD::Victory
             return false;
         }
 
+        StopPleasureReturnBurstForPlayerActionLocked(speaker, it->second, "recruit_commit", true);
+
         const auto sessionID = g_session.sessionID;
         const auto requestPhase = g_session.phase;
         const bool dialogueOpen = IsDialogueMenuOpen();
@@ -3448,6 +4244,273 @@ namespace TFD::Victory
             waitForDialogueClose ? 0 : 1,
             kRecruitCommitDelay.count(),
             kRecruitDialogueCloseTimeout.count());
+        return true;
+    }
+
+    bool RequestPleasure(RE::Actor* speaker, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!g_installed.load(std::memory_order_acquire) ||
+            !TFD::Settings::GetEnabled() ||
+            g_loadTransition.load(std::memory_order_acquire) ||
+            !speaker || speaker->IsDisabled() || speaker->IsDead()) {
+            spdlog::warn(
+                "[TFD][Victory][P33O] Pleasure rejected actor={:08X} gate=invalid_runtime reason={}",
+                speaker ? speaker->GetFormID() : 0u,
+                reasonText);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::uint32_t sessionID = 0;
+        SessionPhase requestPhase = SessionPhase::Empty;
+        bool dialogueOpen = false;
+        bool visualBleedoutOwned = false;
+        bool visualStopSent = false;
+
+        {
+            std::scoped_lock lk(g_lock);
+            const bool commitPhase =
+                g_session.phase == SessionPhase::DialogueOpen ||
+                g_session.phase == SessionPhase::AwaitingChoiceCommit;
+            if (!g_session.active ||
+                g_session.selectedActorFormID != actorFormID ||
+                !commitPhase) {
+                spdlog::warn(
+                    "[TFD][Victory][P33O] Pleasure rejected actor={:08X} gate=session_mismatch active={} selected={:08X} session={} phase={} reason={}",
+                    actorFormID,
+                    g_session.active ? 1 : 0,
+                    g_session.selectedActorFormID,
+                    g_session.sessionID,
+                    ToString(g_session.phase),
+                    reasonText);
+                return false;
+            }
+
+            auto it = g_enemyEntries.find(actorFormID);
+            if (it == g_enemyEntries.end() ||
+                !it->second.managed ||
+                it->second.autoDeathIssued ||
+                it->second.fatalDamageApplied) {
+                spdlog::warn(
+                    "[TFD][Victory][P33O] Pleasure rejected actor={:08X} gate=defeated_entry_invalid session={} reason={}",
+                    actorFormID,
+                    g_session.sessionID,
+                    reasonText);
+                return false;
+            }
+
+            StopPleasureReturnBurstForPlayerActionLocked(speaker, it->second, "pleasure_commit", true);
+
+            sessionID = g_session.sessionID;
+            requestPhase = g_session.phase;
+            dialogueOpen = IsDialogueMenuOpen();
+
+            g_session.phase = SessionPhase::PleasureCommitted;
+            g_sessionOpenDeadline = {};
+            g_choiceCommitDeadline = {};
+            g_killDeadline = {};
+            g_killFinalizeNotBefore = {};
+            g_killStage = KillStage::None;
+            ClearLootTransitionLocked("pleasure_commit_prepare");
+            ClearRecruitTransitionLocked("pleasure_commit_prepare");
+            SetConditionState(0);
+            ArmPleasureDialogueCloseGuardLocked(speaker, sessionID, Now(), "victory_pleasure_commit");
+
+            it->second.countdownHeld = true;
+            it->second.heldSessionID = sessionID;
+            it->second.autoDeathIssued = false;
+            it->second.fatalDamageApplied = false;
+
+            visualBleedoutOwned = it->second.visualBleedoutStarted && !it->second.visualBleedoutStopSent;
+            if (visualBleedoutOwned) {
+                visualStopSent = speaker->NotifyAnimationGraph("BleedoutStop");
+                if (visualStopSent) {
+                    it->second.visualBleedoutStopSent = true;
+                }
+            }
+
+            spdlog::info(
+                "[TFD][Victory][P36A] Pleasure commit accepted actor={:08X} session={} phase={} requestPhase={} dialogueOpen={} visualBleedoutOwned={} BleedoutStopSent={} reason={} countdownHeld=1 source=VictorySpecial closeGuard=1 victoryState=0",
+                actorFormID,
+                sessionID,
+                ToString(g_session.phase),
+                ToString(requestPhase),
+                dialogueOpen ? 1 : 0,
+                visualBleedoutOwned ? 1 : 0,
+                visualStopSent ? 1 : 0,
+                reasonText);
+        }
+
+        (void)CloseVictoryDialogueMenu(speaker, "victory_pleasure_commit", false);
+        return true;
+    }
+
+    bool CompletePleasureHandoff(RE::Actor* speaker, bool started, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!speaker) {
+            spdlog::warn("[TFD][Victory][P33O] Pleasure handoff complete rejected reason=no_speaker started={} source={}", started ? 1 : 0, reasonText);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::scoped_lock lk(g_lock);
+        if (!g_session.active ||
+            g_session.selectedActorFormID != actorFormID ||
+            g_session.phase != SessionPhase::PleasureCommitted) {
+            spdlog::warn(
+                "[TFD][Victory][P33O] Pleasure handoff complete rejected actor={:08X} started={} active={} selected={:08X} session={} phase={} reason={}",
+                actorFormID,
+                started ? 1 : 0,
+                g_session.active ? 1 : 0,
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                reasonText);
+            return false;
+        }
+
+        if (!started) {
+            ResetSessionLocked("victory_pleasure_start_failed", true);
+            spdlog::warn(
+                "[TFD][Victory][P33O] Pleasure handoff failed actor={:08X} action=restart_countdown reason={}",
+                actorFormID,
+                reasonText);
+            return false;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        if (it == g_enemyEntries.end()) {
+            ResetSessionLocked("victory_pleasure_handoff_lost_entry", false);
+            spdlog::warn(
+                "[TFD][Victory][P33P] Pleasure handoff failed actor={:08X} gate=missing_defeated_entry reason={}",
+                actorFormID,
+                reasonText);
+            return false;
+        }
+
+        auto& entry = it->second;
+        SetConditionState(0);
+        ArmPleasureDialogueCloseGuardLocked(speaker, g_session.sessionID, Now(), "victory_pleasure_handoff");
+        if (entry.visualBleedoutStarted && !entry.visualBleedoutStopSent) {
+            const bool stopSent = speaker->NotifyAnimationGraph("BleedoutStop");
+            if (stopSent) {
+                entry.visualBleedoutStopSent = true;
+            }
+            spdlog::info(
+                "[TFD][Victory][P33P] Pleasure handoff visual stop actor={:08X} sent={} reason={}",
+                actorFormID,
+                stopSent ? 1 : 0,
+                reasonText);
+        }
+
+        (void)RestoreLootReleaseHealth(speaker, entry.thresholdPct);
+        ApplyRegenOverride(speaker, entry);
+        TFD::Actor::Ops::ApplyDefeatedEnemyPassiveOverride(speaker, entry.savedAggression, entry.aggressionOverridden);
+        TFD::Actor::Ops::ClearDefeatedEnemyMirror(speaker, entry.aliasSlot, entry.factionApplied, "victory_pleasure_scene_suspended");
+
+        if (speaker->IsInCombat()) {
+            speaker->StopCombat();
+        }
+        if (auto* process = RE::ProcessLists::GetSingleton()) {
+            process->StopCombatAndAlarmOnActor(speaker, false);
+        }
+        speaker->EvaluatePackage(false, true);
+        speaker->EvaluatePackage(true, true);
+
+        spdlog::info(
+            "[TFD][Victory][P36A] Pleasure handoff armed actor={:08X} session={} reason={} ownership=held countdownHeld=1 defeatedEntryHeld=1 mirrorSuspended=1 releaseAtSceneEnd=0 closeGuard=1 victoryState=0",
+            actorFormID,
+            g_session.sessionID,
+            reasonText);
+        return true;
+    }
+
+    bool CompletePleasureScene(RE::Actor* speaker, bool sceneSucceeded, std::string_view reason)
+    {
+        const auto reasonText = ReasonText(reason);
+        if (!speaker) {
+            spdlog::warn("[TFD][Victory][P33P] Pleasure scene complete rejected reason=no_speaker succeeded={}", sceneSucceeded ? 1 : 0);
+            return false;
+        }
+
+        const auto actorFormID = speaker->GetFormID();
+        std::scoped_lock lk(g_lock);
+        if (!g_session.active ||
+            g_session.selectedActorFormID != actorFormID ||
+            g_session.phase != SessionPhase::PleasureCommitted) {
+            spdlog::warn(
+                "[TFD][Victory][P33P] Pleasure scene complete rejected actor={:08X} succeeded={} active={} selected={:08X} session={} phase={} reason={}",
+                actorFormID,
+                sceneSucceeded ? 1 : 0,
+                g_session.active ? 1 : 0,
+                g_session.selectedActorFormID,
+                g_session.sessionID,
+                ToString(g_session.phase),
+                reasonText);
+            return false;
+        }
+
+        auto it = g_enemyEntries.find(actorFormID);
+        if (it == g_enemyEntries.end()) {
+            ResetSessionLocked("victory_pleasure_scene_lost_entry", false);
+            spdlog::warn(
+                "[TFD][Victory][P33P] Pleasure scene complete failed actor={:08X} gate=missing_defeated_entry succeeded={} reason={}",
+                actorFormID,
+                sceneSucceeded ? 1 : 0,
+                reasonText);
+            return false;
+        }
+
+        auto actorSP = it->second.handle.get();
+        auto* actor = actorSP.get();
+        if (!actor || actor->IsDisabled()) {
+            ResetSessionLocked("victory_pleasure_scene_invalid_actor", false);
+            spdlog::warn(
+                "[TFD][Victory][P33P] Pleasure scene complete failed actor={:08X} gate=invalid_actor succeeded={} reason={}",
+                actorFormID,
+                sceneSucceeded ? 1 : 0,
+                reasonText);
+            return false;
+        }
+
+        if (actor->IsDead()) {
+            ResetSessionLocked("victory_pleasure_scene_actor_dead", false);
+            (void)ReleaseEntryByIDLocked(actorFormID, "victory_pleasure_scene_actor_dead", false);
+            spdlog::info(
+                "[TFD][Victory][P33P] Pleasure scene complete actor already dead actor={:08X} succeeded={} reason={}",
+                actorFormID,
+                sceneSucceeded ? 1 : 0,
+                reasonText);
+            return true;
+        }
+
+        const auto sessionID = g_session.sessionID;
+        ResetSessionLocked(sceneSucceeded ? "victory_pleasure_scene_succeeded" : "victory_pleasure_scene_failed", true);
+
+        auto postIt = g_enemyEntries.find(actorFormID);
+        if (postIt == g_enemyEntries.end()) {
+            spdlog::warn(
+                "[TFD][Victory][P33P] Pleasure scene complete lost entry after session reset actor={:08X} session={} succeeded={} reason={}",
+                actorFormID,
+                sessionID,
+                sceneSucceeded ? 1 : 0,
+                reasonText);
+            return false;
+        }
+
+        ArmPleasureReturnBleedoutLocked(actor, postIt->second, Now(), reason);
+        RefreshConditionStateLocked();
+
+        spdlog::info(
+            "[TFD][Victory][P36A] Pleasure lifecycle returned to defeated countdown actor={:08X} session={} succeeded={} graceAfterDelayedBurstStart={:.1f} delayedBurstStartMs={} reason={} reopenViaManualActivation=1",
+            actorFormID,
+            sessionID,
+            sceneSucceeded ? 1 : 0,
+            kEnemyKnockSeconds,
+            kPleasureReturnDelayedBleedoutStartDelay.count(),
+            reasonText);
         return true;
     }
 
@@ -3541,6 +4604,41 @@ namespace TFD::Victory
             kRecruitHitDiagnosticSecondDelay.count(),
             ReasonText(reason));
         LogRecruitHitDiagnosticSampleLocked(target, cause, "hit_event_immediate", reason);
+    }
+
+    RE::FormID FindPendingEnemyVisualEntry(RE::Actor* observer, float radius)
+    {
+        std::scoped_lock lk(g_lock);
+        const auto observerPos = observer ? observer->GetPosition() : RE::NiPoint3{};
+        const bool hasObserver = observer != nullptr;
+        const float maxDistance = (std::max)(0.0f, radius);
+
+        for (const auto& [formID, entry] : g_enemyEntries) {
+            if (!entry.managed ||
+                !entry.softEnterActive ||
+                entry.softEnterHardStateApplied ||
+                entry.autoDeathIssued ||
+                entry.fatalDamageApplied) {
+                continue;
+            }
+
+            auto actorSp = RE::Actor::LookupByHandle(entry.handle.native_handle());
+            auto* actor = actorSp.get();
+            if (!actor || actor->IsDead() || actor->IsDisabled() || !actor->Is3DLoaded()) {
+                continue;
+            }
+
+            if (hasObserver && maxDistance > 0.0f) {
+                const float dist = DistanceOrZero(actor->GetPosition(), observerPos);
+                if (dist > maxDistance) {
+                    continue;
+                }
+            }
+
+            return formID;
+        }
+
+        return 0;
     }
 
     bool IsCombatBehaviorSuppressedActor(RE::Actor* actor)

@@ -14,6 +14,7 @@
 #include "TFDTransition.h"
 #include "TFDCaptiveRecaptureRecovery.h"
 #include "TFDForceGreetState.h"
+#include "TFDPlayerDownRouter.h"
 
 #include <SKSE/SKSE.h>
 
@@ -69,6 +70,102 @@ namespace TFD::Captive
 		static constexpr auto kRecoverGearOpenNotifyCooldown = std::chrono::milliseconds(750);
 		RE::FormID g_lastRecoverGearOpenNotifyRefID{ 0 };
 		std::chrono::steady_clock::time_point g_lastRecoverGearOpenNotifyAt{};
+
+
+		float DistanceToPlayer(RE::Actor* player, RE::Actor* actor)
+		{
+			if (!player || !actor) {
+				return 99999.0f;
+			}
+			const auto pp = player->GetPosition();
+			const auto ap = actor->GetPosition();
+			const float dx = ap.x - pp.x;
+			const float dy = ap.y - pp.y;
+			const float dz = ap.z - pp.z;
+			return std::sqrt(dx * dx + dy * dy + dz * dz);
+		}
+
+		bool IsUsableEscapeBreakPreferred(RE::Actor* player, RE::Actor* actor, float* outDistance = nullptr)
+		{
+			if (outDistance) {
+				*outDistance = 99999.0f;
+			}
+			if (!player || !actor || actor == player || actor->IsDisabled() || actor->IsDead(false) || !actor->Is3DLoaded()) {
+				return false;
+			}
+			auto* playerCell = player->GetParentCell();
+			auto* actorCell = actor->GetParentCell();
+			if (playerCell && actorCell && playerCell != actorCell) {
+				return false;
+			}
+			const float dist = DistanceToPlayer(player, actor);
+			if (outDistance) {
+				*outDistance = dist;
+			}
+			return dist <= (std::max)(12000.0f, TFD::Settings::GetSweepRadius());
+		}
+
+		RE::Actor* ResolvePendingOverkillRouteAttacker()
+		{
+			if (!TFD::PlayerDownRouter::HasPendingOverkillRoute()) {
+				return nullptr;
+			}
+			const auto pending = TFD::PlayerDownRouter::GetPendingOverkillRoute();
+			if (!pending.attacker) {
+				return nullptr;
+			}
+			auto sp = RE::Actor::LookupByHandle(pending.attacker.native_handle());
+			return sp.get();
+		}
+
+		struct EscapeBreakPreferred
+		{
+			RE::Actor* actor{ nullptr };
+			const char* source{ "none" };
+			float distance{ 99999.0f };
+		};
+
+		EscapeBreakPreferred ResolveEscapeBreakPreferred(RE::Actor* player, bool pendingOverkillRoute, const EscapeTickHandlers& handlers)
+		{
+			EscapeBreakPreferred result{};
+			float dist = 99999.0f;
+
+			if (pendingOverkillRoute) {
+				auto* pendingAttacker = ResolvePendingOverkillRouteAttacker();
+				if (IsUsableEscapeBreakPreferred(player, pendingAttacker, &dist)) {
+					result.actor = pendingAttacker;
+					result.source = "pending_overkill_attacker";
+					result.distance = dist;
+					return result;
+				}
+				spdlog::info(
+					"[TFD][Captive][P32Q] pending overkill attacker unavailable for escape speaker attacker={:08X}",
+					pendingAttacker ? pendingAttacker->GetFormID() : 0u);
+			}
+
+			if (handlers.findBestAggressor) {
+				const float reacquireRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
+				auto* bestAggressor = handlers.findBestAggressor(reacquireRadius);
+				if (IsUsableEscapeBreakPreferred(player, bestAggressor, &dist)) {
+					result.actor = bestAggressor;
+					result.source = "best_active_aggressor";
+					result.distance = dist;
+					return result;
+				}
+			}
+
+			if (handlers.resolveAggressor) {
+				auto* rememberedAggressor = handlers.resolveAggressor();
+				if (IsUsableEscapeBreakPreferred(player, rememberedAggressor, &dist)) {
+					result.actor = rememberedAggressor;
+					result.source = "remembered_aggressor";
+					result.distance = dist;
+					return result;
+				}
+			}
+
+			return result;
+		}
 
 		static RE::TESGlobal* ResolveCaptiveStateGlobal()
 		{
@@ -1246,7 +1343,15 @@ namespace TFD::Captive
 				snapshot.sub == TFD::FlowController::SubFlow::InCombatEscapeBreak;
 			const bool bleedoutEscapeBreak = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
 				snapshot.sub == TFD::FlowController::SubFlow::BleedoutEscapeBreak;
-			const bool captiveThreatOverlay = inCombatEscapeBreak || bleedoutEscapeBreak;
+			const bool escapeFailedPlayerBleedout = snapshot.contextRoot == TFD::FlowController::RootFlow::Captive &&
+				snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
+				(snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+					snapshot.sub == TFD::FlowController::SubFlow::Recapture);
+			const bool escapeBleedoutRuntimeOverlay = g_escapeBleedoutActive || g_recaptureCommitActive;
+			const bool captiveThreatOverlay = inCombatEscapeBreak ||
+				bleedoutEscapeBreak ||
+				escapeFailedPlayerBleedout ||
+				escapeBleedoutRuntimeOverlay;
 
 			if (!phaseEscape && !captiveThreatOverlay) {
 				return false;
@@ -1259,21 +1364,51 @@ namespace TFD::Captive
 			const bool weaponDrawn = actor->IsWeaponDrawn();
 			const bool primaryEscapeBreak = captiveThreatOverlay && snapshot.primaryActorFormID == actor->GetFormID();
 
-			// R271A: Captive is the base context, while InCombatEscapeBreak and
-			// BleedoutEscapeBreak are threat overlays above it. During those overlays
-			// Captive runtime must not refresh TFDCaptiveFaction/package ownership;
-			// combat or bleedout owns hostility, stance, and forcegreet settlement.
+			// R271A/P32G: Captive is the base context, while InCombatEscapeBreak,
+			// BleedoutEscapeBreak, and Captive EscapeFailed + PlayerBleedout are
+			// threat overlays above it. During those overlays Captive runtime must
+			// not refresh TFDCaptiveFaction/package ownership; combat or bleedout
+			// owns hostility, stance, and forcegreet settlement. In log 165 the
+			// second bleedout crashed around dialogue open after the sweep re-applied
+			// TFDCaptiveFaction to the active bleedout speaker while DialogueOpen was
+			// still waiting for Papyrus confirmation. Treat that state as a bleedout
+			// overlay too, not as plain Captive runtime.
 			if (captiveThreatOverlay) {
-				const bool removed = RemoveNativeCaptorRoleFactionForActor(actor,
-					bleedoutEscapeBreak ? "captive_runtime_tick_bleedout_escape_break_suspend" : "captive_runtime_tick_incombat_escape_break_suspend");
-				spdlog::info("[TFD][Captive][R271A] native captive role apply suspended for captive threat overlay actor={:08X} overlay={} phaseEscape={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} primary={} removed={} reason={}",
+				const char* overlayName = "CaptiveThreatOverlay";
+				const char* suspendReason = "captive_runtime_tick_threat_overlay_suspend";
+				if (bleedoutEscapeBreak) {
+					overlayName = "BleedoutEscapeBreak";
+					suspendReason = "captive_runtime_tick_bleedout_escape_break_suspend";
+				}
+				else if (inCombatEscapeBreak) {
+					overlayName = "InCombatEscapeBreak";
+					suspendReason = "captive_runtime_tick_incombat_escape_break_suspend";
+				}
+				else if (escapeFailedPlayerBleedout) {
+					overlayName = "EscapeFailedPlayerBleedout";
+					suspendReason = "captive_runtime_tick_escape_failed_bleedout_suspend";
+				}
+				else if (g_recaptureCommitActive) {
+					overlayName = "RecaptureCommit";
+					suspendReason = "captive_runtime_tick_recapture_commit_suspend";
+				}
+				else if (g_escapeBleedoutActive) {
+					overlayName = "EscapeBleedoutActive";
+					suspendReason = "captive_runtime_tick_escape_bleedout_active_suspend";
+				}
+
+				const bool removed = RemoveNativeCaptorRoleFactionForActor(actor, suspendReason);
+				spdlog::info("[TFD][Captive][P32G] native captive role apply suspended for captive threat/bleed overlay actor={:08X} overlay={} phaseEscape={} hostile={} targetingPlayer={} inCombat={} weaponDrawn={} gatePlayerBleedout={} escapeBleedoutActive={} recaptureCommit={} primary={} removed={} reason={}",
 					actor->GetFormID(),
-					bleedoutEscapeBreak ? "BleedoutEscapeBreak" : "InCombatEscapeBreak",
+					overlayName,
 					phaseEscape ? 1 : 0,
 					hostile ? 1 : 0,
 					targetingPlayer ? 1 : 0,
 					inCombat ? 1 : 0,
 					weaponDrawn ? 1 : 0,
+					snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout ? 1 : 0,
+					g_escapeBleedoutActive ? 1 : 0,
+					g_recaptureCommitActive ? 1 : 0,
 					primaryEscapeBreak ? 1 : 0,
 					removed ? 1 : 0,
 					reason ? reason : "unknown");
@@ -3817,18 +3952,20 @@ namespace TFD::Captive
 		const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
 		const float pct = (hpNow / hpMax) * 100.0f;
 		const float thresh = TFD::Settings::GetDefeatThresholdPct();
-		if (pct > thresh) {
+		const bool pendingOverkillRoute = TFD::PlayerDownRouter::HasPendingOverkillRoute();
+		if (pct > thresh && !pendingOverkillRoute) {
 			return false;
 		}
 
-		RE::Actor* preferred = handlers.resolveAggressor ? handlers.resolveAggressor() : nullptr;
-		if (!preferred && handlers.findBestAggressor) {
-			const float reacquireRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
-			preferred = handlers.findBestAggressor(reacquireRadius);
-		}
+		const auto preferredResult = ResolveEscapeBreakPreferred(player, pendingOverkillRoute, handlers);
+		RE::Actor* preferred = preferredResult.actor;
 
-		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, "escape_broken_threshold");
+		const char* breakReason = pendingOverkillRoute ? "escape_broken_overkill_pending" : "escape_broken_threshold";
+		(void)TFD::FlowController::Controller::GetSingleton().ResolveCaptiveOutcome(TFD::FlowController::CaptiveOutcome::EscapeFailed, preferred ? preferred->GetFormID() : 0u, breakReason);
 		QueueEscapeBreakRebleed(preferred);
+		if (pendingOverkillRoute) {
+			TFD::PlayerDownRouter::ClearPendingOverkillRoute("captive_escape_rebleed");
+		}
 		g_escapeBleedoutActive = true;
 		ResetLockpickWatch();
 		if (handlers.clearLastAggressor) {
@@ -3837,7 +3974,15 @@ namespace TFD::Captive
 		if (handlers.updatePreCombatState) {
 			handlers.updatePreCombatState();
 		}
-		spdlog::info("[TFD][Captive] Escape broken by defeat threshold pct={:.1f} thresh={:.1f} -> escape-bleedout active, schedule rebleed preferred={:08X}", pct, thresh, preferred ? preferred->GetFormID() : 0);
+		spdlog::info(
+			"[TFD][Captive][P32Q] Escape broken by {} pct={:.1f} thresh={:.1f} pendingOverkill={} -> escape-bleedout active, schedule rebleed preferred={:08X} source={} dist={:.1f}",
+			breakReason,
+			pct,
+			thresh,
+			pendingOverkillRoute ? 1 : 0,
+			preferred ? preferred->GetFormID() : 0u,
+			preferredResult.source ? preferredResult.source : "none",
+			preferredResult.distance);
 		return true;
 	}
 

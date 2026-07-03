@@ -1,5 +1,6 @@
 #include "TFDRescueGreet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -22,6 +23,7 @@ namespace TFD::RescueGreet
 {
 	namespace
 	{
+		using Clock = std::chrono::steady_clock;
 		constexpr RE::FormID kRescueGreetInfoLocalFormID = 0x0006FEB0;
 		constexpr RE::FormID kSaviorFactionLocalFormID = 0x0006FEB1;
 		constexpr std::string_view kPluginName{ "TFDEngine.esp" };
@@ -30,6 +32,8 @@ namespace TFD::RescueGreet
 		constexpr int kRescueHardOpenMaxAttempts = 12;
 		constexpr int kRescueHardOpenRetryDelayMs = 220;
 		constexpr int kRescueDialogueCloseRetryDelayMs = 650;
+		constexpr int kRescuePostLoadSettleDelayMs = 1400;
+		constexpr int kRescueFallbackWorldReadyDelayMs = 2200;
 
 		struct RuntimeState
 		{
@@ -39,6 +43,8 @@ namespace TFD::RescueGreet
 			bool worldReadySeen = false;
 			bool exhausted = false;
 			int attempts = 0;
+			Clock::time_point armedAt{};
+			Clock::time_point worldReadyAt{};
 			std::string source{};
 			std::string reason{};
 		};
@@ -56,6 +62,8 @@ namespace TFD::RescueGreet
 			g_runtime.worldReadySeen = false;
 			g_runtime.exhausted = false;
 			g_runtime.attempts = 0;
+			g_runtime.armedAt = {};
+			g_runtime.worldReadyAt = {};
 			g_runtime.source.clear();
 			g_runtime.reason.clear();
 		}
@@ -64,6 +72,43 @@ namespace TFD::RescueGreet
 		{
 			auto* ui = RE::UI::GetSingleton();
 			return ui && ui->IsMenuOpen(RE::DialogueMenu::MENU_NAME);
+		}
+
+		bool IsRescueCommitted()
+		{
+			return TFD::ForceGreetState::IsRescueCommitted();
+		}
+
+		void ClearSaviorFactionToken(const char* reason);
+
+		const char* StateName(State state)
+		{
+			switch (state) {
+			case State::PostTeleportPending:
+				return "PostTeleportPending";
+			case State::Armed:
+				return "Armed";
+			case State::Running:
+				return "Running";
+			default:
+				return "Idle";
+			}
+		}
+
+		void StopNativeRetryAfterCommitted(const char* reason)
+		{
+			const auto formID = g_speakerFormID.exchange(0, std::memory_order_acq_rel);
+			const auto state = g_state.exchange(State::Idle, std::memory_order_acq_rel);
+			ClearSaviorFactionToken(reason ? reason : "rescue_committed_stop_retry");
+			ResetRuntime(reason ? reason : "rescue_committed_stop_retry");
+
+			if (state != State::Idle || formID != 0) {
+				spdlog::info(
+					"[TFD][RescueGreet][P32X] native retry stopped after committed speaker={:08X} state={} reason={}",
+					formID,
+					StateName(state),
+					reason ? reason : "rescue_committed_stop_retry");
+			}
 		}
 
 		bool IsLoadingOrMainMenuOpen()
@@ -80,6 +125,42 @@ namespace TFD::RescueGreet
 
 			auto* player = RE::PlayerCharacter::GetSingleton();
 			return player && player->GetParentCell();
+		}
+
+		bool IsPostTeleportOpenSettleReady(int& outDelayMs)
+		{
+			outDelayMs = 0;
+
+			if (g_state.load(std::memory_order_acquire) != State::PostTeleportPending) {
+				return true;
+			}
+
+			const auto now = Clock::now();
+			std::chrono::milliseconds remaining{ 0 };
+			{
+				std::scoped_lock lk(g_runtime.lock);
+				if (g_runtime.worldReadySeen && g_runtime.worldReadyAt.time_since_epoch().count() != 0) {
+					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_runtime.worldReadyAt);
+					remaining = std::chrono::milliseconds(kRescuePostLoadSettleDelayMs) - elapsed;
+				}
+				else if (g_runtime.armedAt.time_since_epoch().count() != 0) {
+					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - g_runtime.armedAt);
+					remaining = std::chrono::milliseconds(kRescueFallbackWorldReadyDelayMs) - elapsed;
+				}
+				else {
+					remaining = std::chrono::milliseconds(kRescuePostLoadSettleDelayMs);
+				}
+			}
+
+			if (remaining.count() > 0) {
+				outDelayMs = static_cast<int>(std::clamp<long long>(
+					remaining.count(),
+					static_cast<long long>(kRescueHardOpenRetryDelayMs),
+					static_cast<long long>(kRescueFallbackWorldReadyDelayMs)));
+				return false;
+			}
+
+			return true;
 		}
 
 		bool IsRetryExhausted()
@@ -263,7 +344,6 @@ namespace TFD::RescueGreet
 				speaker->MoveTo(player);
 				speaker->SetPosition(pos, true);
 				moved = true;
-				std::this_thread::sleep_for(std::chrono::milliseconds(60));
 			}
 
 			speaker->EvaluatePackage(false, true);
@@ -309,6 +389,11 @@ namespace TFD::RescueGreet
 
 		bool TryPostTeleportHardOpen(RE::Actor* speaker, const char* reason)
 		{
+			if (IsRescueCommitted()) {
+				StopNativeRetryAfterCommitted(reason ? reason : "hard_open_committed_guard");
+				return false;
+			}
+
 			if (!speaker || !IsValidSavior(speaker)) {
 				spdlog::warn(
 					"[TFD][RescueGreet][R36D] post-load hard-open rejected invalid speaker={:08X} reason={}",
@@ -331,6 +416,17 @@ namespace TFD::RescueGreet
 					speaker->GetFormID(),
 					reason ? reason : "rescue_hard_open");
 				QueueRetryTask("world_not_ready_retry_r36d", kRescueHardOpenRetryDelayMs);
+				return false;
+			}
+
+			int postLoadSettleDelayMs = 0;
+			if (!IsPostTeleportOpenSettleReady(postLoadSettleDelayMs)) {
+				spdlog::info(
+					"[TFD][RescueGreet][P33H] post-load hard-open held for world settle speaker={:08X} delayMs={} reason={}",
+					speaker->GetFormID(),
+					postLoadSettleDelayMs,
+					reason ? reason : "rescue_hard_open");
+				QueueRetryTask("post_load_world_settle_retry_p33h", postLoadSettleDelayMs);
 				return false;
 			}
 
@@ -373,6 +469,11 @@ namespace TFD::RescueGreet
 					"[TFD][RescueGreet][R36D] world ready -> assign Savior speaker={:08X} reason={}",
 					speaker->GetFormID(),
 					reason ? reason : "rescue_hard_open");
+			}
+
+			if (IsRescueCommitted()) {
+				StopNativeRetryAfterCommitted(reason ? reason : "hard_open_late_committed_guard");
+				return false;
 			}
 
 			ApplyExclusiveSaviorFactionToken(speaker, reason ? reason : "rescue_hard_open");
@@ -430,7 +531,7 @@ namespace TFD::RescueGreet
 			return;
 		}
 
-		spdlog::info("[TFD][RescueGreet][R36D] Install post-teleport owned hard-open path + auto retry lock");
+		spdlog::info("[TFD][RescueGreet][R36D] Install post-teleport owned hard-open path + auto retry lock + P33H world-settle gate");
 	}
 
 	void ResetRuntime(const char* reason)
@@ -462,6 +563,7 @@ namespace TFD::RescueGreet
 		{
 			std::scoped_lock lk(g_runtime.lock);
 			ResetRuntimeLocked();
+			g_runtime.armedAt = Clock::now();
 			g_runtime.source = source ? source : "unknown";
 			g_runtime.reason = reason ? reason : "rescue_post_teleport";
 		}
@@ -499,6 +601,7 @@ namespace TFD::RescueGreet
 		{
 			std::scoped_lock lk(g_runtime.lock);
 			g_runtime.worldReadySeen = true;
+			g_runtime.worldReadyAt = Clock::now();
 		}
 
 		spdlog::info(
@@ -513,6 +616,11 @@ namespace TFD::RescueGreet
 	{
 		const auto state = g_state.load(std::memory_order_acquire);
 		if (state == State::Idle) {
+			return false;
+		}
+
+		if (IsRescueCommitted()) {
+			StopNativeRetryAfterCommitted(reason ? reason : "retry_committed_guard");
 			return false;
 		}
 
@@ -574,6 +682,11 @@ namespace TFD::RescueGreet
 	{
 		const auto state = g_state.load(std::memory_order_acquire);
 		if (state == State::Idle) {
+			return;
+		}
+
+		if (IsRescueCommitted()) {
+			StopNativeRetryAfterCommitted(opening ? "dialogue_open_event_committed_guard" : "dialogue_closed_committed_guard");
 			return;
 		}
 

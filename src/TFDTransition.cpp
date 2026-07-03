@@ -351,6 +351,59 @@ namespace TFD::Transition
 			return best;
 		}
 
+
+		static RE::Actor* ResolveStandingPlayerSideSaviorFromSnapshot(const RuntimeHandlers& handlers, float radius)
+		{
+			auto* player = ResolvePlayer(handlers);
+			if (!player) {
+				return nullptr;
+			}
+
+			TFD::Actor::ScanOptions options{};
+			options.radius = radius > 0.0f ? (std::max)(radius, 5000.0f) : 5000.0f;
+			options.npcOnly = false;
+			auto snapshot = TFD::Actor::BuildSnapshot(player, options);
+			auto playerSide = TFD::Actor::ResolveStandingPlayerSideActors(snapshot, false);
+
+			RE::Actor* best = nullptr;
+			float bestDist = std::numeric_limits<float>::max();
+			for (auto* actor : playerSide) {
+				if (!actor || actor == player || actor->IsDead() || actor->IsDisabled()) {
+					continue;
+				}
+				if (!actor->HasKeywordString("ActorTypeNPC")) {
+					continue;
+				}
+
+				const bool validTeammate =
+					IsActiveFollowerActor(handlers, actor) ||
+					TFD::TeammateManager::IsPlayerSideTeammateActor(actor) ||
+					TFD::TeammateManager::IsTFDManagedTeammateActor(actor) ||
+					IsStandingAllyThresholdActor(handlers, actor);
+				if (!validTeammate) {
+					continue;
+				}
+
+				const float dist = Distance3D(actor->GetPosition(), player->GetPosition());
+				if (radius > 0.0f && dist > (std::max)(radius, 5000.0f)) {
+					continue;
+				}
+				if (dist < bestDist) {
+					bestDist = dist;
+					best = actor;
+				}
+			}
+
+			if (best) {
+				spdlog::info(
+					"[TFD][Transition][P33L] standing player-side Savior selected actor={:08X} dist={:.1f} radius={:.1f}",
+					best->GetFormID(),
+					bestDist,
+					options.radius);
+			}
+			return best;
+		}
+
 		static RE::AlchemyItem* ResolveRecoveryPotionCandidate()
 		{
 			auto* player = RE::PlayerCharacter::GetSingleton();
@@ -1267,10 +1320,22 @@ namespace TFD::Transition
 
 		const float followerRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius() + 400.0f);
 		NoMarkerFallbackCandidates candidates{};
-		candidates.savior = ResolveBestHumanoidSavior(handlers, followerRadius);
 		auto followers = ResolveFollowerCandidates(handlers, followerRadius);
 		candidates.standingFollower = followers.standing;
 		candidates.downedFollower = followers.downed;
+		candidates.savior = ResolveBestHumanoidSavior(handlers, followerRadius);
+		if (!candidates.savior && candidates.standingFollower) {
+			candidates.savior = candidates.standingFollower;
+			spdlog::info(
+				"[TFD][Transition][P33L] standing follower promoted to Savior actor={:08X} reason=registered_teammate",
+				candidates.savior->GetFormID());
+		}
+		if (!candidates.savior) {
+			candidates.savior = ResolveStandingPlayerSideSaviorFromSnapshot(handlers, followerRadius);
+			if (candidates.savior && !candidates.standingFollower) {
+				candidates.standingFollower = candidates.savior;
+			}
+		}
 		candidates.cachedRescueDestination = ResolveCachedRescueDestinationForFallback(handlers);
 		candidates.recoveryPotion = ResolveRecoveryPotionCandidate();
 
@@ -1284,11 +1349,19 @@ namespace TFD::Transition
 		const auto resolution = TFD::FlowController::EvaluateNonCaptiveFallback(input);
 
 		switch (resolution) {
-		case TFD::FlowController::NonCaptiveFallbackResolution::RescueCached:
+		case TFD::FlowController::NonCaptiveFallbackResolution::RescueCached: {
 			g_fallback.branch = FallbackBranch::RescueCached;
-			g_fallback.follower = candidates.savior ? candidates.savior->GetHandle() : RE::ActorHandle{};
+			RE::Actor* follower = candidates.savior ? candidates.savior : candidates.standingFollower;
+			g_fallback.follower = follower ? follower->GetHandle() : RE::ActorHandle{};
 			g_fallback.destination = candidates.cachedRescueDestination ? candidates.cachedRescueDestination->GetHandle() : RE::ObjectRefHandle{};
+			if (follower) {
+				spdlog::info(
+					"[TFD][Transition][P33L] RescueCached Savior follower locked actor={:08X} source={}",
+					follower->GetFormID(),
+					(candidates.savior == follower) ? "savior_priority" : "standing_follower");
+			}
 			break;
+		}
 		case TFD::FlowController::NonCaptiveFallbackResolution::RecoveryFollower: {
 			g_fallback.branch = FallbackBranch::RecoveryFollower;
 			RE::Actor* follower = candidates.savior ? candidates.savior : candidates.standingFollower;
@@ -1595,16 +1668,26 @@ namespace TFD::Transition
 		if (handlers.setRescueStateValue) {
 			handlers.setRescueStateValue(0);
 		}
-		return BeginImmediate(
-			Kind::Rescue,
+
+		// P33G: Rescue/Savior is a phase-based flow, not an immediate dialogue
+		// transaction.  The old BeginImmediate path blocked the game thread around
+		// MoveTo with synthetic fader sleeps, then continued as if teleport/loading
+		// had already settled.  That violates the Rescue contract:
+		//   battle observe win -> rescue marker teleport/loading -> post-load FG.
+		// Execute only the rescue transition request here and let LoadingMenu closed /
+		// RescueGreet::NotifyWorldReady own the post-teleport hard-open.
+		ClearPendingFadeIn();
+		if (QueueRequest(Kind::Rescue, false, reason)) {
+			return true;
+		}
+
+		spdlog::info("[TFD][Transition][P33G] rescue transition executing without blocking fader sleeps reason={}",
+			reason ? reason : "rescue_transition");
+		return TFD::Rescue::ExecuteResolvedBranch(
+			BuildRescueStateFromFallback(),
 			reason,
-			[&](const char* why) {
-				return TFD::Rescue::ExecuteResolvedBranch(
-					BuildRescueStateFromFallback(),
-					why,
-					BuildRescueHandlers(handlers),
-					[](FallbackBranch branch) { return GetBranchName(branch); });
-			});
+			BuildRescueHandlers(handlers),
+			[](FallbackBranch branch) { return GetBranchName(branch); });
 	}
 
 	void BeginRecoverTransition(const char* reason, const RuntimeHandlers& handlers)

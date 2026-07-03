@@ -2,6 +2,7 @@
 #include "TFDActor.h"
 #include "TFDCombatBehavior.h"
 #include "TFDTransition.h"
+#include "TFDVictory.h"
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
@@ -24,6 +25,7 @@
 #include <mutex>
 
 #include "TFDFlowController.h"
+#include "TFDForceGreetState.h"
 #include "TFDDefeatMonitor.h"
 #include "TFDSettings.h"
 #include "TFDHostilityController.h"
@@ -114,6 +116,18 @@ namespace TFD::Bleedout
 				snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
 				(snapshot.sub == TFD::FlowController::SubFlow::EscapeAttempt ||
 					snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
+					snapshot.sub == TFD::FlowController::SubFlow::Recapture);
+		}
+
+		bool IsCaptiveEscapeBleedoutRetryAllowed()
+		{
+			if (TFD::Captive::IsEscapeBleedoutActive()) {
+				return true;
+			}
+			const auto snapshot = TFD::FlowController::Controller::GetSingleton().GetSnapshot();
+			return snapshot.root == TFD::FlowController::RootFlow::Captive &&
+				snapshot.gate == TFD::FlowController::DecisionGate::PlayerBleedout &&
+				(snapshot.sub == TFD::FlowController::SubFlow::EscapeFailed ||
 					snapshot.sub == TFD::FlowController::SubFlow::Recapture);
 		}
 
@@ -765,7 +779,7 @@ namespace TFD::Bleedout
 				return;
 			}
 
-			auto ids = g_bleedoutDialogueFactionActorIds;
+			const std::vector<std::uint32_t> ids = g_bleedoutDialogueFactionActorIds;
 			g_bleedoutDialogueFactionActorIds.clear();
 			std::uint32_t removedCount = 0;
 			for (const auto actorId : ids) {
@@ -793,7 +807,7 @@ namespace TFD::Bleedout
 				return;
 			}
 
-			auto ids = g_bleedoutDialogueFactionActorIds;
+			const std::vector<std::uint32_t> ids = g_bleedoutDialogueFactionActorIds;
 			g_bleedoutDialogueFactionActorIds.clear();
 			std::uint32_t removedBleedoutCount = 0;
 			for (const auto actorId : ids) {
@@ -1655,7 +1669,12 @@ namespace TFD::Bleedout
 			return false;
 		}
 		if (handlers.isCaptiveEscapePhase && handlers.isCaptiveEscapePhase()) {
-			return false;
+			const bool allowCaptiveBleedoutRetry = IsCaptiveEscapeBleedoutRetryAllowed();
+			if (!allowCaptiveBleedoutRetry) {
+				spdlog::info("[TFD][Bleedout][P32S] bleed hotkey blocked by active captive escape phase");
+				return false;
+			}
+			spdlog::info("[TFD][Bleedout][P32S] bleed hotkey allowed during captive escape bleedout retry");
 		}
 		if (handlers.isDialogueOpen && handlers.isDialogueOpen()) {
 			return false;
@@ -3624,9 +3643,14 @@ namespace TFD::Bleedout
 
 	bool BeginWindow(RE::Actor* speaker, const char* reason)
 	{
+		const auto speakerFormID = ActorFormID(speaker);
+		const char* why = reason ? reason : "bleed_window_start";
+		TFD::ForceGreetState::ResetBleedout();
+		spdlog::info("[TFD][Bleedout][P32L] BleedoutFGState reset for new window actor={:08X} reason={}", speakerFormID, why);
+
 		auto& flow = TFD::FlowController::Controller::GetSingleton();
-		const bool ok = flow.BeginPlayerBleedoutDecision(ActorFormID(speaker), reason ? reason : "bleed_window_start");
-		spdlog::info("[TFD][Bleedout] BeginWindow actor={:08X} ok={} reason={}", ActorFormID(speaker), ok ? 1 : 0, reason ? reason : "bleed_window_start");
+		const bool ok = flow.BeginPlayerBleedoutDecision(speakerFormID, why);
+		spdlog::info("[TFD][Bleedout] BeginWindow actor={:08X} ok={} reason={}", speakerFormID, ok ? 1 : 0, why);
 		return ok;
 	}
 
@@ -4375,6 +4399,8 @@ namespace TFD::Bleedout
 		return true;
 	}
 
+	float RuntimeBattleObserveMinSideDistSq(RE::Actor* actor, RE::Actor* player, const std::vector<RE::Actor*>& followers);
+
 	bool IsRuntimeBattleObserveBlockingEnemy(
 		RE::Actor* actor,
 		RE::Actor* player,
@@ -4392,11 +4418,12 @@ namespace TFD::Bleedout
 			return false;
 		}
 
-		// R15: CombatBehavior threat marks are hard proof only after the player side is gone.
-		// While a standing follower/teammate still exists, a stale CB threat marker must not
-		// block Rescue forever once the enemy has no target/combat posture anymore.
-		// Real pressure below is still counted through current target, hostility, combat,
-		// or weapon posture.
+		// R15/P33L: CombatBehavior threat marks are hard proof after the player side is gone,
+		// and they are also a temporary win-blocker while standing followers remain.
+		// Otherwise TFD can suppress an enemy off the downed player, erase its target/combat
+		// posture, then immediately misread that same standing enemy as defeated and teleport
+		// Rescue while combatants are still upright. The mark is still TTL-owned by
+		// CombatBehavior; once it clears, this guard naturally stops blocking.
 		const bool combatBehaviorThreat = IsCombatBehaviorMarkedBleedoutThreat(actor);
 		if (combatBehaviorThreat && followers.empty()) {
 			return true;
@@ -4422,6 +4449,12 @@ namespace TFD::Bleedout
 		}
 
 		if (targetsPlayerSide) {
+			return true;
+		}
+
+		constexpr float kCombatBehaviorWinBlockRadius = 5200.0f;
+		if (combatBehaviorThreat && !followers.empty() &&
+			RuntimeBattleObserveMinSideDistSq(actor, player, followers) <= kCombatBehaviorWinBlockRadius) {
 			return true;
 		}
 
@@ -4622,13 +4655,19 @@ namespace TFD::Bleedout
 			return false;
 		}
 
+		constexpr float kDirectThreatProofRadius = 5200.0f;
+		const float sideDistSq = RuntimeBattleObserveMinSideDistSq(actor, player, followers);
+		const bool combatBehaviorThreat = IsCombatBehaviorMarkedBleedoutThreat(actor);
+		if (combatBehaviorThreat && sideDistSq <= kDirectThreatProofRadius) {
+			return true;
+		}
+
 		const bool combatPosture = actor->IsInCombat() || actor->IsWeaponDrawn();
 		if (!combatPosture) {
 			return false;
 		}
 
-		constexpr float kDirectThreatProofRadius = 5200.0f;
-		return RuntimeBattleObserveMinSideDistSq(actor, player, followers) <= kDirectThreatProofRadius;
+		return sideDistSq <= kDirectThreatProofRadius;
 	}
 
 	std::uint32_t MergeRuntimeBattleObserveDirectThreatsFromSnapshot(
@@ -4701,11 +4740,18 @@ namespace TFD::Bleedout
 		if (!IsRuntimeBattleObserveStandingActor(actor, player)) {
 			return false;
 		}
-		// R15: a CombatBehavior threat marker alone is not active pressure while
-		// a standing player-side actor still exists. Otherwise stale retarget/CB
-		// faction TTL can keep battle observe alive even when activeHostile=0.
+		// R15/P33L: the marker alone remains hard proof with no allies, and while
+		// allies are standing it must still block immediate player-side win if the
+		// marked enemy is still local. TFD just suppressed this target off the downed
+		// player, so target/combat posture may be empty by design, not because the
+		// enemy has been defeated.
 		const bool combatBehaviorThreat = IsCombatBehaviorMarkedBleedoutThreat(actor);
 		if (combatBehaviorThreat && followers.empty()) {
+			return true;
+		}
+		constexpr float kCombatBehaviorActiveThreatRadius = 5200.0f;
+		if (combatBehaviorThreat && !followers.empty() &&
+			RuntimeBattleObserveMinSideDistSq(actor, player, followers) <= kCombatBehaviorActiveThreatRadius) {
 			return true;
 		}
 
@@ -5032,6 +5078,17 @@ namespace TFD::Bleedout
 			}
 		}
 
+		if (const auto victoryVisualPending = TFD::Victory::FindPendingEnemyVisualEntry(player, radius); victoryVisualPending != 0) {
+			if (state.bleedBattleObservePendingEmptyEnemyTicks) *state.bleedBattleObservePendingEmptyEnemyTicks = 0;
+			ExtendRuntimeBattleObserveHold(state, now, std::chrono::milliseconds(550));
+			spdlog::info(
+				"[TFD][Bleedout][P33M] pending player-side win held reason=victory_visual_pending actor={:08X} followers={} enemies={} activeEnemies=0",
+				victoryVisualPending,
+				static_cast<unsigned int>(followers.size()),
+				static_cast<unsigned int>(enemies.size()));
+			return;
+		}
+
 		if (auto* blockingThreat = ResolveRuntimeBattleObserveDirectBlockingThreat(
 				player,
 				radius,
@@ -5122,6 +5179,16 @@ namespace TFD::Bleedout
 			if (emptyEnemyTicks < 4) {
 				return;
 			}
+			if (const auto victoryVisualPending = TFD::Victory::FindPendingEnemyVisualEntry(player, radius); victoryVisualPending != 0) {
+				if (state.bleedBattleObserveActiveEmptyEnemyTicks) *state.bleedBattleObserveActiveEmptyEnemyTicks = 0;
+				spdlog::info(
+					"[TFD][Bleedout][P33M] active player-side win held reason=victory_visual_pending actor={:08X} followers={} enemies={} activeEnemies=0",
+					victoryVisualPending,
+					static_cast<unsigned int>(followers.size()),
+					static_cast<unsigned int>(enemies.size()));
+				return;
+			}
+
 			if (auto* blockingThreat = ResolveRuntimeBattleObserveDirectBlockingThreat(
 					player,
 					radius,
@@ -5170,10 +5237,17 @@ namespace TFD::Bleedout
 		const float hpMax = (std::max)(1.0f, player->GetPermanentActorValue(RE::ActorValue::kHealth));
 		const float pct = (hpNow / hpMax) * 100.0f;
 		const float thresh = TFD::Settings::GetDefeatThresholdPct();
-		if (pct > thresh) {
+		const bool captiveEscapeRebleed = IsCaptiveEscapeRebleedFlow() || TFD::Captive::IsEscapeBleedoutActive();
+		if (pct > thresh && !captiveEscapeRebleed) {
 			setPending(false);
-			spdlog::info("[TFD][Bleedout] pending escape-break rebleed canceled pct={:.1f} thresh={:.1f}", pct, thresh);
+			if (handlers.setPlayerBleedImmune) {
+				handlers.setPlayerBleedImmune(false);
+			}
+			spdlog::info("[TFD][Bleedout][P32N] pending escape-break rebleed canceled pct={:.1f} thresh={:.1f} captiveEscapeRebleed=0", pct, thresh);
 			return false;
+		}
+		if (pct > thresh && captiveEscapeRebleed) {
+			spdlog::warn("[TFD][Bleedout][P32N] pending escape-break rebleed forced despite high HP pct={:.1f} thresh={:.1f} reason=captive_escape_killmove_or_overkill_veto", pct, thresh);
 		}
 		const float scanRadius = (std::max)(2400.0f, TFD::Settings::GetSweepRadius());
 		if (handlers.clearEnemyTargetsToPlayerForDefeat) handlers.clearEnemyTargetsToPlayerForDefeat(player, scanRadius, "escape_break_rebleed");
@@ -5196,6 +5270,30 @@ namespace TFD::Bleedout
 		return true;
 	}
 
+	bool ShouldLogSpeakerPrimeRetrySkip(std::uint32_t speakerFormID, std::string_view reason)
+	{
+		static std::mutex s_lock;
+		static std::uint32_t s_lastSpeakerFormID = 0;
+		static std::string s_lastReason{};
+		static Clock::time_point s_lastLog{};
+
+		const auto now = Clock::now();
+		const std::string reasonText(reason);
+		std::scoped_lock lk(s_lock);
+		const bool sameContext =
+			s_lastSpeakerFormID == speakerFormID &&
+			s_lastReason == reasonText;
+		if (sameContext && s_lastLog.time_since_epoch().count() != 0 &&
+			std::chrono::duration_cast<std::chrono::milliseconds>(now - s_lastLog).count() < 5000) {
+			return false;
+		}
+
+		s_lastSpeakerFormID = speakerFormID;
+		s_lastReason = reasonText;
+		s_lastLog = now;
+		return true;
+	}
+
 	void MaintainRuntimeSpeakerKick(RuntimeHostStateRefs state, RE::Actor* player, const RuntimeHostHandlers& handlers)
 	{
 		if (!state.inBleedState || !state.inBleedState->load(std::memory_order_acquire)) return;
@@ -5206,19 +5304,26 @@ namespace TFD::Bleedout
 			TFD::InteractionRouter::DialogueOpen::Mode::Bleedout,
 			*state.bleedSpeakerId);
 		if (TFD::BleedoutGreet::HasSeenDialogue()) {
-			spdlog::info("[TFD][Bleedout][CB07] speaker prime retry skipped reason=dialogue_menu_seen speaker={:08X}", *state.bleedSpeakerId);
+			if (ShouldLogSpeakerPrimeRetrySkip(*state.bleedSpeakerId, "dialogue_menu_seen")) {
+				spdlog::info("[TFD][Bleedout][P32I] speaker prime retry skipped reason=dialogue_menu_seen speaker={:08X}", *state.bleedSpeakerId);
+			}
 			return;
 		}
 		if (nativeOpenSucceeded) {
 			// CB07: once the native forcegreet handoff reports success, stop overdrive
 			// retries. The Papyrus ack can arrive late, and reopening here causes the
-			// visible double-forcegreet/reopen loop.
-			spdlog::info("[TFD][Bleedout][CB07] speaker prime retry skipped reason=native_open_succeeded_awaiting_ack speaker={:08X}", *state.bleedSpeakerId);
+			// visible double-forcegreet/reopen loop. P32I only throttles this skip log;
+			// it does not change cancel-vs-commit reopen semantics.
+			if (ShouldLogSpeakerPrimeRetrySkip(*state.bleedSpeakerId, "native_open_succeeded_awaiting_ack")) {
+				spdlog::info("[TFD][Bleedout][P32I] speaker prime retry skipped reason=native_open_succeeded_awaiting_ack speaker={:08X}", *state.bleedSpeakerId);
+			}
 			return;
 		}
 		if (TFD::InteractionRouter::DialogueOpen::IsActive() &&
 			TFD::InteractionRouter::DialogueOpen::GetMode() == TFD::InteractionRouter::DialogueOpen::Mode::Bleedout) {
-			spdlog::info("[TFD][Bleedout][CB07] speaker prime retry skipped reason=native_open_pending speaker={:08X}", *state.bleedSpeakerId);
+			if (ShouldLogSpeakerPrimeRetrySkip(*state.bleedSpeakerId, "native_open_pending")) {
+				spdlog::info("[TFD][Bleedout][P32I] speaker prime retry skipped reason=native_open_pending speaker={:08X}", *state.bleedSpeakerId);
+			}
 			return;
 		}
 		if (TFD::BleedoutGreet::HasFlowGreetConfirmed()) {

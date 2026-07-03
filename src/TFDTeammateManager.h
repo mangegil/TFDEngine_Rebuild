@@ -1,12 +1,18 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <vector>
 
 namespace RE
 {
     class Actor;
+}
+
+namespace SKSE
+{
+    class SerializationInterface;
 }
 
 namespace TFD::TeammateManager
@@ -35,6 +41,10 @@ namespace TFD::TeammateManager
     bool RegisterOrRefreshTeammateNowImmediatePackage(RE::Actor* actor, const char* reason = nullptr);
     bool RegisterOrRefreshTeammateNowDeferredPackage(RE::Actor* actor, const char* reason = nullptr);
     void QueueHumanoidTeammateCatchupAfterLoad(const char* reason = nullptr);
+    void ResetHumanoidContractTransientForLoad(const char* reason = nullptr);
+    void ClearHumanoidContractStateForLoad(const char* reason = nullptr);
+    bool SaveHumanoidContractState(SKSE::SerializationInterface* intfc);
+    bool LoadHumanoidContractState(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length);
 
     void ArmVictoryRecruitVisualRefreshHold(RE::Actor* actor, double seconds = 3.0, const char* reason = nullptr);
     bool IsVictoryRecruitVisualRefreshHoldActor(RE::Actor* actor);

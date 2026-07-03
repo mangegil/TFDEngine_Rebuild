@@ -214,7 +214,9 @@ namespace TFD::Rescue
 		}
 
 		player->MoveTo(dest);
-		std::this_thread::sleep_for(std::chrono::milliseconds(120));
+		spdlog::info("[TFD][Rescue][P33G] MoveTo rescue destination requested without blocking sleep dest={:08X} reason={}",
+			dest ? dest->GetFormID() : 0u,
+			reason ? reason : "rescue_transition");
 		if (handlers.recoverPlayerForTransition) {
 			handlers.recoverPlayerForTransition();
 		}

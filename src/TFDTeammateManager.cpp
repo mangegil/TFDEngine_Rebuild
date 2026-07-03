@@ -5,6 +5,7 @@
 
 #include <RE/Skyrim.h>
 #include <SKSE/SKSE.h>
+#include <SKSE/Interfaces.h>
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -400,7 +401,8 @@ namespace
         constexpr std::uint32_t kDeferredHumanoidAssignMaxAttempts = 30;
         constexpr double kContractExpiryRetryBlockedSeconds = 8.0;
         constexpr double kContractExpiryRetryFailedSeconds = 12.0;
-        constexpr double kContractExpiryRetryAfterOpenSeconds = 45.0;
+        constexpr double kContractExpiryRetryAfterOpenSeconds = 4.0; // P48A: expired contract forcegreet must reopen until decision
+        constexpr double kContractExpiryResolveRetrySeconds = 4.0;
         constexpr double kContractExpiryPackageGraceSeconds = 0.0; // R66: native opens expired teammate dialogue immediately; CK package must not win first frame
         constexpr double kContractExpiryPleasureHoldMaxSeconds = 300.0;
         constexpr double kContractExpiryPleasureHoldLogIntervalSeconds = 5.0;
@@ -513,6 +515,43 @@ namespace
                 return true;
             }
             return false;
+        }
+
+        bool RemoveFollowerAnchorFactionsUnsafe(RE::Actor* actor, const char* reason)
+        {
+            ResolveRegistry();
+            if (!actor || actor == Player()) {
+                return false;
+            }
+
+            const bool currentBefore = g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction);
+            const bool playerBefore = g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction);
+            bool changed = false;
+
+            if (currentBefore) {
+                actor->RemoveFromFaction(g_registry.currentFollowerFaction);
+                changed = true;
+            }
+            if (playerBefore) {
+                actor->RemoveFromFaction(g_registry.playerFollowerFaction);
+                changed = true;
+            }
+
+            if (changed) {
+                const bool currentAfter = g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction);
+                const bool playerAfter = g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction);
+                spdlog::info(
+                    "[TFD][TeammateManager][P49A] follower anchor factions removed actor={:08X} reason={} currentBefore={} currentAfter={} playerBefore={} playerAfter={} playerTeammate={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown",
+                    currentBefore ? 1 : 0,
+                    currentAfter ? 1 : 0,
+                    playerBefore ? 1 : 0,
+                    playerAfter ? 1 : 0,
+                    actor->IsPlayerTeammate() ? 1 : 0);
+            }
+
+            return changed;
         }
 
         bool IsActorInExpiredAliasUnsafe(RE::Actor* actor)
@@ -967,6 +1006,9 @@ namespace
         void WriteAlias(RE::BGSRefAlias* alias, RE::Actor* actor);
         void RefreshRecruitCapacityGlobalsUnsafe(const char* reason);
         void ClearExpiredTeammateStatusForActorIdUnsafe(RE::FormID actorId, const char* reason);
+        bool IsContractExpiredUnsafe(RE::Actor* actor, double nowDays, double* endDayOut);
+        int FindTeammateAliasIndexForActorUnsafe(RE::Actor* actor);
+        bool ArmExpiredTeammateStatusUnsafe(RE::Actor* actor, int teammateAliasIndex, const char* reason, bool resetNativeFallbackGrace);
 
         double CurrentGameDays()
         {
@@ -1100,6 +1142,49 @@ namespace
             return reason && std::string_view(reason) == "extend_contract_pleasure";
         }
 
+        bool HasExpiredContractDecisionAuthorityUnsafe(RE::Actor* actor, const char* reason, double* endDayOut = nullptr)
+        {
+            ResolveRegistry();
+            if (!actor || actor == Player() || actor->IsDead() || actor->IsDisabled()) {
+                return false;
+            }
+            if (!IsTFDConvertedTeammate(actor)) {
+                spdlog::warn("[TFD][TeammateManager][P48A] expired contract decision rejected actor={:08X} reason={} detail=not_tfd_converted",
+                    actor ? actor->GetFormID() : 0u,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            const double nowDays = CurrentGameDays();
+            double endDay = 0.0;
+            const bool contractExpired = IsContractExpiredUnsafe(actor, nowDays, &endDay);
+            if (endDayOut) {
+                *endDayOut = endDay;
+            }
+
+            const bool activeActor = g_contractExpiryActiveActor == actorId;
+            const bool knownExpired = g_expiredContractActors.find(actorId) != g_expiredContractActors.end();
+            const bool expiredAlias = IsActorInExpiredAliasUnsafe(actor);
+            const bool expiredFaction = g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction);
+            const bool queueUnclaimedExpired = g_contractExpiryActiveActor == 0 && contractExpired;
+            const bool ok = activeActor || knownExpired || expiredAlias || expiredFaction || queueUnclaimedExpired;
+
+            if (!ok) {
+                spdlog::warn("[TFD][TeammateManager][P48A] expired contract decision rejected actor={:08X} reason={} detail=not_expired_decision_actor active={:08X} known={} alias={} faction={} contractExpired={} endDay={:.4f} nowDay={:.4f}",
+                    actorId,
+                    reason ? reason : "unknown",
+                    g_contractExpiryActiveActor,
+                    knownExpired ? 1 : 0,
+                    expiredAlias ? 1 : 0,
+                    expiredFaction ? 1 : 0,
+                    contractExpired ? 1 : 0,
+                    endDay,
+                    nowDays);
+            }
+            return ok;
+        }
+
         RE::FormID ParseFirstFormIDToken(std::string_view text)
         {
             while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
@@ -1161,7 +1246,7 @@ namespace
             g_contractExpiryPleasureHoldStartedSec = nowReal;
             g_contractExpiryPleasureHoldLastLogSec = 0.0;
 
-            spdlog::info("[TFD][TeammateManager] contract expiry queue hold begin actor={:08X} reason={} policy=wait_afterpleasure_terminal",
+            spdlog::info("[TFD][TeammateManager] contract expiry queue hold begin actor={:08X} reason={} policy=exclusive_active_actor_until_contract_decision",
                 actorId,
                 reason ? reason : "unknown");
         }
@@ -1216,6 +1301,83 @@ namespace
                 return;
             }
             EndContractExpiryPleasureHoldUnsafe(actorId, eventName ? eventName : "after_pleasure_terminal");
+        }
+
+        bool BeginContractExpiryPleasureHoldForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            double endDay = 0.0;
+            if (!HasExpiredContractDecisionAuthorityUnsafe(actor, reason ? reason : "extend_contract_pleasure_start", &endDay)) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            if (g_contractExpiryActiveActor != 0 && g_contractExpiryActiveActor != actorId) {
+                spdlog::warn("[TFD][TeammateManager][P48A] contract expiry pleasure start rejected actor={:08X} active={:08X} reason={} detail=queue_active_other_actor",
+                    actorId,
+                    g_contractExpiryActiveActor,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            int aliasIndex = g_contractExpiryActiveAliasIndex;
+            if (aliasIndex < 0 || g_contractExpiryActiveActor != actorId) {
+                aliasIndex = FindTeammateAliasIndexForActorUnsafe(actor);
+            }
+            if (aliasIndex < 0) {
+                spdlog::warn("[TFD][TeammateManager][P48A] contract expiry pleasure start rejected actor={:08X} reason={} detail=no_teammate_alias",
+                    actorId,
+                    reason ? reason : "unknown");
+                return false;
+            }
+
+            g_expiredContractActors.insert(actorId);
+            g_contractExpiryActiveActor = actorId;
+            g_contractExpiryActiveAliasIndex = aliasIndex;
+            g_contractExpiryNextAttemptSec.erase(actorId);
+            ArmExpiredTeammateStatusUnsafe(actor, aliasIndex, reason ? reason : "extend_contract_pleasure_start", false);
+            BeginContractExpiryPleasureHoldUnsafe(actorId, reason ? reason : "extend_contract_pleasure_start");
+
+            spdlog::info("[TFD][TeammateManager][P48A] contract expiry pleasure queue locked actor={:08X} slot={} endDay={:.4f} reason={} pendingActorsWillWait=1",
+                actorId,
+                aliasIndex + 1,
+                endDay,
+                reason ? reason : "unknown");
+            return true;
+        }
+
+        bool FailContractExpiryPleasureHoldForActorUnsafe(RE::Actor* actor, const char* reason)
+        {
+            if (!actor) {
+                return false;
+            }
+
+            const auto actorId = actor->GetFormID();
+            EndContractExpiryPleasureHoldUnsafe(actorId, reason ? reason : "extend_contract_pleasure_failed");
+
+            double endDay = 0.0;
+            if (!HasExpiredContractDecisionAuthorityUnsafe(actor, reason ? reason : "extend_contract_pleasure_failed", &endDay)) {
+                return false;
+            }
+
+            int aliasIndex = g_contractExpiryActiveAliasIndex;
+            if (aliasIndex < 0 || g_contractExpiryActiveActor != actorId) {
+                aliasIndex = FindTeammateAliasIndexForActorUnsafe(actor);
+            }
+            if (aliasIndex >= 0) {
+                g_contractExpiryActiveActor = actorId;
+                g_contractExpiryActiveAliasIndex = aliasIndex;
+                g_expiredContractActors.insert(actorId);
+                ArmExpiredTeammateStatusUnsafe(actor, aliasIndex, reason ? reason : "extend_contract_pleasure_failed", false);
+            }
+
+            g_contractExpiryNextAttemptSec[actorId] = NowRealSeconds() + kContractExpiryResolveRetrySeconds;
+            spdlog::info("[TFD][TeammateManager][P48A] contract expiry pleasure failed actor={:08X} slot={} endDay={:.4f} reason={} action=reopen_same_actor retry={:.1f}s",
+                actorId,
+                aliasIndex + 1,
+                endDay,
+                reason ? reason : "unknown",
+                kContractExpiryResolveRetrySeconds);
+            return true;
         }
 
         RE::TESTopicInfo* ResolveTeammateGreetTopicInfo()
@@ -1455,6 +1617,7 @@ namespace
                 return;
             }
 
+            EndContractExpiryPleasureHoldUnsafe(actorId, reason ? reason : "contract_runtime_clear");
             ClearExpiredTeammateStatusForActorIdUnsafe(actorId, reason ? reason : "contract_runtime_clear");
 
             g_expiredContractActors.erase(actorId);
@@ -1522,9 +1685,11 @@ namespace
 
         bool ExtendContractForActorUnsafe(RE::Actor* actor, const char* reason)
         {
-            if (!actor || !IsValidTeammate(actor)) {
-                spdlog::warn("[TFD][TeammateManager] contract extend rejected actor={:08X} reason={} detail=not_valid_teammate",
+            double endDay = 0.0;
+            if (!HasExpiredContractDecisionAuthorityUnsafe(actor, reason ? reason : "contract_extend", &endDay)) {
+                spdlog::warn("[TFD][TeammateManager][P48A] contract extend rejected actor={:08X} active={:08X} reason={} detail=not_expired_decision_actor",
                     actor ? actor->GetFormID() : 0u,
+                    g_contractExpiryActiveActor,
                     reason ? reason : "unknown");
                 return false;
             }
@@ -1532,21 +1697,18 @@ namespace
             const double nowDays = CurrentGameDays();
             const auto actorId = actor->GetFormID();
             const auto found = g_contractEndDays.find(actorId);
-            const double oldEnd = found != g_contractEndDays.end() ? found->second : nowDays;
+            const double oldEnd = found != g_contractEndDays.end() ? found->second : endDay;
             const double base = std::max(nowDays, oldEnd);
             const double newEnd = base + kHumanoidContractDays;
             g_contractEndDays[actorId] = newEnd;
-            const bool holdQueueForPleasure = IsReasonExtendContractPleasure(reason);
+
             ClearContractExpiryRuntimeForActorIdUnsafe(actorId, reason ? reason : "contract_extend");
-            if (holdQueueForPleasure) {
-                BeginContractExpiryPleasureHoldUnsafe(actorId, "extend_contract_pleasure");
-            }
-            spdlog::info("[TFD][TeammateManager] contract extended actor={:08X} oldEndDay={:.4f} newEndDay={:.4f} reason={} holdQueue={}",
+
+            spdlog::info("[TFD][TeammateManager][P48A] contract extended actor={:08X} oldEndDay={:.4f} newEndDay={:.4f} reason={} decision=resolved queueAdvance=1",
                 actorId,
                 oldEnd,
                 newEnd,
-                reason ? reason : "unknown",
-                holdQueueForPleasure ? 1 : 0);
+                reason ? reason : "unknown");
             return true;
         }
 
@@ -1589,6 +1751,9 @@ namespace
             return cleared;
         }
 
+        RE::Actor* LookupActorById(RE::FormID actorId);
+        void QueuePostTerminatePackageRefreshUnsafe(RE::FormID actorId, const char* reason);
+
         bool ReleaseHumanoidTeammateContractUnsafe(RE::Actor* actor, const char* reason)
         {
             if (!actor || actor == Player()) {
@@ -1596,16 +1761,33 @@ namespace
             }
 
             ResolveRegistry();
+            const bool tfdBefore = g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction);
+            const bool expiredBefore = g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction);
+            const bool knownBefore = WasKnownConvertedTeammate(actor);
+            const bool aliasManagedBefore = IsAliasManagedTeammate(actor);
+            if (!tfdBefore && !expiredBefore && !knownBefore && !aliasManagedBefore) {
+                spdlog::warn("[TFD][TeammateManager][P50A] terminate contract rejected actor={:08X} reason={} detail=not_tfd_teammate tfd={} expired={} known={} aliasManaged={}",
+                    actor->GetFormID(),
+                    reason ? reason : "unknown",
+                    tfdBefore ? 1 : 0,
+                    expiredBefore ? 1 : 0,
+                    knownBefore ? 1 : 0,
+                    aliasManagedBefore ? 1 : 0);
+                return false;
+            }
+
             RemoveContractForActorUnsafe(actor, reason ? reason : "release_contract");
             ClearAliasForActorUnsafe(actor, reason ? reason : "release_contract");
             ForgetConvertedTeammate(actor, reason ? reason : "release_contract");
 
-            if (g_registry.teammateFaction && actor->IsInFaction(g_registry.teammateFaction)) {
+            if (tfdBefore) {
                 actor->RemoveFromFaction(g_registry.teammateFaction);
             }
-            if (g_registry.expiredTeammateFaction && actor->IsInFaction(g_registry.expiredTeammateFaction)) {
+            if (expiredBefore) {
                 actor->RemoveFromFaction(g_registry.expiredTeammateFaction);
             }
+
+            const bool anchorsRemoved = RemoveFollowerAnchorFactionsUnsafe(actor, reason ? reason : "release_contract");
 
             if (!actor->IsDead() && !actor->IsDisabled()) {
                 if (actor->IsInCombat()) {
@@ -1623,12 +1805,21 @@ namespace
                 if (actor->Is3DLoaded()) {
                     actor->EvaluatePackage();
                 }
+                QueuePostTerminatePackageRefreshUnsafe(actor->GetFormID(), reason ? reason : "release_contract");
             }
 
             RefreshRecruitCapacityGlobalsUnsafe(reason ? reason : "release_contract");
-            spdlog::info("[TFD][TeammateManager] humanoid contract terminated actor={:08X} reason={}",
+            spdlog::info("[TFD][TeammateManager][P50A] humanoid contract terminated actor={:08X} reason={} tfdBefore={} expiredBefore={} knownBefore={} aliasManagedBefore={} expiredRequired=0 anchorsRemoved={} currentFollower={} playerFollower={} playerTeammate={} postRefreshQueued=1",
                 actor->GetFormID(),
-                reason ? reason : "unknown");
+                reason ? reason : "unknown",
+                tfdBefore ? 1 : 0,
+                expiredBefore ? 1 : 0,
+                knownBefore ? 1 : 0,
+                aliasManagedBefore ? 1 : 0,
+                anchorsRemoved ? 1 : 0,
+                g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction) ? 1 : 0,
+                g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction) ? 1 : 0,
+                actor->IsPlayerTeammate() ? 1 : 0);
             return true;
         }
 
@@ -1806,6 +1997,52 @@ namespace
         RE::Actor* LookupActorById(RE::FormID actorId)
         {
             return actorId != 0 ? RE::TESForm::LookupByID<RE::Actor>(actorId) : nullptr;
+        }
+
+        void QueuePostTerminatePackageRefreshUnsafe(RE::FormID actorId, const char* reason)
+        {
+            if (actorId == 0) {
+                return;
+            }
+
+            const std::string reasonCopy = reason ? reason : "terminate_contract";
+            auto* task = SKSE::GetTaskInterface();
+            if (!task) {
+                return;
+            }
+
+            task->AddTask([actorId, reasonCopy]() {
+                auto* actor = LookupActorById(actorId);
+                if (!actor || actor->IsDead() || actor->IsDisabled()) {
+                    spdlog::info("[TFD][TeammateManager][P49A] post-terminate package refresh skipped actor={:08X} reason={} detail=missing_dead_or_disabled",
+                        actorId,
+                        reasonCopy);
+                    return;
+                }
+
+                const bool anchorsRemoved = RemoveFollowerAnchorFactionsUnsafe(actor, (reasonCopy + "_post_task").c_str());
+                if (actor->IsInCombat()) {
+                    actor->StopCombat();
+                }
+                if (auto* process = RE::ProcessLists::GetSingleton()) {
+                    process->StopCombatAndAlarmOnActor(actor, false);
+                }
+
+                bool evaluated = false;
+                if (actor->Is3DLoaded()) {
+                    actor->EvaluatePackage();
+                    evaluated = true;
+                }
+
+                spdlog::info("[TFD][TeammateManager][P49A] post-terminate package refresh actor={:08X} reason={} anchorsRemoved={} playerTeammate={} currentFollower={} playerFollower={} evaluated={}",
+                    actorId,
+                    reasonCopy,
+                    anchorsRemoved ? 1 : 0,
+                    actor->IsPlayerTeammate() ? 1 : 0,
+                    g_registry.currentFollowerFaction && actor->IsInFaction(g_registry.currentFollowerFaction) ? 1 : 0,
+                    g_registry.playerFollowerFaction && actor->IsInFaction(g_registry.playerFollowerFaction) ? 1 : 0,
+                    evaluated ? 1 : 0);
+            });
         }
 
         void SyncExpiredFactionActiveUnsafe(RE::Actor* actor, bool active, const char* reason)
@@ -2976,13 +3213,13 @@ namespace
             }
 
             if (IsContractExpiryPleasureHoldActiveUnsafe(nowReal)) {
-                if (g_contractExpiryActiveActor != 0) {
-                    spdlog::info("[TFD][TeammateManager] contract expiry active actor cleared actor={:08X} reason=pleasure_queue_hold",
-                        g_contractExpiryActiveActor);
-                    ClearExpiredTeammateStatusForActorIdUnsafe(g_contractExpiryActiveActor, "pleasure_queue_hold");
-                    g_contractExpiryActiveActor = 0;
-                    g_contractExpiryActiveAliasIndex = -1;
+                RE::Actor* heldActor = LookupActorById(g_contractExpiryPleasureHoldActor);
+                if (heldActor && g_contractExpiryActiveActor == g_contractExpiryPleasureHoldActor && g_contractExpiryActiveAliasIndex >= 0) {
+                    ArmExpiredTeammateStatusUnsafe(heldActor, g_contractExpiryActiveAliasIndex, "contract_expired_queue_hold_retain", false);
                 }
+                spdlog::debug("[TFD][TeammateManager][P48A] contract expiry queue blocked by active pleasure actor={:08X} pendingExpired={}",
+                    g_contractExpiryPleasureHoldActor,
+                    static_cast<unsigned>(expired.size()));
                 return;
             }
 
@@ -3038,6 +3275,133 @@ namespace
                 ArmExpiredTeammateStatusUnsafe(active->actor, active->aliasIndex, "contract_expired_queue_retain", false);
                 TryOpenContractExpiredGreetUnsafe(active->actor, nowDays, nowReal);
             }
+        }
+
+        struct ContractStateSaveHeader
+        {
+            std::uint32_t count{ 0 };
+            std::uint32_t reserved{ 0 };
+        };
+
+        struct ContractStateSaveEntry
+        {
+            RE::FormID actorFormID{ 0 };
+            double endDay{ 0.0 };
+        };
+
+        void ResetContractExpiryQueueRuntimeUnsafe(const char* reason)
+        {
+            ResolveRegistry();
+            g_expiredContractActors.clear();
+            g_contractExpiryNextAttemptSec.clear();
+            g_contractExpiryOpenAttempts.clear();
+            g_contractExpiryActiveActor = 0;
+            g_contractExpiryActiveAliasIndex = -1;
+            g_contractExpiryPleasureHoldActor = 0;
+            g_contractExpiryPleasureHoldStartedSec = 0.0;
+            g_contractExpiryPleasureHoldLastLogSec = 0.0;
+            ClearAllExpiredTeammateStatusUnsafe(reason ? reason : "contract_expiry_runtime_reset");
+            spdlog::info("[TFD][TeammateManager][P48A] contract expiry runtime reset reason={}", reason ? reason : "unknown");
+        }
+
+        void ClearContractStateForLoadUnsafe(const char* reason)
+        {
+            ResolveRegistry();
+            g_contractEndDays.clear();
+            ResetContractExpiryQueueRuntimeUnsafe(reason ? reason : "contract_state_clear_for_load");
+            spdlog::info("[TFD][TeammateManager][P48A] contract state cleared reason={}", reason ? reason : "unknown");
+        }
+
+        bool SaveContractStateUnsafe(SKSE::SerializationInterface* intfc)
+        {
+            if (!intfc) {
+                return false;
+            }
+
+            std::vector<ContractStateSaveEntry> entries;
+            entries.reserve(g_contractEndDays.size());
+            for (const auto& [actorId, endDay] : g_contractEndDays) {
+                if (actorId == 0 || endDay <= 0.0) {
+                    continue;
+                }
+                entries.push_back(ContractStateSaveEntry{ actorId, endDay });
+            }
+
+            ContractStateSaveHeader header{};
+            header.count = static_cast<std::uint32_t>(entries.size());
+            if (!intfc->WriteRecordData(&header, sizeof(header))) {
+                spdlog::error("[TFD][TeammateManager][P48A] SaveContractState -> header write failed");
+                return false;
+            }
+            for (const auto& entry : entries) {
+                if (!intfc->WriteRecordData(&entry, sizeof(entry))) {
+                    spdlog::error("[TFD][TeammateManager][P48A] SaveContractState -> entry write failed actor={:08X}", entry.actorFormID);
+                    return false;
+                }
+            }
+
+            spdlog::info("[TFD][TeammateManager][P48A] SaveContractState -> contracts={}", header.count);
+            return true;
+        }
+
+        bool LoadContractStateUnsafe(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length)
+        {
+            if (!intfc) {
+                return false;
+            }
+            if (version != 1) {
+                if (length > 0) {
+                    std::string skip(length, '\0');
+                    intfc->ReadRecordData(skip.data(), length);
+                }
+                spdlog::warn("[TFD][TeammateManager][P48A] LoadContractState -> unsupported version={} length={}", version, length);
+                return false;
+            }
+            if (length < sizeof(ContractStateSaveHeader)) {
+                spdlog::warn("[TFD][TeammateManager][P48A] LoadContractState -> short record length={}", length);
+                return false;
+            }
+
+            ClearContractStateForLoadUnsafe("serialization_load_contract_state");
+
+            ContractStateSaveHeader header{};
+            if (!intfc->ReadRecordData(&header, sizeof(header))) {
+                spdlog::error("[TFD][TeammateManager][P48A] LoadContractState -> header read failed");
+                return false;
+            }
+
+            const std::uint32_t maxEntriesByLength = (length - static_cast<std::uint32_t>(sizeof(header))) / static_cast<std::uint32_t>(sizeof(ContractStateSaveEntry));
+            const std::uint32_t toRead = std::min(header.count, maxEntriesByLength);
+            if (header.count > maxEntriesByLength) {
+                spdlog::warn("[TFD][TeammateManager][P48A] LoadContractState -> declared count exceeds record length declared={} maxByLength={}", header.count, maxEntriesByLength);
+            }
+
+            std::uint32_t loaded = 0;
+            for (std::uint32_t i = 0; i < toRead; ++i) {
+                ContractStateSaveEntry entry{};
+                if (!intfc->ReadRecordData(&entry, sizeof(entry))) {
+                    spdlog::error("[TFD][TeammateManager][P48A] LoadContractState -> entry read failed index={}", i);
+                    return false;
+                }
+                if (entry.actorFormID == 0 || entry.endDay <= 0.0) {
+                    continue;
+                }
+
+                RE::FormID resolved = 0;
+                if (intfc->ResolveFormID(entry.actorFormID, resolved) && resolved != 0) {
+                    g_contractEndDays[resolved] = entry.endDay;
+                    ++loaded;
+                }
+            }
+
+            const std::uint32_t readBytes = static_cast<std::uint32_t>(sizeof(ContractStateSaveHeader) + (sizeof(ContractStateSaveEntry) * toRead));
+            if (length > readBytes) {
+                std::string skip(length - readBytes, '\0');
+                intfc->ReadRecordData(skip.data(), static_cast<std::uint32_t>(skip.size()));
+            }
+
+            spdlog::info("[TFD][TeammateManager][P48A] LoadContractState -> loaded={} declared={} read={} length={}", loaded, header.count, toRead, length);
+            return true;
         }
 
         void SyncAliasesImpl()
@@ -3313,6 +3677,8 @@ namespace TFD::TeammateManager::BridgeInternal
     constexpr const char* kHumanoidTeammateAssignEvent = "TFDHumanoidTeammateAssign";
     constexpr const char* kTeammateGreetStartedEvent = "TFDTeammateGreetStarted";
     constexpr const char* kTeammateExtendContractGoldEvent = "TFDTeammateExtendContractGold";
+    constexpr const char* kTeammateExtendContractPleasureStartEvent = "TFDTeammateExtendContractPleasureStart";
+    constexpr const char* kTeammateExtendContractPleasureFailedEvent = "TFDTeammateExtendContractPleasureFailed";
     constexpr const char* kTeammateExtendContractPleasureEvent = "TFDTeammateExtendContractPleasure";
     constexpr const char* kTeammateRestoreHealthPotionEvent = "TFDTeammateRestoreHealthPotion";
     constexpr const char* kTeammateRestoreHealthPleasureEvent = "TFDTeammateRestoreHealthPleasure";
@@ -3371,6 +3737,16 @@ namespace TFD::TeammateManager::BridgeInternal
             if (name == kTeammateExtendContractGoldEvent) {
                 const bool ok = AliasInternal::ExtendContractForActorUnsafe(senderActor, "extend_contract_gold");
                 spdlog::info("[TFD][TeammateManager] contract extend gold actor={:08X} ok={}", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateExtendContractPleasureStartEvent) {
+                const bool ok = AliasInternal::BeginContractExpiryPleasureHoldForActorUnsafe(senderActor, "extend_contract_pleasure_start");
+                spdlog::info("[TFD][TeammateManager][P48A] contract extend pleasure start actor={:08X} ok={} queueHold=1", senderActor->GetFormID(), ok ? 1 : 0);
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (name == kTeammateExtendContractPleasureFailedEvent) {
+                const bool ok = AliasInternal::FailContractExpiryPleasureHoldForActorUnsafe(senderActor, "extend_contract_pleasure_failed");
+                spdlog::info("[TFD][TeammateManager][P48A] contract extend pleasure failed actor={:08X} ok={} queueReopen=1", senderActor->GetFormID(), ok ? 1 : 0);
                 return RE::BSEventNotifyControl::kContinue;
             }
             if (name == kTeammateExtendContractPleasureEvent) {
@@ -3530,6 +3906,31 @@ namespace TFD::TeammateManager
         AliasInternal::QueueHumanoidTeammateCatchupAfterLoad(reason);
     }
 
+
+    void ResetHumanoidContractTransientForLoad(const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ResolveRegistry();
+        AliasInternal::ResetContractExpiryQueueRuntimeUnsafe(reason ? reason : "native_contract_transient_reset_for_load");
+    }
+
+    void ClearHumanoidContractStateForLoad(const char* reason)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        AliasInternal::ClearContractStateForLoadUnsafe(reason ? reason : "native_contract_state_clear_for_load");
+    }
+
+    bool SaveHumanoidContractState(SKSE::SerializationInterface* intfc)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        return AliasInternal::SaveContractStateUnsafe(intfc);
+    }
+
+    bool LoadHumanoidContractState(SKSE::SerializationInterface* intfc, std::uint32_t version, std::uint32_t length)
+    {
+        std::scoped_lock lock(AliasInternal::g_syncLock);
+        return AliasInternal::LoadContractStateUnsafe(intfc, version, length);
+    }
 
     std::size_t RestoreNow()
     {

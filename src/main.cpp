@@ -119,6 +119,8 @@ static constexpr std::uint32_t kProgressRecord = 'TDSP';
 static constexpr std::uint32_t kProgressVersion = 3;
 static constexpr std::uint32_t kLocationCacheRecord = 'TDLC';
 static constexpr std::uint32_t kLocationCacheVersion = 2;
+static constexpr std::uint32_t kTeammateContractRecord = 'TDTC';
+static constexpr std::uint32_t kTeammateContractVersion = 1;
 
 struct SavedProgressRecord
 {
@@ -222,6 +224,16 @@ static void OnSerializationSave(SKSE::SerializationInterface* intfc)
         rec.workJobType,
         rec.workAssignmentState);
 
+    if (!intfc->OpenRecord(kTeammateContractRecord, kTeammateContractVersion)) {
+        spdlog::error("[TFD] Serialization Save -> OpenRecord teammate contract failed");
+        return;
+    }
+
+    if (!TFD::TeammateManager::SaveHumanoidContractState(intfc)) {
+        spdlog::error("[TFD] Serialization Save -> SaveHumanoidContractState failed");
+        return;
+    }
+
     if (!intfc->OpenRecord(kLocationCacheRecord, kLocationCacheVersion)) {
         spdlog::error("[TFD] Serialization Save -> OpenRecord location cache failed");
         return;
@@ -238,6 +250,7 @@ static void OnSerializationRevert(SKSE::SerializationInterface*)
     spdlog::info("[TFD] Serialization Revert -> prepare save swap");
     TFD::DefeatMonitor::QueueDefaultProgressState();
     TFD::Location::ClearRescueCache();
+    TFD::TeammateManager::ClearHumanoidContractStateForLoad("serialization_revert");
     ResetTransientStateForLoad();
     TFD::Victory::SetLoadTransition(true, "serialization_revert");
     TFD::DefeatMonitor::SetLoadTransition(true);
@@ -250,6 +263,7 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
 
     TFD::DefeatMonitor::QueueDefaultProgressState();
     TFD::Location::ClearRescueCache();
+    TFD::TeammateManager::ClearHumanoidContractStateForLoad("serialization_load_begin");
     gPendingLoadFinalize.store(true, std::memory_order_release);
 
     if (!intfc) {
@@ -262,6 +276,7 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
     std::uint32_t length = 0;
     bool sawProgress = false;
     bool sawLocationCache = false;
+    bool sawTeammateContract = false;
 
     while (intfc->GetNextRecordInfo(type, version, length)) {
         if (type == kProgressRecord) {
@@ -292,6 +307,13 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
             continue;
         }
 
+        if (type == kTeammateContractRecord) {
+            if (TFD::TeammateManager::LoadHumanoidContractState(intfc, version, length)) {
+                sawTeammateContract = true;
+            }
+            continue;
+        }
+
         if (type == kLocationCacheRecord) {
             if (TFD::Location::LoadRescueCache(intfc, version, length)) {
                 sawLocationCache = true;
@@ -305,9 +327,10 @@ static void OnSerializationLoad(SKSE::SerializationInterface* intfc)
         }
     }
 
-    spdlog::info("[TFD] Serialization Load -> progressRecord={} locationCache={}",
+    spdlog::info("[TFD] Serialization Load -> progressRecord={} locationCache={} teammateContract={}",
         sawProgress ? "yes" : "no",
-        sawLocationCache ? "yes" : "no");
+        sawLocationCache ? "yes" : "no",
+        sawTeammateContract ? "yes" : "no");
 }
 
 class LoadMenuSink : public RE::BSTEventSink<RE::MenuOpenCloseEvent>
